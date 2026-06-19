@@ -40,9 +40,12 @@ $YATIMA_MODELS_DIR  (else  ${XDG_CACHE_HOME:-~/.cache}/yatima/models)
         config.json  tokenizer.json  *.safetensors  [model.safetensors.index.json]
 ```
 
-This is exactly possum's `--to <root>` → `<org>/<name>` layout, so the two
-tools agree by **convention, not coupling**. `Engine::load` is HF-agnostic — it
-takes a directory.
+This mirrors the layout written by
+[`possum`](https://github.com/shayne-fletcher/possum), our standalone Hugging
+Face model-artifact downloader. Acquisition is kept a separate concern from
+inference — **possum acquires, yatima loads** — so the two agree by
+**convention, not coupling**, and either can evolve (or be replaced) on its own.
+`Engine::load` itself is HF-agnostic: it takes a directory.
 
 `model_shards()` is the single discovery rule used by **both** `Engine::load`
 (what to mmap) and `is_model_present()` (what must exist): if
@@ -53,7 +56,8 @@ hit.
 ## Auto-fetch (the `fetch` feature)
 
 `yatima generate --repo <id>` fetches on a cache miss by calling
-**`possum-lib`** in-process (no shelling out):
+[`possum-lib`](https://github.com/shayne-fletcher/possum) in-process (no
+shelling out):
 
 - **cache hit** → quiet load.
 - **cache miss** → `ensure_model` downloads via `possum_lib::model::download`
