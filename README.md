@@ -14,8 +14,13 @@
   </a>
 </p>
 
-`yatima` is a Rust runtime for language-integrated LLMs — inference as an
-in-process library function.
+`yatima` is a Rust runtime for language-integrated LLMs — calling a local model
+as an ordinary in-process function. It's a building block to compose freely, not
+a fixed product shape: weights are acquired by
+[`possum`](https://github.com/shayne-fletcher/possum) and loaded by `yatima`,
+which owns the runtime (loading, generation, and — later — capability-scoped
+tools) while renting the inference engine
+([candle](https://github.com/huggingface/candle)).
 
 ## Building
 
@@ -24,3 +29,8 @@ cargo build                            # build
 cargo test                             # the whole suite
 cargo run --bin yatima -- --help       # explore the CLI
 ```
+
+## Notes
+
+- [Design](notes/design.md) — the `Engine::generate` contract, model storage,
+  and auto-fetch.

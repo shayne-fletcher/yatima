@@ -1,9 +1,12 @@
 # yatima — design notes
 
 `yatima` is a small Rust runtime for **language-integrated LLMs**: calling a
-local model as an ordinary in-process function rather than a network service.
-We **own the runtime, rent the engine** — `yatima-lib` owns loading, the
-generation loop, and (next) capability-scoped tools; the inference engine
+local model as an ordinary in-process function. That's a *building block*, not a
+fixed product shape — embed it in an app, wrap it in a service, drive it from a
+TUI, compose it however the work demands; the in-process function is the
+foundation those are built on, not an alternative to them. We **own the runtime,
+rent the engine** — `yatima-lib` owns loading, the generation loop, and (next)
+capability-scoped tools; the inference engine
 ([candle](https://github.com/huggingface/candle)) is a swappable dependency.
 
 ## Crates
