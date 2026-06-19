@@ -126,8 +126,9 @@ jobs:
               <p>the runtime — inference as an in-process library function.</p>
             </li>
             <li>
-              <h2><a href="yatima_cli/index.html">yatima-cli</a></h2>
-              <p>the <code>yatima</code> command-line front-end.</p>
+              <h2><a href="yatima/index.html">yatima-cli</a></h2>
+              <p>the <code>yatima</code> command-line front-end (binary crate
+              <code>yatima</code>).</p>
             </li>
           </ul>
           <footer>
