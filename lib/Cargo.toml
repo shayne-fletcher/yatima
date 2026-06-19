@@ -4,4 +4,28 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 
+# candle is pinned to the exact git rev validated during bring-up (≈0.10.2);
+# the upstream `qwen` example ran our local DeepSeek weights against this rev.
 [dependencies]
+candle-core = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
+candle-transformers = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
+tokenizers = "0.22"
+serde_json = "1"
+anyhow = "1"
+
+# Auto-fetch (the `fetch` feature) embeds possum's downloader as a library,
+# pinned to the rev where its model commands moved into possum-lib.
+possum-lib = { git = "https://github.com/shayne-fletcher/possum", rev = "52a9cd7390701f93437debe67c7b82ea80edff88", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+
+[features]
+metal = [
+  "candle-core/metal",
+  "candle-nn/metal",
+  "candle-transformers/metal",
+]
+fetch = ["dep:possum-lib", "dep:tokio"]
+
+[dev-dependencies]
+tempfile = "3"
