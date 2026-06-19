@@ -1,0 +1,82 @@
+name: build and test
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: SebRollen/toml-action@v1.0.2
+      id: read_rust_toolchain
+      with:
+        file: rust-toolchain
+        field: toolchain.channel
+    - uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: ${{ steps.read_rust_toolchain.outputs.value }}
+        components: clippy, rustfmt
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: shared-build-cache
+        cache-targets: true
+        cache-all-crates: true
+    - name: format check
+      run: cargo fmt --all --check
+    - name: clippy check
+      run: cargo clippy --all-targets
+    - name: build
+      run: cargo build
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - uses: actions/checkout@v4
+    - uses: SebRollen/toml-action@v1.0.2
+      id: read_rust_toolchain
+      with:
+        file: rust-toolchain
+        field: toolchain.channel
+    - uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: ${{ steps.read_rust_toolchain.outputs.value }}
+        components: clippy, rustfmt
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: shared-build-cache
+        cache-targets: true
+        cache-all-crates: true
+    - name: run tests
+      run: cargo test
+  publish-docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: SebRollen/toml-action@v1.0.2
+      id: read_rust_toolchain
+      with:
+        file: rust-toolchain
+        field: toolchain.channel
+    - uses: dtolnay/rust-toolchain@v1
+      with:
+        toolchain: ${{ steps.read_rust_toolchain.outputs.value }}
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: shared-build-cache
+        cache-targets: true
+        cache-all-crates: true
+    - name: build docs
+      run: cargo doc --no-deps
+    - name: redirect docs root to the library crate
+      run: echo '<meta http-equiv="refresh" content="0; url=yatima_lib/index.html">' > target/doc/index.html
+    - name: disable jekyll
+      run: touch target/doc/.nojekyll
+    - name: publish to gh_pages
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: target/doc
