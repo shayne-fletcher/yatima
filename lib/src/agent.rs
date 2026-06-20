@@ -491,6 +491,35 @@ mod tests {
         assert_eq!(run.answer, "Got it: the data.");
     }
 
+    #[test]
+    fn immediate_answer_when_no_tool_call() {
+        // upholds: AGENT-1 — a model that answers directly yields 0 tool rounds.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&["The answer is 42."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let run = agent.run("q").unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.steps, 0);
+        assert_eq!(run.answer, "The answer is 42.");
+    }
+
+    #[test]
+    fn strip_think_keeps_only_the_answer() {
+        assert_eq!(strip_think("no think here"), "no think here");
+        assert_eq!(
+            strip_think("<think>weighing it</think>\nthe answer"),
+            "the answer"
+        );
+        // multiple closers: keep what follows the last one.
+        assert_eq!(strip_think("a</think>b</think>final"), "final");
+        assert_eq!(strip_think("  padded  "), "padded");
+        // an unterminated think block is left intact (trimmed).
+        assert_eq!(
+            strip_think("<think>still thinking"),
+            "<think>still thinking"
+        );
+    }
+
     // End-to-end agent runs over a real, tool-trained model (Qwen2.5-Instruct,
     // Qwen2 arch). Gated: need the weights and `YATIMA_E2E=1`, skip fast
     // otherwise. Assertions are *tool-side* (the tool returns the real file
