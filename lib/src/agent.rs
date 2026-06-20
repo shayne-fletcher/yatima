@@ -631,4 +631,53 @@ mod tests {
 
         Ok(())
     }
+
+    /// The GGUF quantized path through the *agent* (a 32B-Q4 Qwen2.5). Gated on
+    /// `YATIMA_E2E=1` and the cached GGUF; proves the quantized model drives the
+    /// full read-file-then-answer loop. Self-contained: it summarizes a known tmp
+    /// file, so assertions (tool fired, Final, the answer mentions the subject)
+    /// are stable. Run with `--features metal --nocapture`.
+    #[test]
+    fn e2e_gguf_agent_reads_and_answers() -> Result<()> {
+        if std::env::var_os("YATIMA_E2E").is_none() {
+            eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+            return Ok(());
+        }
+        let dir = crate::model_dir(
+            &crate::models_root(),
+            &crate::ModelId::parse("bartowski/Qwen2.5-32B-Instruct-GGUF").unwrap(),
+        );
+        if !crate::is_model_present(&dir) {
+            eprintln!("skipping e2e: GGUF model not cached at {}", dir.display());
+            return Ok(());
+        }
+
+        let tmp = tmp_with_file(
+            "about.txt",
+            "Yatima is a Rust runtime for language-integrated LLMs: it calls a local \
+             model as an in-process function and lets it act through capability-scoped tools.",
+        );
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+
+        let mut engine = crate::Engine::load(&dir, crate::device(false)?)?;
+        let run = qwen_agent(&mut engine, &tools, 4)
+            .run("Read about.txt and tell me in one sentence what Yatima is.")?;
+        dump(&run);
+
+        assert!(run.steps >= 1, "the model should have called read_file");
+        assert_eq!(run.stop, AgentStop::Final);
+        assert!(
+            tool_turns(&run)
+                .iter()
+                .any(|t| t.content.contains("Rust runtime") && !t.content.contains("error")),
+            "the tool must have fed back about.txt"
+        );
+        let answer = run.answer.to_lowercase();
+        assert!(
+            answer.contains("rust") || answer.contains("runtime") || answer.contains("llm"),
+            "the quantized model's answer should be grounded in the file: {:?}",
+            run.answer
+        );
+        Ok(())
+    }
 }
