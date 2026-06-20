@@ -235,14 +235,14 @@ fn parse_deepseek_call(after: &str) -> Result<ToolCall> {
 }
 
 /// Extract a JSON value from a fenced ```json … ``` block, or failing that the
-/// first balanced `{…}` span.
+/// first balanced `{…}` span (string-aware, so it can't panic on `}` before `{`).
 fn extract_json_block(s: &str) -> Result<Value> {
     let body = if let Some(i) = s.find("```json") {
         let rest = &s[i + "```json".len()..];
         let end = rest.find("```").unwrap_or(rest.len());
-        &rest[..end]
-    } else if let (Some(a), Some(b)) = (s.find('{'), s.rfind('}')) {
-        &s[a..=b]
+        rest[..end].to_string()
+    } else if let Some(obj) = balanced_object(s) {
+        obj
     } else {
         bail!("tool call missing JSON arguments");
     };
@@ -550,6 +550,31 @@ mod tests {
         let codec = DeepSeekToolCall;
         let text = "<｜tool▁call▁begin｜>function<｜tool▁sep｜>read_file\nno json here";
         assert!(codec.parse(text).unwrap().is_err());
+    }
+
+    #[test]
+    fn deepseek_codec_does_not_panic_on_inverted_braces() {
+        // upholds: PROTO-1 — `}` before `{` must yield an error, never a slice
+        // panic (the old first-`{`..last-`}` extractor would panic here).
+        let codec = DeepSeekToolCall;
+        let text = "<｜tool▁call▁begin｜>function<｜tool▁sep｜>read_file\n}{<｜tool▁call▁end｜>";
+        assert!(codec.parse(text).unwrap().is_err());
+    }
+
+    proptest::proptest! {
+        // upholds: PROTO-1 — no model output, however malformed, may panic a
+        // codec's parse; it must return None or Some(Ok/Err).
+        #[test]
+        fn codecs_never_panic_on_arbitrary_text(s in ".*") {
+            let _ = JsonToolCall.parse(&s);
+            let _ = QwenToolCall.parse(&s);
+            let _ = DeepSeekToolCall.parse(&s);
+            let wrapped = format!("<tool_call>{s}</tool_call>");
+            let _ = JsonToolCall.parse(&wrapped);
+            let _ = QwenToolCall.parse(&wrapped);
+            let ds = format!("<｜tool▁call▁begin｜>{s}<｜tool▁call▁end｜>");
+            let _ = DeepSeekToolCall.parse(&ds);
+        }
     }
 
     #[test]
