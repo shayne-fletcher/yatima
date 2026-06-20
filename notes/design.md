@@ -15,7 +15,7 @@ the lawful-composition algebra is rented from
 
 - **`yatima-lib`** — the capability as a function: `Engine::{load, generate,
   generate_fold}`, `Sampling`/`GenOpts`/`Generation`/`StopReason`, the
-  `RepoId`/`models_root`/`model_dir` resolver, the `presence`/`model_shards`
+  `ModelId`/`models_root`/`model_dir` resolver, the `presence`/`model_shards`
   discovery, and (behind the `fetch` feature) `ensure_model`.
 - **`yatima-cli`** — a thin wrapper: `yatima generate` and `yatima models-dir`,
   with model selection parsed into a `ModelSource` ADT at the edge.
@@ -62,7 +62,7 @@ Weights are re-downloadable ⇒ they live under the XDG **cache**:
 
 ```
 $YATIMA_MODELS_DIR  (else  ${XDG_CACHE_HOME:-~/.cache}/yatima/models)
-  └── <org>/<name>/        # = model_dir(models_root(), &RepoId)
+  └── <org>/<name>/        # = model_dir(models_root(), &ModelId)
         config.json  tokenizer.json  *.safetensors  [model.safetensors.index.json]
 ```
 
@@ -71,7 +71,7 @@ This mirrors the layout written by
 Face downloader: **possum acquires, yatima loads** — agreement by *convention,
 not coupling* (MS-2). `Engine::load` is HF-agnostic (takes a directory).
 
-- **`RepoId`** is a validated newtype: a `--repo` id (untrusted input) is parsed
+- **`ModelId`** is a validated newtype: a `--repo` id (untrusted input) is parsed
   rejecting empty / absolute / `..` / empty-component ids, so `model_dir` cannot
   escape the root (MS-3). The same `is_safe_relative` check guards shard names
   read from the (untrusted) index `weight_map`.
@@ -94,27 +94,14 @@ out): cache hit → quiet load; miss → `ensure_model` downloads (include
 
 ## Registries
 
-These are stated, not enforced by the compiler; each is protected by a test.
+The **canonical** invariant & law registry lives in the crate docs — see the
+`yatima-lib` crate doc (`lib.rs`: model store/discovery + generation) and the
+`yatima-cli` `main.rs` doc (`CLI-1`/`CLI-2`). Each is protected by a test that
+cites its id in an `// upholds: <id>` comment (`grep -r 'upholds:'`).
 
-**Invariants**
-- **MS-1** `models_root` precedence: `$YATIMA_MODELS_DIR` → `$XDG_CACHE_HOME/
-  yatima/models` → `$HOME/.cache/yatima/models`.
-- **MS-2** `model_dir` mirrors possum's `<root>/<org>/<name>`.
-- **MS-3** repo ids & shard names never escape the root/model dir.
-- **MD-1/2** discovery: unsharded = all `*.safetensors`; indexed = unique
-  `weight_map` values (deduped, sorted).
-- **FETCH-2** `ensure_model` re-checks presence; a partial dir never reaches
-  `load`.
-- **CLI-1** exactly one model source (`--model` xor `--repo`); **CLI-2**
-  `--offline` never fetches.
-
-**Laws**
-- **SAM-1** `Sampling` → `LogitsProcessor` total; **SAM-2** greedy ignores seed.
-- **STOP-1** exactly one `StopReason`; **GEN-3** `tokens ≤ max_tokens`.
-- **GE-1** stateless: repeated greedy runs on the same engine+prompt are
-  byte-identical.
-- **DISC** indexed shards dedupe idempotently and are deterministically ordered;
-  containment holds.
+In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
+**FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
+**GEN-3**, **GE-1**); CLI (**CLI-1/2**).
 
 ## State machines
 
@@ -163,3 +150,8 @@ Capability-scoped tool runtime + agent loop + conversation state (the next
 layer); engine swappability (mistral.rs / llama.cpp-GGUF); download
 integrity/resume; porting the lattice combinators (`Max`/`Min`/`All`/`Any`/
 `LatticeMap`) down into `axiom`; the Haskell study of the `generate` contract.
+
+A shared dependency-light crate (working name **`lexicon`**) for `ModelId` + the
+`<root>/<org>/<name>` layout — extracted once there's a real trigger (possum
+validating its own ids, or a second consumer), so possum and yatima share one
+definition instead of two.

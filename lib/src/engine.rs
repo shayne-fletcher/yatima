@@ -382,7 +382,7 @@ pub fn is_model_present(dir: &Path) -> bool {
 /// completeness after download so a partial fetch is never handed to
 /// [`Engine::load`].
 #[cfg(feature = "fetch")]
-pub async fn ensure_model(repo: &crate::RepoId, models_root: &Path) -> Result<PathBuf> {
+pub async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> Result<PathBuf> {
     let dir = crate::model_dir(models_root, repo);
     if is_model_present(&dir) {
         return Ok(dir);
@@ -413,7 +413,7 @@ pub async fn ensure_model(repo: &crate::RepoId, models_root: &Path) -> Result<Pa
 /// Blocking wrapper around [`ensure_model`] for synchronous callers (the CLI);
 /// drives the async fetch on a private tokio runtime.
 #[cfg(feature = "fetch")]
-pub fn ensure_model_blocking(repo: &crate::RepoId, models_root: &Path) -> Result<PathBuf> {
+pub fn ensure_model_blocking(repo: &crate::ModelId, models_root: &Path) -> Result<PathBuf> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(ensure_model(repo, models_root))
 }
@@ -457,6 +457,7 @@ mod tests {
 
     #[test]
     fn gen_opts_defaults_are_greedy() {
+        // upholds: SAM-2 (the default sampling is the deterministic, seed-free one)
         let o = GenOpts::default();
         assert_eq!(o.max_tokens, 256);
         assert_eq!(o.sampling, Sampling::Greedy);
@@ -464,6 +465,7 @@ mod tests {
 
     #[test]
     fn eos_from_generation_config_single_id() {
+        // upholds: EOS-1
         let cfg = serde_json::json!({ "eos_token_id": 151643 });
         let gen = serde_json::json!({ "eos_token_id": 151643 });
         assert_eq!(extract_eos_ids(&cfg, Some(&gen)), HashSet::from([151643]));
@@ -471,18 +473,21 @@ mod tests {
 
     #[test]
     fn eos_handles_array() {
+        // upholds: EOS-1
         let cfg = serde_json::json!({ "eos_token_id": [151643, 151645] });
         assert_eq!(extract_eos_ids(&cfg, None), HashSet::from([151643, 151645]));
     }
 
     #[test]
     fn eos_empty_when_absent() {
+        // upholds: EOS-1
         let cfg = serde_json::json!({ "hidden_size": 3584 });
         assert!(extract_eos_ids(&cfg, None).is_empty());
     }
 
     #[test]
     fn is_model_present_requires_all_indexed_shards() {
+        // upholds: MD-3
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("config.json"), "{}").unwrap();
@@ -502,6 +507,7 @@ mod tests {
 
     #[test]
     fn is_model_present_false_without_config_or_tokenizer() {
+        // upholds: MD-3
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("model.safetensors"), "x").unwrap();
@@ -510,6 +516,7 @@ mod tests {
 
     #[test]
     fn is_model_present_unsharded_ok() {
+        // upholds: MD-1
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("config.json"), "{}").unwrap();
@@ -520,6 +527,7 @@ mod tests {
 
     #[test]
     fn model_shards_rejects_escaping_index() {
+        // upholds: MS-3
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(
@@ -531,7 +539,25 @@ mod tests {
     }
 
     #[test]
+    fn model_shards_dedups_and_sorts_indexed() {
+        // upholds: MD-2 / DISC — duplicate shard refs collapse; order is stable.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(
+            p.join("model.safetensors.index.json"),
+            r#"{"weight_map": {"a": "m-2.safetensors", "b": "m-1.safetensors", "c": "m-2.safetensors"}}"#,
+        )
+        .unwrap();
+        let shards = model_shards(p).unwrap();
+        assert_eq!(
+            shards,
+            vec![p.join("m-1.safetensors"), p.join("m-2.safetensors")],
+        );
+    }
+
+    #[test]
     fn presence_reports_missing_shards() {
+        // upholds: MD-3
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("config.json"), "{}").unwrap();
@@ -558,7 +584,7 @@ mod tests {
             eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
             return Ok(());
         }
-        let repo = crate::RepoId::parse("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B").unwrap();
+        let repo = crate::ModelId::parse("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B").unwrap();
         let dir = crate::model_dir(&crate::models_root(), &repo);
         if !dir.join("config.json").exists() {
             eprintln!("skipping e2e: weights absent at {}", dir.display());
@@ -589,7 +615,10 @@ mod tests {
             "STOP-1: greedy run stops by EOS or max_tokens"
         );
         let (second, _) = run(&mut engine)?;
-        assert_eq!(first, second, "greedy generation must be deterministic");
+        assert_eq!(
+            first, second,
+            "GE-1: greedy generation must be deterministic"
+        );
         Ok(())
     }
 }

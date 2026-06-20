@@ -1,11 +1,16 @@
 //! `yatima` — a thin CLI over the in-process inference library.
+//!
+//! CLI invariants (part of the registry; see `yatima-lib`'s crate doc for the
+//! rest). Protected by tests that cite the id (`// upholds: <id>`):
+//! - **CLI-1** generation has exactly one model source (`--model` xor `--repo`).
+//! - **CLI-2** `--offline` never fetches; an absent model is a clear error.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use yatima_lib::{device, model_dir, models_root, Engine, GenOpts, RepoId, Sampling};
+use yatima_lib::{device, model_dir, models_root, Engine, GenOpts, ModelId, Sampling};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -60,7 +65,7 @@ fn main() -> Result<()> {
         Command::ModelsDir { repo } => {
             let root = models_root();
             let path = match repo {
-                Some(r) => model_dir(&root, &RepoId::parse(&r)?),
+                Some(r) => model_dir(&root, &ModelId::parse(&r)?),
                 None => root,
             };
             println!("{}", path.display());
@@ -114,7 +119,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
 enum ModelSource {
     Directory(PathBuf),
     Repository {
-        id: RepoId,
+        id: ModelId,
         root: PathBuf,
         fetch: FetchPolicy,
     },
@@ -135,7 +140,7 @@ impl ModelSource {
         match (model, repo) {
             (Some(dir), None) => Ok(ModelSource::Directory(dir)),
             (None, Some(repo)) => Ok(ModelSource::Repository {
-                id: RepoId::parse(&repo)?,
+                id: ModelId::parse(&repo)?,
                 root: models_dir.unwrap_or_else(models_root),
                 fetch: if offline {
                     FetchPolicy::Offline
@@ -173,13 +178,13 @@ impl ModelSource {
 }
 
 #[cfg(feature = "fetch")]
-fn fetch_model(id: &RepoId, root: &std::path::Path) -> Result<PathBuf> {
+fn fetch_model(id: &ModelId, root: &std::path::Path) -> Result<PathBuf> {
     eprintln!("fetching {id} …");
     yatima_lib::ensure_model_blocking(id, root)
 }
 
 #[cfg(not(feature = "fetch"))]
-fn fetch_model(id: &RepoId, _root: &std::path::Path) -> Result<PathBuf> {
+fn fetch_model(id: &ModelId, _root: &std::path::Path) -> Result<PathBuf> {
     bail!("model '{id}' not present and yatima was built without the `fetch` feature")
 }
 
@@ -189,12 +194,14 @@ mod tests {
 
     #[test]
     fn source_directory() {
+        // upholds: CLI-1
         let s = ModelSource::from_args(Some(PathBuf::from("/m")), None, None, false).unwrap();
         assert!(matches!(s, ModelSource::Directory(_)));
     }
 
     #[test]
     fn source_repository_online_and_offline() {
+        // upholds: CLI-1
         let on = ModelSource::from_args(None, Some("org/name".into()), None, false).unwrap();
         assert!(matches!(
             on,
@@ -213,9 +220,9 @@ mod tests {
         ));
     }
 
-    // CLI-1: exactly one model source.
     #[test]
     fn source_is_exclusive_and_required() {
+        // upholds: CLI-1 — exactly one model source.
         assert!(ModelSource::from_args(
             Some(PathBuf::from("/m")),
             Some("org/name".into()),
@@ -227,7 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn source_rejects_escaping_repo_id() {
+    fn source_rejects_escaping_model_id() {
+        // upholds: MS-3
         assert!(ModelSource::from_args(None, Some("../escape".into()), None, false).is_err());
+    }
+
+    #[test]
+    fn offline_absent_errors_without_network() {
+        // upholds: CLI-2 — offline + absent model errors, never fetches.
+        let src = ModelSource::from_args(
+            None,
+            Some("org/name".into()),
+            Some(PathBuf::from("/nonexistent-yatima-models-xyzzy")),
+            true,
+        )
+        .unwrap();
+        assert!(src.resolve().is_err());
     }
 }

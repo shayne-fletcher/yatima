@@ -12,7 +12,7 @@
 //! - **MS-1** `models_root` precedence: `$YATIMA_MODELS_DIR`, else
 //!   `${XDG_CACHE_HOME}/yatima/models`, else `$HOME/.cache/yatima/models`.
 //! - **MS-2** [`model_dir`] mirrors possum's `<root>/<org>/<name>` layout.
-//! - **MS-3** a [`RepoId`] and index shard names never escape the root / model
+//! - **MS-3** a [`ModelId`] and index shard names never escape the root / model
 //!   directory (untrusted input is contained).
 //! - **MD-1** unsharded discovery is every `*.safetensors`, sorted.
 //! - **MD-2** indexed discovery is the unique `weight_map` values, deduped and
@@ -67,11 +67,11 @@ pub fn models_root() -> PathBuf {
 /// [`model_dir`] is containment-safe by construction (invariant MS-3). The id
 /// is untrusted input (a CLI flag), so this is the security boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoId(String);
+pub struct ModelId(String);
 
-impl RepoId {
+impl ModelId {
     /// Parse and validate a repository id.
-    pub fn parse(s: &str) -> Result<RepoId> {
+    pub fn parse(s: &str) -> Result<ModelId> {
         if s.is_empty() {
             bail!("empty repository id");
         }
@@ -81,7 +81,7 @@ impl RepoId {
         if !is_safe_relative(s) {
             bail!("repository id '{s}' must be relative with no '.' / '..' / root components");
         }
-        Ok(RepoId(s.to_string()))
+        Ok(ModelId(s.to_string()))
     }
 
     /// The underlying id string.
@@ -90,29 +90,29 @@ impl RepoId {
     }
 }
 
-impl std::fmt::Display for RepoId {
+impl std::fmt::Display for ModelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::str::FromStr for RepoId {
+impl std::str::FromStr for ModelId {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
-        RepoId::parse(s)
+        ModelId::parse(s)
     }
 }
 
 /// The leaf directory holding a repository's files under `models_root`,
 /// mirroring possum's on-disk layout (`<root>/<org>/<name>`). Safe by
-/// construction: [`RepoId`] cannot escape the root.
-pub fn model_dir(models_root: &Path, repo: &RepoId) -> PathBuf {
+/// construction: [`ModelId`] cannot escape the root.
+pub fn model_dir(models_root: &Path, repo: &ModelId) -> PathBuf {
     models_root.join(repo.as_str())
 }
 
 /// Whether a path string is a relative path made only of normal components
 /// (no root/prefix, no `..`) — i.e. it cannot escape a directory it is joined
-/// onto. Used to validate both [`RepoId`]s and shard names from an index
+/// onto. Used to validate both [`ModelId`]s and shard names from an index
 /// manifest (untrusted data).
 pub(crate) fn is_safe_relative(s: &str) -> bool {
     let p = Path::new(s);
@@ -141,67 +141,73 @@ mod tests {
 
     #[test]
     fn models_root_prefers_yatima_models_dir() {
+        // upholds: MS-1
         let r = resolve_models_root(Some("/m".into()), Some("/c".into()), Some("/h".into()));
         assert_eq!(r, PathBuf::from("/m"));
     }
 
     #[test]
     fn models_root_falls_back_to_xdg_cache_home() {
+        // upholds: MS-1
         let r = resolve_models_root(None, Some("/c".into()), Some("/h".into()));
         assert_eq!(r, PathBuf::from("/c/yatima/models"));
     }
 
     #[test]
     fn models_root_falls_back_to_home_cache() {
+        // upholds: MS-1
         let r = resolve_models_root(None, None, Some("/h".into()));
         assert_eq!(r, PathBuf::from("/h/.cache/yatima/models"));
     }
 
     #[test]
     fn model_dir_mirrors_possum_layout() {
+        // upholds: MS-2
         let root = PathBuf::from("/models");
-        let repo = RepoId::parse("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B").unwrap();
+        let id = ModelId::parse("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B").unwrap();
         assert_eq!(
-            model_dir(&root, &repo),
+            model_dir(&root, &id),
             PathBuf::from("/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"),
         );
     }
 
     #[test]
-    fn repo_id_accepts_valid_ids() {
+    fn model_id_accepts_valid_ids() {
+        // upholds: MS-3
         for id in [
             "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
             "Qwen/Qwen2.5-Coder-7B",
             "gpt2",
         ] {
-            assert!(RepoId::parse(id).is_ok(), "{id} should parse");
+            assert!(ModelId::parse(id).is_ok(), "{id} should parse");
         }
     }
 
     #[test]
-    fn repo_id_rejects_escaping_ids() {
+    fn model_id_rejects_escaping_ids() {
+        // upholds: MS-3
         for id in ["", "../etc", "a/../../b", "/abs/path", "a//b", "./x"] {
-            assert!(RepoId::parse(id).is_err(), "{id:?} should be rejected");
+            assert!(ModelId::parse(id).is_err(), "{id:?} should be rejected");
         }
     }
 
     #[test]
-    fn repo_id_cannot_escape_model_dir() {
-        // Even constructed by hand, a parsed id stays under the root.
+    fn model_id_cannot_escape_model_dir() {
+        // upholds: MS-3 — even constructed by hand, a parsed id stays under root.
         let root = PathBuf::from("/models");
-        let repo = RepoId::parse("org/name").unwrap();
-        assert!(model_dir(&root, &repo).starts_with(&root));
+        let id = ModelId::parse("org/name").unwrap();
+        assert!(model_dir(&root, &id).starts_with(&root));
     }
 
     use proptest::prelude::*;
 
     proptest! {
-        // MS-3: for ANY input string, a parsed RepoId joins to a path that
-        // stays under the root and has no `..` — parse rejects everything else.
+        // upholds: MS-3 — for ANY input string, a parsed ModelId joins to a path
+        // under the root with no `..`; parse rejects everything else.
         #[test]
-        fn repo_id_never_escapes(s in ".*") {
+        fn model_id_never_escapes(s in ".*") {
             let root = PathBuf::from("/models");
-            if let Ok(id) = RepoId::parse(&s) {
+            if let Ok(id) = ModelId::parse(&s) {
                 let dir = model_dir(&root, &id);
                 prop_assert!(dir.starts_with(&root));
                 prop_assert!(dir
@@ -210,7 +216,7 @@ mod tests {
             }
         }
 
-        // MS-1: models_root always follows the declared precedence.
+        // upholds: MS-1 — models_root always follows the declared precedence.
         #[test]
         fn models_root_follows_precedence(
             ym in proptest::option::of("[^\u{0}/][^\u{0}]{0,16}"),
