@@ -161,6 +161,23 @@ not coupling* (MS-2). `Engine::load` is HF-agnostic (takes a directory).
   over `config.json`, `tokenizer.json`, and every shard, so a partial shard set
   is never a false cache hit; `missing` names what's absent.
 
+### Supported architectures
+
+`Engine::load` dispatches on the model's architecture rather than assuming one.
+`detect_arch` reads `config.json`'s `architectures` class name (and falls back to
+`model_type`), then a private `CausalLm` trait gives the generation loop one
+uniform `forward`/`reset` regardless of family. candle's models come in two
+shapes: most self-manage a KV cache (`forward(ids, offset)` + `clear_kv_cache`);
+**Llama** threads an external cache and has no clear (reset = rebuild it), and
+returns last-token logits as `[1, vocab]` vs the others' `[1, 1, vocab]` — both
+normalized by the single `last_token_logits` helper. Unsupported models fail with
+a clear "unsupported architecture" error, not a serde mismatch.
+
+Loadable today: **Qwen2, Llama, Mistral, Phi-3, Gemma-2, StarCoder2**. Note this
+covers *loading + `generate`* (raw completion) for all of them; the **agent**
+path still assumes the Qwen/ChatML tool format — per-model chat templates are a
+later slice. GGUF/quantized loading (to run much larger models) is the next slice.
+
 ## Auto-fetch (the `fetch` feature)
 
 `yatima generate --repo <id>` fetches on a cache miss by calling
@@ -169,6 +186,8 @@ out): cache hit → quiet load; miss → `ensure_model` downloads (include
 `*.safetensors`/`*.json`, exclude `figures/*`, `ProgressMode::Auto`), **re-checks
 `presence`** (FETCH-2: never hand a partial dir to `load`), then loads;
 `--offline` never touches the network; `--model <dir>` bypasses resolution.
+Gated repos (e.g. Gemma) authenticate when `HF_TOKEN` is set in the environment
+(passed to possum as a bearer token; unset → public-only, as before).
 
 ## Concurrency
 
@@ -278,11 +297,11 @@ tolerant parser is the default path; it handles the observed defects. (Note:
 constrained decoding only ever addresses tool-call *validity*, never free-text
 answer quality.)
 
-**Engine swappability** — two axes: (a) cross-architecture inside candle via a
-config-dispatched `Model` enum (Llama / Mistral / Phi / Gemma + GGUF
-`quantized_*`) — today only Qwen2 loads, so a fetched R1-Distill-Llama-8B is
-parked here; (b) other backends (mistral.rs, llama.cpp) via more `Completer`
-impls.
+**Engine swappability** — cross-architecture dispatch is **done** (Qwen2, Llama,
+Mistral, Phi-3, Gemma-2, StarCoder2 — see "Supported architectures"). Remaining:
+(a) **GGUF/quantized** loading (`gguf_file` + `quantized_*`) to run much larger
+models on the same hardware — the next slice and the real answer-quality lever;
+(b) other backends (mistral.rs, llama.cpp) via more `Completer` impls.
 
 **Async engine-actor** owning the `Engine` and wrapping `run_with` (also the home
 for conversation/KV-cache reuse) — see Concurrency.

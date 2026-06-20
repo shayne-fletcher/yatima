@@ -3,17 +3,18 @@
 //! `Engine::load` reads a local model directory (HF-agnostic) and
 //! `Engine::generate` runs a stateless, raw-completion generation loop,
 //! streaming decoded text fragments to a callback. The engine rents candle's
-//! Qwen2 implementation; we own the load/generate boundary.
+//! transformer implementations, dispatching on the model's architecture (see
+//! [`CausalLm`] / [`detect_arch`]); we own the load/generate boundary.
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::qwen2::{Config, ModelForCausalLM};
+use candle_transformers::models::{gemma2, llama, mistral, phi3, qwen2, starcoder2};
 use candle_transformers::utils::apply_repeat_penalty;
 use tokenizers::Tokenizer;
 
@@ -91,9 +92,112 @@ pub struct Generation {
     pub stop: StopReason,
 }
 
+/// A causal language model behind one uniform interface, so the generation loop
+/// is architecture-agnostic. candle's models come in two shapes: most manage an
+/// internal KV cache (`forward(ids, seqlen_offset)` + `clear_kv_cache`), while
+/// Llama threads an external [`llama::Cache`]. This trait hides that difference.
+trait CausalLm {
+    /// Logits for the next token. `pos` is the sequence offset (0 on prefill).
+    /// The returned tensor's shape may be `[1, 1, vocab]` or `[1, vocab]`
+    /// depending on the model — callers normalize via [`last_token_logits`].
+    fn forward(&mut self, input: &Tensor, pos: usize) -> Result<Tensor>;
+    /// Clear/rebuild the KV cache so the next call starts fresh (stateless per
+    /// generation — upholds GE-1).
+    fn reset(&mut self) -> Result<()>;
+}
+
+/// Implement [`CausalLm`] for a candle model with a self-managed KV cache
+/// (`forward(&mut self, ids, offset)` + `clear_kv_cache`). All the supported
+/// architectures except Llama fit this shape.
+macro_rules! self_cache_causal_lm {
+    ($ty:ty) => {
+        impl CausalLm for $ty {
+            fn forward(&mut self, input: &Tensor, pos: usize) -> Result<Tensor> {
+                Ok(<$ty>::forward(self, input, pos)?)
+            }
+            fn reset(&mut self) -> Result<()> {
+                self.clear_kv_cache();
+                Ok(())
+            }
+        }
+    };
+}
+
+self_cache_causal_lm!(qwen2::ModelForCausalLM);
+self_cache_causal_lm!(mistral::Model);
+self_cache_causal_lm!(phi3::Model);
+self_cache_causal_lm!(gemma2::Model);
+self_cache_causal_lm!(starcoder2::Model);
+
+/// Llama threads an external cache and has no `clear_kv_cache`; this wrapper
+/// holds the cache (and what's needed to rebuild it) so it fits [`CausalLm`].
+struct LlamaLm {
+    model: llama::Llama,
+    cache: llama::Cache,
+    cfg: llama::Config,
+    device: Device,
+    dtype: DType,
+}
+
+impl CausalLm for LlamaLm {
+    fn forward(&mut self, input: &Tensor, pos: usize) -> Result<Tensor> {
+        Ok(self.model.forward(input, pos, &mut self.cache)?)
+    }
+    fn reset(&mut self) -> Result<()> {
+        // Llama has no clear_kv_cache — a fresh Cache is the reset.
+        self.cache = llama::Cache::new(true, self.dtype, &self.cfg, &self.device)?;
+        Ok(())
+    }
+}
+
+/// Reduce a model's raw output to a 1-D `[vocab]` F32 logit vector for the last
+/// position. The single normalization point: self-cache models return
+/// `[1, 1, vocab]` and Llama returns `[1, vocab]`; `flatten_all` handles both,
+/// and any future shape only needs fixing here.
+fn last_token_logits(logits: &Tensor) -> Result<Tensor> {
+    Ok(logits.flatten_all()?.to_dtype(DType::F32)?)
+}
+
+/// The model architectures the runtime can load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arch {
+    Qwen2,
+    Llama,
+    Mistral,
+    Phi3,
+    Gemma2,
+    Starcoder2,
+}
+
+/// Detect the architecture from `config.json`, accepting both the
+/// `architectures` class name (e.g. `Qwen2ForCausalLM`) and the `model_type`
+/// short form (e.g. `qwen2`), so the fallback is real.
+fn detect_arch(config: &serde_json::Value) -> Result<Arch> {
+    let class = config
+        .get("architectures")
+        .and_then(|a| a.get(0))
+        .and_then(|s| s.as_str());
+    let model_type = config.get("model_type").and_then(|s| s.as_str());
+    match class.or(model_type) {
+        Some(name) => match name {
+            "Qwen2ForCausalLM" | "qwen2" => Ok(Arch::Qwen2),
+            "LlamaForCausalLM" | "llama" => Ok(Arch::Llama),
+            "MistralForCausalLM" | "mistral" => Ok(Arch::Mistral),
+            "Phi3ForCausalLM" | "phi3" => Ok(Arch::Phi3),
+            "Gemma2ForCausalLM" | "gemma2" => Ok(Arch::Gemma2),
+            "Starcoder2ForCausalLM" | "starcoder2" => Ok(Arch::Starcoder2),
+            other => bail!(
+                "unsupported architecture: {other} (supported: Qwen2, Llama, \
+                 Mistral, Phi3, Gemma2, Starcoder2)"
+            ),
+        },
+        None => bail!("config.json has no `architectures` or `model_type`"),
+    }
+}
+
 /// A loaded model ready to generate. Construct with [`Engine::load`].
 pub struct Engine {
-    model: ModelForCausalLM,
+    model: Box<dyn CausalLm>,
     tokenizer: Tokenizer,
     device: Device,
     eos: HashSet<u32>,
@@ -118,8 +222,7 @@ impl Engine {
 
         let config_bytes = std::fs::read(&config_path)?;
         let config_value: serde_json::Value = serde_json::from_slice(&config_bytes)?;
-        let config: Config = serde_json::from_slice(&config_bytes)
-            .context("parsing config.json as a Qwen2 config")?;
+        let arch = detect_arch(&config_value)?;
 
         let gen_config_path = model_dir.join("generation_config.json");
         let gen_config_value = if gen_config_path.exists() {
@@ -143,7 +246,52 @@ impl Engine {
             DType::F32
         };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)? };
-        let model = ModelForCausalLM::new(&config, vb)?;
+
+        // Build the arch-specific model behind the uniform `CausalLm` interface.
+        // Each `Config` is parsed from the same bytes; errors name the arch.
+        let parse =
+            |what: &str| -> anyhow::Error { anyhow!("parsing config.json as a {what} config") };
+        let model: Box<dyn CausalLm> = match arch {
+            Arch::Qwen2 => {
+                let cfg: qwen2::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Qwen2"))?;
+                Box::new(qwen2::ModelForCausalLM::new(&cfg, vb)?)
+            }
+            Arch::Mistral => {
+                let cfg: mistral::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Mistral"))?;
+                Box::new(mistral::Model::new(&cfg, vb)?)
+            }
+            Arch::Phi3 => {
+                let cfg: phi3::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Phi3"))?;
+                Box::new(phi3::Model::new(&cfg, vb)?)
+            }
+            Arch::Gemma2 => {
+                let cfg: gemma2::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Gemma2"))?;
+                Box::new(gemma2::Model::new(false, &cfg, vb)?)
+            }
+            Arch::Starcoder2 => {
+                let cfg: starcoder2::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Starcoder2"))?;
+                Box::new(starcoder2::Model::new(&cfg, vb)?)
+            }
+            Arch::Llama => {
+                let cfg: llama::LlamaConfig =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Llama"))?;
+                let cfg = cfg.into_config(false);
+                let cache = llama::Cache::new(true, dtype, &cfg, &device)?;
+                let model = llama::Llama::load(vb, &cfg)?;
+                Box::new(LlamaLm {
+                    model,
+                    cache,
+                    cfg,
+                    device: device.clone(),
+                    dtype,
+                })
+            }
+        };
 
         Ok(Self {
             model,
@@ -182,7 +330,7 @@ impl Engine {
         init: A,
         mut step: impl FnMut(A, &str) -> Result<ControlFlow<A, A>>,
     ) -> Result<(A, Generation)> {
-        self.model.clear_kv_cache();
+        self.model.reset()?;
 
         let mut stream = TokenOutputStream::new(self.tokenizer.clone());
         let mut tokens = self
@@ -205,7 +353,7 @@ impl Engine {
             let ctxt = &tokens[start_pos..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input, start_pos)?;
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let logits = last_token_logits(&logits)?;
             let logits = if opts.repeat_penalty == 1.0 {
                 logits
             } else {
@@ -394,6 +542,9 @@ pub(crate) async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> R
         exclude: vec!["figures/*".to_string()],
         concurrency: 4,
         progress: possum_lib::model::ProgressMode::Auto,
+        // Authenticate gated repos (e.g. Gemma) when `HF_TOKEN` is set; `None`
+        // otherwise, so public repos download exactly as before.
+        token: std::env::var("HF_TOKEN").ok(),
         ..Default::default()
     };
     possum_lib::model::download(&request)
@@ -461,6 +612,45 @@ mod tests {
         let o = GenOpts::default();
         assert_eq!(o.max_tokens, 256);
         assert_eq!(o.sampling, Sampling::Greedy);
+    }
+
+    #[test]
+    fn detect_arch_maps_class_names() {
+        for (class, want) in [
+            ("Qwen2ForCausalLM", Arch::Qwen2),
+            ("LlamaForCausalLM", Arch::Llama),
+            ("MistralForCausalLM", Arch::Mistral),
+            ("Phi3ForCausalLM", Arch::Phi3),
+            ("Gemma2ForCausalLM", Arch::Gemma2),
+            ("Starcoder2ForCausalLM", Arch::Starcoder2),
+        ] {
+            let cfg = serde_json::json!({ "architectures": [class] });
+            assert_eq!(detect_arch(&cfg).unwrap(), want, "class {class}");
+        }
+    }
+
+    #[test]
+    fn detect_arch_falls_back_to_model_type() {
+        // No `architectures`, only the short `model_type` form — the fallback
+        // must be real for every family.
+        for (mt, want) in [
+            ("qwen2", Arch::Qwen2),
+            ("llama", Arch::Llama),
+            ("mistral", Arch::Mistral),
+            ("phi3", Arch::Phi3),
+            ("gemma2", Arch::Gemma2),
+            ("starcoder2", Arch::Starcoder2),
+        ] {
+            let cfg = serde_json::json!({ "model_type": mt });
+            assert_eq!(detect_arch(&cfg).unwrap(), want, "model_type {mt}");
+        }
+    }
+
+    #[test]
+    fn detect_arch_rejects_unknown_and_missing() {
+        assert!(detect_arch(&serde_json::json!({ "architectures": ["FooForCausalLM"] })).is_err());
+        assert!(detect_arch(&serde_json::json!({ "model_type": "foo" })).is_err());
+        assert!(detect_arch(&serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -620,6 +810,57 @@ mod tests {
             first, second,
             "GE-1: greedy generation must be deterministic"
         );
+        Ok(())
+    }
+
+    // Per-family load+generate over the real models. Gated on `YATIMA_E2E=1`;
+    // each family is skipped if its weights aren't cached, so this passes
+    // whether one or all six are present. One representative model per arch.
+    #[test]
+    fn e2e_each_architecture_loads_and_generates() -> Result<()> {
+        if std::env::var_os("YATIMA_E2E").is_none() {
+            eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+            return Ok(());
+        }
+        let models = [
+            ("Qwen/Qwen2.5-7B-Instruct", Arch::Qwen2),
+            ("TinyLlama/TinyLlama-1.1B-Chat-v1.0", Arch::Llama),
+            ("mistralai/Mistral-7B-Instruct-v0.3", Arch::Mistral),
+            ("microsoft/Phi-3-mini-4k-instruct", Arch::Phi3),
+            ("google/gemma-2-2b-it", Arch::Gemma2),
+            ("bigcode/starcoder2-3b", Arch::Starcoder2),
+        ];
+
+        let mut ran = 0;
+        for (repo, _arch) in models {
+            let id = crate::ModelId::parse(repo).unwrap();
+            let dir = crate::model_dir(&crate::models_root(), &id);
+            if !dir.join("config.json").exists() {
+                eprintln!("skip {repo}: not cached");
+                continue;
+            }
+            eprintln!("e2e {repo} …");
+            let mut engine = Engine::load(&dir, device(false)?)?;
+            let opts = GenOpts {
+                max_tokens: 12,
+                sampling: Sampling::Greedy,
+                ..Default::default()
+            };
+            let mut out = String::new();
+            let gen = engine.generate("Rust is", &opts, |s| {
+                out.push_str(s);
+                Ok(())
+            })?;
+            assert!(!out.trim().is_empty(), "{repo}: empty completion");
+            assert!(gen.tokens <= 12, "{repo}: GEN-3 tokens ≤ max_tokens");
+            assert!(
+                matches!(gen.stop, StopReason::Eos | StopReason::MaxTokens),
+                "{repo}: STOP-1"
+            );
+            eprintln!("  ok: {:?}", out.trim());
+            ran += 1;
+        }
+        eprintln!("e2e ran {ran}/6 families");
         Ok(())
     }
 }
