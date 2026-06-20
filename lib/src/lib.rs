@@ -53,6 +53,7 @@
 
 mod agent;
 mod capability;
+mod chat;
 mod completer;
 mod engine;
 mod template;
@@ -61,6 +62,7 @@ mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Role, Run, Turn};
 pub use capability::Dir;
+pub use chat::ChatSession;
 pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
 pub use engine::ensure_model_blocking;

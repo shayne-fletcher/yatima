@@ -367,11 +367,21 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **Sampling quality** — `top_p`/`top_k` nucleus sampling (only temperature
   today) for better free-text on smaller models; download integrity/resume.
 
+### Embedding (library surface)
+- **`ChatSession` — done.** The multi-turn fold is a public lib type
+  (`ChatSession<C: Completer, T: PromptTemplate>`, borrows the completer like
+  `Agent`), exercised by `lib/examples/embed.rs` (a real non-CLI consumer:
+  conversation + model→`enum`→native branch) and dogfooded by the CLI's one-shot
+  `chat`. This is what makes "language-integrated" a demonstrated fact.
+- **Streaming `Completer`** — the next API step: a token-callback variant so
+  `ChatSession` can stream too (today streaming is `Engine::generate`-only, so the
+  interactive REPL keeps its own loop). Would let the CLI fully dogfood
+  `ChatSession`.
+- A worked **service/TUI** embedder — the next consumer after the example.
+
 ### Architecture / research
 - **Async engine-actor** owning the `Engine` and wrapping `run_with` — the home
   for cross-request concurrency and KV-cache reuse (see Concurrency).
-- **`ChatSession` / library surface** — extract the REPL's transcript fold into a
-  lib type once a second consumer (TUI, server) appears.
 - **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the
   `<root>/<org>/<name>` layout, extracted once there's a real trigger (possum
   validating its own ids, or a second consumer).

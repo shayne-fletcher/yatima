@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use yatima_lib::{
-    device, model_dir, models_root, Agent, ChatMlTemplate, Completer, Dir, Engine, GemmaTemplate,
-    GenOpts, JsonToolCall, ListDir, MistralTemplate, ModelId, PlainTemplate, PromptTemplate,
-    QwenToolCall, ReadFile, Role, Sampling, ToolCallCodec, Tools, Turn,
+    device, model_dir, models_root, Agent, ChatMlTemplate, ChatSession, Completer, Dir, Engine,
+    GemmaTemplate, GenOpts, JsonToolCall, ListDir, MistralTemplate, ModelId, PlainTemplate,
+    PromptTemplate, QwenToolCall, ReadFile, Role, Sampling, ToolCallCodec, Tools, Turn,
 };
 
 #[derive(Parser)]
@@ -227,28 +227,30 @@ fn chat(args: ChatArgs) -> Result<()> {
         ..Default::default()
     };
 
-    // The conversation transcript, seeded with the optional system turn. Memory
-    // comes from re-rendering the whole transcript each turn (the engine stays
-    // stateless per call).
-    let mut turns: Vec<Turn> = Vec::new();
-    if let Some(system) = args.system {
-        turns.push(Turn {
-            role: Role::System,
-            content: system,
-        });
-    }
-
+    let system = args.system;
     match args.prompt {
-        // One-shot: a single user turn, answer, done.
+        // One-shot: dogfood the library `ChatSession` (batch). Memory isn't
+        // needed for a single turn, but this exercises the public embedding API.
         Some(prompt) => {
-            turns.push(Turn {
-                role: Role::User,
-                content: prompt,
-            });
-            respond(&mut engine, template.as_ref(), &opts, &mut turns)?;
+            let mut session = ChatSession::new(&mut engine, template).with_opts(opts);
+            if let Some(sys) = system {
+                session = session.with_system(sys);
+            }
+            println!("{}", session.turn(&prompt)?);
         }
-        // Interactive: loop reading stdin, accumulating turns.
-        None => chat_repl(&mut engine, template.as_ref(), &opts, turns)?,
+        // Interactive: a streaming REPL that accumulates the transcript (the live
+        // UX wants token streaming, which `ChatSession`'s batch `turn` doesn't do
+        // yet — see the streaming-`Completer` roadmap item).
+        None => {
+            let mut turns: Vec<Turn> = Vec::new();
+            if let Some(sys) = system {
+                turns.push(Turn {
+                    role: Role::System,
+                    content: sys,
+                });
+            }
+            chat_repl(&mut engine, template.as_ref(), &opts, turns)?;
+        }
     }
     Ok(())
 }

@@ -16,6 +16,15 @@ pub trait PromptTemplate {
     fn render(&self, turns: &[Turn]) -> String;
 }
 
+/// A boxed template is a template — lets a runtime-chosen `Box<dyn
+/// PromptTemplate>` (e.g. the CLI's `--format`) satisfy generic bounds like
+/// `ChatSession<_, T: PromptTemplate>`.
+impl<T: PromptTemplate + ?Sized> PromptTemplate for Box<T> {
+    fn render(&self, turns: &[Turn]) -> String {
+        (**self).render(turns)
+    }
+}
+
 /// A minimal, backend-agnostic role layout. Not any model's trained format —
 /// fine for scripted tests and as a fallback, but off-distribution for a real
 /// instruction/reasoning model.

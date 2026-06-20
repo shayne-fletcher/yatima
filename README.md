@@ -119,6 +119,25 @@ cargo run -p yatima-cli --release --bin yatima --features metal -- agent \
 A missing model is fetched on demand (the `fetch` feature) via `possum`;
 `--offline` never touches the network.
 
+## Embedding
+
+The CLI is just one consumer — `yatima-lib` is meant to be called *as a library*,
+the model as an ordinary in-process function woven into your own control flow:
+
+```rust
+use yatima_lib::{ChatSession, ChatMlTemplate, Engine, device};
+
+let mut engine = Engine::load(model_dir, device(false)?)?;
+let mut chat = ChatSession::new(&mut engine, ChatMlTemplate).with_system("Be brief.");
+let answer = chat.turn("My name is Ada.")?;        // remembers across turns
+let recall = chat.turn("What is my name?")?;       // -> "Your name is Ada."
+```
+
+Because it's in-process, model output flows straight into native code — e.g. ask
+for a label and `match` on a Rust `enum`, no serialization or service boundary.
+See [`lib/examples/embed.rs`](lib/examples/embed.rs) (a conversation **and** a
+classify-then-branch triage loop): `cargo run --example embed --features metal`.
+
 ## Notes
 
 - [Design](notes/design.md) — the `generate` contract, model storage and
