@@ -13,8 +13,6 @@ candle-transformers = { git = "https://github.com/huggingface/candle", rev = "01
 tokenizers = "0.22"
 serde_json = "1"
 anyhow = "1"
-# axiom — the lawful-composition foundation (presence frontier as an All-fold).
-axiom = { git = "https://github.com/shayne-fletcher/axiom", rev = "6ab20228e47f724ac61f855a771f9a99725cf36e" }
 
 # Auto-fetch (the `fetch` feature) embeds possum's downloader as a library,
 # pinned to the rev where its model commands moved into possum-lib.

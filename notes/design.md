@@ -7,9 +7,7 @@ TUI, compose it however the work demands; the in-process function is the
 foundation those are built on, not an alternative to them. We **own the runtime,
 rent the engine** — `yatima-lib` owns loading, the generation loop, and
 capability-scoped tools; the inference engine
-([candle](https://github.com/huggingface/candle)) is a swappable dependency, and
-the lawful-composition algebra is rented from
-[`axiom`](https://github.com/shayne-fletcher/axiom).
+([candle](https://github.com/huggingface/candle)) is a swappable dependency.
 
 ## Crates
 
@@ -55,9 +53,9 @@ DeepSeek's `<｜end▁of▁sentence｜>` = 151643) — never hard-coded strings.
 
 **North star — a hylomorphism.** Generation *unfolds* a fragment stream (a
 coalgebra deciding termination on EOS/max/break) and *folds* it with the caller's
-`step` algebra: `generate = ana ; cata = hylo`. The recursion-scheme vocabulary
-(`Functor`/`Fix`/`fold`) lives in `axiom::fix`; the hot loop stays imperative,
-but this is the denotation the Haskell study formalizes.
+`step` algebra: `generate = ana ; cata = hylo`. The hot loop stays imperative;
+this is the denotation, not the implementation — the recursion-scheme reading is
+what the (planned) Haskell study formalizes.
 
 ## Acting: capability-scoped tools & the agent loop
 
@@ -160,9 +158,8 @@ not coupling* (MS-2). `Engine::load` is HF-agnostic (takes a directory).
   (what to mmap) and `presence` (what must exist): index `weight_map` values when
   present (deduped, sorted, contained), else all `*.safetensors` (MD-1/MD-2).
 - **`presence(dir) -> { complete, missing }`**: `complete` is the conjunction
-  (axiom's `bool` meet — the `All` lattice) over `config.json`, `tokenizer.json`,
-  and every shard, so a partial shard set is never a false cache hit; `missing`
-  names what's absent.
+  over `config.json`, `tokenizer.json`, and every shard, so a partial shard set
+  is never a false cache hit; `missing` names what's absent.
 
 ## Auto-fetch (the `fetch` feature)
 
@@ -261,9 +258,11 @@ stateDiagram-v2
 - Anil Madhavapeddy, *"Language Integrated LLMs as an OCaml Function"* —
   https://anil.recoil.org/notes/language-integrated-llms. Kindred motivation for
   calling a local model as an ordinary in-process function.
-- **Algebra:** [`axiom`](https://github.com/shayne-fletcher/axiom) — the
-  lawful-composition foundation (`All`/lattices, `Fix`/`fold`); influenced by
-  `monarch-1/algebra`.
+- **Algebra (related, not a dependency):**
+  [`axiom`](https://github.com/shayne-fletcher/axiom) — a lawful-composition
+  library (`All`/lattices, `Fix`/`fold`). yatima doesn't depend on it today; it's
+  the intended home for the recursion-scheme formalization (see the Haskell study
+  in Deferred).
 
 ## Deferred
 
@@ -290,9 +289,9 @@ for conversation/KV-cache reuse) — see Concurrency.
 
 Also: richer capabilities (`write` / `net` / `proc`) and their tools;
 multi-tool-per-turn / planning; conversation persistence; an MCP edge adapter;
-download integrity/resume; porting the lattice combinators
-(`Max`/`Min`/`All`/`Any`/`LatticeMap`) down into `axiom`; the Haskell study of
-the `generate` and agent contracts (AGENT/CAP/PROTO join the propositions).
+download integrity/resume; the Haskell study of the `generate` and agent
+contracts (AGENT/CAP/PROTO join the propositions), the planned home for the
+recursion-scheme reading and `axiom`.
 
 A shared dependency-light crate (working name **`lexicon`**) for `ModelId` + the
 `<root>/<org>/<name>` layout — extracted once there's a real trigger (possum

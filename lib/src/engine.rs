@@ -350,12 +350,9 @@ pub(crate) struct Presence {
 /// Is `dir` a loadable model, and what's missing?
 ///
 /// `complete` is the conjunction over the required files — `config.json`,
-/// `tokenizer.json`, and every shard from [`model_shards`] — computed with
-/// axiom's `bool` meet (the `All` lattice; ⊤ = true is the identity), so a
-/// partial shard set is never a false cache hit.
+/// `tokenizer.json`, and every shard from [`model_shards`] — so a partial shard
+/// set is never a false cache hit; `missing` names the absent ones.
 pub(crate) fn presence(dir: &Path) -> Presence {
-    use axiom::{BoundedMeetSemilattice, MeetSemilattice};
-
     let mut required = vec![dir.join("config.json"), dir.join("tokenizer.json")];
     match model_shards(dir) {
         Ok(shards) => required.extend(shards),
@@ -368,17 +365,11 @@ pub(crate) fn presence(dir: &Path) -> Presence {
         }
     }
 
-    // presence = ⋀ over required files (bool meet = AND; ⊤ = identity).
-    let mut complete = bool::top();
-    let mut missing = Vec::new();
-    for path in required {
-        let exists = path.exists();
-        complete = complete.meet(&exists);
-        if !exists {
-            missing.push(path);
-        }
+    let missing: Vec<PathBuf> = required.into_iter().filter(|p| !p.exists()).collect();
+    Presence {
+        complete: missing.is_empty(),
+        missing,
     }
-    Presence { complete, missing }
 }
 
 /// Whether `dir` holds a loadable model (the `complete` flag of `presence`).
