@@ -84,14 +84,41 @@ The design is **small composable seams**, simplest concrete impl behind each:
   hard-errors**: an unknown name (AGENT-2) or a tool failure becomes an
   `is_error` `ToolResult` the model can recover from (PROTO-1). First tools:
   `ReadFile`, `ListDir` (read-only).
-- **`ToolCallCodec`** (the protocol) — `JsonToolCall` is the
-  `<tool_call>{json}</tool_call>` convention encoding name + JSON args;
-  `parse` returns `None` (a plain answer), `Some(Ok)` (a call), or `Some(Err)`
-  (malformed ⇒ an error turn). Constrained decoding is the future this admits.
+- **`PromptTemplate`** (the chat format) — renders the transcript into the
+  model's *native* prompt string. `ChatMlTemplate` (Qwen2.5), `DeepSeekR1Template`
+  (R1 distills), `PlainTemplate` (fallback/tests). A model is acutely sensitive to
+  its trained format; the wrong one degenerates it.
+- **`ToolCallCodec`** (the protocol) — `QwenToolCall` (ChatML/Hermes
+  `<tool_call>{json}</tool_call>` with `arguments`), `DeepSeekToolCall` (native
+  `<｜tool▁call…｜>` framing), `JsonToolCall` (a plain convention). `parse` returns
+  `None` (a plain answer), `Some(Ok)` (a call), or `Some(Err)` (malformed ⇒ an
+  error turn), and is **panic-proof on any input** (proptest). Each does strict
+  JSON first, then a **tolerant** pass that recovers common real-model defects
+  (an unquoted name, braces inside string values) — defense-in-depth until
+  constrained decoding makes invalid calls impossible.
 - **`Agent`** — `run` collects the final answer; `run_with` is the fold a future
   actor/TUI streams `AgentEvent`s into (`run` is the `acc = ()` specialization).
   Bounded by `max_steps`; `AgentStop` is `Final` / `MaxSteps` / `Stopped` (the
   last when the caller's fold returns `ControlFlow::Break`).
+
+**Speaking the model's native format (hard-won).** Getting a base model to
+*reliably* act took three corrections, each now a guarded invariant:
+- **Detokenization must be faithful.** Streaming decode emits a fragment unless
+  the text ends in U+FFFD (an unfinished byte sequence) — the canonical TGI/vLLM
+  condition. candle's example heuristic (emit on a trailing alphanumeric) buffers
+  punctuation and, on a stop, drops it — silently truncating tool-call JSON
+  (`"`, `}`, `</tool_call>`). A weights-free round-trip test pins this.
+- **Repetition penalty is per-call.** ~1.1 keeps prose from degenerating
+  (repeated words) but mangles structured JSON punctuation; it is a `GenOpts`
+  knob, kept on (prose) and absorbed for tool calls by the tolerant parser.
+- **Model choice matters.** R1 distills were trained on reasoning, not
+  tool-calling, and won't emit tool calls even when shown the format; Qwen2.5
+  (Qwen2 arch, loads unchanged) is trained for it and is the agent default.
+
+Tool-call *validity* is thus solved structurally (native format + tolerant parse,
+soon constrained decoding); free-text answer *quality* (e.g. a 7B greedily
+misreading a value back) is a separate, model-bound concern that constrained
+decoding does **not** address.
 
 **Honesty (where we partially, not wholly, match Anil's ocap story).** Rust gives
 *capabilities by construction + enforced containment*, not Eio's
@@ -239,11 +266,12 @@ stateDiagram-v2
 
 ## Deferred
 
-**Prompt fidelity** — a `PromptTemplate` seam with a model-native chat template
-(the minimal role template is off-distribution for an R1 distill, which
-destabilizes it), and few-shot / **constrained decoding** for reliable tool
-calls. This is the next slice: the loop is correct, but a base reasoning distill
-won't emit tool calls until prompted in its trained format.
+**Constrained decoding** — grammar-masked logits so a tool call is *always*
+well-formed JSON, making invalid calls impossible by construction (the principled
+replacement for the tolerant parser, which stays as defense-in-depth). The next
+slice on the generation path. It fixes structured-call *validity* only — not
+free-text answer quality. (Prompt fidelity itself is done: native `ChatMlTemplate`
+/ `DeepSeekR1Template`, with Qwen2.5 as the tool-calling default.)
 
 **Engine swappability** — two axes: (a) cross-architecture inside candle via a
 config-dispatched `Model` enum (Llama / Mistral / Phi / Gemma + GGUF
