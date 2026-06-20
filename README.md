@@ -28,7 +28,8 @@ renting the inference engine ([candle](https://github.com/huggingface/candle)).
   stateless, raw-completion loop, streaming decoded fragments to a fold. The
   generation contract is stated as laws and protected by tests. The loader
   dispatches on architecture — Qwen2, Llama, Mistral, Phi-3, Gemma-2 and
-  StarCoder2 all load (the agent's tool format is Qwen/ChatML for now).
+  StarCoder2 — and loads **GGUF/quantized** weights too, so a 32B-Q4 runs on a
+  Mac (the agent's tool format is Qwen/ChatML for now).
 - **Capability-scoped tools** — a tool *holds* its authority (e.g. a `Dir`
   rooted at one directory); the file tools cannot reach outside it, a tool not in
   the agent's set is uncallable, and a malformed or unknown call becomes an error

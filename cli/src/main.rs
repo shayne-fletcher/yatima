@@ -63,6 +63,10 @@ struct GenerateArgs {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// With `--repo`, fetch this single GGUF file (quantized) instead of
+    /// safetensors shards.
+    #[arg(long)]
+    gguf: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -100,6 +104,10 @@ struct AgentArgs {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// With `--repo`, fetch this single GGUF file (quantized) instead of
+    /// safetensors shards.
+    #[arg(long)]
+    gguf: Option<String>,
     /// The model's chat / tool-call format.
     #[arg(long, value_enum, default_value_t = ChatFormat::Qwen)]
     format: ChatFormat,
@@ -149,8 +157,14 @@ fn sampling_of(temperature: f64, seed: u64) -> Sampling {
 }
 
 fn agent(args: AgentArgs) -> Result<()> {
-    let dir =
-        ModelSource::from_args(args.model, args.repo, args.models_dir, args.offline)?.resolve()?;
+    let dir = ModelSource::from_args(
+        args.model,
+        args.repo,
+        args.models_dir,
+        args.offline,
+        args.gguf,
+    )?
+    .resolve()?;
 
     let root = match args.root {
         Some(r) => r,
@@ -238,8 +252,14 @@ fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
 }
 
 fn generate(args: GenerateArgs) -> Result<()> {
-    let dir =
-        ModelSource::from_args(args.model, args.repo, args.models_dir, args.offline)?.resolve()?;
+    let dir = ModelSource::from_args(
+        args.model,
+        args.repo,
+        args.models_dir,
+        args.offline,
+        args.gguf,
+    )?
+    .resolve()?;
 
     let prompt = match args.prompt {
         Some(p) => p,
@@ -277,6 +297,8 @@ enum ModelSource {
         id: ModelId,
         root: PathBuf,
         fetch: FetchPolicy,
+        /// A single GGUF file to fetch instead of safetensors shards.
+        gguf: Option<String>,
     },
 }
 
@@ -291,11 +313,13 @@ impl ModelSource {
         repo: Option<String>,
         models_dir: Option<PathBuf>,
         offline: bool,
+        gguf: Option<String>,
     ) -> Result<ModelSource> {
         match (model, repo) {
             (Some(dir), None) => Ok(ModelSource::Directory(dir)),
             (None, Some(repo)) => Ok(ModelSource::Repository {
                 id: ModelId::parse(&repo)?,
+                gguf,
                 root: models_dir.unwrap_or_else(models_root),
                 fetch: if offline {
                     FetchPolicy::Offline
@@ -313,7 +337,12 @@ impl ModelSource {
     fn resolve(self) -> Result<PathBuf> {
         match self {
             ModelSource::Directory(dir) => Ok(dir),
-            ModelSource::Repository { id, root, fetch } => {
+            ModelSource::Repository {
+                id,
+                root,
+                fetch,
+                gguf,
+            } => {
                 let dir = model_dir(&root, &id);
                 if yatima_lib::is_model_present(&dir) {
                     return Ok(dir);
@@ -325,7 +354,7 @@ impl ModelSource {
                         dir.display(),
                         root.display()
                     ),
-                    FetchPolicy::Online => fetch_model(&id, &root),
+                    FetchPolicy::Online => fetch_model(&id, &root, gguf.as_deref()),
                 }
             }
         }
@@ -333,13 +362,13 @@ impl ModelSource {
 }
 
 #[cfg(feature = "fetch")]
-fn fetch_model(id: &ModelId, root: &std::path::Path) -> Result<PathBuf> {
+fn fetch_model(id: &ModelId, root: &std::path::Path, gguf: Option<&str>) -> Result<PathBuf> {
     eprintln!("fetching {id} …");
-    yatima_lib::ensure_model_blocking(id, root)
+    yatima_lib::ensure_model_blocking(id, root, gguf)
 }
 
 #[cfg(not(feature = "fetch"))]
-fn fetch_model(id: &ModelId, _root: &std::path::Path) -> Result<PathBuf> {
+fn fetch_model(id: &ModelId, _root: &std::path::Path, _gguf: Option<&str>) -> Result<PathBuf> {
     bail!("model '{id}' not present and yatima was built without the `fetch` feature")
 }
 
@@ -350,14 +379,14 @@ mod tests {
     #[test]
     fn source_directory() {
         // upholds: CLI-1
-        let s = ModelSource::from_args(Some(PathBuf::from("/m")), None, None, false).unwrap();
+        let s = ModelSource::from_args(Some(PathBuf::from("/m")), None, None, false, None).unwrap();
         assert!(matches!(s, ModelSource::Directory(_)));
     }
 
     #[test]
     fn source_repository_online_and_offline() {
         // upholds: CLI-1
-        let on = ModelSource::from_args(None, Some("org/name".into()), None, false).unwrap();
+        let on = ModelSource::from_args(None, Some("org/name".into()), None, false, None).unwrap();
         assert!(matches!(
             on,
             ModelSource::Repository {
@@ -365,7 +394,7 @@ mod tests {
                 ..
             }
         ));
-        let off = ModelSource::from_args(None, Some("org/name".into()), None, true).unwrap();
+        let off = ModelSource::from_args(None, Some("org/name".into()), None, true, None).unwrap();
         assert!(matches!(
             off,
             ModelSource::Repository {
@@ -382,16 +411,17 @@ mod tests {
             Some(PathBuf::from("/m")),
             Some("org/name".into()),
             None,
-            false
+            false,
+            None
         )
         .is_err());
-        assert!(ModelSource::from_args(None, None, None, false).is_err());
+        assert!(ModelSource::from_args(None, None, None, false, None).is_err());
     }
 
     #[test]
     fn source_rejects_escaping_model_id() {
         // upholds: MS-3
-        assert!(ModelSource::from_args(None, Some("../escape".into()), None, false).is_err());
+        assert!(ModelSource::from_args(None, Some("../escape".into()), None, false, None).is_err());
     }
 
     #[test]
@@ -415,8 +445,14 @@ mod tests {
         assert_eq!(args.prompt, "do a thing");
         assert_eq!(args.max_steps, 3);
         // the model source is parsed by the same checked path as `generate`.
-        let src =
-            ModelSource::from_args(args.model, args.repo, args.models_dir, args.offline).unwrap();
+        let src = ModelSource::from_args(
+            args.model,
+            args.repo,
+            args.models_dir,
+            args.offline,
+            args.gguf,
+        )
+        .unwrap();
         assert!(matches!(src, ModelSource::Repository { .. }));
     }
 
@@ -446,6 +482,7 @@ mod tests {
             Some("org/name".into()),
             Some(PathBuf::from("/nonexistent-yatima-models-xyzzy")),
             true,
+            None,
         )
         .unwrap();
         assert!(src.resolve().is_err());

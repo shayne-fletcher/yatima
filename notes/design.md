@@ -173,10 +173,23 @@ returns last-token logits as `[1, vocab]` vs the others' `[1, 1, vocab]` — bot
 normalized by the single `last_token_logits` helper. Unsupported models fail with
 a clear "unsupported architecture" error, not a serde mismatch.
 
-Loadable today: **Qwen2, Llama, Mistral, Phi-3, Gemma-2, StarCoder2**. Note this
-covers *loading + `generate`* (raw completion) for all of them; the **agent**
-path still assumes the Qwen/ChatML tool format — per-model chat templates are a
-later slice. GGUF/quantized loading (to run much larger models) is the next slice.
+Loadable today: **Qwen2, Llama, Mistral, Phi-3, Gemma-2, StarCoder2** (safetensors)
+plus **GGUF/quantized** Qwen2 and Llama. Note this covers *loading + `generate`*
+(raw completion) for all of them; the **agent** path still assumes the Qwen/ChatML
+tool format — per-model chat templates are a later slice.
+
+**GGUF / quantized.** A model dir with a single `*.gguf` (+ `tokenizer.json`, no
+`config.json`) takes the quantized path: `Engine::load_gguf` reads the file's
+metadata for the architecture (`general.architecture` → `quantized_qwen2` /
+`quantized_llama`) and EOS (`tokenizer.ggml.eos_token_id`, unioned with any
+`<|im_end|>`/`<|endoftext|>` in the vocab). The quantized model types fit the same
+self-cache `CausalLm` shape, and quantized matmul runs on Metal — so a **32B-Q4**
+(~20 GB) runs on a 48 GB Mac, which is the real lever for answer quality on long
+prose. Acquire with `--model <dir>` (drop in the `.gguf` + a `tokenizer.json`;
+Qwen2.5 shares one tokenizer across sizes) or `--repo <id> --gguf <file>` to fetch
+a single quant file (GGUF repos often omit `tokenizer.json` — then prefer
+`--model`). Deferred: tokenizer auto-sourcing, sharded multi-file GGUF, more
+quantized arches.
 
 ## Auto-fetch (the `fetch` feature)
 
@@ -297,10 +310,9 @@ tolerant parser is the default path; it handles the observed defects. (Note:
 constrained decoding only ever addresses tool-call *validity*, never free-text
 answer quality.)
 
-**Engine swappability** — cross-architecture dispatch is **done** (Qwen2, Llama,
-Mistral, Phi-3, Gemma-2, StarCoder2 — see "Supported architectures"). Remaining:
-(a) **GGUF/quantized** loading (`gguf_file` + `quantized_*`) to run much larger
-models on the same hardware — the next slice and the real answer-quality lever;
+**Engine swappability** — cross-architecture dispatch **and GGUF/quantized
+loading are done** (see "Supported architectures" / "GGUF / quantized"). Remaining:
+(a) tokenizer auto-sourcing + sharded multi-file GGUF + more quantized arches;
 (b) other backends (mistral.rs, llama.cpp) via more `Completer` impls.
 
 **Async engine-actor** owning the `Engine` and wrapping `run_with` (also the home

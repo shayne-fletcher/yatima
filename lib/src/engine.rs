@@ -11,10 +11,13 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
+use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::{gemma2, llama, mistral, phi3, qwen2, starcoder2};
+use candle_transformers::models::{
+    gemma2, llama, mistral, phi3, quantized_llama, quantized_qwen2, qwen2, starcoder2,
+};
 use candle_transformers::utils::apply_repeat_penalty;
 use tokenizers::Tokenizer;
 
@@ -129,6 +132,11 @@ self_cache_causal_lm!(phi3::Model);
 self_cache_causal_lm!(gemma2::Model);
 self_cache_causal_lm!(starcoder2::Model);
 
+// Quantized (GGUF) models fit the same self-cache shape: `forward(&mut self, x,
+// index_pos)` + `clear_kv_cache()`.
+self_cache_causal_lm!(quantized_qwen2::ModelWeights);
+self_cache_causal_lm!(quantized_llama::ModelWeights);
+
 /// Llama threads an external cache and has no `clear_kv_cache`; this wrapper
 /// holds the cache (and what's needed to rebuild it) so it fits [`CausalLm`].
 struct LlamaLm {
@@ -195,6 +203,37 @@ fn detect_arch(config: &serde_json::Value) -> Result<Arch> {
     }
 }
 
+/// The single `*.gguf` in `dir`, if present — the signal to take the quantized
+/// load path. `None` means a safetensors (or absent) model.
+fn gguf_in(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.find_map(|e| {
+        let p = e.ok()?.path();
+        (p.extension().is_some_and(|x| x == "gguf")).then_some(p)
+    })
+}
+
+/// EOS ids for a GGUF model: the file's `tokenizer.ggml.eos_token_id` metadata,
+/// plus any chat end-of-turn tokens present in the tokenizer vocab (Qwen's
+/// `<|im_end|>`, `<|endoftext|>`) so instruct models stop cleanly. A missing EOS
+/// only degrades to stopping on `max_tokens`, never a wrong result.
+fn gguf_eos_ids(content: &gguf_file::Content, tokenizer: &Tokenizer) -> HashSet<u32> {
+    let mut eos = HashSet::new();
+    if let Some(id) = content
+        .metadata
+        .get("tokenizer.ggml.eos_token_id")
+        .and_then(|v| v.to_u32().ok())
+    {
+        eos.insert(id);
+    }
+    let vocab = tokenizer.get_vocab(true);
+    for tok in ["<|im_end|>", "<|endoftext|>"] {
+        if let Some(&id) = vocab.get(tok) {
+            eos.insert(id);
+        }
+    }
+    eos
+}
+
 /// A loaded model ready to generate. Construct with [`Engine::load`].
 pub struct Engine {
     model: Box<dyn CausalLm>,
@@ -207,10 +246,17 @@ pub struct Engine {
 impl Engine {
     /// Load weights + tokenizer from a local model directory.
     ///
-    /// Strict discovery: `config.json` and `tokenizer.json` are required; all
-    /// `*.safetensors` in the directory are loaded (the sharded case). Fails
-    /// loudly otherwise. EOS ids are read from the config(s), not hard-coded.
+    /// Two layouts are supported. A **GGUF** dir (a single `*.gguf` plus
+    /// `tokenizer.json`, no `config.json`) loads the quantized model — see
+    /// [`Engine::load_gguf`]. Otherwise the **safetensors** layout
+    /// (`config.json`, `tokenizer.json`, `*.safetensors`) is loaded, dispatched
+    /// by [`detect_arch`]. EOS ids come from the config / GGUF metadata, never
+    /// hard-coded.
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
+        if let Some(gguf) = gguf_in(model_dir) {
+            return Self::load_gguf(model_dir, &gguf, device);
+        }
+
         let config_path = model_dir.join("config.json");
         let tokenizer_path = model_dir.join("tokenizer.json");
         if !config_path.exists() {
@@ -291,6 +337,56 @@ impl Engine {
                     dtype,
                 })
             }
+        };
+
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+            eos,
+            dtype,
+        })
+    }
+
+    /// Load a quantized model from a GGUF file. A GGUF carries its own metadata
+    /// (architecture, EOS) in place of `config.json`; the tokenizer still comes
+    /// from a sibling `tokenizer.json`. The quantized weights run on the same
+    /// device (Metal-quantized is supported).
+    fn load_gguf(model_dir: &Path, gguf_path: &Path, device: Device) -> Result<Self> {
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            bail!(
+                "GGUF model at {} needs a sibling tokenizer.json",
+                model_dir.display()
+            );
+        }
+        let tokenizer =
+            Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("loading tokenizer: {e}"))?;
+
+        let mut file = std::fs::File::open(gguf_path)?;
+        let content = gguf_file::Content::read(&mut file)
+            .map_err(|e| anyhow!("reading GGUF {}: {e}", gguf_path.display()))?;
+
+        let arch = content
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .map(String::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("GGUF metadata has no general.architecture"))?;
+
+        let eos = gguf_eos_ids(&content, &tokenizer);
+        // GGUF weights carry their own quantized dtype; report q-on-device.
+        let dtype = DType::F32;
+
+        let model: Box<dyn CausalLm> = match arch.as_str() {
+            "qwen2" => Box::new(quantized_qwen2::ModelWeights::from_gguf(
+                content, &mut file, &device,
+            )?),
+            "llama" => Box::new(quantized_llama::ModelWeights::from_gguf(
+                content, &mut file, &device,
+            )?),
+            other => bail!("unsupported GGUF architecture: {other} (supported: qwen2, llama)"),
         };
 
         Ok(Self {
@@ -497,10 +593,21 @@ pub(crate) struct Presence {
 
 /// Is `dir` a loadable model, and what's missing?
 ///
-/// `complete` is the conjunction over the required files — `config.json`,
-/// `tokenizer.json`, and every shard from [`model_shards`] — so a partial shard
-/// set is never a false cache hit; `missing` names the absent ones.
+/// Two layouts: a **GGUF** dir is complete iff it has a `*.gguf` and a
+/// `tokenizer.json` (no `config.json`); otherwise the **safetensors** layout
+/// requires `config.json`, `tokenizer.json`, and every shard from
+/// [`model_shards`] — so a partial shard set is never a false cache hit.
+/// `missing` names the absent ones.
 pub(crate) fn presence(dir: &Path) -> Presence {
+    if gguf_in(dir).is_some() {
+        let tok = dir.join("tokenizer.json");
+        let missing: Vec<PathBuf> = [tok].into_iter().filter(|p| !p.exists()).collect();
+        return Presence {
+            complete: missing.is_empty(),
+            missing,
+        };
+    }
+
     let mut required = vec![dir.join("config.json"), dir.join("tokenizer.json")];
     match model_shards(dir) {
         Ok(shards) => required.extend(shards),
@@ -529,16 +636,29 @@ pub fn is_model_present(dir: &Path) -> bool {
 /// with possum on a cache miss; returns the model directory. Re-checks
 /// completeness after download so a partial fetch is never handed to
 /// [`Engine::load`].
+///
+/// `gguf` selects a single quantized file to fetch (plus `*.json` for the
+/// tokenizer) instead of the safetensors shards — for `--repo <id> --gguf
+/// <file>`. Note GGUF repos often omit `tokenizer.json`; if it's missing after
+/// the fetch, the completeness check fails with a clear error.
 #[cfg(feature = "fetch")]
-pub(crate) async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> Result<PathBuf> {
+pub(crate) async fn ensure_model(
+    repo: &crate::ModelId,
+    models_root: &Path,
+    gguf: Option<&str>,
+) -> Result<PathBuf> {
     let dir = crate::model_dir(models_root, repo);
     if is_model_present(&dir) {
         return Ok(dir);
     }
+    let include = match gguf {
+        Some(file) => vec![file.to_string(), "*.json".to_string()],
+        None => vec!["*.safetensors".to_string(), "*.json".to_string()],
+    };
     let request = possum_lib::model::DownloadRequest {
         repository: repo.as_str().to_string(),
         to: dir.clone(),
-        include: vec!["*.safetensors".to_string(), "*.json".to_string()],
+        include,
         exclude: vec!["figures/*".to_string()],
         concurrency: 4,
         progress: possum_lib::model::ProgressMode::Auto,
@@ -553,7 +673,9 @@ pub(crate) async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> R
     let p = presence(&dir);
     if !p.complete {
         bail!(
-            "model {repo} still incomplete after fetch at {} (missing: {:?})",
+            "model {repo} still incomplete after fetch at {} (missing: {:?}). \
+             For a GGUF repo without tokenizer.json, place the .gguf + a \
+             tokenizer.json in a dir and use --model.",
             dir.display(),
             p.missing
         );
@@ -564,9 +686,13 @@ pub(crate) async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> R
 /// Blocking wrapper around `ensure_model` for synchronous callers (the CLI);
 /// drives the async fetch on a private tokio runtime.
 #[cfg(feature = "fetch")]
-pub fn ensure_model_blocking(repo: &crate::ModelId, models_root: &Path) -> Result<PathBuf> {
+pub fn ensure_model_blocking(
+    repo: &crate::ModelId,
+    models_root: &Path,
+    gguf: Option<&str>,
+) -> Result<PathBuf> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(ensure_model(repo, models_root))
+    runtime.block_on(ensure_model(repo, models_root, gguf))
 }
 
 /// Collect EOS token ids from the model config and (optional) generation
@@ -716,6 +842,36 @@ mod tests {
     }
 
     #[test]
+    fn gguf_dir_is_detected_and_present() {
+        // A GGUF dir (one *.gguf + tokenizer.json, no config.json) is detected as
+        // the quantized path and counts as present.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("model.gguf"), "x").unwrap();
+        std::fs::write(p.join("tokenizer.json"), "{}").unwrap();
+        assert_eq!(gguf_in(p), Some(p.join("model.gguf")));
+        assert!(is_model_present(p)); // no config.json required for GGUF
+    }
+
+    #[test]
+    fn gguf_dir_without_tokenizer_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("model.gguf"), "x").unwrap();
+        assert!(gguf_in(p).is_some());
+        assert!(!is_model_present(p)); // GGUF still needs a tokenizer.json
+    }
+
+    #[test]
+    fn safetensors_dir_is_not_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("config.json"), "{}").unwrap();
+        std::fs::write(p.join("model.safetensors"), "x").unwrap();
+        assert_eq!(gguf_in(p), None);
+    }
+
+    #[test]
     fn model_shards_rejects_escaping_index() {
         // upholds: MS-3
         let dir = tempfile::tempdir().unwrap();
@@ -822,20 +978,24 @@ mod tests {
             eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
             return Ok(());
         }
+        // Safetensors families + one GGUF (quantized) repo; the GGUF entry also
+        // exercises the quantized load path. Presence is layout-aware, so any
+        // absent model is skipped.
         let models = [
-            ("Qwen/Qwen2.5-7B-Instruct", Arch::Qwen2),
-            ("TinyLlama/TinyLlama-1.1B-Chat-v1.0", Arch::Llama),
-            ("mistralai/Mistral-7B-Instruct-v0.3", Arch::Mistral),
-            ("microsoft/Phi-3-mini-4k-instruct", Arch::Phi3),
-            ("google/gemma-2-2b-it", Arch::Gemma2),
-            ("bigcode/starcoder2-3b", Arch::Starcoder2),
+            "Qwen/Qwen2.5-7B-Instruct",
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+            "microsoft/Phi-3-mini-4k-instruct",
+            "google/gemma-2-2b-it",
+            "bigcode/starcoder2-3b",
+            "bartowski/Qwen2.5-32B-Instruct-GGUF",
         ];
 
         let mut ran = 0;
-        for (repo, _arch) in models {
+        for repo in models {
             let id = crate::ModelId::parse(repo).unwrap();
             let dir = crate::model_dir(&crate::models_root(), &id);
-            if !dir.join("config.json").exists() {
+            if !is_model_present(&dir) {
                 eprintln!("skip {repo}: not cached");
                 continue;
             }
