@@ -10,7 +10,10 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use yatima_lib::{device, model_dir, models_root, Engine, GenOpts, ModelId, Sampling};
+use yatima_lib::{
+    device, model_dir, models_root, Agent, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
+    ReadFile, Sampling, Tools,
+};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -23,6 +26,8 @@ struct Cli {
 enum Command {
     /// Generate a completion from local model weights.
     Generate(GenerateArgs),
+    /// Run an agent loop: the model acts through capability-scoped tools.
+    Agent(AgentArgs),
     /// Print the resolved models directory (or a repository's leaf dir).
     ModelsDir {
         /// Resolve to this repository's leaf directory under the models root.
@@ -59,6 +64,50 @@ struct GenerateArgs {
     offline: bool,
 }
 
+#[derive(clap::Args)]
+struct AgentArgs {
+    /// Explicit model directory.
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Repository id, resolved under the models root.
+    #[arg(long)]
+    repo: Option<String>,
+    /// Override the models root (else $YATIMA_MODELS_DIR / XDG cache).
+    #[arg(long)]
+    models_dir: Option<PathBuf>,
+    /// The task / question for the agent.
+    #[arg(long)]
+    prompt: String,
+    /// Capability root the file tools may read under (default: cwd).
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// System prompt; a sensible default is used when omitted.
+    #[arg(long)]
+    system: Option<String>,
+    /// Maximum tool rounds before giving up.
+    #[arg(long, default_value_t = 6)]
+    max_steps: usize,
+    #[arg(long, default_value_t = 512)]
+    max_tokens: usize,
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f64,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Force CPU instead of the GPU.
+    #[arg(long)]
+    cpu: bool,
+    /// Don't auto-fetch a missing model; error instead.
+    #[arg(long)]
+    offline: bool,
+    /// Print the full transcript (to stderr), not just the final answer.
+    #[arg(long)]
+    verbose: bool,
+}
+
+const DEFAULT_AGENT_SYSTEM: &str =
+    "You are a helpful assistant. You can read files under the working directory \
+     using the provided tools. Call a tool when it helps, then answer.";
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -71,7 +120,61 @@ fn main() -> Result<()> {
             println!("{}", path.display());
         }
         Command::Generate(args) => generate(args)?,
+        Command::Agent(args) => agent(args)?,
     }
+    Ok(())
+}
+
+/// Map the CLI's `temperature`/`seed` flags to a [`Sampling`] policy: a
+/// non-positive temperature means deterministic greedy (no seed).
+fn sampling_of(temperature: f64, seed: u64) -> Sampling {
+    if temperature <= 0.0 {
+        Sampling::Greedy
+    } else {
+        Sampling::Sample { temperature, seed }
+    }
+}
+
+fn agent(args: AgentArgs) -> Result<()> {
+    let dir =
+        ModelSource::from_args(args.model, args.repo, args.models_dir, args.offline)?.resolve()?;
+
+    let root = match args.root {
+        Some(r) => r,
+        None => std::env::current_dir()?,
+    };
+    let cap = Dir::new(&root);
+    let tools = Tools::new()
+        .with(ReadFile::new(cap.clone()))
+        .with(ListDir::new(cap));
+
+    let opts = GenOpts {
+        max_tokens: args.max_tokens,
+        sampling: sampling_of(args.temperature, args.seed),
+    };
+
+    let mut engine = Engine::load(&dir, device(args.cpu)?)?;
+    eprintln!(
+        "loaded {} [{}]; tools rooted at {}",
+        dir.display(),
+        engine.backend(),
+        root.display()
+    );
+
+    let system = args
+        .system
+        .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
+    let mut agent =
+        Agent::new(&mut engine, &tools, JsonToolCall, system, args.max_steps).with_opts(opts);
+    let run = agent.run(&args.prompt)?;
+
+    if args.verbose {
+        for turn in &run.transcript {
+            eprintln!("── {:?} ──\n{}\n", turn.role, turn.content);
+        }
+    }
+    println!("{}", run.answer);
+    eprintln!("[{} steps, {:?}]", run.steps, run.stop);
     Ok(())
 }
 
@@ -91,17 +194,9 @@ fn generate(args: GenerateArgs) -> Result<()> {
     let mut engine = Engine::load(&dir, device(args.cpu)?)?;
     eprintln!("loaded {} [{}]", dir.display(), engine.backend());
 
-    let sampling = if args.temperature <= 0.0 {
-        Sampling::Greedy
-    } else {
-        Sampling::Sample {
-            temperature: args.temperature,
-            seed: args.seed,
-        }
-    };
     let opts = GenOpts {
         max_tokens: args.max_tokens,
-        sampling,
+        sampling: sampling_of(args.temperature, args.seed),
     };
     let mut stdout = std::io::stdout();
     let generation = engine.generate(&prompt, &opts, |piece| {
@@ -237,6 +332,50 @@ mod tests {
     fn source_rejects_escaping_model_id() {
         // upholds: MS-3
         assert!(ModelSource::from_args(None, Some("../escape".into()), None, false).is_err());
+    }
+
+    #[test]
+    fn agent_command_parses_with_repo_and_prompt() {
+        let cli = Cli::try_parse_from([
+            "yatima",
+            "agent",
+            "--repo",
+            "org/name",
+            "--prompt",
+            "do a thing",
+            "--root",
+            "/tmp",
+            "--max-steps",
+            "3",
+        ])
+        .unwrap();
+        let Command::Agent(args) = cli.command else {
+            panic!("expected the agent subcommand");
+        };
+        assert_eq!(args.prompt, "do a thing");
+        assert_eq!(args.max_steps, 3);
+        // the model source is parsed by the same checked path as `generate`.
+        let src =
+            ModelSource::from_args(args.model, args.repo, args.models_dir, args.offline).unwrap();
+        assert!(matches!(src, ModelSource::Repository { .. }));
+    }
+
+    #[test]
+    fn agent_requires_a_prompt() {
+        // clap rejects a missing required --prompt before any work happens.
+        assert!(Cli::try_parse_from(["yatima", "agent", "--repo", "org/name"]).is_err());
+    }
+
+    #[test]
+    fn sampling_zero_temp_is_greedy() {
+        assert_eq!(sampling_of(0.0, 7), Sampling::Greedy);
+        assert!(matches!(
+            sampling_of(0.8, 7),
+            Sampling::Sample {
+                temperature,
+                seed: 7
+            } if temperature == 0.8
+        ));
     }
 
     #[test]
