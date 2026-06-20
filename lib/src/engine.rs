@@ -58,7 +58,7 @@ impl Sampling {
 pub struct GenOpts {
     pub max_tokens: usize,
     pub sampling: Sampling,
-    /// Repetition penalty over the last [`REPEAT_LAST_N`] tokens. `1.0` disables
+    /// Repetition penalty over the last `REPEAT_LAST_N` tokens. `1.0` disables
     /// it (the right choice for structured/tool-call output); ~`1.1` suits prose.
     pub repeat_penalty: f32,
 }
@@ -298,7 +298,7 @@ pub fn device(cpu: bool) -> Result<Device> {
 ///
 /// Used by both [`Engine::load`] (what to mmap) and [`is_model_present`] (what
 /// must exist) so the two never disagree.
-pub fn model_shards(dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn model_shards(dir: &Path) -> Result<Vec<PathBuf>> {
     let index = dir.join("model.safetensors.index.json");
     if index.exists() {
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?)?;
@@ -342,7 +342,7 @@ pub fn model_shards(dir: &Path) -> Result<Vec<PathBuf>> {
 /// The completeness of a model directory: whether it is loadable, and which
 /// required files are missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Presence {
+pub(crate) struct Presence {
     pub complete: bool,
     pub missing: Vec<PathBuf>,
 }
@@ -353,7 +353,7 @@ pub struct Presence {
 /// `tokenizer.json`, and every shard from [`model_shards`] — computed with
 /// axiom's `bool` meet (the `All` lattice; ⊤ = true is the identity), so a
 /// partial shard set is never a false cache hit.
-pub fn presence(dir: &Path) -> Presence {
+pub(crate) fn presence(dir: &Path) -> Presence {
     use axiom::{BoundedMeetSemilattice, MeetSemilattice};
 
     let mut required = vec![dir.join("config.json"), dir.join("tokenizer.json")];
@@ -381,7 +381,7 @@ pub fn presence(dir: &Path) -> Presence {
     Presence { complete, missing }
 }
 
-/// Whether `dir` holds a loadable model (the `complete` flag of [`presence`]).
+/// Whether `dir` holds a loadable model (the `complete` flag of `presence`).
 pub fn is_model_present(dir: &Path) -> bool {
     presence(dir).complete
 }
@@ -391,7 +391,7 @@ pub fn is_model_present(dir: &Path) -> bool {
 /// completeness after download so a partial fetch is never handed to
 /// [`Engine::load`].
 #[cfg(feature = "fetch")]
-pub async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> Result<PathBuf> {
+pub(crate) async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> Result<PathBuf> {
     let dir = crate::model_dir(models_root, repo);
     if is_model_present(&dir) {
         return Ok(dir);
@@ -419,7 +419,7 @@ pub async fn ensure_model(repo: &crate::ModelId, models_root: &Path) -> Result<P
     Ok(dir)
 }
 
-/// Blocking wrapper around [`ensure_model`] for synchronous callers (the CLI);
+/// Blocking wrapper around `ensure_model` for synchronous callers (the CLI);
 /// drives the async fetch on a private tokio runtime.
 #[cfg(feature = "fetch")]
 pub fn ensure_model_blocking(repo: &crate::ModelId, models_root: &Path) -> Result<PathBuf> {

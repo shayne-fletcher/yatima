@@ -17,11 +17,11 @@
 //! - **MD-1** unsharded discovery is every `*.safetensors`, sorted.
 //! - **MD-2** indexed discovery is the unique `weight_map` values, deduped and
 //!   sorted (also covers the dedup/order half of **DISC**).
-//! - **MD-3** [`presence`] = `config.json` ∧ `tokenizer.json` ∧ all shards; a
+//! - **MD-3** `presence` = `config.json` ∧ `tokenizer.json` ∧ all shards; a
 //!   partial shard set is never a false cache hit.
 //! - **EOS-1** EOS ids are read from `config.json` / `generation_config.json`
 //!   as a *set* — never hard-coded token strings.
-//! - **FETCH-1** [`ensure_model`] re-checks [`presence`] after download; a
+//! - **FETCH-1** `ensure_model` re-checks `presence` after download; a
 //!   partial directory never reaches [`Engine::load`] (gated e2e / fetch path).
 //!
 //! Generation:
@@ -56,12 +56,9 @@ mod tool;
 pub use agent::{Agent, AgentEvent, AgentStop, Role, Run, Turn};
 pub use capability::Dir;
 pub use completer::{Completer, Completion};
-pub use engine::{
-    device, is_model_present, model_shards, presence, Engine, GenOpts, Generation, Presence,
-    Sampling, StopReason,
-};
 #[cfg(feature = "fetch")]
-pub use engine::{ensure_model, ensure_model_blocking};
+pub use engine::ensure_model_blocking;
+pub use engine::{device, is_model_present, Engine, GenOpts, Generation, Sampling, StopReason};
 pub use template::{ChatMlTemplate, DeepSeekR1Template, PlainTemplate, PromptTemplate};
 pub use tool::{
     DeepSeekToolCall, JsonToolCall, ListDir, QwenToolCall, ReadFile, Tool, ToolCall, ToolCallCodec,

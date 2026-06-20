@@ -33,7 +33,7 @@ impl Dir {
 
     /// Resolve a relative path under the root, rejecting anything that could
     /// escape it — absolute paths, `..`, or other non-normal components (CAP-1,
-    /// reusing the [`crate::is_safe_relative`] containment check / MS-3).
+    /// reusing the `is_safe_relative` containment check / MS-3).
     pub fn resolve(&self, rel: &str) -> Result<PathBuf> {
         if !crate::is_safe_relative(rel) {
             bail!("path {rel:?} escapes the capability root {:?}", self.root);
