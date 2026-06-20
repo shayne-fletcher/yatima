@@ -50,13 +50,46 @@ cargo test                             # the whole suite (no GPU needed)
 cargo run --bin yatima -- --help       # explore the CLI
 ```
 
+## Try it
+
+The most compact demo is an agent that can read only the directory you grant it,
+then asks a local Qwen-format model to summarize this README:
+
+```bash
+cargo run -p yatima-cli --release --bin yatima --features metal -- agent \
+  --model ~/.cache/yatima/models/bartowski/Qwen2.5-32B-Instruct-GGUF \
+  --format qwen \
+  --root . \
+  --prompt "Read README.md and summarize what yatima is in three sentences." \
+  --max-tokens 256
+```
+
+Expected shape:
+
+```text
+loaded .../Qwen2.5-32B-Instruct-GGUF [metal/F32]; tools rooted at .
+Yatima is a Rust runtime designed for language-integrated LLMs, allowing local
+models to be called as in-process functions. ...
+[1 steps, Final]
+```
+
+That one command exercises the core path: local model load, an agent turn, a
+capability-scoped `read_file` tool call under `--root`, and a grounded final
+answer.
+
 ```bash
 # generate a completion
-yatima generate --repo deepseek-ai/DeepSeek-R1-Distill-Qwen-7B --prompt "Rust is"
+cargo run -p yatima-cli --release --bin yatima --features metal -- generate \
+  --repo deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+  --prompt "Rust is"
 
 # run an agent with read-only file tools scoped to a directory
-yatima agent --repo deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
-  --root ./docs --prompt "What's in README.md?" --verbose
+cargo run -p yatima-cli --release --bin yatima --features metal -- agent \
+  --model ~/.cache/yatima/models/bartowski/Qwen2.5-32B-Instruct-GGUF \
+  --format qwen \
+  --root . \
+  --prompt "What's in README.md?" \
+  --verbose
 ```
 
 A missing model is fetched on demand (the `fetch` feature) via `possum`;
