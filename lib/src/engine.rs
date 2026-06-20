@@ -19,9 +19,12 @@ use tokenizers::Tokenizer;
 
 use crate::token_output_stream::TokenOutputStream;
 
-/// Match the upstream qwen example's anti-repetition defaults; without them a
-/// temperature-0 raw completion of an instruction-tuned distill degenerates.
-const REPEAT_PENALTY: f32 = 1.1;
+/// The upstream qwen example's anti-repetition default; without it a
+/// temperature-0 raw *prose* completion of an instruction-tuned distill
+/// degenerates. It is the wrong default for *structured* output, though — it
+/// penalises the punctuation JSON repeats (`"`, `{`, `<`), corrupting tool
+/// calls — so it is a per-call [`GenOpts`] knob the agent turns off.
+const DEFAULT_REPEAT_PENALTY: f32 = 1.1;
 const REPEAT_LAST_N: usize = 64;
 
 /// How the next token is chosen. Replaces the old `temperature <= 0` sentinel
@@ -55,6 +58,9 @@ impl Sampling {
 pub struct GenOpts {
     pub max_tokens: usize,
     pub sampling: Sampling,
+    /// Repetition penalty over the last [`REPEAT_LAST_N`] tokens. `1.0` disables
+    /// it (the right choice for structured/tool-call output); ~`1.1` suits prose.
+    pub repeat_penalty: f32,
 }
 
 impl Default for GenOpts {
@@ -62,6 +68,7 @@ impl Default for GenOpts {
         Self {
             max_tokens: 256,
             sampling: Sampling::Greedy,
+            repeat_penalty: DEFAULT_REPEAT_PENALTY,
         }
     }
 }
@@ -199,11 +206,11 @@ impl Engine {
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input, start_pos)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let logits = if REPEAT_PENALTY == 1.0 {
+            let logits = if opts.repeat_penalty == 1.0 {
                 logits
             } else {
                 let start = tokens.len().saturating_sub(REPEAT_LAST_N);
-                apply_repeat_penalty(&logits, REPEAT_PENALTY, &tokens[start..])?
+                apply_repeat_penalty(&logits, opts.repeat_penalty, &tokens[start..])?
             };
 
             let next = logits_processor.sample(&logits)?;
@@ -225,13 +232,15 @@ impl Engine {
             }
         }
 
-        // Flush trailing buffered text — but not when the caller asked to stop.
-        if stop != StopReason::Stopped {
-            if let Some(rest) = stream.decode_rest()? {
-                acc = match step(acc, &rest)? {
-                    ControlFlow::Continue(a) | ControlFlow::Break(a) => a,
-                };
-            }
+        // Always flush trailing buffered text. The incremental detokenizer holds
+        // back punctuation until the next alphanumeric token, so on *any* exit
+        // (EOS, max_tokens, or a caller `Break`) the buffered tail — closing
+        // quotes, `}`, a stop marker like `</tool_call>` — must be delivered, or
+        // the accumulated text is silently truncated (corrupting tool-call JSON).
+        if let Some(rest) = stream.decode_rest()? {
+            acc = match step(acc, &rest)? {
+                ControlFlow::Continue(a) | ControlFlow::Break(a) => a,
+            };
         }
 
         Ok((
@@ -595,6 +604,7 @@ mod tests {
         let opts = GenOpts {
             max_tokens: 16,
             sampling: Sampling::Greedy,
+            ..Default::default()
         };
         let prompt = "Rust is a systems programming language that";
 
