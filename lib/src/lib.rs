@@ -59,10 +59,10 @@ pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
 pub use engine::ensure_model_blocking;
 pub use engine::{device, is_model_present, Engine, GenOpts, Generation, Sampling, StopReason};
-pub use template::{ChatMlTemplate, DeepSeekR1Template, PlainTemplate, PromptTemplate};
+pub use template::{ChatMlTemplate, PlainTemplate, PromptTemplate};
 pub use tool::{
-    DeepSeekToolCall, JsonToolCall, ListDir, QwenToolCall, ReadFile, Tool, ToolCall, ToolCallCodec,
-    ToolResult, ToolSpec, Tools,
+    JsonToolCall, ListDir, QwenToolCall, ReadFile, Tool, ToolCall, ToolCallCodec, ToolResult,
+    ToolSpec, Tools,
 };
 
 use anyhow::{bail, Result};

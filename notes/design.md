@@ -85,12 +85,12 @@ The design is **small composable seams**, simplest concrete impl behind each:
   `is_error` `ToolResult` the model can recover from (PROTO-1). First tools:
   `ReadFile`, `ListDir` (read-only).
 - **`PromptTemplate`** (the chat format) — renders the transcript into the
-  model's *native* prompt string. `ChatMlTemplate` (Qwen2.5), `DeepSeekR1Template`
-  (R1 distills), `PlainTemplate` (fallback/tests). A model is acutely sensitive to
-  its trained format; the wrong one degenerates it.
+  model's *native* prompt string. `ChatMlTemplate` (Qwen2.5), `PlainTemplate`
+  (fallback/tests). A model is acutely sensitive to its trained format; the wrong
+  one degenerates it.
 - **`ToolCallCodec`** (the protocol) — `QwenToolCall` (ChatML/Hermes
-  `<tool_call>{json}</tool_call>` with `arguments`), `DeepSeekToolCall` (native
-  `<｜tool▁call…｜>` framing), `JsonToolCall` (a plain convention). `parse` returns
+  `<tool_call>{json}</tool_call>` with `arguments`) and `JsonToolCall` (a plain
+  convention, for tests / the `plain` fallback). `parse` returns
   `None` (a plain answer), `Some(Ok)` (a call), or `Some(Err)` (malformed ⇒ an
   error turn), and is **panic-proof on any input** (proptest). Each does strict
   JSON first, then a **tolerant** pass that recovers common real-model defects

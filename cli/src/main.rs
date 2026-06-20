@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use yatima_lib::{
-    device, model_dir, models_root, Agent, ChatMlTemplate, Completer, DeepSeekR1Template,
-    DeepSeekToolCall, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId, PlainTemplate,
-    PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec, Tools,
+    device, model_dir, models_root, Agent, ChatMlTemplate, Completer, Dir, Engine, GenOpts,
+    JsonToolCall, ListDir, ModelId, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile,
+    Sampling, ToolCallCodec, Tools,
 };
 
 #[derive(Parser)]
@@ -113,8 +113,6 @@ struct AgentArgs {
 enum ChatFormat {
     /// Qwen2.5-Instruct: ChatML + `<tool_call>` (trained for tools).
     Qwen,
-    /// DeepSeek-R1(-Distill): native `<｜tool▁call…｜>` framing.
-    Deepseek,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
     Plain,
 }
@@ -191,17 +189,6 @@ fn agent(args: AgentArgs) -> Result<()> {
             &tools,
             QwenToolCall,
             ChatMlTemplate,
-            system,
-            args.max_steps,
-            opts,
-            &args.prompt,
-            args.verbose,
-        ),
-        ChatFormat::Deepseek => run_agent(
-            &mut engine,
-            &tools,
-            DeepSeekToolCall,
-            DeepSeekR1Template,
             system,
             args.max_steps,
             opts,

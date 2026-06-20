@@ -1,14 +1,12 @@
 //! Prompt templates — rendering a transcript into a model's *native* prompt
 //! string.
 //!
-//! A base model is acutely sensitive to its trained chat format: feed an R1
-//! distill a generic `<|role|>` layout and it destabilises (degenerate
-//! repetition, no instruction-following). [`PromptTemplate`] is the seam that
-//! makes the format per-model; [`DeepSeekR1Template`] matches the tokenizer's
-//! `chat_template` (BOS, `<｜User｜>`/`<｜Assistant｜>`, an opening `<think>`, and
-//! native tool-output framing) so the model behaves and can emit native tool
-//! calls. [`PlainTemplate`] keeps the minimal layout for models with no known
-//! template and for tests.
+//! A model is acutely sensitive to its trained chat format: feed it a generic
+//! `<|role|>` layout and it can destabilise (degenerate repetition, no
+//! instruction-following). [`PromptTemplate`] is the seam that makes the format
+//! per-model; [`ChatMlTemplate`] matches Qwen2.5's trained format, and
+//! [`PlainTemplate`] keeps the minimal layout for models with no known template
+//! and for tests.
 
 use crate::agent::{Role, Turn};
 
@@ -36,61 +34,6 @@ impl PromptTemplate for PlainTemplate {
             s.push_str(&format!("<|{tag}|>\n{}\n", turn.content));
         }
         s.push_str("<|assistant|>\n");
-        s
-    }
-}
-
-const BOS: &str = "<｜begin▁of▁sentence｜>";
-const USER: &str = "<｜User｜>";
-const ASSISTANT: &str = "<｜Assistant｜>";
-const THINK_OPEN: &str = "<think>\n";
-const OUTPUTS_BEGIN: &str = "<｜tool▁outputs▁begin｜>";
-const OUTPUTS_END: &str = "<｜tool▁outputs▁end｜>";
-const OUTPUT_BEGIN: &str = "<｜tool▁output▁begin｜>";
-const OUTPUT_END: &str = "<｜tool▁output▁end｜>";
-
-/// The DeepSeek-R1(-Distill) native chat format, mirroring the model's trained
-/// `chat_template`: a leading BOS, the system prompt prepended raw, then
-/// `<｜User｜>` / `<｜Assistant｜>` turns and native `<｜tool▁output…｜>` framing for
-/// tool results. The generation cue opens a forced `<think>` block on a fresh
-/// assistant turn; after tool outputs the assistant turn continues, so no new
-/// tag is added (matching the template).
-pub struct DeepSeekR1Template;
-
-impl PromptTemplate for DeepSeekR1Template {
-    fn render(&self, turns: &[Turn]) -> String {
-        let mut s = String::from(BOS);
-        // The system prompt sits right after BOS (the template concatenates it
-        // raw, with no role wrapper).
-        for turn in turns.iter().filter(|t| t.role == Role::System) {
-            s.push_str(&turn.content);
-        }
-        for turn in turns {
-            match turn.role {
-                Role::System => {}
-                Role::User => {
-                    s.push_str(USER);
-                    s.push_str(&turn.content);
-                }
-                Role::Assistant => {
-                    s.push_str(ASSISTANT);
-                    s.push_str(&turn.content);
-                }
-                Role::Tool => {
-                    s.push_str(OUTPUTS_BEGIN);
-                    s.push_str(OUTPUT_BEGIN);
-                    s.push_str(&turn.content);
-                    s.push_str(OUTPUT_END);
-                    s.push_str(OUTPUTS_END);
-                }
-            }
-        }
-        // Cue the next turn. After a tool output the assistant continues the turn
-        // that made the call, so no `<｜Assistant｜>` is added.
-        if turns.last().map(|t| t.role) != Some(Role::Tool) {
-            s.push_str(ASSISTANT);
-            s.push_str(THINK_OPEN);
-        }
         s
     }
 }
@@ -144,35 +87,6 @@ mod tests {
             role,
             content: content.to_string(),
         }
-    }
-
-    #[test]
-    fn deepseek_renders_native_tokens_with_think_cue() {
-        let s = DeepSeekR1Template.render(&[turn(Role::System, "SYS"), turn(Role::User, "hi")]);
-        assert_eq!(
-            s,
-            "<｜begin▁of▁sentence｜>SYS<｜User｜>hi<｜Assistant｜><think>\n"
-        );
-    }
-
-    #[test]
-    fn deepseek_continues_after_tool_output_without_new_tag() {
-        let s = DeepSeekR1Template.render(&[
-            turn(Role::System, "S"),
-            turn(Role::User, "u"),
-            turn(Role::Assistant, "A<｜tool▁call▁end｜>"),
-            turn(Role::Tool, "[read_file ok] X"),
-        ]);
-        assert_eq!(
-            s,
-            "<｜begin▁of▁sentence｜>S<｜User｜>u<｜Assistant｜>A<｜tool▁call▁end｜>\
-             <｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>[read_file ok] X\
-             <｜tool▁output▁end｜><｜tool▁outputs▁end｜>"
-        );
-        assert!(
-            !s.ends_with("<think>\n"),
-            "no new assistant cue after a tool output"
-        );
     }
 
     #[test]
