@@ -363,12 +363,26 @@ fn parse_name_token(s: &str) -> String {
     }
 }
 
-/// The first balanced `{...}` span at the start of `s` (brace-counted).
+/// The first balanced `{...}` span at the start of `s`, counting braces only
+/// outside JSON strings — so an argument value containing `{` or `}` (a path, a
+/// snippet of code) does not close the object early.
 fn balanced_object(s: &str) -> Option<String> {
     let start = s.find('{')?;
     let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
     for (offset, ch) in s[start..].char_indices() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -563,6 +577,43 @@ mod tests {
     }
 
     #[test]
+    fn qwen_codec_strict_with_braces_in_values() {
+        // upholds: PROTO-1 — valid JSON whose values contain braces (code, paths)
+        // parses via the strict path untouched.
+        let codec = QwenToolCall;
+        let text = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": \
+                    {\"path\": \"m.rs\", \"content\": \"fn main() {}\"}}\n</tool_call>";
+        let call = codec.parse(text).unwrap().unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.args["content"], "fn main() {}");
+    }
+
+    #[test]
+    fn qwen_codec_tolerant_with_braces_in_values() {
+        // upholds: PROTO-1 — the tolerant path (unquoted name) must still capture
+        // an arguments object whose string values contain `}` (the balanced_object
+        // string-awareness fix); a naive brace counter would truncate here.
+        let codec = QwenToolCall;
+        let text = "<tool_call>\n{\"name\": write_file, \"arguments\": \
+                    {\"path\": \"m.rs\", \"content\": \"x } y { z\"}}\n</tool_call>";
+        let call = codec.parse(text).unwrap().unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.args["path"], "m.rs");
+        assert_eq!(call.args["content"], "x } y { z");
+    }
+
+    #[test]
+    fn qwen_codec_tolerant_with_nested_args() {
+        // upholds: PROTO-1 — unquoted name with a nested arguments object.
+        let codec = QwenToolCall;
+        let text = "<tool_call>\n{\"name\": configure, \"arguments\": \
+                    {\"opts\": {\"a\": 1, \"b\": [2, 3]}}}\n</tool_call>";
+        let call = codec.parse(text).unwrap().unwrap();
+        assert_eq!(call.name, "configure");
+        assert_eq!(call.args["opts"]["b"][1], 3);
+    }
+
+    #[test]
     fn qwen_codec_plain_and_malformed() {
         // upholds: PROTO-1
         let codec = QwenToolCall;
@@ -585,6 +636,24 @@ mod tests {
         });
         assert!(result.is_error);
         assert!(result.content.contains("unknown tool"));
+    }
+
+    #[test]
+    fn read_file_missing_path_arg_is_error() {
+        // upholds: PROTO-1 — a call missing a required argument is a recoverable
+        // error result, not a panic.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let r = tools.dispatch(&ToolCall {
+            name: "read_file".to_string(),
+            args: json("{}"),
+        });
+        assert!(r.is_error);
+        let r2 = tools.dispatch(&ToolCall {
+            name: "read_file".to_string(),
+            args: Value::Null,
+        });
+        assert!(r2.is_error);
     }
 
     #[test]

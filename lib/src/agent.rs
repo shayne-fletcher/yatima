@@ -432,6 +432,65 @@ mod tests {
         assert_eq!(observed, 2, "saw ToolCall then ToolResult, then stopped");
     }
 
+    #[test]
+    fn multi_step_two_tool_calls_then_answer() {
+        // upholds: AGENT-1 — the loop chains multiple tool rounds then answers
+        // (the no-GPU analogue of the servers.txt + runbook.md demo).
+        let tmp = tmp_with_file("servers.txt", "web02: DOWN");
+        {
+            let mut f = std::fs::File::create(tmp.path().join("runbook.md")).unwrap();
+            write!(f, "restart it and page on-call").unwrap();
+        }
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let mut model = Scripted::new(&[
+            &call("read_file", "servers.txt"),
+            &call("read_file", "runbook.md"),
+            "Restart web02 and page the on-call.",
+        ]);
+
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let run = agent.run("what should I do?").unwrap();
+
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.steps, 2);
+        assert_eq!(run.answer, "Restart web02 and page the on-call.");
+        let tool_turns: Vec<&Turn> = run
+            .transcript
+            .iter()
+            .filter(|t| t.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_turns.len(), 2);
+        assert!(tool_turns[0].content.contains("DOWN"));
+        assert!(tool_turns[1].content.contains("restart it"));
+    }
+
+    #[test]
+    fn multi_step_recovers_from_failed_tool() {
+        // upholds: PROTO-1 — a failed tool call (missing file) yields an error
+        // result the model recovers from, then a correct answer.
+        let tmp = tmp_with_file("real.txt", "the data");
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let mut model = Scripted::new(&[
+            &call("read_file", "missing.txt"),
+            &call("read_file", "real.txt"),
+            "Got it: the data.",
+        ]);
+
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let run = agent.run("q").unwrap();
+
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.steps, 2);
+        let tool_turns: Vec<&Turn> = run
+            .transcript
+            .iter()
+            .filter(|t| t.role == Role::Tool)
+            .collect();
+        assert!(tool_turns[0].content.contains("error"));
+        assert!(!tool_turns[1].content.contains("error"));
+        assert_eq!(run.answer, "Got it: the data.");
+    }
+
     // End-to-end agent loop over a real, tool-trained model (Qwen2.5-Instruct,
     // Qwen2 arch) + a real ReadFile capability. Gated: needs the weights and
     // `YATIMA_E2E=1`, skips fast otherwise. Qwen2.5 reliably emits native tool
