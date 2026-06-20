@@ -491,52 +491,115 @@ mod tests {
         assert_eq!(run.answer, "Got it: the data.");
     }
 
-    // End-to-end agent loop over a real, tool-trained model (Qwen2.5-Instruct,
-    // Qwen2 arch) + a real ReadFile capability. Gated: needs the weights and
-    // `YATIMA_E2E=1`, skips fast otherwise. Qwen2.5 reliably emits native tool
-    // calls, so this asserts a tool actually fired (steps >= 1) and the loop
-    // terminated within budget. Run with `--features metal --nocapture` to read
-    // the transcript.
-    #[test]
-    fn e2e_agent_calls_a_tool() -> Result<()> {
+    // End-to-end agent runs over a real, tool-trained model (Qwen2.5-Instruct,
+    // Qwen2 arch). Gated: need the weights and `YATIMA_E2E=1`, skip fast
+    // otherwise. Assertions are *tool-side* (the tool returns the real file
+    // content regardless of how the model phrases its answer), so they are
+    // deterministic given that Qwen2.5 reliably calls the tool. These lock in the
+    // manual CLI demos. Run with `--features metal --nocapture` to read the
+    // transcripts.
+
+    /// Skip-guarded Qwen model dir, or `None` if the e2e gate/weights are absent.
+    fn e2e_qwen_dir() -> Option<PathBuf> {
         if std::env::var_os("YATIMA_E2E").is_none() {
             eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
-            return Ok(());
+            return None;
         }
-        let repo = crate::ModelId::parse("Qwen/Qwen2.5-7B-Instruct").unwrap();
-        let dir = crate::model_dir(&crate::models_root(), &repo);
+        let dir = crate::model_dir(
+            &crate::models_root(),
+            &crate::ModelId::parse("Qwen/Qwen2.5-7B-Instruct").unwrap(),
+        );
         if !dir.join("config.json").exists() {
             eprintln!("skipping e2e: weights absent at {}", dir.display());
-            return Ok(());
+            return None;
         }
+        Some(dir)
+    }
 
-        let tmp = tmp_with_file("fact.txt", "The capital of France is Paris.");
-        let tools = Tools::new()
-            .with(ReadFile::new(Dir::new(tmp.path())))
-            .with(crate::ListDir::new(Dir::new(tmp.path())));
-
-        let mut engine = crate::Engine::load(&dir, crate::device(false)?)?;
-        let mut agent = Agent::new(
-            &mut engine,
-            &tools,
-            crate::tool::QwenToolCall,
-            crate::template::ChatMlTemplate,
-            "You are a helpful assistant. Use the read_file tool to read files.",
-            4,
-        );
-        let run = agent.run("Read fact.txt and tell me the capital of France.")?;
-
+    fn dump(run: &Run) {
         for turn in &run.transcript {
             eprintln!("── {:?} ──\n{}\n", turn.role, turn.content);
         }
         eprintln!("[{} steps, {:?}]", run.steps, run.stop);
+    }
 
-        assert!(run.steps >= 1, "the model should have called a tool");
-        assert!(run.steps <= 4, "AGENT-1: steps stay within max_steps");
-        assert!(
-            matches!(run.stop, AgentStop::Final | AgentStop::MaxSteps),
-            "the loop terminates by answering or exhausting the budget"
-        );
+    fn tool_turns(run: &Run) -> Vec<&Turn> {
+        run.transcript
+            .iter()
+            .filter(|t| t.role == Role::Tool)
+            .collect()
+    }
+
+    use std::path::PathBuf;
+
+    fn qwen_agent<'a>(
+        engine: &'a mut crate::Engine,
+        tools: &'a Tools,
+        max_steps: usize,
+    ) -> Agent<'a, crate::Engine, crate::tool::QwenToolCall, crate::template::ChatMlTemplate> {
+        Agent::new(
+            engine,
+            tools,
+            crate::tool::QwenToolCall,
+            crate::template::ChatMlTemplate,
+            "You are a helpful assistant. Read files with the provided tools.",
+            max_steps,
+        )
+    }
+
+    // Both demos in one test so the ~15 GB model is loaded once and reused (an
+    // Engine is one-generation-at-a-time; scenarios run sequentially on the same
+    // engine). Assertions are tool-side, hence deterministic given Qwen calls the
+    // tool. Run with `--features metal --nocapture` to watch the transcripts.
+    #[test]
+    fn e2e_agent_demos() -> Result<()> {
+        let Some(dir) = e2e_qwen_dir() else {
+            return Ok(());
+        };
+        let mut engine = crate::Engine::load(&dir, crate::device(false)?)?;
+
+        // Single-read demo (the "launch code" CLI run).
+        {
+            let tmp = tmp_with_file("secret.txt", "The launch code is ZEBRA-42.");
+            let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+            let run = qwen_agent(&mut engine, &tools, 4)
+                .run("Read secret.txt and tell me the launch code.")?;
+            dump(&run);
+            assert!(run.steps >= 1, "the model should have called a tool");
+            assert!(run.steps <= 4, "AGENT-1: steps stay within max_steps");
+            assert!(
+                tool_turns(&run)
+                    .iter()
+                    .any(|t| t.content.contains("ZEBRA-42") && !t.content.contains("error")),
+                "the tool must have fed back the real file content"
+            );
+        }
+
+        // Multi-step investigation demo (servers.txt + runbook.md).
+        {
+            let tmp = tmp_with_file("servers.txt", "web01: healthy\nweb02: DOWN\ndb01: healthy");
+            {
+                let mut f = std::fs::File::create(tmp.path().join("runbook.md")).unwrap();
+                write!(
+                    f,
+                    "If a web server is DOWN, restart it and page the on-call."
+                )
+                .unwrap();
+            }
+            let tools = Tools::new()
+                .with(ReadFile::new(Dir::new(tmp.path())))
+                .with(crate::ListDir::new(Dir::new(tmp.path())));
+            let run = qwen_agent(&mut engine, &tools, 6).run(
+                "Check servers.txt for any DOWN servers, then consult runbook.md for the \
+                 procedure, and tell me exactly what action to take.",
+            )?;
+            dump(&run);
+            assert!(run.steps >= 1, "the model should have called a tool");
+            assert!(run.steps <= 6, "AGENT-1: steps stay within max_steps");
+            let reads: String = tool_turns(&run).iter().map(|t| t.content.clone()).collect();
+            assert!(reads.contains("DOWN"), "servers.txt content should be read");
+        }
+
         Ok(())
     }
 }
