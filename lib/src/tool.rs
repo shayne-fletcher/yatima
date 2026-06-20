@@ -8,10 +8,11 @@
 //! can see and recover from (PROTO-1).
 //!
 //! [`ToolCallCodec`] is the wire format between model text and a [`ToolCall`].
-//! [`JsonToolCall`] is the first impl: the `<tool_call>{json}</tool_call>`
-//! convention for a base model with no native tool tokens. Schemas follow the
-//! de-facto standard (JSON Schema params, name + JSON args); a future codec can
-//! emit a native tool-call form or a constrained grammar.
+//! Real models use their own native codec ([`QwenToolCall`], [`DeepSeekToolCall`]);
+//! [`JsonToolCall`] is a neutral `<tool_call>{json}</tool_call>` convention that
+//! is *not* any specific model's format — it backs the model-free agent-loop
+//! tests and the `plain` fallback for a model with no known native format.
+//! Schemas follow the de-facto standard (JSON Schema params, name + JSON args).
 
 use crate::capability::Dir;
 use anyhow::{anyhow, bail, Result};
@@ -122,7 +123,11 @@ pub trait ToolCallCodec {
     fn parse(&self, text: &str) -> Option<Result<ToolCall>>;
 }
 
-/// The `<tool_call>{ "name": ..., "args": {...} }</tool_call>` convention.
+/// A neutral `<tool_call>{ "name": ..., "args": {...} }</tool_call>` convention —
+/// not any specific model's native format (note `"args"`, vs Qwen's
+/// `"arguments"`). Used by the model-free agent-loop tests and the `plain`
+/// fallback; for a real model prefer its native codec ([`QwenToolCall`],
+/// [`DeepSeekToolCall`]).
 pub struct JsonToolCall;
 
 const OPEN: &str = "<tool_call>";
