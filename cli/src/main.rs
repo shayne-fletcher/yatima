@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use yatima_lib::{device, model_dir, models_root, Engine, GenOpts};
+use yatima_lib::{device, model_dir, models_root, Engine, GenOpts, RepoId, Sampling};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
         Command::ModelsDir { repo } => {
             let root = models_root();
             let path = match repo {
-                Some(r) => model_dir(&root, &r),
+                Some(r) => model_dir(&root, &RepoId::parse(&r)?),
                 None => root,
             };
             println!("{}", path.display());
@@ -71,38 +71,8 @@ fn main() -> Result<()> {
 }
 
 fn generate(args: GenerateArgs) -> Result<()> {
-    let dir = match (args.model, args.repo) {
-        (Some(d), None) => d,
-        (None, Some(repo)) => {
-            let root = args.models_dir.unwrap_or_else(models_root);
-            let dir = model_dir(&root, &repo);
-            if !yatima_lib::is_model_present(&dir) {
-                if args.offline {
-                    bail!(
-                        "model '{repo}' not present at {} (drop --offline to fetch, or run: \
-                         possum model download --repository {repo} --to {})",
-                        dir.display(),
-                        root.display()
-                    );
-                }
-                #[cfg(feature = "fetch")]
-                {
-                    eprintln!("fetching {repo} …");
-                    yatima_lib::ensure_model_blocking(&repo, &root)?;
-                }
-                #[cfg(not(feature = "fetch"))]
-                {
-                    bail!(
-                        "model '{repo}' not present and yatima was built without the \
-                         `fetch` feature"
-                    );
-                }
-            }
-            dir
-        }
-        (Some(_), Some(_)) => bail!("pass only one of --model / --repo"),
-        (None, None) => bail!("specify --model <dir> or --repo <id>"),
-    };
+    let dir =
+        ModelSource::from_args(args.model, args.repo, args.models_dir, args.offline)?.resolve()?;
 
     let prompt = match args.prompt {
         Some(p) => p,
@@ -116,17 +86,148 @@ fn generate(args: GenerateArgs) -> Result<()> {
     let mut engine = Engine::load(&dir, device(args.cpu)?)?;
     eprintln!("loaded {} [{}]", dir.display(), engine.backend());
 
+    let sampling = if args.temperature <= 0.0 {
+        Sampling::Greedy
+    } else {
+        Sampling::Sample {
+            temperature: args.temperature,
+            seed: args.seed,
+        }
+    };
     let opts = GenOpts {
         max_tokens: args.max_tokens,
-        temperature: args.temperature,
-        seed: args.seed,
+        sampling,
     };
     let mut stdout = std::io::stdout();
-    engine.generate(&prompt, &opts, |piece| {
+    let generation = engine.generate(&prompt, &opts, |piece| {
         stdout.write_all(piece.as_bytes())?;
         stdout.flush()?;
         Ok(())
     })?;
     println!();
+    eprintln!("[{} tokens, {:?}]", generation.tokens, generation.stop);
     Ok(())
+}
+
+/// Where a model's files come from — exactly one source, parsed at the edge so
+/// the rest of the program never sees an invalid combination (CLI-1).
+enum ModelSource {
+    Directory(PathBuf),
+    Repository {
+        id: RepoId,
+        root: PathBuf,
+        fetch: FetchPolicy,
+    },
+}
+
+enum FetchPolicy {
+    Online,
+    Offline,
+}
+
+impl ModelSource {
+    fn from_args(
+        model: Option<PathBuf>,
+        repo: Option<String>,
+        models_dir: Option<PathBuf>,
+        offline: bool,
+    ) -> Result<ModelSource> {
+        match (model, repo) {
+            (Some(dir), None) => Ok(ModelSource::Directory(dir)),
+            (None, Some(repo)) => Ok(ModelSource::Repository {
+                id: RepoId::parse(&repo)?,
+                root: models_dir.unwrap_or_else(models_root),
+                fetch: if offline {
+                    FetchPolicy::Offline
+                } else {
+                    FetchPolicy::Online
+                },
+            }),
+            (Some(_), Some(_)) => bail!("pass only one of --model / --repo"),
+            (None, None) => bail!("specify --model <dir> or --repo <id>"),
+        }
+    }
+
+    /// Resolve to a concrete model directory, fetching on a cache miss when the
+    /// policy is `Online` (CLI-2: `Offline` never touches the network).
+    fn resolve(self) -> Result<PathBuf> {
+        match self {
+            ModelSource::Directory(dir) => Ok(dir),
+            ModelSource::Repository { id, root, fetch } => {
+                let dir = model_dir(&root, &id);
+                if yatima_lib::is_model_present(&dir) {
+                    return Ok(dir);
+                }
+                match fetch {
+                    FetchPolicy::Offline => bail!(
+                        "model '{id}' not present at {} (drop --offline to fetch, or run: \
+                         possum model download --repository {id} --to {})",
+                        dir.display(),
+                        root.display()
+                    ),
+                    FetchPolicy::Online => fetch_model(&id, &root),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fetch")]
+fn fetch_model(id: &RepoId, root: &std::path::Path) -> Result<PathBuf> {
+    eprintln!("fetching {id} …");
+    yatima_lib::ensure_model_blocking(id, root)
+}
+
+#[cfg(not(feature = "fetch"))]
+fn fetch_model(id: &RepoId, _root: &std::path::Path) -> Result<PathBuf> {
+    bail!("model '{id}' not present and yatima was built without the `fetch` feature")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_directory() {
+        let s = ModelSource::from_args(Some(PathBuf::from("/m")), None, None, false).unwrap();
+        assert!(matches!(s, ModelSource::Directory(_)));
+    }
+
+    #[test]
+    fn source_repository_online_and_offline() {
+        let on = ModelSource::from_args(None, Some("org/name".into()), None, false).unwrap();
+        assert!(matches!(
+            on,
+            ModelSource::Repository {
+                fetch: FetchPolicy::Online,
+                ..
+            }
+        ));
+        let off = ModelSource::from_args(None, Some("org/name".into()), None, true).unwrap();
+        assert!(matches!(
+            off,
+            ModelSource::Repository {
+                fetch: FetchPolicy::Offline,
+                ..
+            }
+        ));
+    }
+
+    // CLI-1: exactly one model source.
+    #[test]
+    fn source_is_exclusive_and_required() {
+        assert!(ModelSource::from_args(
+            Some(PathBuf::from("/m")),
+            Some("org/name".into()),
+            None,
+            false
+        )
+        .is_err());
+        assert!(ModelSource::from_args(None, None, None, false).is_err());
+    }
+
+    #[test]
+    fn source_rejects_escaping_repo_id() {
+        assert!(ModelSource::from_args(None, Some("../escape".into()), None, false).is_err());
+    }
 }
