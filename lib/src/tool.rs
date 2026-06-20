@@ -14,7 +14,7 @@
 //! emit a native tool-call form or a constrained grammar.
 
 use crate::capability::Dir;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 
 /// What a tool advertises to the model: its name, a description, and a JSON
@@ -178,6 +178,77 @@ fn parse_call_json(json: &str) -> Result<ToolCall> {
     Ok(ToolCall { name, args })
 }
 
+/// The DeepSeek-R1 native tool-call format. The model is *trained* to emit it,
+/// so we speak its language rather than impose a convention: a call is
+/// `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n```json\nARGS\n```<｜tool▁call▁end｜>`.
+/// These markers are plain text (not special tokens), so they survive
+/// detokenization and a string-stop on `<｜tool▁call▁end｜>` works.
+pub struct DeepSeekToolCall;
+
+const DS_CALL_BEGIN: &str = "<｜tool▁call▁begin｜>";
+const DS_CALL_END: &str = "<｜tool▁call▁end｜>";
+const DS_SEP: &str = "<｜tool▁sep｜>";
+
+impl ToolCallCodec for DeepSeekToolCall {
+    fn render_system(&self, specs: &[ToolSpec]) -> String {
+        let mut s = String::from(
+            "You have access to the following tools. When a tool helps, call it \
+             (you know the tool-call format); otherwise answer directly.\n\n\
+             ## Tools\n",
+        );
+        for spec in specs {
+            s.push_str(&format!(
+                "- {}: {}\n  arguments (JSON Schema): {}\n",
+                spec.name, spec.description, spec.params
+            ));
+        }
+        s
+    }
+
+    fn stop_strings(&self) -> Vec<String> {
+        vec![DS_CALL_END.to_string()]
+    }
+
+    fn parse(&self, text: &str) -> Option<Result<ToolCall>> {
+        let begin = text.find(DS_CALL_BEGIN)?;
+        Some(parse_deepseek_call(&text[begin + DS_CALL_BEGIN.len()..]))
+    }
+}
+
+/// Parse the body after `<｜tool▁call▁begin｜>`: `function<｜tool▁sep｜>NAME\n```json
+/// ARGS```…`. The name runs to the first newline; the arguments are the fenced
+/// JSON block (falling back to the first balanced `{…}`).
+fn parse_deepseek_call(after: &str) -> Result<ToolCall> {
+    let sep = after
+        .find(DS_SEP)
+        .ok_or_else(|| anyhow!("tool call missing '{DS_SEP}'"))?;
+    let rest = &after[sep + DS_SEP.len()..];
+    let nl = rest
+        .find('\n')
+        .ok_or_else(|| anyhow!("tool call missing a name terminator"))?;
+    let name = rest[..nl].trim().to_string();
+    if name.is_empty() {
+        bail!("tool call has an empty name");
+    }
+    let args = extract_json_block(&rest[nl..])?;
+    Ok(ToolCall { name, args })
+}
+
+/// Extract a JSON value from a fenced ```json … ``` block, or failing that the
+/// first balanced `{…}` span.
+fn extract_json_block(s: &str) -> Result<Value> {
+    let body = if let Some(i) = s.find("```json") {
+        let rest = &s[i + "```json".len()..];
+        let end = rest.find("```").unwrap_or(rest.len());
+        &rest[..end]
+    } else if let (Some(a), Some(b)) = (s.find('{'), s.rfind('}')) {
+        &s[a..=b]
+    } else {
+        bail!("tool call missing JSON arguments");
+    };
+    serde_json::from_str(body.trim()).map_err(|e| anyhow!("malformed tool-call JSON: {e}"))
+}
+
 /// Read a UTF-8 text file under a [`Dir`] capability.
 pub struct ReadFile {
     dir: Dir,
@@ -297,6 +368,41 @@ mod tests {
             .unwrap()
             .is_err());
         assert!(codec.parse("<tool_call>{\"name\":\"x\"").unwrap().is_err());
+    }
+
+    #[test]
+    fn deepseek_codec_parses_native_call() {
+        // upholds: PROTO-1 — the model's native format parses to a ToolCall; the
+        // think block before it and the stop marker after are ignored.
+        let codec = DeepSeekToolCall;
+        let text = "<think>\nlet me read it\n</think>\n\
+                    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>read_file\n\
+                    ```json\n{\"path\": \"a.txt\"}\n```<｜tool▁call▁end｜>";
+        let call = codec.parse(text).unwrap().unwrap();
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.args, json(r#"{"path": "a.txt"}"#));
+    }
+
+    #[test]
+    fn deepseek_codec_plain_answer_is_none_and_stops_on_call_end() {
+        // upholds: PROTO-1 — pure reasoning/answer has no call; the stop string
+        // is the native call terminator.
+        let codec = DeepSeekToolCall;
+        assert!(codec
+            .parse("<think>done</think>\nThe answer is 42.")
+            .is_none());
+        assert_eq!(
+            codec.stop_strings(),
+            vec!["<｜tool▁call▁end｜>".to_string()]
+        );
+    }
+
+    #[test]
+    fn deepseek_codec_malformed_is_some_err() {
+        // upholds: PROTO-1 — an attempted call with no JSON is a parse error.
+        let codec = DeepSeekToolCall;
+        let text = "<｜tool▁call▁begin｜>function<｜tool▁sep｜>read_file\nno json here";
+        assert!(codec.parse(text).unwrap().is_err());
     }
 
     #[test]

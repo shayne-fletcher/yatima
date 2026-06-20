@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use yatima_lib::{
-    device, model_dir, models_root, Agent, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
-    ReadFile, Sampling, Tools,
+    device, model_dir, models_root, Agent, DeepSeekR1Template, DeepSeekToolCall, Dir, Engine,
+    GenOpts, ListDir, ModelId, ReadFile, Sampling, Tools,
 };
 
 #[derive(Parser)]
@@ -164,8 +164,17 @@ fn agent(args: AgentArgs) -> Result<()> {
     let system = args
         .system
         .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
-    let mut agent =
-        Agent::new(&mut engine, &tools, JsonToolCall, system, args.max_steps).with_opts(opts);
+    // DeepSeek-R1 native format (the model we ship against); template selection
+    // by model config is a future refinement.
+    let mut agent = Agent::new(
+        &mut engine,
+        &tools,
+        DeepSeekToolCall,
+        DeepSeekR1Template,
+        system,
+        args.max_steps,
+    )
+    .with_opts(opts);
     let run = agent.run(&args.prompt)?;
 
     if args.verbose {

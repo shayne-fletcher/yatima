@@ -49,6 +49,7 @@ mod agent;
 mod capability;
 mod completer;
 mod engine;
+mod template;
 mod token_output_stream;
 mod tool;
 
@@ -61,8 +62,10 @@ pub use engine::{
 };
 #[cfg(feature = "fetch")]
 pub use engine::{ensure_model, ensure_model_blocking};
+pub use template::{DeepSeekR1Template, PlainTemplate, PromptTemplate};
 pub use tool::{
-    JsonToolCall, ListDir, ReadFile, Tool, ToolCall, ToolCallCodec, ToolResult, ToolSpec, Tools,
+    DeepSeekToolCall, JsonToolCall, ListDir, ReadFile, Tool, ToolCall, ToolCallCodec, ToolResult,
+    ToolSpec, Tools,
 };
 
 use anyhow::{bail, Result};

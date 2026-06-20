@@ -9,6 +9,7 @@
 //! against a scripted [`Completer`] with no GPU.
 
 use crate::completer::Completer;
+use crate::template::PromptTemplate;
 use crate::tool::{ToolCall, ToolCallCodec, ToolResult, Tools};
 use crate::GenOpts;
 use anyhow::Result;
@@ -59,31 +60,36 @@ pub struct Run {
     pub stop: AgentStop,
 }
 
-/// An agent: a [`Completer`] driven against a set of [`Tools`] via a
-/// [`ToolCallCodec`], bounded by `max_steps`.
-pub struct Agent<'a, C: Completer, K: ToolCallCodec> {
+/// An agent: a [`Completer`] driven against a set of [`Tools`], using a
+/// [`PromptTemplate`] to speak the model's native format and a [`ToolCallCodec`]
+/// to encode/parse tool calls, bounded by `max_steps`.
+pub struct Agent<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> {
     completer: &'a mut C,
     tools: &'a Tools,
     codec: K,
+    template: T,
     system: String,
     max_steps: usize,
     opts: GenOpts,
 }
 
-impl<'a, C: Completer, K: ToolCallCodec> Agent<'a, C, K> {
+impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
     /// Build an agent. `system` is the base system prompt; the codec's tool
-    /// instructions are appended to it.
+    /// instructions are appended to it, and the whole transcript is rendered by
+    /// `template` into the model's native prompt format.
     pub fn new(
         completer: &'a mut C,
         tools: &'a Tools,
         codec: K,
+        template: T,
         system: impl Into<String>,
         max_steps: usize,
-    ) -> Agent<'a, C, K> {
+    ) -> Agent<'a, C, K, T> {
         Agent {
             completer,
             tools,
             codec,
+            template,
             system: system.into(),
             max_steps,
             opts: GenOpts::default(),
@@ -91,7 +97,7 @@ impl<'a, C: Completer, K: ToolCallCodec> Agent<'a, C, K> {
     }
 
     /// Override the generation options used for each turn (default greedy).
-    pub fn with_opts(mut self, opts: GenOpts) -> Agent<'a, C, K> {
+    pub fn with_opts(mut self, opts: GenOpts) -> Agent<'a, C, K, T> {
         self.opts = opts;
         self
     }
@@ -134,7 +140,7 @@ impl<'a, C: Completer, K: ToolCallCodec> Agent<'a, C, K> {
         let stop;
 
         loop {
-            let prompt = render_prompt(&transcript);
+            let prompt = self.template.render(&transcript);
             let completion = self.completer.complete(&prompt, &self.opts, &stops)?;
             let text = completion.text;
             transcript.push(Turn {
@@ -143,12 +149,14 @@ impl<'a, C: Completer, K: ToolCallCodec> Agent<'a, C, K> {
             });
 
             match self.codec.parse(&text) {
-                // A plain answer: the run is done.
+                // A plain answer: the run is done (a model's reasoning block, if
+                // any, is stripped from the surfaced answer).
                 None => {
-                    match step(acc, AgentEvent::Final(text.clone()))? {
+                    let final_answer = strip_think(&text);
+                    match step(acc, AgentEvent::Final(final_answer.clone()))? {
                         ControlFlow::Continue(a) | ControlFlow::Break(a) => acc = a,
                     }
-                    answer = text;
+                    answer = final_answer;
                     stop = AgentStop::Final;
                     break;
                 }
@@ -208,22 +216,14 @@ impl<'a, C: Completer, K: ToolCallCodec> Agent<'a, C, K> {
     }
 }
 
-/// Render the transcript into a single prompt. A minimal, backend-agnostic role
-/// template (native chat templates are a later refinement); the closing
-/// `<|assistant|>` cues the model to speak next.
-fn render_prompt(transcript: &[Turn]) -> String {
-    let mut s = String::new();
-    for turn in transcript {
-        let tag = match turn.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
-        };
-        s.push_str(&format!("<|{tag}|>\n{}\n", turn.content));
+/// Strip a leading reasoning block from a model's answer: keep only what follows
+/// the last `</think>`. A no-op for output with no think block (so it is safe
+/// for any template/codec).
+fn strip_think(text: &str) -> String {
+    match text.rfind("</think>") {
+        Some(i) => text[i + "</think>".len()..].trim().to_string(),
+        None => text.trim().to_string(),
     }
-    s.push_str("<|assistant|>\n");
-    s
 }
 
 /// Render a tool result as the `tool`-turn content the model reads back.
@@ -236,6 +236,7 @@ fn render_result(result: &ToolResult) -> String {
 mod tests {
     use super::*;
     use crate::completer::Completion;
+    use crate::template::PlainTemplate;
     use crate::tool::{JsonToolCall, ReadFile};
     use crate::{capability::Dir, StopReason};
     use std::io::Write;
@@ -295,7 +296,14 @@ mod tests {
             "Based on the file, the sky is blue.",
         ]);
 
-        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, "You are a helper.", 5);
+        let mut agent = Agent::new(
+            &mut model,
+            &tools,
+            JsonToolCall,
+            PlainTemplate,
+            "You are a helper.",
+            5,
+        );
         let run = agent.run("What does note.txt say?").unwrap();
 
         assert_eq!(run.stop, AgentStop::Final);
@@ -316,7 +324,7 @@ mod tests {
         let mut model =
             Scripted::new(&[&call("nonexistent", "x"), "Sorry, I will just answer: 4."]);
 
-        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, "helper", 5);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
         let run = agent.run("compute 2+2").unwrap();
 
         assert_eq!(run.stop, AgentStop::Final);
@@ -334,7 +342,7 @@ mod tests {
         let mut model =
             Scripted::new(&["<tool_call>{not valid json}</tool_call>", "Answer: done."]);
 
-        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, "helper", 5);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
         let run = agent.run("go").unwrap();
 
         assert_eq!(run.stop, AgentStop::Final);
@@ -355,7 +363,7 @@ mod tests {
         let c = call("read_file", "a.txt");
         let mut model = Scripted::new(&[&c, &c, &c, &c, &c]);
 
-        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, "helper", 3);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 3);
         let run = agent.run("loop").unwrap();
 
         assert_eq!(run.stop, AgentStop::MaxSteps);
@@ -374,17 +382,18 @@ mod tests {
         let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
 
         let mut m1 = Scripted::new(&texts);
-        let run_plain = Agent::new(&mut m1, &tools, JsonToolCall, "helper", 5)
+        let run_plain = Agent::new(&mut m1, &tools, JsonToolCall, PlainTemplate, "helper", 5)
             .run("q")
             .unwrap();
 
         let mut m2 = Scripted::new(&texts);
-        let (events, run_folded) = Agent::new(&mut m2, &tools, JsonToolCall, "helper", 5)
-            .run_with("q", Vec::new(), |mut acc, event| {
-                acc.push(event);
-                Ok(ControlFlow::Continue(acc))
-            })
-            .unwrap();
+        let (events, run_folded) =
+            Agent::new(&mut m2, &tools, JsonToolCall, PlainTemplate, "helper", 5)
+                .run_with("q", Vec::new(), |mut acc, event| {
+                    acc.push(event);
+                    Ok(ControlFlow::Continue(acc))
+                })
+                .unwrap();
 
         // the two runs agree on the observable outcome
         assert_eq!(run_plain.answer, run_folded.answer);
@@ -407,7 +416,7 @@ mod tests {
         let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
         let mut model = Scripted::new(&[&call("read_file", "a.txt"), "unreached"]);
 
-        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, "helper", 5);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
         let (observed, run) = agent
             .run_with("q", 0usize, |n, event| {
                 Ok(match event {
@@ -451,7 +460,8 @@ mod tests {
         let mut agent = Agent::new(
             &mut engine,
             &tools,
-            JsonToolCall,
+            crate::tool::DeepSeekToolCall,
+            crate::template::DeepSeekR1Template,
             "You are a helpful assistant. Use the read_file tool to read files.",
             4,
         );
