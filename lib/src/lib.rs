@@ -1,5 +1,36 @@
 //! a Rust runtime for language-integrated LLMs — inference as an in-process
 //! library function.
+//!
+//! # Invariant & law registry
+//!
+//! The canonical list of the contracts this crate upholds. They are stated, not
+//! compiler-enforced; each is protected by a test that cites its id (grep the
+//! `invariant`/`law` comments in the test modules). `notes/design.md` explains
+//! them in prose. (CLI-level invariants `CLI-1`/`CLI-2` live in `yatima-cli`.)
+//!
+//! Model store & discovery:
+//! - **MS-1** `models_root` precedence: `$YATIMA_MODELS_DIR`, else
+//!   `${XDG_CACHE_HOME}/yatima/models`, else `$HOME/.cache/yatima/models`.
+//! - **MS-2** [`model_dir`] mirrors possum's `<root>/<org>/<name>` layout.
+//! - **MS-3** a [`RepoId`] and index shard names never escape the root / model
+//!   directory (untrusted input is contained).
+//! - **MD-1** unsharded discovery is every `*.safetensors`, sorted.
+//! - **MD-2** indexed discovery is the unique `weight_map` values, deduped and
+//!   sorted (also covers the dedup/order half of **DISC**).
+//! - **MD-3** [`presence`] = `config.json` ∧ `tokenizer.json` ∧ all shards; a
+//!   partial shard set is never a false cache hit.
+//! - **EOS-1** EOS ids are read from `config.json` / `generation_config.json`
+//!   as a *set* — never hard-coded token strings.
+//! - **FETCH-1** [`ensure_model`] re-checks [`presence`] after download; a
+//!   partial directory never reaches [`Engine::load`] (gated e2e / fetch path).
+//!
+//! Generation:
+//! - **SAM-1** every [`Sampling`] maps to exactly one candle `LogitsProcessor`;
+//!   **SAM-2** `Greedy` ignores any seed.
+//! - **STOP-1** every successful generation returns exactly one [`StopReason`].
+//! - **GEN-3** a generation emits at most `max_tokens` tokens.
+//! - **GE-1** stateless: repeated `Greedy` runs on the same engine + prompt are
+//!   byte-identical (gated e2e).
 
 mod engine;
 mod token_output_stream;

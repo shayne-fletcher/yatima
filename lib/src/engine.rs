@@ -338,13 +338,12 @@ pub struct Presence {
     pub missing: Vec<PathBuf>,
 }
 
-/// The presence "frontier": is `dir` a loadable model, and what's missing?
+/// Is `dir` a loadable model, and what's missing?
 ///
 /// `complete` is the conjunction over the required files — `config.json`,
 /// `tokenizer.json`, and every shard from [`model_shards`] — computed with
-/// axiom's `bool` meet (the `All` lattice; ⊤ = true is the identity). A partial
-/// shard set is therefore not a false cache hit. This is the receive-half
-/// frontier of the possum→yatima acquisition correspondence (notes/design.md).
+/// axiom's `bool` meet (the `All` lattice; ⊤ = true is the identity), so a
+/// partial shard set is never a false cache hit.
 pub fn presence(dir: &Path) -> Presence {
     use axiom::{BoundedMeetSemilattice, MeetSemilattice};
 

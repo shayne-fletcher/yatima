@@ -78,10 +78,10 @@ not coupling* (MS-2). `Engine::load` is HF-agnostic (takes a directory).
 - **`model_shards`** is the single discovery rule used by both `Engine::load`
   (what to mmap) and `presence` (what must exist): index `weight_map` values when
   present (deduped, sorted, contained), else all `*.safetensors` (MD-1/MD-2).
-- **`presence(dir) -> { complete, missing }`** is the receive frontier:
-  `complete` is the conjunction (axiom's `bool` meet — the `All` lattice) over
-  `config.json`, `tokenizer.json`, and every shard. A partial shard set is never
-  a false cache hit; `missing` names what's absent.
+- **`presence(dir) -> { complete, missing }`**: `complete` is the conjunction
+  (axiom's `bool` meet — the `All` lattice) over `config.json`, `tokenizer.json`,
+  and every shard, so a partial shard set is never a false cache hit; `missing`
+  names what's absent.
 
 ## Auto-fetch (the `fetch` feature)
 
@@ -91,24 +91,6 @@ out): cache hit → quiet load; miss → `ensure_model` downloads (include
 `*.safetensors`/`*.json`, exclude `figures/*`, `ProgressMode::Auto`), **re-checks
 `presence`** (FETCH-2: never hand a partial dir to `load`), then loads;
 `--offline` never touches the network; `--model <dir>` bypasses resolution.
-
-## Acquisition as a delivery guarantee
-
-The possum↔yatima boundary is, in [`relay`](https://github.com/shayne-fletcher/relay)'s
-two-halves vocabulary, a **reliable-delivery** correspondence — two complementary
-halves, *no shared runtime object*, joined only by the on-disk layout + index
-manifest (relay's `Frame`/`Session`):
-
-| relay (Haskell) | yatima acquisition |
-|---|---|
-| send half (`Outbox`, retransmit) | possum — selection + atomic `.incomplete`→rename (never release a torn frame) |
-| receive **frontier** (`ReceiverHalf`) | `presence` — the releasable set = `All` over required files |
-| cumulative **ack** (`Inbox.ackFrontier`) | `ensure_model`'s post-download re-check (incomplete ⇒ error/NAK) |
-| duplicate **dedup** (`n < expected`) | cache-hit idempotence (ACQ-2 / FETCH-2) |
-| end-to-end guarantee | present ⟹ loadable (ACQ-3 / MD-3) |
-
-Laws: **ACQ-1** atomic release (no torn frame), **ACQ-2** cache-hit idempotence,
-**ACQ-3** present ⟹ loadable. relay is the Haskell sibling of this algebra.
 
 ## Registries
 
@@ -133,7 +115,6 @@ These are stated, not enforced by the compiler; each is protected by a test.
   byte-identical.
 - **DISC** indexed shards dedupe idempotently and are deterministically ordered;
   containment holds.
-- **ACQ-1/2/3** above.
 
 ## State machines
 
@@ -142,13 +123,13 @@ Model acquisition / loading:
 ```mermaid
 stateDiagram-v2
     [*] --> SourceSelected
-    SourceSelected --> Present: is_model_present
-    SourceSelected --> Missing: not present
+    SourceSelected --> Present: present
+    SourceSelected --> Missing: absent
     Missing --> Error: offline
     Missing --> Fetching: online
-    Fetching --> Present: re-check presence
-    Fetching --> Error: download failed / still incomplete
-    Present --> Loaded: Engine::load
+    Fetching --> Present: recheck presence
+    Fetching --> Error: download failed or incomplete
+    Present --> Loaded: load
     Loaded --> [*]
 ```
 
@@ -158,11 +139,10 @@ Generation:
 stateDiagram-v2
     [*] --> Prefill
     Prefill --> Decode
-    Decode --> Emit: token decoded to a fragment
-    Decode --> Stop: EOS
-    Decode --> Stop: max_tokens
-    Emit --> Stop: step returns Break / Err
-    Emit --> Decode: step returns Continue
+    Decode --> Emit: fragment decoded
+    Decode --> Stop: EOS or max_tokens
+    Emit --> Stop: step Break or Err
+    Emit --> Decode: step Continue
     Stop --> Flush
     Flush --> [*]
 ```
@@ -176,13 +156,10 @@ stateDiagram-v2
 - **Algebra:** [`axiom`](https://github.com/shayne-fletcher/axiom) — the
   lawful-composition foundation (`All`/lattices, `Fix`/`fold`); influenced by
   `monarch-1/algebra`.
-- **Delivery algebra (Haskell sibling):**
-  [`relay`](https://github.com/shayne-fletcher/relay).
 
 ## Deferred
 
 Capability-scoped tool runtime + agent loop + conversation state (the next
 layer); engine swappability (mistral.rs / llama.cpp-GGUF); download
-integrity/resume; porting `axiom`'s missing combinators (`Max`/`Min`/`All`/`Any`/
-`LatticeMap`) from monarch; the Haskell study of the `generate` contract and the
-acquisition correspondence.
+integrity/resume; porting the lattice combinators (`Max`/`Min`/`All`/`Any`/
+`LatticeMap`) down into `axiom`; the Haskell study of the `generate` contract.
