@@ -17,9 +17,38 @@ capability-scoped tools; the inference engine
   discovery, and (behind the `fetch` feature) `ensure_model`. Plus the acting
   layer: the `Completer` model seam, `Dir` capabilities, `Tool`/`Tools` with the
   `ToolCallCodec` protocol, and the `Agent` loop.
-- **`yatima-cli`** — a thin wrapper: `yatima generate`, `yatima agent`, and
-  `yatima models-dir`, with model selection parsed into a `ModelSource` ADT at
-  the edge.
+- **`yatima-cli`** — a thin wrapper: `yatima generate`, `yatima chat`, `yatima
+  agent`, and `yatima models-dir`, with model selection parsed into a
+  `ModelSource` ADT at the edge.
+
+## Three layers
+
+The runtime exposes three increasing-capability modes over the same `Engine`:
+
+- **`generate`** — raw completion, no chat template. The primitive.
+- **`chat`** — instruction-following: apply the model's native chat template (no
+  tools). Renders a `[system?, user]` transcript via a `PromptTemplate`
+  (`--format qwen|gemma|mistral|plain`) then streams `Engine::generate`. This is
+  the layer that makes an *instruct* model behave as trained — without it, an
+  instruct model is fed raw text and underperforms.
+- **`agent`** — the tool loop, for **tool-trained** models only.
+
+The split matters because **chat needs only a chat template, but agent needs the
+model to be trained to emit tool calls** — two different bars. Gemma-2 clears the
+first, not the second. Capability by model family:
+
+| Model family      | generate | chat  | agent/tools |
+|-------------------|----------|-------|-------------|
+| Qwen2.5-Instruct  | yes      | yes   | yes         |
+| Gemma-2-it        | yes      | yes   | no          |
+| Mistral-v0.3      | yes      | yes   | later/complex |
+| TinyLlama-chat    | yes      | yes   | no          |
+| StarCoder2        | yes      | maybe | no          |
+
+Chat templates omit a literal BOS when the model's tokenizer adds one
+(Gemma `<bos>`, Mistral `<s>` via `TemplateProcessing`) — never double-BOS
+(TMPL-1); models without a system role fold system text into the first user turn
+(TMPL-2).
 
 ## Generation: an effectful fold (the contract)
 
@@ -252,7 +281,7 @@ cites its id in an `// upholds: <id>` comment (`grep -r 'upholds:'`).
 In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
 **GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **CAP-1/2**, **PROTO-1**);
-CLI (**CLI-1/2**).
+chat templates (**TMPL-1/2**); CLI (**CLI-1/2**).
 
 ## State machines
 

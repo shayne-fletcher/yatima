@@ -4,7 +4,7 @@
 //! `Engine::generate` runs a stateless, raw-completion generation loop,
 //! streaming decoded text fragments to a callback. The engine rents candle's
 //! transformer implementations, dispatching on the model's architecture (see
-//! [`CausalLm`] / [`detect_arch`]); we own the load/generate boundary.
+//! `CausalLm` / `detect_arch`); we own the load/generate boundary.
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -248,9 +248,9 @@ impl Engine {
     ///
     /// Two layouts are supported. A **GGUF** dir (a single `*.gguf` plus
     /// `tokenizer.json`, no `config.json`) loads the quantized model — see
-    /// [`Engine::load_gguf`]. Otherwise the **safetensors** layout
+    /// `load_gguf`. Otherwise the **safetensors** layout
     /// (`config.json`, `tokenizer.json`, `*.safetensors`) is loaded, dispatched
-    /// by [`detect_arch`]. EOS ids come from the config / GGUF metadata, never
+    /// by `detect_arch`. EOS ids come from the config / GGUF metadata, never
     /// hard-coded.
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
         if let Some(gguf) = gguf_in(model_dir) {
@@ -926,6 +926,7 @@ mod tests {
     // weights and `YATIMA_E2E=1`; skips fast otherwise so CI stays green.
     #[test]
     fn e2e_generate_is_deterministic_at_temp_zero() -> Result<()> {
+        // upholds: GE-1, GEN-3, STOP-1
         if std::env::var_os("YATIMA_E2E").is_none() {
             eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
             return Ok(());

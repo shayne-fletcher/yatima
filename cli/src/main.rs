@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use yatima_lib::{
-    device, model_dir, models_root, Agent, ChatMlTemplate, Completer, Dir, Engine, GenOpts,
-    JsonToolCall, ListDir, ModelId, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile,
-    Sampling, ToolCallCodec, Tools,
+    device, model_dir, models_root, Agent, ChatMlTemplate, Completer, Dir, Engine, GemmaTemplate,
+    GenOpts, JsonToolCall, ListDir, MistralTemplate, ModelId, PlainTemplate, PromptTemplate,
+    QwenToolCall, ReadFile, Role, Sampling, ToolCallCodec, Tools, Turn,
 };
 
 #[derive(Parser)]
@@ -27,6 +27,8 @@ struct Cli {
 enum Command {
     /// Generate a completion from local model weights.
     Generate(GenerateArgs),
+    /// Chat with an instruction-tuned model (applies its chat template; no tools).
+    Chat(ChatArgs),
     /// Run an agent loop: the model acts through capability-scoped tools.
     Agent(AgentArgs),
     /// Print the resolved models directory (or a repository's leaf dir).
@@ -116,13 +118,67 @@ struct AgentArgs {
     verbose: bool,
 }
 
-/// Which model-native chat + tool-call format to speak.
-#[derive(Clone, Copy, ValueEnum)]
+/// Which model-native chat format to speak. `Qwen`/`Plain` also carry a
+/// tool-call codec (usable by `agent`); `Gemma`/`Mistral` are chat-only.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ChatFormat {
-    /// Qwen2.5-Instruct: ChatML + `<tool_call>` (trained for tools).
+    /// Qwen2.5-Instruct: ChatML (+ `<tool_call>` tools).
     Qwen,
+    /// Gemma-2-it: `<start_of_turn>` (chat only).
+    Gemma,
+    /// Mistral-v0.3: `[INST] … [/INST]` (chat only).
+    Mistral,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
     Plain,
+}
+
+impl ChatFormat {
+    /// The prompt template for this format (used by `chat`).
+    fn template(self) -> Box<dyn PromptTemplate> {
+        match self {
+            ChatFormat::Qwen => Box::new(ChatMlTemplate),
+            ChatFormat::Gemma => Box::new(GemmaTemplate),
+            ChatFormat::Mistral => Box::new(MistralTemplate),
+            ChatFormat::Plain => Box::new(PlainTemplate),
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct ChatArgs {
+    /// Explicit model directory.
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Repository id, resolved under the models root.
+    #[arg(long)]
+    repo: Option<String>,
+    /// Override the models root (else $YATIMA_MODELS_DIR / XDG cache).
+    #[arg(long)]
+    models_dir: Option<PathBuf>,
+    /// The user message.
+    #[arg(long)]
+    prompt: String,
+    /// Optional system instruction.
+    #[arg(long)]
+    system: Option<String>,
+    /// The model's chat format.
+    #[arg(long, value_enum, default_value_t = ChatFormat::Qwen)]
+    format: ChatFormat,
+    #[arg(long, default_value_t = 256)]
+    max_tokens: usize,
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f64,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Force CPU instead of the GPU.
+    #[arg(long)]
+    cpu: bool,
+    /// Don't auto-fetch a missing model; error instead.
+    #[arg(long)]
+    offline: bool,
+    /// With `--repo`, fetch this single GGUF file (quantized).
+    #[arg(long)]
+    gguf: Option<String>,
 }
 
 const DEFAULT_AGENT_SYSTEM: &str =
@@ -141,8 +197,54 @@ fn main() -> Result<()> {
             println!("{}", path.display());
         }
         Command::Generate(args) => generate(args)?,
+        Command::Chat(args) => chat(args)?,
         Command::Agent(args) => agent(args)?,
     }
+    Ok(())
+}
+
+/// Chat: apply the model's chat template to a `[system?, user]` transcript and
+/// stream the answer. No tools — the middle layer between raw `generate` and the
+/// `agent` tool loop.
+fn chat(args: ChatArgs) -> Result<()> {
+    let dir = ModelSource::from_args(
+        args.model,
+        args.repo,
+        args.models_dir,
+        args.offline,
+        args.gguf,
+    )?
+    .resolve()?;
+
+    let mut turns = Vec::new();
+    if let Some(system) = args.system {
+        turns.push(Turn {
+            role: Role::System,
+            content: system,
+        });
+    }
+    turns.push(Turn {
+        role: Role::User,
+        content: args.prompt,
+    });
+    let prompt = args.format.template().render(&turns);
+
+    let mut engine = Engine::load(&dir, device(args.cpu)?)?;
+    eprintln!("loaded {} [{}]", dir.display(), engine.backend());
+
+    let opts = GenOpts {
+        max_tokens: args.max_tokens,
+        sampling: sampling_of(args.temperature, args.seed),
+        ..Default::default()
+    };
+    let mut stdout = std::io::stdout();
+    let generation = engine.generate(&prompt, &opts, |piece| {
+        stdout.write_all(piece.as_bytes())?;
+        stdout.flush()?;
+        Ok(())
+    })?;
+    println!();
+    eprintln!("[{} tokens, {:?}]", generation.tokens, generation.stop);
     Ok(())
 }
 
@@ -219,6 +321,10 @@ fn agent(args: AgentArgs) -> Result<()> {
             opts,
             &args.prompt,
             args.verbose,
+        ),
+        ChatFormat::Gemma | ChatFormat::Mistral => bail!(
+            "--format gemma/mistral is chat-only (not tool-trained); use `yatima chat` \
+             for those models, or --format qwen for the agent"
         ),
     }
 }
@@ -381,6 +487,39 @@ mod tests {
         // upholds: CLI-1
         let s = ModelSource::from_args(Some(PathBuf::from("/m")), None, None, false, None).unwrap();
         assert!(matches!(s, ModelSource::Directory(_)));
+    }
+
+    #[test]
+    fn chat_command_parses_with_format() {
+        let cli = Cli::try_parse_from([
+            "yatima",
+            "chat",
+            "--repo",
+            "google/gemma-2-2b-it",
+            "--prompt",
+            "explain rust",
+            "--format",
+            "gemma",
+        ])
+        .unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected the chat subcommand");
+        };
+        assert_eq!(args.prompt, "explain rust");
+        assert!(matches!(args.format, ChatFormat::Gemma));
+        // chat accepts the chat-only formats; the template registry covers all four.
+        assert!(matches!(
+            ChatFormat::Mistral.template().render(&[Turn {
+                role: Role::User,
+                content: "x".into()
+            }]),
+            s if s.contains("[INST]")
+        ));
+    }
+
+    #[test]
+    fn chat_requires_a_prompt() {
+        assert!(Cli::try_parse_from(["yatima", "chat", "--repo", "x/y"]).is_err());
     }
 
     #[test]

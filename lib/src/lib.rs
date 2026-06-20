@@ -44,6 +44,12 @@
 //!   compiler-absolute — see `notes/design.md`.
 //! - **PROTO-1** a malformed/unknown tool call becomes an `is_error` result the
 //!   model can recover from, never a silent mis-execution.
+//!
+//! Chat templates (instruction-following prompt rendering):
+//! - **TMPL-1** a [`PromptTemplate`] emits no literal BOS when the model's
+//!   tokenizer adds one (Gemma `<bos>`, Mistral `<s>`) — never double-BOS.
+//! - **TMPL-2** for a model with no system role (Gemma, Mistral), system text is
+//!   folded into the first user turn rather than emitted as a system turn.
 
 mod agent;
 mod capability;
@@ -59,7 +65,7 @@ pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
 pub use engine::ensure_model_blocking;
 pub use engine::{device, is_model_present, Engine, GenOpts, Generation, Sampling, StopReason};
-pub use template::{ChatMlTemplate, PlainTemplate, PromptTemplate};
+pub use template::{ChatMlTemplate, GemmaTemplate, MistralTemplate, PlainTemplate, PromptTemplate};
 pub use tool::{
     JsonToolCall, ListDir, QwenToolCall, ReadFile, Tool, ToolCall, ToolCallCodec, ToolResult,
     ToolSpec, Tools,

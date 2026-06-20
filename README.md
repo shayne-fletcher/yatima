@@ -24,12 +24,27 @@ renting the inference engine ([candle](https://github.com/huggingface/candle)).
 
 ## What it does
 
-- **Inference as a function** — `Engine::{load, generate, generate_with}` runs a
-  stateless, raw-completion loop, streaming decoded fragments to a fold. The
-  generation contract is stated as laws and protected by tests. The loader
-  dispatches on architecture — Qwen2, Llama, Mistral, Phi-3, Gemma-2 and
-  StarCoder2 — and loads **GGUF/quantized** weights too, so a 32B-Q4 runs on a
-  Mac (the agent's tool format is Qwen/ChatML for now).
+Three layers, increasing in capability:
+
+- **`generate`** — raw completion. `Engine::{load, generate, generate_with}` runs
+  a stateless loop streaming decoded fragments to a fold; the contract is stated
+  as laws and protected by tests. The loader dispatches on architecture — Qwen2,
+  Llama, Mistral, Phi-3, Gemma-2, StarCoder2 — and loads **GGUF/quantized**
+  weights too, so a 32B-Q4 runs on a Mac.
+- **`chat`** — instruction-following, no tools. Applies a model's native chat
+  template (`--format qwen|gemma|mistral|plain`) so an instruct model behaves as
+  trained. Works for any instruct model.
+- **`agent`** — a tool loop for **tool-trained** models (currently Qwen/ChatML).
+
+**Capability matrix** (what each model can do):
+
+| Model family      | generate | chat  | agent/tools |
+|-------------------|----------|-------|-------------|
+| Qwen2.5-Instruct  | yes      | yes   | yes         |
+| Gemma-2-it        | yes      | yes   | no          |
+| Mistral-v0.3      | yes      | yes   | later/complex |
+| TinyLlama-chat    | yes      | yes   | no          |
+| StarCoder2        | yes      | maybe | no          |
 - **Capability-scoped tools** — a tool *holds* its authority (e.g. a `Dir`
   rooted at one directory); the file tools cannot reach outside it, a tool not in
   the agent's set is uncallable, and a malformed or unknown call becomes an error

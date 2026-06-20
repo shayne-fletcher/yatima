@@ -78,6 +78,76 @@ fn block(s: &mut String, role: &str, content: &str) {
     s.push('\n');
 }
 
+/// Gemma-2's trained chat format: `<start_of_turn>{role}\n{content}<end_of_turn>`
+/// turns with `assistant`→`model`. Gemma has **no system role**, so any system
+/// text is folded into the next user turn. Emits **no `<bos>`**: Gemma's
+/// tokenizer adds it automatically (its `TemplateProcessing` post-processor on
+/// `encode(_, true)`), so a literal one would double-BOS. Chat-only (no tools).
+pub struct GemmaTemplate;
+
+impl PromptTemplate for GemmaTemplate {
+    fn render(&self, turns: &[Turn]) -> String {
+        let mut s = String::new();
+        let mut pending_system: Option<String> = None;
+        for turn in turns {
+            match turn.role {
+                Role::System => pending_system = Some(turn.content.clone()),
+                Role::Assistant => gemma_turn(&mut s, "model", &turn.content),
+                Role::User | Role::Tool => {
+                    let content = match pending_system.take() {
+                        Some(sys) => format!("{sys}\n\n{}", turn.content),
+                        None => turn.content.clone(),
+                    };
+                    gemma_turn(&mut s, "user", &content);
+                }
+            }
+        }
+        s.push_str("<start_of_turn>model\n");
+        s
+    }
+}
+
+fn gemma_turn(s: &mut String, role: &str, content: &str) {
+    s.push_str("<start_of_turn>");
+    s.push_str(role);
+    s.push('\n');
+    s.push_str(content);
+    s.push_str("<end_of_turn>\n");
+}
+
+/// Mistral-v0.3's plain `[INST] … [/INST]` chat format (chat-only — **no**
+/// `[TOOL_CALLS]` tool markers). System text folds into the first `[INST]`;
+/// `[/INST]` is itself the generation cue. Emits **no `<s>`**: Mistral's
+/// tokenizer adds it via `TemplateProcessing` on `encode(_, true)`, like Gemma.
+pub struct MistralTemplate;
+
+impl PromptTemplate for MistralTemplate {
+    fn render(&self, turns: &[Turn]) -> String {
+        let mut s = String::new();
+        let mut pending_system: Option<String> = None;
+        for turn in turns {
+            match turn.role {
+                Role::System => pending_system = Some(turn.content.clone()),
+                Role::Assistant => {
+                    s.push(' ');
+                    s.push_str(&turn.content);
+                    s.push_str("</s>");
+                }
+                Role::User | Role::Tool => {
+                    let content = match pending_system.take() {
+                        Some(sys) => format!("{sys}\n\n{}", turn.content),
+                        None => turn.content.clone(),
+                    };
+                    s.push_str("[INST] ");
+                    s.push_str(&content);
+                    s.push_str("[/INST]");
+                }
+            }
+        }
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +175,82 @@ mod tests {
              <|im_start|>user\n<tool_response>\n[read_file ok] X\n</tool_response><|im_end|>\n\
              <|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn gemma_folds_system_and_cues_model_without_bos() {
+        // upholds: TMPL-1, TMPL-2
+        let s = GemmaTemplate.render(&[turn(Role::System, "Be brief."), turn(Role::User, "hi")]);
+        assert_eq!(
+            s,
+            "<start_of_turn>user\nBe brief.\n\nhi<end_of_turn>\n<start_of_turn>model\n"
+        );
+        assert!(
+            !s.contains("<bos>"),
+            "Gemma template must not emit a literal <bos>"
+        );
+    }
+
+    #[test]
+    fn gemma_plain_user_turn() {
+        let s = GemmaTemplate.render(&[turn(Role::User, "explain rust")]);
+        assert_eq!(
+            s,
+            "<start_of_turn>user\nexplain rust<end_of_turn>\n<start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn mistral_folds_system_into_inst_without_bos() {
+        // upholds: TMPL-1, TMPL-2
+        let s = MistralTemplate.render(&[turn(Role::System, "Be brief."), turn(Role::User, "hi")]);
+        assert_eq!(s, "[INST] Be brief.\n\nhi[/INST]");
+        assert!(
+            !s.contains("<s>"),
+            "Mistral template must not emit a literal <s>"
+        );
+    }
+
+    #[test]
+    fn mistral_plain_user_turn() {
+        let s = MistralTemplate.render(&[turn(Role::User, "explain rust")]);
+        assert_eq!(s, "[INST] explain rust[/INST]");
+    }
+
+    // Chat e2e: Gemma-2 with its template returns an instruction-shaped answer.
+    // Gated on `YATIMA_E2E=1` + the cached model; skips otherwise. CI-stable
+    // assertion is non-emptiness (the beats-raw-generate comparison is manual).
+    // Run with `--features metal --nocapture`.
+    #[test]
+    fn e2e_chat_gemma_follows_instruction() -> anyhow::Result<()> {
+        if std::env::var_os("YATIMA_E2E").is_none() {
+            eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+            return Ok(());
+        }
+        let dir = crate::model_dir(
+            &crate::models_root(),
+            &crate::ModelId::parse("google/gemma-2-2b-it").unwrap(),
+        );
+        if !crate::is_model_present(&dir) {
+            eprintln!("skipping e2e: gemma-2-2b-it not cached");
+            return Ok(());
+        }
+        let mut engine = crate::Engine::load(&dir, crate::device(false)?)?;
+        let prompt = GemmaTemplate.render(&[turn(Role::User, "Explain Rust in one sentence.")]);
+        let opts = crate::GenOpts {
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        engine.generate(&prompt, &opts, |s| {
+            out.push_str(s);
+            Ok(())
+        })?;
+        eprintln!("gemma chat → {out:?}");
+        assert!(
+            out.trim().len() > 10,
+            "expected an instruction-shaped answer, got {out:?}"
+        );
+        Ok(())
     }
 }
