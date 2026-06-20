@@ -155,10 +155,11 @@ struct ChatArgs {
     /// Override the models root (else $YATIMA_MODELS_DIR / XDG cache).
     #[arg(long)]
     models_dir: Option<PathBuf>,
-    /// The user message.
+    /// The user message. Omit for an interactive multi-turn session (reads
+    /// stdin; `/exit` quits, `/reset` clears the conversation).
     #[arg(long)]
-    prompt: String,
-    /// Optional system instruction.
+    prompt: Option<String>,
+    /// Optional system instruction (applies for the whole session).
     #[arg(long)]
     system: Option<String>,
     /// The model's chat format.
@@ -203,9 +204,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Chat: apply the model's chat template to a `[system?, user]` transcript and
-/// stream the answer. No tools — the middle layer between raw `generate` and the
-/// `agent` tool loop.
+/// Chat: apply the model's chat template (no tools) — the layer between raw
+/// `generate` and the `agent` tool loop. `--prompt` gives one shot; omitting it
+/// opens an interactive multi-turn session that remembers the conversation.
 fn chat(args: ChatArgs) -> Result<()> {
     let dir = ModelSource::from_args(
         args.model,
@@ -216,35 +217,107 @@ fn chat(args: ChatArgs) -> Result<()> {
     )?
     .resolve()?;
 
-    let mut turns = Vec::new();
+    let mut engine = Engine::load(&dir, device(args.cpu)?)?;
+    eprintln!("loaded {} [{}]", dir.display(), engine.backend());
+
+    let template = args.format.template();
+    let opts = GenOpts {
+        max_tokens: args.max_tokens,
+        sampling: sampling_of(args.temperature, args.seed),
+        ..Default::default()
+    };
+
+    // The conversation transcript, seeded with the optional system turn. Memory
+    // comes from re-rendering the whole transcript each turn (the engine stays
+    // stateless per call).
+    let mut turns: Vec<Turn> = Vec::new();
     if let Some(system) = args.system {
         turns.push(Turn {
             role: Role::System,
             content: system,
         });
     }
-    turns.push(Turn {
-        role: Role::User,
-        content: args.prompt,
-    });
-    let prompt = args.format.template().render(&turns);
 
-    let mut engine = Engine::load(&dir, device(args.cpu)?)?;
-    eprintln!("loaded {} [{}]", dir.display(), engine.backend());
+    match args.prompt {
+        // One-shot: a single user turn, answer, done.
+        Some(prompt) => {
+            turns.push(Turn {
+                role: Role::User,
+                content: prompt,
+            });
+            respond(&mut engine, template.as_ref(), &opts, &mut turns)?;
+        }
+        // Interactive: loop reading stdin, accumulating turns.
+        None => chat_repl(&mut engine, template.as_ref(), &opts, turns)?,
+    }
+    Ok(())
+}
 
-    let opts = GenOpts {
-        max_tokens: args.max_tokens,
-        sampling: sampling_of(args.temperature, args.seed),
-        ..Default::default()
-    };
+/// Render the transcript, stream the model's answer to stdout, and append it to
+/// the transcript as an assistant turn (so the next turn remembers it).
+fn respond(
+    engine: &mut Engine,
+    template: &dyn PromptTemplate,
+    opts: &GenOpts,
+    turns: &mut Vec<Turn>,
+) -> Result<()> {
+    let prompt = template.render(turns);
     let mut stdout = std::io::stdout();
-    let generation = engine.generate(&prompt, &opts, |piece| {
+    let mut answer = String::new();
+    engine.generate(&prompt, opts, |piece| {
         stdout.write_all(piece.as_bytes())?;
         stdout.flush()?;
+        answer.push_str(piece);
         Ok(())
     })?;
     println!();
-    eprintln!("[{} tokens, {:?}]", generation.tokens, generation.stop);
+    turns.push(Turn {
+        role: Role::Assistant,
+        content: answer.trim().to_string(),
+    });
+    Ok(())
+}
+
+/// Interactive multi-turn loop: `you> ` prompt, stdin line by line. EOF (Ctrl-D)
+/// or `/exit` ends the session; `/reset` clears the conversation (keeping the
+/// system turn).
+fn chat_repl(
+    engine: &mut Engine,
+    template: &dyn PromptTemplate,
+    opts: &GenOpts,
+    mut turns: Vec<Turn>,
+) -> Result<()> {
+    let system_turns = turns.len(); // the seeded system turn(s) to keep on /reset
+    let stdin = std::io::stdin();
+    eprintln!("entering chat — /exit to quit, /reset to clear history");
+    loop {
+        eprint!("\nyou> ");
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            eprintln!("\nbye");
+            break; // EOF / Ctrl-D
+        }
+        let line = line.trim();
+        match line {
+            "" => continue,
+            "/exit" | "/quit" => {
+                eprintln!("bye");
+                break;
+            }
+            "/reset" => {
+                turns.truncate(system_turns);
+                eprintln!("(history cleared)");
+                continue;
+            }
+            _ => {}
+        }
+        turns.push(Turn {
+            role: Role::User,
+            content: line.to_string(),
+        });
+        respond(engine, template, opts, &mut turns)?;
+    }
     Ok(())
 }
 
@@ -505,7 +578,7 @@ mod tests {
         let Command::Chat(args) = cli.command else {
             panic!("expected the chat subcommand");
         };
-        assert_eq!(args.prompt, "explain rust");
+        assert_eq!(args.prompt.as_deref(), Some("explain rust"));
         assert!(matches!(args.format, ChatFormat::Gemma));
         // chat accepts the chat-only formats; the template registry covers all four.
         assert!(matches!(
@@ -518,8 +591,13 @@ mod tests {
     }
 
     #[test]
-    fn chat_requires_a_prompt() {
-        assert!(Cli::try_parse_from(["yatima", "chat", "--repo", "x/y"]).is_err());
+    fn chat_without_prompt_is_repl_mode() {
+        // Omitting --prompt is valid: it opens the interactive multi-turn REPL.
+        let cli = Cli::try_parse_from(["yatima", "chat", "--repo", "x/y"]).unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected the chat subcommand");
+        };
+        assert!(args.prompt.is_none());
     }
 
     #[test]

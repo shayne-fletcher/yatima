@@ -27,10 +27,13 @@ The runtime exposes three increasing-capability modes over the same `Engine`:
 
 - **`generate`** — raw completion, no chat template. The primitive.
 - **`chat`** — instruction-following: apply the model's native chat template (no
-  tools). Renders a `[system?, user]` transcript via a `PromptTemplate`
-  (`--format qwen|gemma|mistral|plain`) then streams `Engine::generate`. This is
-  the layer that makes an *instruct* model behave as trained — without it, an
-  instruct model is fed raw text and underperforms.
+  tools). Renders a transcript via a `PromptTemplate` (`--format
+  qwen|gemma|mistral|plain`) then streams `Engine::generate`. One-shot with
+  `--prompt`; **omit it for an interactive multi-turn session** (reads stdin;
+  `/exit` quits, `/reset` clears). Conversation memory comes from re-rendering the
+  whole growing transcript each turn — the `Engine` stays stateless per call, so
+  history lives in the prompt, not the KV cache. This is the layer that makes an
+  *instruct* model behave as trained — without it, raw text underperforms.
 - **`agent`** — the tool loop, for **tool-trained** models only.
 
 The split matters because **chat needs only a chat template, but agent needs the
@@ -325,35 +328,53 @@ stateDiagram-v2
   the intended home for the recursion-scheme formalization (see the Haskell study
   in Deferred).
 
-## Deferred
+## Roadmap (future features)
 
-**Constrained decoding** — *tried and shelved; see the lesson.* A top-K
-JSON-prefix masking prototype was built and reverted: generic JSON validity
-forces *structure* but not *meaning*, so Qwen2.5 just shifted to a
-valid-prefix-but-wrong run-on string (`{"name": "read_file, "arguments"…}`) that
-the tolerant parser then misreads — net **worse** than the parser alone. The
-real fix is **schema-aware** masking (the `name` value constrained to a prefix of
-an actual tool name, forcing the closing quote on match; arguments to the param
-schema). Worth doing only as that schema-aware slice, not generic-JSON-first. The
-tolerant parser is the default path; it handles the observed defects. (Note:
-constrained decoding only ever addresses tool-call *validity*, never free-text
-answer quality.)
+Grouped by area; rough priority within each. Items marked *(lesson)* were tried
+and deliberately shelved — the note records why so we don't repeat them.
 
-**Engine swappability** — cross-architecture dispatch **and GGUF/quantized
-loading are done** (see "Supported architectures" / "GGUF / quantized"). Remaining:
-(a) tokenizer auto-sourcing + sharded multi-file GGUF + more quantized arches;
-(b) other backends (mistral.rs, llama.cpp) via more `Completer` impls.
+### Chat
+- **Context-window management** — the multi-turn REPL grows the transcript
+  unbounded and will degrade/err past the model's window; add trimming (drop or
+  summarize oldest turns) keyed off a token budget.
+- **Readline niceties** — line editing + history (e.g. `rustyline`); the loop is
+  plain `stdin` today.
+- **Conversation persistence** — save/load a session transcript.
+- **Reasoning-model think-stripping in chat** — instruct defaults don't emit a
+  `<think>` block; add stripping if a reasoning model is used via `chat`.
 
-**Async engine-actor** owning the `Engine` and wrapping `run_with` (also the home
-for conversation/KV-cache reuse) — see Concurrency.
+### Tools / agent
+- **Constrained decoding** *(lesson)* — a top-K JSON-prefix masking prototype was
+  built and reverted: generic JSON validity forces *structure* but not *meaning*,
+  so Qwen2.5 shifted to a valid-prefix-but-wrong run-on string the tolerant
+  parser misreads — net **worse** than the parser alone. The real fix is
+  **schema-aware** masking (the `name` constrained to a prefix of a real tool
+  name, forcing the closing quote on match; arguments to the param schema). Only
+  worth doing schema-aware. Addresses tool-call *validity* only, never free-text
+  quality.
+- **Native Mistral tool codec** (`[TOOL_CALLS]` / `[AVAILABLE_TOOLS]`) — a second
+  tool-trained family in the agent; complex (special-token detok, 9-char IDs).
+- **Richer capabilities** — `write` / `net` / `proc` capabilities and their tools
+  (read-only `Dir` today); multi-tool-per-turn / planning.
+- **MCP edge adapter** — consume an MCP server *as* a `Tool`, or expose our tools
+  *as* an MCP server (out-of-process; rides the same seams at the edge).
 
-Also: richer capabilities (`write` / `net` / `proc`) and their tools;
-multi-tool-per-turn / planning; conversation persistence; an MCP edge adapter;
-download integrity/resume; the Haskell study of the `generate` and agent
-contracts (AGENT/CAP/PROTO join the propositions), the planned home for the
-recursion-scheme reading and `axiom`.
+### Models / engine
+- **Engine swappability** — cross-arch dispatch + GGUF/quantized are **done**.
+  Remaining: tokenizer auto-sourcing + sharded multi-file GGUF + more quantized
+  arches; other backends (mistral.rs, llama.cpp) via more `Completer` impls.
+- **More chat templates** — Llama-3, Zephyr/TinyLlama (same shape as Gemma/Mistral).
+- **Sampling quality** — `top_p`/`top_k` nucleus sampling (only temperature
+  today) for better free-text on smaller models; download integrity/resume.
 
-A shared dependency-light crate (working name **`lexicon`**) for `ModelId` + the
-`<root>/<org>/<name>` layout — extracted once there's a real trigger (possum
-validating its own ids, or a second consumer), so possum and yatima share one
-definition instead of two.
+### Architecture / research
+- **Async engine-actor** owning the `Engine` and wrapping `run_with` — the home
+  for cross-request concurrency and KV-cache reuse (see Concurrency).
+- **`ChatSession` / library surface** — extract the REPL's transcript fold into a
+  lib type once a second consumer (TUI, server) appears.
+- **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the
+  `<root>/<org>/<name>` layout, extracted once there's a real trigger (possum
+  validating its own ids, or a second consumer).
+- **The Haskell study** — formalize the `generate` and agent contracts
+  (GE/STOP/AGENT/CAP/PROTO/TMPL as propositions); the planned home for the
+  recursion-scheme reading and `axiom`.

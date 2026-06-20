@@ -93,10 +93,19 @@ capability-scoped `read_file` tool call under `--root`, and a grounded final
 answer.
 
 ```bash
-# generate a completion
+# generate a completion (raw)
 cargo run -p yatima-cli --release --bin yatima --features metal -- generate \
   --repo deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
   --prompt "Rust is"
+
+# chat — one-shot (applies the model's chat template)
+cargo run -p yatima-cli --release --bin yatima --features metal -- chat \
+  --repo google/gemma-2-2b-it --format gemma \
+  --prompt "Explain Rust in two sentences."
+
+# chat — interactive multi-turn (omit --prompt); /exit quits, /reset clears
+cargo run -p yatima-cli --release --bin yatima --features metal -- chat \
+  --repo Qwen/Qwen2.5-7B-Instruct --format qwen
 
 # run an agent with read-only file tools scoped to a directory
 cargo run -p yatima-cli --release --bin yatima --features metal -- agent \

@@ -217,6 +217,40 @@ mod tests {
         assert_eq!(s, "[INST] explain rust[/INST]");
     }
 
+    #[test]
+    fn templates_render_multi_turn_history_with_cue() {
+        // upholds: TMPL-2 — a mid-conversation transcript carries prior turns so
+        // the model has memory, and ends with the generation cue. This is what
+        // makes the chat REPL remember (history lives in the prompt).
+        let convo = [
+            turn(Role::User, "My name is Ada."),
+            turn(Role::Assistant, "Nice to meet you, Ada."),
+            turn(Role::User, "What is my name?"),
+        ];
+
+        let qwen = ChatMlTemplate.render(&convo);
+        assert!(qwen.contains("My name is Ada."), "history present (qwen)");
+        assert!(
+            qwen.contains("Nice to meet you, Ada."),
+            "prior answer present"
+        );
+        assert!(
+            qwen.ends_with("<|im_start|>assistant\n"),
+            "ends with the cue"
+        );
+
+        let gemma = GemmaTemplate.render(&convo);
+        assert!(gemma.contains("My name is Ada."), "history present (gemma)");
+        assert!(
+            gemma.contains("<start_of_turn>model\nNice to meet you, Ada.<end_of_turn>"),
+            "prior assistant turn rendered as model"
+        );
+        assert!(
+            gemma.ends_with("<start_of_turn>model\n"),
+            "ends with the cue"
+        );
+    }
+
     // Chat e2e: Gemma-2 with its template returns an instruction-shaped answer.
     // Gated on `YATIMA_E2E=1` + the cached model; skips otherwise. CI-stable
     // assertion is non-emptiness (the beats-raw-generate comparison is manual).
@@ -250,6 +284,55 @@ mod tests {
         assert!(
             out.trim().len() > 10,
             "expected an instruction-shaped answer, got {out:?}"
+        );
+        Ok(())
+    }
+
+    // Multi-turn memory e2e: exercises exactly what the chat REPL does — push a
+    // user turn, generate, append the answer, push a second user turn that refers
+    // back, and re-render the *whole* transcript. Asserts the second answer
+    // recalls a fact from the first turn. Gated; uses Qwen2.5 (reliable recall).
+    #[test]
+    fn e2e_chat_remembers_across_turns() -> anyhow::Result<()> {
+        if std::env::var_os("YATIMA_E2E").is_none() {
+            eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+            return Ok(());
+        }
+        let dir = crate::model_dir(
+            &crate::models_root(),
+            &crate::ModelId::parse("Qwen/Qwen2.5-7B-Instruct").unwrap(),
+        );
+        if !crate::is_model_present(&dir) {
+            eprintln!("skipping e2e: Qwen2.5-7B-Instruct not cached");
+            return Ok(());
+        }
+        let mut engine = crate::Engine::load(&dir, crate::device(false)?)?;
+        let opts = crate::GenOpts {
+            max_tokens: 64,
+            ..Default::default()
+        };
+
+        let answer = |engine: &mut crate::Engine, turns: &[Turn]| -> anyhow::Result<String> {
+            let prompt = ChatMlTemplate.render(turns);
+            let mut out = String::new();
+            engine.generate(&prompt, &opts, |s| {
+                out.push_str(s);
+                Ok(())
+            })?;
+            Ok(out.trim().to_string())
+        };
+
+        // Turn 1: tell it a fact.
+        let mut turns = vec![turn(Role::User, "My name is Ada. Please remember it.")];
+        let a1 = answer(&mut engine, &turns)?;
+        turns.push(turn(Role::Assistant, &a1));
+        // Turn 2: ask it back — only answerable from the re-rendered history.
+        turns.push(turn(Role::User, "What is my name?"));
+        let a2 = answer(&mut engine, &turns)?;
+        eprintln!("turn1 → {a1:?}\nturn2 → {a2:?}");
+        assert!(
+            a2.contains("Ada"),
+            "second answer must recall the name from turn 1, got {a2:?}"
         );
         Ok(())
     }
