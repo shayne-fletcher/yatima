@@ -166,9 +166,10 @@ fn agent(args: AgentArgs) -> Result<()> {
     let opts = GenOpts {
         max_tokens: args.max_tokens,
         sampling: sampling_of(args.temperature, args.seed),
-        // Tool calls are structured JSON; a repetition penalty corrupts them by
-        // penalising the punctuation they repeat, so disable it for the agent.
-        repeat_penalty: 1.0,
+        // Keep the default repetition penalty: prose answers degenerate
+        // (repeated words) without it. The penalty can mangle a tool call's JSON
+        // punctuation, but the tolerant tool-call parser recovers those.
+        ..Default::default()
     };
 
     let mut engine = Engine::load(&dir, device(args.cpu)?)?;

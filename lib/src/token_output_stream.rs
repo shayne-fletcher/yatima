@@ -137,4 +137,37 @@ mod tests {
         );
         assert_eq!(with_rest, reference);
     }
+
+    // Prose round-trip with the words that doubled in live runs ("would would",
+    // "have have", ...) — to tell a detokenizer double-emit from model
+    // degeneration.
+    #[test]
+    fn incremental_detok_preserves_prose() {
+        let dir = crate::model_dir(
+            &crate::models_root(),
+            &crate::ModelId::parse("Qwen/Qwen2.5-7B-Instruct").unwrap(),
+        );
+        let path = dir.join("tokenizer.json");
+        if !path.exists() {
+            eprintln!("skipping: Qwen tokenizer absent at {}", path.display());
+            return;
+        }
+        let tk = Tokenizer::from_file(&path).unwrap();
+        let input = "You would have to check the network configuration of the server, \
+                     and you would need more of the runbook procedure to take the next action.";
+        let ids = tk.encode(input, false).unwrap().get_ids().to_vec();
+
+        let mut stream = TokenOutputStream::new(tk);
+        let mut out = String::new();
+        for id in ids {
+            if let Some(f) = stream.next_token(id).unwrap() {
+                out.push_str(&f);
+            }
+        }
+        if let Some(f) = stream.decode_rest().unwrap() {
+            out.push_str(&f);
+        }
+        eprintln!("out: {out:?}");
+        assert_eq!(out, input, "prose must round-trip with no duplicated words");
+    }
 }
