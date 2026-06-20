@@ -94,8 +94,9 @@ The design is **small composable seams**, simplest concrete impl behind each:
   `None` (a plain answer), `Some(Ok)` (a call), or `Some(Err)` (malformed ⇒ an
   error turn), and is **panic-proof on any input** (proptest). Each does strict
   JSON first, then a **tolerant** pass that recovers common real-model defects
-  (an unquoted name, braces inside string values) — defense-in-depth until
-  constrained decoding makes invalid calls impossible.
+  (an unquoted name, braces inside string values) — this is the actual line of
+  defense for tool-call validity (constrained decoding was tried and shelved; see
+  Deferred).
 - **`Agent`** — `run` collects the final answer; `run_with` is the fold a future
   actor/TUI streams `AgentEvent`s into (`run` is the `acc = ()` specialization).
   Bounded by `max_steps`; `AgentStop` is `Final` / `MaxSteps` / `Stopped` (the
@@ -115,10 +116,10 @@ The design is **small composable seams**, simplest concrete impl behind each:
   tool-calling, and won't emit tool calls even when shown the format; Qwen2.5
   (Qwen2 arch, loads unchanged) is trained for it and is the agent default.
 
-Tool-call *validity* is thus solved structurally (native format + tolerant parse,
-soon constrained decoding); free-text answer *quality* (e.g. a 7B greedily
-misreading a value back) is a separate, model-bound concern that constrained
-decoding does **not** address.
+Tool-call *validity* is handled by native format + tolerant parsing (constrained
+decoding was tried and did not earn its keep — see Deferred). Free-text answer
+*quality* (e.g. a 7B greedily misreading a value back) is a separate, model-bound
+concern that neither addresses.
 
 **Honesty (where we partially, not wholly, match Anil's ocap story).** Rust gives
 *capabilities by construction + enforced containment*, not Eio's
@@ -266,12 +267,17 @@ stateDiagram-v2
 
 ## Deferred
 
-**Constrained decoding** — grammar-masked logits so a tool call is *always*
-well-formed JSON, making invalid calls impossible by construction (the principled
-replacement for the tolerant parser, which stays as defense-in-depth). The next
-slice on the generation path. It fixes structured-call *validity* only — not
-free-text answer quality. (Prompt fidelity itself is done: native `ChatMlTemplate`
-/ `DeepSeekR1Template`, with Qwen2.5 as the tool-calling default.)
+**Constrained decoding** — *tried and shelved; see the lesson.* A top-K
+JSON-prefix masking prototype was built and reverted: generic JSON validity
+forces *structure* but not *meaning*, so Qwen2.5 just shifted to a
+valid-prefix-but-wrong run-on string (`{"name": "read_file, "arguments"…}`) that
+the tolerant parser then misreads — net **worse** than the parser alone. The
+real fix is **schema-aware** masking (the `name` value constrained to a prefix of
+an actual tool name, forcing the closing quote on match; arguments to the param
+schema). Worth doing only as that schema-aware slice, not generic-JSON-first. The
+tolerant parser is the default path; it handles the observed defects. (Note:
+constrained decoding only ever addresses tool-call *validity*, never free-text
+answer quality.)
 
 **Engine swappability** — two axes: (a) cross-architecture inside candle via a
 config-dispatched `Model` enum (Llama / Mistral / Phi / Gemma + GGUF
