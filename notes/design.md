@@ -92,6 +92,46 @@ out): cache hit → quiet load; miss → `ensure_model` downloads (include
 `presence`** (FETCH-2: never hand a partial dir to `load`), then loads;
 `--offline` never touches the network; `--model <dir>` bypasses resolution.
 
+## Concurrency
+
+Decode is sequential and compute-bound — token *n+1* depends on *n*, and the hot
+loop does GPU/CPU work with nothing to await. So the **core stays synchronous**:
+an `async fn generate` would be a lie that blocks the executor and starves other
+tasks. Concurrency belongs to *delivery*, not decode.
+
+The async form is therefore an **adapter over `generate_with`, not a second
+engine path** — run the blocking fold on `spawn_blocking` and let `step` send
+fragments down a bounded channel:
+
+```rust
+pub fn generate_events(engine, prompt, opts) -> mpsc::Receiver<Event>;
+pub enum Event { Fragment(String), Done(Generation) }
+```
+
+Two properties fall out of choices already made:
+
+- **Cancellation** — if the consumer drops the receiver, `blocking_send` fails,
+  `step` returns `ControlFlow::Break`, and generation stops
+  (`StopReason::Stopped`). This is why the `generate_with` primitive exists; the
+  plain `generate` callback (`-> Result<()>`) can't express it.
+- **Backpressure** — a *bounded* channel parks the decode thread when the
+  consumer is slow, so generation tracks the client's pace.
+
+Categorically: decode is the coalgebra (unfold), `step` the algebra (fold), and
+the channel adapter is the natural transformation carrying a blocking fold into
+an async stream — without touching the core.
+
+Scope honesty: per-completion decode is sequential and GPU-bound; *cross-request*
+parallelism is a batching/scheduling concern rented from the engine / a future
+server, not faked here. One `Engine` (mutable KV cache, ~15 GB weights) is
+one-generation-at-a-time.
+
+**Deferred** (build when a real async client exists): the durable shape is an
+**engine actor** owning the `Engine` and serving `(prompt, opts, reply)` requests
+over a channel — also the home for conversation/KV-cache reuse and the agent
+loop, so concurrency and the capability-scoped tool runtime are the *same* future
+component.
+
 ## Registries
 
 The **canonical** invariant & law registry lives in the crate docs — see the
