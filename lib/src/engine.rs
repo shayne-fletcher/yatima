@@ -157,18 +157,18 @@ impl Engine {
         format!("{dev}/{:?}", self.dtype)
     }
 
-    /// Generation as an **effectful fold** over the stream of decoded text
-    /// fragments — the primitive of which [`generate`](Engine::generate) is the
-    /// `acc = ()` specialization. Stateless request-reply (the KV cache is
-    /// cleared on entry); raw completion (prompt fed as-is, no chat template).
+    /// Generate, folding each decoded text fragment into an accumulator — the
+    /// primitive of which [`generate`](Engine::generate) is the `acc = ()`
+    /// specialization. Stateless request-reply (the KV cache is cleared on
+    /// entry); raw completion (prompt fed as-is, no chat template).
     ///
-    /// `step` threads an accumulator and returns a [`ControlFlow`]:
-    /// `Continue(acc)` keeps folding, `Break(acc)` stops voluntarily
+    /// `step` threads the accumulator and returns a [`ControlFlow`]:
+    /// `Continue(acc)` keeps going, `Break(acc)` stops voluntarily
     /// (`StopReason::Stopped`), and an `Err` is propagated to the caller.
-    /// Generation also stops on EOS or `max_tokens`. Conceptually a
-    /// hylomorphism: an unfold of fragments (terminating on EOS/max/break)
-    /// consumed by `step` (see `axiom::fix` for the recursion-scheme vocabulary).
-    pub fn generate_fold<A>(
+    /// Generation also stops on EOS or `max_tokens`. (This is an effectful fold
+    /// over the generated fragment stream; `notes/design.md` gives the
+    /// categorical reading.)
+    pub fn generate_with<A>(
         &mut self,
         prompt: &str,
         opts: &GenOpts,
@@ -244,7 +244,7 @@ impl Engine {
     }
 
     /// Run inference, streaming decoded text fragments to `on_token` (the
-    /// `acc = ()` specialization of [`generate_fold`](Engine::generate_fold)).
+    /// `acc = ()` specialization of [`generate_with`](Engine::generate_with)).
     /// Returning `Err` from `on_token` stops generation and is surfaced.
     pub fn generate(
         &mut self,
@@ -252,7 +252,7 @@ impl Engine {
         opts: &GenOpts,
         mut on_token: impl FnMut(&str) -> Result<()>,
     ) -> Result<Generation> {
-        let ((), generation) = self.generate_fold(prompt, opts, (), |(), piece| {
+        let ((), generation) = self.generate_with(prompt, opts, (), |(), piece| {
             on_token(piece)?;
             Ok(ControlFlow::Continue(()))
         })?;

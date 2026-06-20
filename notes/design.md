@@ -14,7 +14,7 @@ the lawful-composition algebra is rented from
 ## Crates
 
 - **`yatima-lib`** — the capability as a function: `Engine::{load, generate,
-  generate_fold}`, `Sampling`/`GenOpts`/`Generation`/`StopReason`, the
+  generate_with}`, `Sampling`/`GenOpts`/`Generation`/`StopReason`, the
   `ModelId`/`models_root`/`model_dir` resolver, the `presence`/`model_shards`
   discovery, and (behind the `fetch` feature) `ensure_model`.
 - **`yatima-cli`** — a thin wrapper: `yatima generate` and `yatima models-dir`,
@@ -22,11 +22,11 @@ the lawful-composition algebra is rented from
 
 ## Generation: an effectful fold (the contract)
 
-`generate_fold` is the primitive; `generate` is the `acc = ()` specialization
+`generate_with` is the primitive; `generate` is the `acc = ()` specialization
 that just streams fragments to a side-effecting callback.
 
 ```rust
-fn generate_fold<A>(&mut self, prompt: &str, opts: &GenOpts, init: A,
+fn generate_with<A>(&mut self, prompt: &str, opts: &GenOpts, init: A,
     step: impl FnMut(A, &str) -> Result<ControlFlow<A, A>>) -> Result<(A, Generation)>;
 ```
 
