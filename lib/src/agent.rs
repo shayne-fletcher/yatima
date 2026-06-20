@@ -432,19 +432,19 @@ mod tests {
         assert_eq!(observed, 2, "saw ToolCall then ToolResult, then stopped");
     }
 
-    // End-to-end agent loop over the real model + a real ReadFile capability.
-    // Gated like the engine e2e: needs the weights and `YATIMA_E2E=1`, skips
-    // fast otherwise. Best-effort — base distills aren't reliably tool-callers,
-    // so we assert the loop *terminates cleanly within budget* (the contract),
-    // not that the model chose to call a tool. Run with `--features metal` and
-    // `--nocapture` to read the transcript.
+    // End-to-end agent loop over a real, tool-trained model (Qwen2.5-Instruct,
+    // Qwen2 arch) + a real ReadFile capability. Gated: needs the weights and
+    // `YATIMA_E2E=1`, skips fast otherwise. Qwen2.5 reliably emits native tool
+    // calls, so this asserts a tool actually fired (steps >= 1) and the loop
+    // terminated within budget. Run with `--features metal --nocapture` to read
+    // the transcript.
     #[test]
-    fn e2e_agent_loop_terminates() -> Result<()> {
+    fn e2e_agent_calls_a_tool() -> Result<()> {
         if std::env::var_os("YATIMA_E2E").is_none() {
             eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
             return Ok(());
         }
-        let repo = crate::ModelId::parse("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B").unwrap();
+        let repo = crate::ModelId::parse("Qwen/Qwen2.5-7B-Instruct").unwrap();
         let dir = crate::model_dir(&crate::models_root(), &repo);
         if !dir.join("config.json").exists() {
             eprintln!("skipping e2e: weights absent at {}", dir.display());
@@ -460,8 +460,8 @@ mod tests {
         let mut agent = Agent::new(
             &mut engine,
             &tools,
-            crate::tool::DeepSeekToolCall,
-            crate::template::DeepSeekR1Template,
+            crate::tool::QwenToolCall,
+            crate::template::ChatMlTemplate,
             "You are a helpful assistant. Use the read_file tool to read files.",
             4,
         );
@@ -472,6 +472,7 @@ mod tests {
         }
         eprintln!("[{} steps, {:?}]", run.steps, run.stop);
 
+        assert!(run.steps >= 1, "the model should have called a tool");
         assert!(run.steps <= 4, "AGENT-1: steps stay within max_steps");
         assert!(
             matches!(run.stop, AgentStop::Final | AgentStop::MaxSteps),

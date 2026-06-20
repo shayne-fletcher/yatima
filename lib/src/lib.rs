@@ -62,10 +62,10 @@ pub use engine::{
 };
 #[cfg(feature = "fetch")]
 pub use engine::{ensure_model, ensure_model_blocking};
-pub use template::{DeepSeekR1Template, PlainTemplate, PromptTemplate};
+pub use template::{ChatMlTemplate, DeepSeekR1Template, PlainTemplate, PromptTemplate};
 pub use tool::{
-    DeepSeekToolCall, JsonToolCall, ListDir, ReadFile, Tool, ToolCall, ToolCallCodec, ToolResult,
-    ToolSpec, Tools,
+    DeepSeekToolCall, JsonToolCall, ListDir, QwenToolCall, ReadFile, Tool, ToolCall, ToolCallCodec,
+    ToolResult, ToolSpec, Tools,
 };
 
 use anyhow::{bail, Result};

@@ -249,6 +249,139 @@ fn extract_json_block(s: &str) -> Result<Value> {
     serde_json::from_str(body.trim()).map_err(|e| anyhow!("malformed tool-call JSON: {e}"))
 }
 
+/// The Qwen2.5-Instruct native tool-call format (ChatML + Hermes-style). The
+/// model is trained for it: tool signatures are advertised in the system prompt
+/// inside `<tools></tools>`, and a call is `<tool_call>\n{"name": ...,
+/// "arguments": {...}}\n</tool_call>`.
+pub struct QwenToolCall;
+
+const QWEN_OPEN: &str = "<tool_call>";
+const QWEN_CLOSE: &str = "</tool_call>";
+
+impl ToolCallCodec for QwenToolCall {
+    fn render_system(&self, specs: &[ToolSpec]) -> String {
+        let mut s = String::from(
+            "# Tools\n\nYou may call one or more functions to assist with the user \
+             query.\n\nYou are provided with function signatures within \
+             <tools></tools> XML tags:\n<tools>",
+        );
+        for spec in specs {
+            let signature = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.params,
+                }
+            });
+            s.push('\n');
+            s.push_str(&signature.to_string());
+        }
+        s.push_str(
+            "\n</tools>\n\nFor each function call, return a json object with function \
+             name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\
+             {\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n\
+             The name and all string values must be double-quoted. For example:\n\
+             <tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"README.md\"}}\n\
+             </tool_call>",
+        );
+        s
+    }
+
+    fn stop_strings(&self) -> Vec<String> {
+        vec![QWEN_CLOSE.to_string()]
+    }
+
+    fn parse(&self, text: &str) -> Option<Result<ToolCall>> {
+        let start = text.find(QWEN_OPEN)?;
+        let rest = &text[start + QWEN_OPEN.len()..];
+        let json = match rest.find(QWEN_CLOSE) {
+            Some(end) => &rest[..end],
+            None => return Some(Err(anyhow!("unterminated <tool_call> (no closing tag)"))),
+        };
+        Some(parse_qwen_call(json))
+    }
+}
+
+/// Parse Qwen's `{"name": ..., "arguments": {...}}` call object. Strict JSON
+/// first; on failure, a tolerant pass repairs the common real-model defect of an
+/// unquoted name (the model imitating the `<function-name>` placeholder), as long
+/// as the `arguments` object itself is valid JSON.
+fn parse_qwen_call(json: &str) -> Result<ToolCall> {
+    let json = json.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(json) {
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool_call missing string field 'name'"))?
+            .to_string();
+        let args = value
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        return Ok(ToolCall { name, args });
+    }
+    lenient_qwen_call(json)
+}
+
+/// Tolerant recovery for not-quite-JSON tool calls: extract the function name
+/// (quoted or a bare identifier) and the `arguments` object (which must itself
+/// parse as JSON).
+fn lenient_qwen_call(json: &str) -> Result<ToolCall> {
+    let name = field_after(json, "\"name\"")
+        .map(parse_name_token)
+        .ok_or_else(|| anyhow!("malformed tool_call JSON: could not find a 'name'"))?;
+    if name.is_empty() {
+        bail!("tool_call has an empty name");
+    }
+    let args = match field_after(json, "\"arguments\"").and_then(balanced_object) {
+        Some(obj) => {
+            serde_json::from_str(&obj).map_err(|e| anyhow!("malformed tool_call arguments: {e}"))?
+        }
+        None => Value::Object(Default::default()),
+    };
+    Ok(ToolCall { name, args })
+}
+
+/// The substring just after `key` and its `:` separator.
+fn field_after<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    let i = s.find(key)?;
+    let rest = &s[i + key.len()..];
+    let colon = rest.find(':')?;
+    Some(rest[colon + 1..].trim_start())
+}
+
+/// The name token at the start of `s`: a quoted string, or a bare identifier.
+fn parse_name_token(s: &str) -> String {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("").to_string()
+    } else {
+        s.chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            .collect()
+    }
+}
+
+/// The first balanced `{...}` span at the start of `s` (brace-counted).
+fn balanced_object(s: &str) -> Option<String> {
+    let start = s.find('{')?;
+    let mut depth = 0i32;
+    for (offset, ch) in s[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[start..start + offset + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Read a UTF-8 text file under a [`Dir`] capability.
 pub struct ReadFile {
     dir: Dir,
@@ -403,6 +536,42 @@ mod tests {
         let codec = DeepSeekToolCall;
         let text = "<｜tool▁call▁begin｜>function<｜tool▁sep｜>read_file\nno json here";
         assert!(codec.parse(text).unwrap().is_err());
+    }
+
+    #[test]
+    fn qwen_codec_parses_native_call() {
+        // upholds: PROTO-1 — Qwen's ChatML/Hermes call object parses (note the
+        // 'arguments' key, distinct from our JsonToolCall 'args').
+        let codec = QwenToolCall;
+        let text = "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.txt\"}}\n</tool_call>";
+        let call = codec.parse(text).unwrap().unwrap();
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.args, json(r#"{"path": "a.txt"}"#));
+    }
+
+    #[test]
+    fn qwen_codec_tolerates_unquoted_name() {
+        // upholds: PROTO-1 — real Qwen output sometimes leaves the name unquoted
+        // (imitating the <function-name> placeholder); recover it when the
+        // arguments object is valid JSON (the exact first-call string we saw).
+        let codec = QwenToolCall;
+        let text =
+            "<tool_call>\n{\"name\": read_file, \"arguments\": {\"path\": \"secret.txt\"}}\n</tool_call>";
+        let call = codec.parse(text).unwrap().unwrap();
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.args, json(r#"{"path": "secret.txt"}"#));
+    }
+
+    #[test]
+    fn qwen_codec_plain_and_malformed() {
+        // upholds: PROTO-1
+        let codec = QwenToolCall;
+        assert!(codec.parse("Just an answer.").is_none());
+        assert!(codec
+            .parse("<tool_call>\nnot json\n</tool_call>")
+            .unwrap()
+            .is_err());
+        assert_eq!(codec.stop_strings(), vec!["</tool_call>".to_string()]);
     }
 
     #[test]

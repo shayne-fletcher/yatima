@@ -9,10 +9,11 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use yatima_lib::{
-    device, model_dir, models_root, Agent, DeepSeekR1Template, DeepSeekToolCall, Dir, Engine,
-    GenOpts, ListDir, ModelId, ReadFile, Sampling, Tools,
+    device, model_dir, models_root, Agent, ChatMlTemplate, Completer, DeepSeekR1Template,
+    DeepSeekToolCall, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId, PlainTemplate,
+    PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec, Tools,
 };
 
 #[derive(Parser)]
@@ -99,9 +100,23 @@ struct AgentArgs {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// The model's chat / tool-call format.
+    #[arg(long, value_enum, default_value_t = ChatFormat::Qwen)]
+    format: ChatFormat,
     /// Print the full transcript (to stderr), not just the final answer.
     #[arg(long)]
     verbose: bool,
+}
+
+/// Which model-native chat + tool-call format to speak.
+#[derive(Clone, Copy, ValueEnum)]
+enum ChatFormat {
+    /// Qwen2.5-Instruct: ChatML + `<tool_call>` (trained for tools).
+    Qwen,
+    /// DeepSeek-R1(-Distill): native `<｜tool▁call…｜>` framing.
+    Deepseek,
+    /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
+    Plain,
 }
 
 const DEFAULT_AGENT_SYSTEM: &str =
@@ -151,6 +166,9 @@ fn agent(args: AgentArgs) -> Result<()> {
     let opts = GenOpts {
         max_tokens: args.max_tokens,
         sampling: sampling_of(args.temperature, args.seed),
+        // Tool calls are structured JSON; a repetition penalty corrupts them by
+        // penalising the punctuation they repeat, so disable it for the agent.
+        repeat_penalty: 1.0,
     };
 
     let mut engine = Engine::load(&dir, device(args.cpu)?)?;
@@ -164,20 +182,64 @@ fn agent(args: AgentArgs) -> Result<()> {
     let system = args
         .system
         .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
-    // DeepSeek-R1 native format (the model we ship against); template selection
-    // by model config is a future refinement.
-    let mut agent = Agent::new(
-        &mut engine,
-        &tools,
-        DeepSeekToolCall,
-        DeepSeekR1Template,
-        system,
-        args.max_steps,
-    )
-    .with_opts(opts);
-    let run = agent.run(&args.prompt)?;
 
-    if args.verbose {
+    // The codec/template pair is the model's native format, chosen by --format.
+    match args.format {
+        ChatFormat::Qwen => run_agent(
+            &mut engine,
+            &tools,
+            QwenToolCall,
+            ChatMlTemplate,
+            system,
+            args.max_steps,
+            opts,
+            &args.prompt,
+            args.verbose,
+        ),
+        ChatFormat::Deepseek => run_agent(
+            &mut engine,
+            &tools,
+            DeepSeekToolCall,
+            DeepSeekR1Template,
+            system,
+            args.max_steps,
+            opts,
+            &args.prompt,
+            args.verbose,
+        ),
+        ChatFormat::Plain => run_agent(
+            &mut engine,
+            &tools,
+            JsonToolCall,
+            PlainTemplate,
+            system,
+            args.max_steps,
+            opts,
+            &args.prompt,
+            args.verbose,
+        ),
+    }
+}
+
+/// Build an agent for a given codec/template pair, run it, and print the answer
+/// (full transcript to stderr when `verbose`). Generic so each `--format` arm
+/// keeps the concrete, monomorphic `Agent` types.
+#[allow(clippy::too_many_arguments)]
+fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
+    engine: &mut C,
+    tools: &Tools,
+    codec: K,
+    template: T,
+    system: String,
+    max_steps: usize,
+    opts: GenOpts,
+    prompt: &str,
+    verbose: bool,
+) -> Result<()> {
+    let mut agent = Agent::new(engine, tools, codec, template, system, max_steps).with_opts(opts);
+    let run = agent.run(prompt)?;
+
+    if verbose {
         for turn in &run.transcript {
             eprintln!("── {:?} ──\n{}\n", turn.role, turn.content);
         }
@@ -206,6 +268,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
     let opts = GenOpts {
         max_tokens: args.max_tokens,
         sampling: sampling_of(args.temperature, args.seed),
+        ..Default::default()
     };
     let mut stdout = std::io::stdout();
     let generation = engine.generate(&prompt, &opts, |piece| {
