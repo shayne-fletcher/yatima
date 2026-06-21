@@ -58,12 +58,15 @@
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
 //!   name is an `is_error` result, never ambient execution (sandbox by omission).
+//! - **TOOL-1** tool calls are async task executions: they can be awaited,
+//!   joined, watched through [`ToolEvent`], and cooperatively cancelled without
+//!   changing their argument schema.
 //! - **CAP-1** a [`Dir`]-scoped tool cannot reach paths outside its root
 //!   (containment, reusing `is_safe_relative` / MS-3).
 //! - **CAP-2** the agent's effects ⊆ the union of its tools' capabilities —
 //!   enforced for omission (AGENT-2) and containment (CAP-1); by construction
-//!   otherwise (tools hold their caps, no ambient `std::fs`). Stated, not
-//!   compiler-absolute — see `notes/design.md`.
+//!   otherwise (tools hold their caps, no ambient `std::fs` or arbitrary
+//!   network destination). Stated, not compiler-absolute — see `notes/design.md`.
 //! - **PROTO-1** a malformed/unknown tool call becomes an `is_error` result the
 //!   model can recover from, never a silent mis-execution.
 //!
@@ -84,7 +87,7 @@ mod token_output_stream;
 mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Role, Run, Turn};
-pub use capability::Dir;
+pub use capability::{Dir, NtfyTopic, WebOrigin, WriteDir};
 pub use chat::ChatSession;
 pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
@@ -100,8 +103,9 @@ pub use template::{
     ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
 };
 pub use tool::{
-    JsonToolCall, ListDir, QwenToolCall, ReadFile, Tool, ToolCall, ToolCallCodec, ToolResult,
-    ToolSpec, Tools,
+    JsonToolCall, ListDir, QwenToolCall, ReadFile, ReadUrl, SendNotification, Tool, ToolCall,
+    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolResult, ToolSpec, ToolTask, Tools,
+    WriteFile,
 };
 
 use anyhow::{bail, Result};

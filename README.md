@@ -51,10 +51,11 @@ Three layers, increasing in capability:
   rooted at one directory); the file tools cannot reach outside it, a tool not in
   the agent's set is uncallable, and a malformed or unknown call becomes an error
   the model can recover from — never a silent mis-execution.
-- **An agent loop** — `Agent::run` / `run_with` fold model turns: the model emits
-  a tool call, a capability-scoped tool runs, the result is fed back, bounded by
-  `max_steps`. The loop is synchronous and provable against a scripted model with
-  no GPU.
+- **An agent loop** — `Agent::run_async` / `run_with_async` fold model turns:
+  the model emits a tool call, a capability-scoped async tool runs, the result is
+  fed back, bounded by `max_steps`. Tool calls are awaitable, joinable,
+  watchable, and cooperatively cancellable; the synchronous `run` wrappers remain
+  for simple callers.
 
 Kindred in spirit to Anil Madhavapeddy's
 [*Language Integrated LLMs as an OCaml Function*](https://anil.recoil.org/notes/language-integrated-llms).
@@ -93,6 +94,27 @@ models to be called as in-process functions. ...
 That one command exercises the core path: local model load, an agent turn, a
 capability-scoped `read_file` tool call under `--root`, and a grounded final
 answer.
+
+The library tool set now includes read/list directory tools, a separate
+`WriteDir`-scoped `write_file`, `WebOrigin`-scoped `read_url`, and
+`NtfyTopic`-scoped `send_notification`. Each tool holds its own authority; the
+model supplies only arguments within that authority.
+
+Tools execute as async tasks. A caller can use `Tools::dispatch_async` when it
+only needs the result, or `Tools::spawn` to receive `ToolEvent`s, join the task,
+and request cooperative cancellation. This is the intended foundation for TUIs,
+supervising agents, long-running downloads, process tools, and network effects.
+
+There is also an opt-in live test for the notification tool. Subscribe your
+phone to an ntfy topic first, then run:
+
+```bash
+YATIMA_NTFY_TOPIC=we-could-be-coding-haskell \
+  cargo test -p yatima-lib e2e_send_notification_to_phone -- --ignored
+```
+
+The normal test suite never publishes to ntfy.sh; this ignored test exists so
+you can prove the `NtfyTopic` capability and `send_notification` tool end to end.
 
 ```bash
 # generate a completion (raw)

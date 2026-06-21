@@ -120,9 +120,10 @@ what the (planned) Haskell study formalizes.
 If `generate_with` folds *tokens* into a value, the agent loop folds *turns*: the
 model emits a tool call, a capability-scoped tool runs, its result is fed back,
 and the loop repeats until the model answers or `max_steps` is reached (the
-hylomorphism nests one level up). It is synchronous (turns are sequential and
-compute-bound, per the concurrency note) and provable against a *scripted*
-`Completer` with no GPU.
+hylomorphism nests one level up). Model turns are sequential, but tool execution
+is async: a caller can await the result, watch lifecycle/progress events, join
+the task, or request cooperative cancellation. The loop is still provable against
+a *scripted* `Completer` with no GPU.
 
 The design is **small composable seams**, simplest concrete impl behind each:
 
@@ -136,10 +137,12 @@ The design is **small composable seams**, simplest concrete impl behind each:
   `ModelId` (MS-3 / CAP-1). A tool *holds* its capabilities; we never hand it
   ambient `std::fs`.
 - **`Tool` / `Tools`** — a tool advertises a `ToolSpec` (JSON-Schema params, the
-  de-facto standard) and runs `call(args)`. `Tools::dispatch` **never
-  hard-errors**: an unknown name (AGENT-2) or a tool failure becomes an
-  `is_error` `ToolResult` the model can recover from (PROTO-1). First tools:
-  `ReadFile`, `ListDir` (read-only).
+  de-facto standard) and runs `async call(args, ctx)`. `Tools::dispatch_async`
+  **never hard-errors**: an unknown name (AGENT-2) or a tool failure becomes an
+  `is_error` `ToolResult` the model can recover from (PROTO-1). `Tools::spawn`
+  returns a `ToolTask` with `ToolEvent`s, `join`, and cooperative cancellation.
+  Current tools: `ReadFile`, `ListDir`, `WriteFile`, `ReadUrl`, and
+  `SendNotification`, each holding its own capability.
 - **`PromptTemplate`** (the chat format) — renders the transcript into the
   model's *native* prompt string. `ChatMlTemplate` (Qwen2.5), `PlainTemplate`
   (fallback/tests). A model is acutely sensitive to its trained format; the wrong
@@ -153,10 +156,11 @@ The design is **small composable seams**, simplest concrete impl behind each:
   (an unquoted name, braces inside string values) — this is the actual line of
   defense for tool-call validity (constrained decoding was tried and shelved; see
   Deferred).
-- **`Agent`** — `run` collects the final answer; `run_with` is the fold a future
-  actor/TUI streams `AgentEvent`s into (`run` is the `acc = ()` specialization).
-  Bounded by `max_steps`; `AgentStop` is `Final` / `MaxSteps` / `Stopped` (the
-  last when the caller's fold returns `ControlFlow::Break`).
+- **`Agent`** — `run_async` collects the final answer; `run_with_async` is the
+  fold a future actor/TUI streams `AgentEvent`s into (`run_async` is the `acc =
+  ()` specialization). Synchronous `run` / `run_with` wrappers remain for simple
+  callers. Bounded by `max_steps`; `AgentStop` is `Final` / `MaxSteps` /
+  `Stopped` (the last when the caller's fold returns `ControlFlow::Break`).
 
 **Speaking the model's native format (hard-won).** Getting a base model to
 *reliably* act took three corrections, each now a guarded invariant:
@@ -264,9 +268,9 @@ Gated repos (e.g. Gemma) authenticate when `HF_TOKEN` is set in the environment
 ## Concurrency
 
 Decode is sequential and compute-bound — token *n+1* depends on *n*, and the hot
-loop does GPU/CPU work with nothing to await. So the **core stays synchronous**:
-an `async fn generate` would be a lie that blocks the executor and starves other
-tasks. Concurrency belongs to *delivery*, not decode.
+loop does GPU/CPU work with nothing to await. So the **generation core stays
+synchronous**: an `async fn generate` would be a lie that blocks the executor and
+starves other tasks. Concurrency belongs to *delivery*, not decode.
 
 The async form is therefore an **adapter over `generate_with`, not a second
 engine path** — run the blocking fold on `spawn_blocking` and let `step` send
@@ -295,11 +299,17 @@ parallelism is a batching/scheduling concern rented from the engine / a future
 server, not faked here. One `Engine` (mutable KV cache, ~15 GB weights) is
 one-generation-at-a-time.
 
-**Deferred** (build when a real async client exists): the durable shape is an
-**engine actor** owning the `Engine` and serving `(prompt, opts, reply)` requests
-over a channel — also the home for conversation/KV-cache reuse and the agent
-loop, so concurrency and the capability-scoped tool runtime are the *same* future
-component.
+Tool execution is different: tools are effectful boundary calls (filesystem,
+HTTP, notifications, future process/MCP adapters), so the tool core is async.
+`ToolCtx` carries lifecycle emission and cooperative cancellation; `Tools::spawn`
+is the join/watch/cancel surface, while the agent normally awaits each tool
+result before the next model turn.
+
+**Deferred**: the durable engine-side shape is an **engine actor** owning the
+`Engine` and serving `(prompt, opts, reply)` requests over a channel — also the
+home for conversation/KV-cache reuse and cross-request scheduling. That actor can
+compose with the async tool runtime, but it is not required to make tools
+awaitable/watchable today.
 
 ## Registries
 
@@ -310,8 +320,8 @@ cites its id in an `// upholds: <id>` comment (`grep -r 'upholds:'`).
 
 In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
-**GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **CAP-1/2**, **PROTO-1**);
-chat templates (**TMPL-1/2**); CLI (**CLI-1/2**).
+**GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1**, **CAP-1/2**,
+**PROTO-1**); chat templates (**TMPL-1/2**); CLI (**CLI-1/2**).
 
 ## State machines
 
@@ -381,8 +391,9 @@ and deliberately shelved — the note records why so we don't repeat them.
   quality.
 - **Native Mistral tool codec** (`[TOOL_CALLS]` / `[AVAILABLE_TOOLS]`) — a second
   tool-trained family in the agent; complex (special-token detok, 9-char IDs).
-- **Richer capabilities** — `write` / `net` / `proc` capabilities and their tools
-  (read-only `Dir` today); multi-tool-per-turn / planning.
+- **Richer capabilities** — process capabilities and tools, plus multi-tool-per
+  turn / planning. `WriteDir`, `WebOrigin`, and `NtfyTopic` are now present as
+  first slices of the broader capability model.
 - **MCP edge adapter** — consume an MCP server *as* a `Tool`, or expose our tools
   *as* an MCP server (out-of-process; rides the same seams at the edge).
 
@@ -411,8 +422,8 @@ and deliberately shelved — the note records why so we don't repeat them.
 - A worked **service/TUI** embedder — the next consumer after the example.
 
 ### Architecture / research
-- **Async engine-actor** owning the `Engine` and wrapping `run_with` — the home
-  for cross-request concurrency and KV-cache reuse (see Concurrency).
+- **Async engine-actor** owning the `Engine` and wrapping `run_with_async` — the
+  home for cross-request concurrency and KV-cache reuse (see Concurrency).
 - **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the
   `<root>/<org>/<name>` layout, extracted once there's a real trigger (possum
   validating its own ids, or a second consumer).

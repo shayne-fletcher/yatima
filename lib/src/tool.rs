@@ -14,9 +14,19 @@
 //! fallback for a model with no known native format. Schemas follow the de-facto
 //! standard (JSON Schema params, name + JSON args).
 
-use crate::capability::Dir;
+use crate::capability::{Dir, NtfyTopic, WebOrigin, WriteDir};
 use anyhow::{anyhow, bail, Result};
+use async_trait::async_trait;
+use reqwest::Client;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+const DEFAULT_READ_URL_MAX_BYTES: usize = 1_000_000;
 
 /// What a tool advertises to the model: its name, a description, and a JSON
 /// Schema for its arguments.
@@ -45,7 +55,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    fn ok(name: &str, content: String) -> ToolResult {
+    pub fn ok(name: &str, content: String) -> ToolResult {
         ToolResult {
             name: name.to_string(),
             content,
@@ -53,7 +63,7 @@ impl ToolResult {
         }
     }
 
-    fn error(name: &str, content: String) -> ToolResult {
+    pub fn error(name: &str, content: String) -> ToolResult {
         ToolResult {
             name: name.to_string(),
             content,
@@ -62,21 +72,128 @@ impl ToolResult {
     }
 }
 
+pub type ToolCallId = u64;
+
+/// Tool execution context supplied by the dispatcher. It carries observability
+/// and cooperative cancellation without making those concerns part of every
+/// tool's argument schema.
+#[derive(Clone)]
+pub struct ToolCtx {
+    call_id: ToolCallId,
+    cancel: CancellationToken,
+    events: broadcast::Sender<ToolEvent>,
+}
+
+impl ToolCtx {
+    fn new(
+        call_id: ToolCallId,
+        cancel: CancellationToken,
+        events: broadcast::Sender<ToolEvent>,
+    ) -> ToolCtx {
+        ToolCtx {
+            call_id,
+            cancel,
+            events,
+        }
+    }
+
+    pub fn call_id(&self) -> ToolCallId {
+        self.call_id
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await
+    }
+
+    pub fn emit_progress(&self, message: impl Into<String>) {
+        let _ = self.events.send(ToolEvent::Progress {
+            call_id: self.call_id,
+            message: message.into(),
+        });
+    }
+}
+
+/// Observable lifecycle events for a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolEvent {
+    Started {
+        call_id: ToolCallId,
+        call: ToolCall,
+    },
+    Progress {
+        call_id: ToolCallId,
+        message: String,
+    },
+    Finished {
+        call_id: ToolCallId,
+        result: ToolResult,
+    },
+    Cancelled {
+        call_id: ToolCallId,
+    },
+}
+
+/// A spawned tool call. The agent can join it, watch lifecycle events, or ask
+/// the tool to stop via cooperative cancellation.
+pub struct ToolTask {
+    call_id: ToolCallId,
+    cancel: CancellationToken,
+    events: broadcast::Receiver<ToolEvent>,
+    join: JoinHandle<ToolResult>,
+}
+
+impl ToolTask {
+    pub fn call_id(&self) -> ToolCallId {
+        self.call_id
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<ToolEvent> {
+        self.events.resubscribe()
+    }
+
+    pub async fn recv(&mut self) -> Option<ToolEvent> {
+        loop {
+            match self.events.recv().await {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    pub async fn join(self) -> ToolResult {
+        match self.join.await {
+            Ok(result) => result,
+            Err(e) => ToolResult::error("", format!("tool task failed: {e}")),
+        }
+    }
+}
+
 /// A tool the model may call. Implementors hold their capabilities and act only
 /// through them.
-pub trait Tool {
+#[async_trait]
+pub trait Tool: Send + Sync {
     /// What the model is told about this tool.
     fn spec(&self) -> ToolSpec;
     /// Run the tool. Returning `Err` is fine — [`Tools::dispatch`] turns it into
     /// an `is_error` [`ToolResult`]; the tool need not format failures itself.
-    fn call(&self, args: &Value) -> Result<String>;
+    async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String>;
 }
 
 /// The set of tools an agent may use. The agent can call *only* these — a name
 /// not present is uncallable (sandbox by omission, AGENT-2).
 #[derive(Default)]
 pub struct Tools {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
+    next_call_id: AtomicU64,
 }
 
 impl Tools {
@@ -86,7 +203,7 @@ impl Tools {
 
     /// Add a tool (builder style).
     pub fn with(mut self, tool: impl Tool + 'static) -> Tools {
-        self.tools.push(Box::new(tool));
+        self.tools.push(Arc::new(tool));
         self
     }
 
@@ -99,12 +216,76 @@ impl Tools {
     /// a tool-level failure becomes an `is_error` [`ToolResult`] (AGENT-2 /
     /// PROTO-1).
     pub fn dispatch(&self, call: &ToolCall) -> ToolResult {
-        match self.tools.iter().find(|t| t.spec().name == call.name) {
-            None => ToolResult::error(&call.name, format!("unknown tool '{}'", call.name)),
-            Some(tool) => match tool.call(&call.args) {
-                Ok(content) => ToolResult::ok(&call.name, content),
-                Err(e) => ToolResult::error(&call.name, e.to_string()),
-            },
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(self.dispatch_async(call)))
+            }
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime for tool dispatch")
+                .block_on(self.dispatch_async(call)),
+        }
+    }
+
+    /// Async dispatch for callers already in a Tokio runtime.
+    pub async fn dispatch_async(&self, call: &ToolCall) -> ToolResult {
+        self.spawn(call.clone()).join().await
+    }
+
+    /// Spawn a tool call as a Tokio task. Call this from within a Tokio runtime;
+    /// use [`Tools::dispatch`] from synchronous code.
+    pub fn spawn(&self, call: ToolCall) -> ToolTask {
+        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (events_tx, events_rx) = broadcast::channel(32);
+        let cancel = CancellationToken::new();
+        let ctx = ToolCtx::new(call_id, cancel.clone(), events_tx.clone());
+        let tool = self
+            .tools
+            .iter()
+            .find(|t| t.spec().name == call.name)
+            .cloned();
+        let task_call = call.clone();
+        let join = tokio::spawn(async move {
+            let _ = events_tx.send(ToolEvent::Started {
+                call_id,
+                call: task_call.clone(),
+            });
+            let result = match tool {
+                None => ToolResult::error(
+                    &task_call.name,
+                    format!("unknown tool '{}'", task_call.name),
+                ),
+                Some(tool) => {
+                    let fut = tool.call(task_call.args.clone(), ctx.clone());
+                    tokio::select! {
+                        _ = ctx.cancelled() => ToolResult::error(&task_call.name, "tool call cancelled".to_string()),
+                        result = fut => match result {
+                            Ok(content) => ToolResult::ok(&task_call.name, content),
+                            Err(e) => ToolResult::error(&task_call.name, e.to_string()),
+                        }
+                    }
+                }
+            };
+            let result = if ctx.is_cancelled() && !result.is_error {
+                ToolResult::error(&task_call.name, "tool call cancelled".to_string())
+            } else {
+                result
+            };
+            if ctx.is_cancelled() {
+                let _ = events_tx.send(ToolEvent::Cancelled { call_id });
+            }
+            let _ = events_tx.send(ToolEvent::Finished {
+                call_id,
+                result: result.clone(),
+            });
+            result
+        });
+        ToolTask {
+            call_id,
+            cancel,
+            events: events_rx,
+            join,
         }
     }
 }
@@ -340,6 +521,7 @@ impl ReadFile {
     }
 }
 
+#[async_trait]
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -355,13 +537,13 @@ impl Tool for ReadFile {
         }
     }
 
-    fn call(&self, args: &Value) -> Result<String> {
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("read_file: missing string argument 'path'"))?;
         let full = self.dir.resolve(path)?; // CAP-1
-        Ok(std::fs::read_to_string(&full)?)
+        Ok(tokio::fs::read_to_string(&full).await?)
     }
 }
 
@@ -376,6 +558,289 @@ impl ListDir {
     }
 }
 
+/// Write a UTF-8 text file under a [`WriteDir`] capability.
+pub struct WriteFile {
+    dir: WriteDir,
+}
+
+impl WriteFile {
+    pub fn new(dir: WriteDir) -> WriteFile {
+        WriteFile { dir }
+    }
+}
+
+#[async_trait]
+impl Tool for WriteFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "write_file".to_string(),
+            description: "Write UTF-8 text to a file, given a path relative to the write root."
+                .to_string(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "file path relative to the write root" },
+                    "content": { "type": "string", "description": "UTF-8 text content to write" },
+                    "create_dirs": {
+                        "type": "boolean",
+                        "description": "create missing parent directories before writing; defaults to false"
+                    }
+                },
+                "required": ["path", "content"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+        let path = required_string(&args, "write_file", "path")?;
+        let content = required_string(&args, "write_file", "content")?;
+        let create_dirs = optional_bool(&args, "write_file", "create_dirs")?.unwrap_or(false);
+        let full = self.dir.resolve(path)?; // CAP-1
+        if create_dirs {
+            if let Some(parent) = full.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        tokio::fs::write(&full, content).await?;
+        Ok(format!("wrote {} bytes", content.len()))
+    }
+}
+
+/// Read a text response from a URL under a [`WebOrigin`] capability.
+pub struct ReadUrl {
+    origin: WebOrigin,
+    client: Client,
+    max_bytes: usize,
+}
+
+impl ReadUrl {
+    pub fn new(origin: WebOrigin) -> Result<ReadUrl> {
+        Self::with_max_bytes(origin, DEFAULT_READ_URL_MAX_BYTES)
+    }
+
+    pub fn with_max_bytes(origin: WebOrigin, max_bytes: usize) -> Result<ReadUrl> {
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        Ok(ReadUrl {
+            origin,
+            client,
+            max_bytes,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ReadUrl {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_url".to_string(),
+            description: "Read a UTF-8/text web URL under the configured origin.".to_string(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "absolute same-origin URL or path relative to the configured origin"
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+        let target = required_string(&args, "read_url", "url")?;
+        let url = self.origin.resolve(target)?;
+        let response = self.client.get(url).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            bail!(
+                "read_url failed with HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        if body.len() > self.max_bytes {
+            bail!(
+                "read_url response too large: {} bytes exceeds {} byte limit",
+                body.len(),
+                self.max_bytes
+            );
+        }
+        Ok(String::from_utf8(body.to_vec())?)
+    }
+}
+
+/// Send a notification to a fixed ntfy topic held as a capability.
+pub struct SendNotification {
+    publisher: NtfyPublisher,
+}
+
+impl SendNotification {
+    pub fn new(topic: NtfyTopic) -> Result<SendNotification> {
+        Ok(SendNotification {
+            publisher: NtfyPublisher::new(topic)?,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for SendNotification {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "send_notification".to_string(),
+            description: "Send a notification to the configured ntfy topic.".to_string(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "notification body"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "optional notification title"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "optional ntfy priority: min, low, default, high, urgent, or 1-5",
+                        "enum": ["min", "low", "default", "high", "urgent", "1", "2", "3", "4", "5"]
+                    },
+                    "tags": {
+                        "type": "array",
+                        "description": "optional ntfy tags/emojis",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["message"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+        self.publisher
+            .publish(&Notification::from_args(&args)?)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Notification {
+    message: String,
+    title: Option<String>,
+    priority: Option<String>,
+    tags: Vec<String>,
+}
+
+impl Notification {
+    fn from_args(args: &Value) -> Result<Notification> {
+        let message = required_string(args, "send_notification", "message")?.to_string();
+        if message.is_empty() {
+            bail!("send_notification: message must not be empty");
+        }
+        let title = optional_string(args, "title")?.map(str::to_string);
+        let priority = optional_string(args, "priority")?.map(str::to_string);
+        if let Some(priority) = &priority {
+            validate_ntfy_priority(priority)?;
+        }
+        let tags = optional_tags(args)?.unwrap_or_default();
+        Ok(Notification {
+            message,
+            title,
+            priority,
+            tags,
+        })
+    }
+}
+
+struct NtfyPublisher {
+    topic: NtfyTopic,
+    client: Client,
+}
+
+impl NtfyPublisher {
+    fn new(topic: NtfyTopic) -> Result<NtfyPublisher> {
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        Ok(NtfyPublisher { topic, client })
+    }
+
+    async fn publish(&self, notification: &Notification) -> Result<String> {
+        let mut req = self
+            .client
+            .post(self.topic.endpoint())
+            .body(notification.message.clone());
+        if let Some(title) = &notification.title {
+            req = req.header("Title", title);
+        }
+        if let Some(priority) = &notification.priority {
+            req = req.header("Priority", priority);
+        }
+        if !notification.tags.is_empty() {
+            req = req.header("Tags", notification.tags.join(","));
+        }
+        let response = req.send().await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("ntfy publish failed with HTTP {status}: {body}");
+        }
+        Ok(if body.trim().is_empty() {
+            "notification sent".to_string()
+        } else {
+            body
+        })
+    }
+}
+
+fn required_string<'a>(args: &'a Value, tool: &str, field: &str) -> Result<&'a str> {
+    args.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{tool}: missing string argument '{field}'"))
+}
+
+fn optional_string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(_) => bail!("send_notification: optional argument '{field}' must be a string"),
+    }
+}
+
+fn optional_bool(args: &Value, tool: &str, field: &str) -> Result<Option<bool>> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => bail!("{tool}: optional argument '{field}' must be a boolean"),
+    }
+}
+
+fn validate_ntfy_priority(priority: &str) -> Result<()> {
+    match priority {
+        "min" | "low" | "default" | "high" | "urgent" | "1" | "2" | "3" | "4" | "5" => Ok(()),
+        _ => bail!("send_notification: invalid priority {priority:?}"),
+    }
+}
+
+fn optional_tags(args: &Value) -> Result<Option<Vec<String>>> {
+    match args.get("tags") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|v| {
+                let tag = v
+                    .as_str()
+                    .ok_or_else(|| anyhow!("send_notification: tags must be strings"))?;
+                if tag.contains(',') || tag.contains('\n') || tag.contains('\r') {
+                    bail!("send_notification: tags must not contain commas or newlines");
+                }
+                Ok(tag.to_string())
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        Some(_) => bail!("send_notification: optional argument 'tags' must be an array"),
+    }
+}
+
+#[async_trait]
 impl Tool for ListDir {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -393,15 +858,16 @@ impl Tool for ListDir {
         }
     }
 
-    fn call(&self, args: &Value) -> Result<String> {
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("list_dir: missing string argument 'path'"))?;
         let full = self.dir.resolve(path)?; // CAP-1
         let mut names = Vec::new();
-        for entry in std::fs::read_dir(&full)? {
-            names.push(entry?.file_name().to_string_lossy().into_owned());
+        let mut entries = tokio::fs::read_dir(&full).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            names.push(entry.file_name().to_string_lossy().into_owned());
         }
         names.sort();
         Ok(names.join("\n"))
@@ -412,6 +878,8 @@ impl Tool for ListDir {
 mod tests {
     use super::*;
     use std::io::Write;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn json(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
@@ -613,5 +1081,313 @@ mod tests {
             args: json(r#"{"path": ".."}"#),
         });
         assert!(escape.is_error);
+    }
+
+    #[test]
+    fn write_file_writes_under_write_capability_root() {
+        // upholds: CAP-1 — a WriteDir-scoped tool cannot write outside its root.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Tools::new().with(WriteFile::new(WriteDir::new(tmp.path())));
+
+        let ok = tools.dispatch(&ToolCall {
+            name: "write_file".to_string(),
+            args: json(r#"{"path": "notes/out.txt", "content": "hello", "create_dirs": true}"#),
+        });
+        assert!(!ok.is_error, "{}", ok.content);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("notes/out.txt")).unwrap(),
+            "hello"
+        );
+
+        let escape = tools.dispatch(&ToolCall {
+            name: "write_file".to_string(),
+            args: json(r#"{"path": "../out.txt", "content": "bad"}"#),
+        });
+        assert!(escape.is_error);
+    }
+
+    #[test]
+    fn write_file_validates_args() {
+        // upholds: PROTO-1 — bad write args are recoverable tool errors.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Tools::new().with(WriteFile::new(WriteDir::new(tmp.path())));
+        for args in [
+            json("{}"),
+            json(r#"{"path": "x"}"#),
+            json(r#"{"path": "x", "content": 1}"#),
+            json(r#"{"path": "x", "content": "y", "create_dirs": "yes"}"#),
+        ] {
+            let result = tools.dispatch(&ToolCall {
+                name: "write_file".to_string(),
+                args,
+            });
+            assert!(result.is_error, "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn send_notification_posts_to_capability_topic() {
+        // upholds: CAP-2 — the notification tool's network authority is exactly
+        // the held NtfyTopic capability, not a topic/server supplied by args.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/we-could-be-coding-haskell"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "test",
+                "event": "message",
+                "topic": "we-could-be-coding-haskell",
+                "message": "Build finished"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let server_uri = server.uri();
+        let args = json(
+            r#"{
+                "message": "Build finished",
+                "title": "yatima",
+                "priority": "high",
+                "tags": ["white_check_mark", "rust"],
+                "topic": "attacker-topic",
+                "server": "https://example.com"
+            }"#,
+        );
+
+        let cap = NtfyTopic::with_server(&server_uri, "we-could-be-coding-haskell").unwrap();
+        let tools = Tools::new().with(SendNotification::new(cap).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "send_notification".to_string(),
+                args,
+            })
+            .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains(r#""event":"message""#));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.url.path(), "/we-could-be-coding-haskell");
+        assert_eq!(request.body, b"Build finished");
+        assert_eq!(header_value(request, "title"), "yatima");
+        assert_eq!(header_value(request, "priority"), "high");
+        assert_eq!(header_value(request, "tags"), "white_check_mark,rust");
+    }
+
+    #[tokio::test]
+    async fn read_url_gets_only_capability_origin() {
+        // upholds: CAP-2 — web read authority is exactly the held WebOrigin.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello web"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let server_uri = server.uri();
+        let origin = WebOrigin::new(&server_uri).unwrap();
+        let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_url".to_string(),
+                args: json(r#"{"url": "/doc"}"#),
+            })
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "hello web");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/doc");
+    }
+
+    #[test]
+    fn read_url_rejects_escaping_origins_before_network() {
+        // upholds: CAP-2 — an arbitrary host cannot be smuggled through args.
+        let origin = WebOrigin::new("https://example.com").unwrap();
+        let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
+        let result = tools.dispatch(&ToolCall {
+            name: "read_url".to_string(),
+            args: json(r#"{"url": "https://evil.example/doc"}"#),
+        });
+        assert!(result.is_error);
+        assert!(result.content.contains("escapes web origin"));
+    }
+
+    #[test]
+    fn notification_args_parse_to_typed_notification() {
+        let notification = Notification::from_args(&json(
+            r#"{
+                "message": "Build finished",
+                "title": "yatima",
+                "priority": "high",
+                "tags": ["white_check_mark", "rust"],
+                "topic": "ignored",
+                "server": "ignored"
+            }"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            notification,
+            Notification {
+                message: "Build finished".to_string(),
+                title: Some("yatima".to_string()),
+                priority: Some("high".to_string()),
+                tags: vec!["white_check_mark".to_string(), "rust".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn send_notification_validates_args_before_publish() {
+        // upholds: PROTO-1 — bad tool arguments are recoverable tool errors,
+        // not malformed HTTP requests. No server is needed: validation is pure.
+        let cap = NtfyTopic::with_server("http://127.0.0.1:1", "topic").unwrap();
+        let tools = Tools::new().with(SendNotification::new(cap).unwrap());
+
+        for args in [
+            json("{}"),
+            json(r#"{"message": ""}"#),
+            json(r#"{"message": "x", "priority": "panic"}"#),
+            json(r#"{"message": "x", "tags": ["bad,tag"]}"#),
+        ] {
+            let result = tools.dispatch(&ToolCall {
+                name: "send_notification".to_string(),
+                args,
+            });
+            assert!(result.is_error, "{result:?}");
+        }
+    }
+
+    struct ProgressTool;
+
+    #[async_trait]
+    impl Tool for ProgressTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "progress".to_string(),
+                description: "test progress".to_string(),
+                params: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: Value, ctx: ToolCtx) -> Result<String> {
+            ctx.emit_progress("halfway");
+            Ok("done".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn spawned_tool_is_watchable_and_joinable() {
+        // upholds: AGENT-2 / CAP-2 — a tool call has a concrete lifecycle the
+        // agent can observe without broadening the tool's authority.
+        let tools = Tools::new().with(ProgressTool);
+        let mut task = tools.spawn(ToolCall {
+            name: "progress".to_string(),
+            args: json("{}"),
+        });
+
+        let started = task.recv().await.unwrap();
+        assert!(matches!(started, ToolEvent::Started { .. }));
+        let progress = task.recv().await.unwrap();
+        assert_eq!(
+            progress,
+            ToolEvent::Progress {
+                call_id: task.call_id(),
+                message: "halfway".to_string()
+            }
+        );
+        let finished = task.recv().await.unwrap();
+        assert!(matches!(
+            finished,
+            ToolEvent::Finished {
+                result: ToolResult {
+                    is_error: false,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let result = task.join().await;
+        assert_eq!(result.content, "done");
+        assert!(!result.is_error);
+    }
+
+    struct CancelTool;
+
+    #[async_trait]
+    impl Tool for CancelTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "cancel_me".to_string(),
+                description: "waits for cancellation".to_string(),
+                params: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: Value, ctx: ToolCtx) -> Result<String> {
+            ctx.cancelled().await;
+            Ok("unreachable".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn spawned_tool_is_cancellable() {
+        // upholds: AGENT-1 — cancellation gives a supervising agent a bounded
+        // way out of a long-running tool.
+        let tools = Tools::new().with(CancelTool);
+        let mut task = tools.spawn(ToolCall {
+            name: "cancel_me".to_string(),
+            args: json("{}"),
+        });
+
+        assert!(matches!(
+            task.recv().await.unwrap(),
+            ToolEvent::Started { .. }
+        ));
+        task.cancel();
+        let result = task.join().await;
+        assert!(result.is_error);
+        assert!(result.content.contains("cancelled"));
+    }
+
+    fn header_value<'a>(request: &'a wiremock::Request, name: &str) -> &'a str {
+        request.headers[name].to_str().unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "sends a real ntfy notification; set YATIMA_NTFY_TOPIC to run"]
+    async fn e2e_send_notification_to_phone() {
+        // upholds: CAP-2 — a real publish still goes through the same
+        // pre-shared NtfyTopic capability.
+        let topic = std::env::var("YATIMA_NTFY_TOPIC")
+            .expect("set YATIMA_NTFY_TOPIC to a topic subscribed on your phone");
+        let server =
+            std::env::var("YATIMA_NTFY_SERVER").unwrap_or_else(|_| "https://ntfy.sh".to_string());
+        let message = std::env::var("YATIMA_NTFY_MESSAGE").unwrap_or_else(|_| {
+            format!(
+                "Yatima live notification test from {}",
+                std::env::var("USER").unwrap_or_else(|_| "your workspace".to_string())
+            )
+        });
+
+        let cap = NtfyTopic::with_server(&server, topic).unwrap();
+        let tools = Tools::new().with(SendNotification::new(cap).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "send_notification".to_string(),
+                args: serde_json::json!({
+                    "message": message,
+                    "title": "yatima",
+                    "priority": "default",
+                    "tags": ["bell"]
+                }),
+            })
+            .await;
+
+        assert!(!result.is_error, "{}", result.content);
     }
 }

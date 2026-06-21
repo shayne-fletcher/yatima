@@ -1,35 +1,37 @@
-//! Embed a local model to turn public SEC facts into a cited research note.
+//! Embed a local model to turn public SEC facts into a cited research note —
+//! and compare models on the same evidence.
 //!
 //! Rust fetches and normalizes real public evidence, an in-process chat model
 //! writes a thesis constrained to that evidence, and Rust audits the result for
 //! unsupported citations and claims.
 //!
 //! ```bash
-//! SEC_USER_AGENT="your-name your-email@example.com" \
-//!   cargo run -p yatima-lib --release --example investment_thesis --features metal -- AAPL
-//! ```
-//!
-//! Pass an explicit model directory as the second argument and chat format as
-//! the third (`qwen`, `gemma`, `mistral`, `glm`, or `plain`) if you do not want the
-//! default Qwen 32B GGUF path:
-//!
-//! ```bash
+//! # default model (local Qwen 32B GGUF), ticker via --ticker
 //! SEC_USER_AGENT="your-name your-email@example.com" \
 //!   cargo run -p yatima-lib --release --example investment_thesis --features metal -- \
-//!     MSFT ~/.cache/yatima/models/google/gemma-2-2b-it gemma
+//!     --ticker AAPL
+//!
+//! # a built-in profile (format inferred from the model)
+//! SEC_USER_AGENT="…" cargo run … --example investment_thesis --features metal -- \
+//!   --ticker MSFT --profile gemma2
+//!
+//! # compare several models on one ticker (loaded one at a time)
+//! SEC_USER_AGENT="…" cargo run … --example investment_thesis --features metal -- \
+//!   --ticker META --compare qwen32b,glm4-32b
 //! ```
 
 use anyhow::{anyhow, bail, Context, Result};
+use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::Parser;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use yatima_lib::{
-    device, ChatMlTemplate, ChatSession, Engine, GemmaTemplate, GenOpts, GlmTemplate,
-    MistralTemplate, PlainTemplate, PromptTemplate, Sampling,
+    device, resolve_format, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile, Sampling,
 };
 
 const COMPANY_TICKERS_URL: &str = "https://www.sec.gov/files/company_tickers.json";
@@ -46,38 +48,76 @@ copy value_text exactly. Do not describe a single-period metric as growth unless
 the supplied evidence includes a prior comparison period. If the evidence is \
 insufficient, say so. Separate thesis, evidence, risks, and testable signals.";
 
+/// Turn SEC facts into a cited research note; optionally compare models.
+#[derive(Debug, Parser)]
+#[command(about, long_about = None)]
+struct Args {
+    /// Ticker symbol (e.g. AAPL).
+    #[arg(long, default_value = "AAPL")]
+    ticker: String,
+    /// Built-in profile name (one of `ModelProfile::BUILTIN_NAMES`).
+    #[arg(long)]
+    profile: Option<String>,
+    /// Explicit model directory (overrides --profile's source).
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Repository id, resolved (and fetched on a miss) under the models root.
+    #[arg(long)]
+    repo: Option<String>,
+    /// With --repo, the single GGUF quant to fetch.
+    #[arg(long)]
+    gguf: Option<String>,
+    /// Chat format; omit to infer from the model's architecture.
+    #[arg(long, value_parser = chat_format_parser())]
+    format: Option<ChatFormat>,
+    /// Prompt prefill chunk; omit for the model/backend default.
+    #[arg(long)]
+    prefill_chunk: Option<usize>,
+    #[arg(long, default_value_t = 768)]
+    max_tokens: usize,
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f64,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Compare these built-in profiles on the same ticker, one at a time.
+    #[arg(long, value_delimiter = ',')]
+    compare: Vec<String>,
+    /// Don't auto-fetch a missing model; error instead.
+    #[arg(long)]
+    offline: bool,
+    /// Force CPU instead of the GPU.
+    #[arg(long)]
+    cpu: bool,
+}
+
+/// A clap value parser for [`ChatFormat`] (names → enum) — clap can't derive
+/// `ValueEnum` on the foreign lib type.
+fn chat_format_parser() -> impl TypedValueParser<Value = ChatFormat> {
+    PossibleValuesParser::new(ChatFormat::NAMES)
+        .map(|s| s.parse::<ChatFormat>().expect("NAMES are valid formats"))
+}
+
+/// One model run: a label for the header plus the resolved [`ModelProfile`].
+#[derive(Debug, Clone, PartialEq)]
+struct RunSpec {
+    label: String,
+    profile: ModelProfile,
+}
+
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let ticker = args
-        .next()
-        .unwrap_or_else(|| "AAPL".to_string())
-        .to_uppercase();
-    let model_dir = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_qwen_32b_dir);
-    let format = args
-        .next()
-        .as_deref()
-        .map(ChatFormat::parse)
-        .transpose()?
-        .unwrap_or(ChatFormat::Qwen);
-    let prefill_chunk = args
-        .next()
-        .map(|s| s.parse::<usize>().context("parsing prefill chunk"))
-        .transpose()?;
+    let args = Args::parse();
+    let runs = plan_runs(&args)?;
 
     let user_agent = std::env::var("SEC_USER_AGENT").context(
         "set SEC_USER_AGENT to a descriptive value with contact info, \
          e.g. 'Your Name your.email@example.com'",
     )?;
-
     let client = Client::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let report = fetch_metrics_report(&client, &ticker)?;
+    let report = fetch_metrics_report(&client, &args.ticker.to_uppercase())?;
     let evidence_json = serde_json::to_string_pretty(&report)?;
     eprintln!(
         "fetched {} SEC metrics for {} / CIK {}",
@@ -85,17 +125,159 @@ fn main() -> Result<()> {
         report.ticker,
         report.cik
     );
+    let prompt = build_prompt(&evidence_json);
 
-    let mut engine = Engine::load(&model_dir, device(false)?)
-        .with_context(|| format!("loading model {}", model_dir.display()))?;
+    // Sequential: one Engine in memory at a time (COMPARE-1).
+    for (i, spec) in runs.iter().enumerate() {
+        if runs.len() > 1 {
+            eprintln!(
+                "\n===== [{}/{}] profile {} =====",
+                i + 1,
+                runs.len(),
+                spec.label
+            );
+        }
+        run_one(spec, &args, &prompt, &report)?;
+    }
+    Ok(())
+}
+
+/// Plan the runs from the parsed args **without loading anything** (COMPARE-1):
+/// `--compare a,b` is one [`RunSpec`] per named built-in; otherwise a single run
+/// from `--profile` (if any) overlaid with the explicit source/format flags,
+/// defaulting to the local Qwen-32B GGUF when no source is given.
+fn plan_runs(args: &Args) -> Result<Vec<RunSpec>> {
+    let builtin = |name: &str| {
+        ModelProfile::builtin(name).ok_or_else(|| {
+            anyhow!(
+                "unknown profile {name:?}; built-ins: {:?}",
+                ModelProfile::BUILTIN_NAMES
+            )
+        })
+    };
+
+    if !args.compare.is_empty() {
+        return args
+            .compare
+            .iter()
+            .map(|name| {
+                Ok(RunSpec {
+                    label: name.clone(),
+                    profile: builtin(name)?,
+                })
+            })
+            .collect();
+    }
+
+    let mut profile = match &args.profile {
+        Some(name) => builtin(name)?,
+        None => ModelProfile::default(),
+    };
+    if args.model.is_some() {
+        profile.dir = args.model.clone();
+        profile.repo = None;
+    }
+    if args.repo.is_some() {
+        profile.repo = args.repo.clone();
+        profile.dir = None;
+    }
+    if args.gguf.is_some() {
+        profile.gguf = args.gguf.clone();
+    }
+    if args.format.is_some() {
+        profile.format = args.format;
+    }
+    if args.prefill_chunk.is_some() {
+        profile.prefill_chunk = args.prefill_chunk;
+    }
+    if profile.repo.is_none() && profile.dir.is_none() {
+        profile.dir = Some(default_qwen_32b_dir());
+    }
+    let label = args.profile.clone().unwrap_or_else(|| "custom".to_string());
+    Ok(vec![RunSpec { label, profile }])
+}
+
+fn run_one(spec: &RunSpec, args: &Args, prompt: &str, report: &MetricsReport) -> Result<()> {
+    let dir = spec.profile.to_source(args.offline)?.resolve()?;
+    let mut engine = Engine::load(&dir, device(args.cpu)?)
+        .with_context(|| format!("loading {}", dir.display()))?;
+
+    // Infer the format from the model unless the profile/flags pinned one.
+    let (format, mismatch) = resolve_format(engine.arch(), spec.profile.format);
+    if let Some(m) = mismatch {
+        eprintln!("warning: {m}");
+    }
+
+    let base = GenOpts {
+        max_tokens: args.max_tokens,
+        sampling: Sampling::from_temperature(args.temperature, args.seed),
+        prefill_chunk: args.prefill_chunk,
+        ..Default::default()
+    };
+    let opts = spec.profile.apply_gen_overrides(base);
+    let prompt_tokens = engine.token_count(prompt).unwrap_or(0);
+    print_run_metadata(spec, &dir, &engine, format, &opts, prompt_tokens);
+
+    let mut chat = ChatSession::new(&mut engine, format.template())
+        .with_system(SYSTEM)
+        .with_opts(opts);
+    let mut stdout = std::io::stdout();
+    let answer = chat
+        .turn_streaming(prompt, &mut |piece| {
+            let _ = stdout.write_all(piece.as_bytes());
+            let _ = stdout.flush();
+        })?
+        .to_string();
+    println!();
+    if let Some(stop) = chat.last_stop() {
+        eprintln!("[stop: {stop:?}]");
+    }
+
+    let check = check_thesis(&answer, report);
+    if !check.is_clean() {
+        eprintln!("\nvalidation warnings:");
+        for warning in &check.warnings {
+            eprintln!("- {warning}");
+        }
+    }
+    Ok(())
+}
+
+/// Print a reproducible run header (META-1): every field needed to repeat the
+/// run, including the *effective* prefill chunk after profile/engine layering.
+fn print_run_metadata(
+    spec: &RunSpec,
+    dir: &Path,
+    engine: &Engine,
+    format: ChatFormat,
+    opts: &GenOpts,
+    prompt_tokens: usize,
+) {
+    let prefill = match opts.prefill_chunk.or(engine.default_prefill_chunk()) {
+        Some(0) | None => "full-prompt".to_string(),
+        Some(n) => format!("{n} tokens"),
+    };
+    let sampling = match opts.sampling {
+        Sampling::Greedy => "greedy".to_string(),
+        Sampling::Sample { temperature, seed } => format!("sample t={temperature} seed={seed}"),
+    };
     eprintln!(
-        "loaded {} [{}]; format {}",
-        model_dir.display(),
+        "run: profile={} source={} arch={:?} format={} backend={} prefill={} max_tokens={} \
+         sampling={} prompt_tokens={}",
+        spec.label,
+        dir.display(),
+        engine.arch(),
+        format,
         engine.backend(),
-        format.name()
+        prefill,
+        opts.max_tokens,
+        sampling,
+        prompt_tokens,
     );
+}
 
-    let prompt = format!(
+fn build_prompt(evidence_json: &str) -> String {
+    format!(
         "\
 Write a concise investment research note from this SEC evidence.
 
@@ -109,75 +291,7 @@ SEC evidence JSON:
 ```json
 {evidence_json}
 ```"
-    );
-
-    let opts = GenOpts {
-        max_tokens: 768,
-        sampling: Sampling::Greedy,
-        prefill_chunk,
-        ..Default::default()
-    };
-    let mut chat = ChatSession::new(&mut engine, format.template())
-        .with_system(SYSTEM)
-        .with_opts(opts);
-    let mut stdout = std::io::stdout();
-    let answer = chat
-        .turn_streaming(&prompt, &mut |piece| {
-            let _ = stdout.write_all(piece.as_bytes());
-            let _ = stdout.flush();
-        })?
-        .to_string();
-    println!();
-    let check = check_thesis(&answer, &report);
-    if !check.is_clean() {
-        eprintln!("\nvalidation warnings:");
-        for warning in &check.warnings {
-            eprintln!("- {warning}");
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatFormat {
-    Qwen,
-    Gemma,
-    Mistral,
-    Glm,
-    Plain,
-}
-
-impl ChatFormat {
-    fn parse(s: &str) -> Result<ChatFormat> {
-        match s {
-            "qwen" => Ok(ChatFormat::Qwen),
-            "gemma" => Ok(ChatFormat::Gemma),
-            "mistral" => Ok(ChatFormat::Mistral),
-            "glm" => Ok(ChatFormat::Glm),
-            "plain" => Ok(ChatFormat::Plain),
-            other => bail!("unknown chat format {other:?}; expected qwen|gemma|mistral|glm|plain"),
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            ChatFormat::Qwen => "qwen",
-            ChatFormat::Gemma => "gemma",
-            ChatFormat::Mistral => "mistral",
-            ChatFormat::Glm => "glm",
-            ChatFormat::Plain => "plain",
-        }
-    }
-
-    fn template(self) -> Box<dyn PromptTemplate> {
-        match self {
-            ChatFormat::Qwen => Box::new(ChatMlTemplate),
-            ChatFormat::Gemma => Box::new(GemmaTemplate),
-            ChatFormat::Mistral => Box::new(MistralTemplate),
-            ChatFormat::Glm => Box::new(GlmTemplate),
-            ChatFormat::Plain => Box::new(PlainTemplate),
-        }
-    }
+    )
 }
 
 fn default_qwen_32b_dir() -> PathBuf {

@@ -26,7 +26,7 @@
 use crate::agent::{Role, Turn};
 use crate::completer::Completer;
 use crate::template::PromptTemplate;
-use crate::GenOpts;
+use crate::{GenOpts, StopReason};
 use anyhow::Result;
 
 /// A stateful, tool-free conversation over a [`Completer`] and a
@@ -39,6 +39,8 @@ pub struct ChatSession<'a, C: Completer, T: PromptTemplate> {
     turns: Vec<Turn>,
     /// How many leading turns are the seeded system prompt (kept on `reset`).
     system_len: usize,
+    /// Why the most recent turn stopped (for run metadata); `None` before any.
+    last_stop: Option<StopReason>,
 }
 
 impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
@@ -51,6 +53,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             opts: GenOpts::default(),
             turns: Vec::new(),
             system_len: 0,
+            last_stop: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         });
         let prompt = self.template.render(&self.turns);
         let completion = self.completer.complete(&prompt, &self.opts, &[])?;
+        self.last_stop = Some(completion.stop);
         self.turns.push(Turn {
             role: Role::Assistant,
             content: completion.text.trim().to_string(),
@@ -101,11 +105,18 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         let completion = self
             .completer
             .complete_streaming(&prompt, &self.opts, &[], on_token)?;
+        self.last_stop = Some(completion.stop);
         self.turns.push(Turn {
             role: Role::Assistant,
             content: completion.text.trim().to_string(),
         });
         Ok(&self.turns.last().expect("just pushed").content)
+    }
+
+    /// Why the most recent turn stopped (EOS / max tokens / cancelled), or
+    /// `None` before the first turn — for run metadata (META-1).
+    pub fn last_stop(&self) -> Option<StopReason> {
+        self.last_stop
     }
 
     /// Clear the conversation back to the seeded system prompt.

@@ -4,13 +4,15 @@
 //! agent folds *turns*: the model emits a tool call, a capability-scoped tool
 //! runs, its result is fed back, and the loop repeats until the model answers or
 //! `max_steps` is reached. [`Agent::run`] collects the final answer;
-//! [`Agent::run_with`] is the fold a future actor/TUI streams [`AgentEvent`]s
-//! into. The loop is sync (turns are sequential and compute-bound) and provable
-//! against a scripted [`Completer`] with no GPU.
+//! [`Agent::run_with_async`] is the fold a future actor/TUI streams
+//! [`AgentEvent`]s into. The model turns are sequential, but tool calls are
+//! async tasks: callers can observe starts/progress/results and cancellation
+//! boundaries while the agent still waits for the result before the next model
+//! turn.
 
 use crate::completer::Completer;
 use crate::template::PromptTemplate;
-use crate::tool::{ToolCall, ToolCallCodec, ToolResult, Tools};
+use crate::tool::{ToolCall, ToolCallCodec, ToolEvent, ToolResult, Tools};
 use crate::GenOpts;
 use anyhow::Result;
 use std::ops::ControlFlow;
@@ -36,6 +38,8 @@ pub struct Turn {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     ToolCall(ToolCall),
+    ToolStarted(ToolCall),
+    ToolProgress(String),
     ToolResult(ToolResult),
     Final(String),
 }
@@ -108,10 +112,38 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         Ok(run)
     }
 
+    /// Async variant of [`Agent::run`]. This is the primitive path for agents
+    /// with network/process tools; [`Agent::run`] is a compatibility wrapper.
+    pub async fn run_async(&mut self, user: &str) -> Result<Run> {
+        let ((), run) = self
+            .run_with_async(user, (), |(), _event| Ok(ControlFlow::Continue(())))
+            .await?;
+        Ok(run)
+    }
+
     /// Run while folding each [`AgentEvent`] into an accumulator. Returning
     /// `ControlFlow::Break` stops the run early ([`AgentStop::Stopped`]). This is
     /// the primitive; [`Agent::run`] is the `acc = ()` specialization.
     pub fn run_with<A>(
+        &mut self,
+        user: &str,
+        init: A,
+        mut step: impl FnMut(A, AgentEvent) -> Result<ControlFlow<A, A>>,
+    ) -> Result<(A, Run)> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(self.run_with_async(user, init, &mut step))
+            }),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(self.run_with_async(user, init, &mut step)),
+        }
+    }
+
+    /// Run while folding each [`AgentEvent`] into an accumulator. Returning
+    /// `ControlFlow::Break` stops the run early ([`AgentStop::Stopped`]).
+    pub async fn run_with_async<A>(
         &mut self,
         user: &str,
         init: A,
@@ -173,7 +205,51 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                     break;
                                 }
                             }
-                            self.tools.dispatch(&call)
+                            let mut task = self.tools.spawn(call);
+                            let result = loop {
+                                match task.recv().await {
+                                    Some(ToolEvent::Started { call, .. }) => {
+                                        match step(acc, AgentEvent::ToolStarted(call))? {
+                                            ControlFlow::Continue(a) => acc = a,
+                                            ControlFlow::Break(a) => {
+                                                task.cancel();
+                                                let _ = task.join().await;
+                                                return Ok((
+                                                    a,
+                                                    Run {
+                                                        answer,
+                                                        transcript,
+                                                        steps,
+                                                        stop: AgentStop::Stopped,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Some(ToolEvent::Progress { message, .. }) => {
+                                        match step(acc, AgentEvent::ToolProgress(message))? {
+                                            ControlFlow::Continue(a) => acc = a,
+                                            ControlFlow::Break(a) => {
+                                                task.cancel();
+                                                let _ = task.join().await;
+                                                return Ok((
+                                                    a,
+                                                    Run {
+                                                        answer,
+                                                        transcript,
+                                                        steps,
+                                                        stop: AgentStop::Stopped,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Some(ToolEvent::Finished { result, .. }) => break result,
+                                    Some(ToolEvent::Cancelled { .. }) => {}
+                                    None => break task.join().await,
+                                }
+                            };
+                            result
                         }
                         Err(e) => ToolResult {
                             name: String::new(),
@@ -401,10 +477,11 @@ mod tests {
         assert_eq!(run_plain.stop, run_folded.stop);
         assert_eq!(run_plain.transcript.len(), run_folded.transcript.len());
 
-        // and run_with saw ToolCall, ToolResult, Final in order
+        // and run_with saw ToolCall, ToolStarted, ToolResult, Final in order
         assert!(matches!(events[0], AgentEvent::ToolCall(_)));
-        assert!(matches!(events[1], AgentEvent::ToolResult(_)));
-        assert!(matches!(events[2], AgentEvent::Final(_)));
+        assert!(matches!(events[1], AgentEvent::ToolStarted(_)));
+        assert!(matches!(events[2], AgentEvent::ToolResult(_)));
+        assert!(matches!(events[3], AgentEvent::Final(_)));
     }
 
     #[test]
@@ -429,7 +506,10 @@ mod tests {
         assert_eq!(run.stop, AgentStop::Stopped);
         assert_eq!(run.steps, 0, "break happens before the round is counted");
         assert!(run.answer.is_empty());
-        assert_eq!(observed, 2, "saw ToolCall then ToolResult, then stopped");
+        assert_eq!(
+            observed, 3,
+            "saw ToolCall, ToolStarted, then ToolResult, then stopped"
+        );
     }
 
     #[test]
