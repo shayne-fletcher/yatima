@@ -210,18 +210,18 @@ plus **GGUF/quantized** Qwen2 and Llama. Note this covers *loading + `generate`*
 (raw completion) for all of them; the **agent** path still assumes the Qwen/ChatML
 tool format — per-model chat templates are a later slice.
 
-**GGUF / quantized.** A model dir with a single `*.gguf` (+ `tokenizer.json`, no
-`config.json`) takes the quantized path: `Engine::load_gguf` reads the file's
-metadata for the architecture (`general.architecture` → `quantized_qwen2` /
-`quantized_llama`) and EOS (`tokenizer.ggml.eos_token_id`, unioned with any
-`<|im_end|>`/`<|endoftext|>` in the vocab). The quantized model types fit the same
-self-cache `CausalLm` shape, and quantized matmul runs on Metal — so a **32B-Q4**
-(~20 GB) runs on a 48 GB Mac, which is the real lever for answer quality on long
-prose. Acquire with `--model <dir>` (drop in the `.gguf` + a `tokenizer.json`;
-Qwen2.5 shares one tokenizer across sizes) or `--repo <id> --gguf <file>` to fetch
-a single quant file (GGUF repos often omit `tokenizer.json` — then prefer
-`--model`). Deferred: tokenizer auto-sourcing, sharded multi-file GGUF, more
-quantized arches.
+**GGUF / quantized.** A model dir with a single `*.gguf` takes the quantized
+path: `Engine::load_gguf` reads the file's metadata for the architecture
+(`general.architecture` → `quantized_qwen2` / `quantized_llama`) and EOS
+(`tokenizer.ggml.eos_token_id`, unioned with any `<|im_end|>`/`<|endoftext|>` in
+the vocab). The quantized model types fit the same self-cache `CausalLm` shape,
+and quantized matmul runs on Metal — so a **32B-Q4** (~20 GB) runs on a 48 GB Mac,
+the real lever for answer quality on long prose. **GGUF is self-contained:** the
+tokenizer is built from the file's embedded `tokenizer.ggml.*` metadata
+(candle-core's `TokenizerFromGguf`) — no sibling `tokenizer.json` needed (one is
+used only if present). So `--repo <id> --gguf <file>` fetches a single file and
+just works; `--model <dir>` also works for a local `.gguf`. Deferred: sharded
+multi-file GGUF, more quantized arches.
 
 ## Auto-fetch (the `fetch` feature)
 
@@ -360,9 +360,10 @@ and deliberately shelved — the note records why so we don't repeat them.
   *as* an MCP server (out-of-process; rides the same seams at the edge).
 
 ### Models / engine
-- **Engine swappability** — cross-arch dispatch + GGUF/quantized are **done**.
-  Remaining: tokenizer auto-sourcing + sharded multi-file GGUF + more quantized
-  arches; other backends (mistral.rs, llama.cpp) via more `Completer` impls.
+- **Engine swappability** — cross-arch dispatch + GGUF/quantized + self-contained
+  GGUF tokenizers are **done**. Remaining: sharded multi-file GGUF + more
+  quantized arches; other backends (mistral.rs, llama.cpp) via more `Completer`
+  impls.
 - **More chat templates** — Llama-3, Zephyr/TinyLlama (same shape as Gemma/Mistral).
 - **Sampling quality** — `top_p`/`top_k` nucleus sampling (only temperature
   today) for better free-text on smaller models; download integrity/resume.

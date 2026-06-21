@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use candle_core::quantized::gguf_file;
+use candle_core::quantized::tokenizer::TokenizerFromGguf;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
@@ -349,23 +350,24 @@ impl Engine {
     }
 
     /// Load a quantized model from a GGUF file. A GGUF carries its own metadata
-    /// (architecture, EOS) in place of `config.json`; the tokenizer still comes
-    /// from a sibling `tokenizer.json`. The quantized weights run on the same
-    /// device (Metal-quantized is supported).
+    /// (architecture, EOS) *and* tokenizer, so it is self-contained: the
+    /// tokenizer is built from the GGUF metadata unless a sibling
+    /// `tokenizer.json` is present (which then wins). Quantized weights run on
+    /// the device (Metal-quantized is supported).
     fn load_gguf(model_dir: &Path, gguf_path: &Path, device: Device) -> Result<Self> {
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        if !tokenizer_path.exists() {
-            bail!(
-                "GGUF model at {} needs a sibling tokenizer.json",
-                model_dir.display()
-            );
-        }
-        let tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("loading tokenizer: {e}"))?;
-
         let mut file = std::fs::File::open(gguf_path)?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow!("reading GGUF {}: {e}", gguf_path.display()))?;
+
+        // A sibling tokenizer.json wins; otherwise build the tokenizer from the
+        // GGUF's embedded `tokenizer.ggml.*` metadata (candle-core's builder).
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let tokenizer = if tokenizer_path.exists() {
+            Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("loading tokenizer: {e}"))?
+        } else {
+            Tokenizer::from_gguf(&content)
+                .map_err(|e| anyhow!("building tokenizer from GGUF metadata: {e}"))?
+        };
 
         let arch = content
             .metadata
@@ -593,18 +595,17 @@ pub(crate) struct Presence {
 
 /// Is `dir` a loadable model, and what's missing?
 ///
-/// Two layouts: a **GGUF** dir is complete iff it has a `*.gguf` and a
-/// `tokenizer.json` (no `config.json`); otherwise the **safetensors** layout
-/// requires `config.json`, `tokenizer.json`, and every shard from
-/// [`model_shards`] — so a partial shard set is never a false cache hit.
-/// `missing` names the absent ones.
+/// Two layouts: a **GGUF** dir is complete on the strength of its `*.gguf` alone
+/// — the tokenizer is built from the file's metadata, no `tokenizer.json` (or
+/// `config.json`) required; otherwise the **safetensors** layout requires
+/// `config.json`, `tokenizer.json`, and every shard from [`model_shards`] — so a
+/// partial shard set is never a false cache hit. `missing` names the absent ones.
 pub(crate) fn presence(dir: &Path) -> Presence {
     if gguf_in(dir).is_some() {
-        let tok = dir.join("tokenizer.json");
-        let missing: Vec<PathBuf> = [tok].into_iter().filter(|p| !p.exists()).collect();
+        // The GGUF is self-contained (weights + tokenizer + metadata).
         return Presence {
-            complete: missing.is_empty(),
-            missing,
+            complete: true,
+            missing: Vec::new(),
         };
     }
 
@@ -842,24 +843,15 @@ mod tests {
     }
 
     #[test]
-    fn gguf_dir_is_detected_and_present() {
-        // A GGUF dir (one *.gguf + tokenizer.json, no config.json) is detected as
-        // the quantized path and counts as present.
+    fn gguf_dir_is_self_contained() {
+        // A GGUF dir is complete on the strength of its *.gguf alone — the
+        // tokenizer is built from the file's metadata, no tokenizer.json or
+        // config.json required.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("model.gguf"), "x").unwrap();
-        std::fs::write(p.join("tokenizer.json"), "{}").unwrap();
         assert_eq!(gguf_in(p), Some(p.join("model.gguf")));
-        assert!(is_model_present(p)); // no config.json required for GGUF
-    }
-
-    #[test]
-    fn gguf_dir_without_tokenizer_is_incomplete() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
-        std::fs::write(p.join("model.gguf"), "x").unwrap();
-        assert!(gguf_in(p).is_some());
-        assert!(!is_model_present(p)); // GGUF still needs a tokenizer.json
+        assert!(is_model_present(p)); // no tokenizer.json / config.json needed
     }
 
     #[test]
