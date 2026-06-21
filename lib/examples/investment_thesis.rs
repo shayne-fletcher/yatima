@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Pass an explicit model directory as the second argument and chat format as
-//! the third (`qwen`, `gemma`, `mistral`, or `plain`) if you do not want the
+//! the third (`qwen`, `gemma`, `mistral`, `glm`, or `plain`) if you do not want the
 //! default Qwen 32B GGUF path:
 //!
 //! ```bash
@@ -24,11 +24,12 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 use yatima_lib::{
-    device, ChatMlTemplate, ChatSession, Engine, GemmaTemplate, GenOpts, MistralTemplate,
-    PlainTemplate, PromptTemplate, Sampling,
+    device, ChatMlTemplate, ChatSession, Engine, GemmaTemplate, GenOpts, GlmTemplate,
+    MistralTemplate, PlainTemplate, PromptTemplate, Sampling,
 };
 
 const COMPANY_TICKERS_URL: &str = "https://www.sec.gov/files/company_tickers.json";
@@ -61,6 +62,10 @@ fn main() -> Result<()> {
         .map(ChatFormat::parse)
         .transpose()?
         .unwrap_or(ChatFormat::Qwen);
+    let prefill_chunk = args
+        .next()
+        .map(|s| s.parse::<usize>().context("parsing prefill chunk"))
+        .transpose()?;
 
     let user_agent = std::env::var("SEC_USER_AGENT").context(
         "set SEC_USER_AGENT to a descriptive value with contact info, \
@@ -109,12 +114,20 @@ SEC evidence JSON:
     let opts = GenOpts {
         max_tokens: 768,
         sampling: Sampling::Greedy,
+        prefill_chunk,
         ..Default::default()
     };
     let mut chat = ChatSession::new(&mut engine, format.template())
         .with_system(SYSTEM)
         .with_opts(opts);
-    let answer = chat.turn(&prompt)?.to_string();
+    let mut stdout = std::io::stdout();
+    let answer = chat
+        .turn_streaming(&prompt, &mut |piece| {
+            let _ = stdout.write_all(piece.as_bytes());
+            let _ = stdout.flush();
+        })?
+        .to_string();
+    println!();
     let check = check_thesis(&answer, &report);
     if !check.is_clean() {
         eprintln!("\nvalidation warnings:");
@@ -122,7 +135,6 @@ SEC evidence JSON:
             eprintln!("- {warning}");
         }
     }
-    println!("{answer}");
     Ok(())
 }
 
@@ -131,6 +143,7 @@ enum ChatFormat {
     Qwen,
     Gemma,
     Mistral,
+    Glm,
     Plain,
 }
 
@@ -140,8 +153,9 @@ impl ChatFormat {
             "qwen" => Ok(ChatFormat::Qwen),
             "gemma" => Ok(ChatFormat::Gemma),
             "mistral" => Ok(ChatFormat::Mistral),
+            "glm" => Ok(ChatFormat::Glm),
             "plain" => Ok(ChatFormat::Plain),
-            other => bail!("unknown chat format {other:?}; expected qwen|gemma|mistral|plain"),
+            other => bail!("unknown chat format {other:?}; expected qwen|gemma|mistral|glm|plain"),
         }
     }
 
@@ -150,6 +164,7 @@ impl ChatFormat {
             ChatFormat::Qwen => "qwen",
             ChatFormat::Gemma => "gemma",
             ChatFormat::Mistral => "mistral",
+            ChatFormat::Glm => "glm",
             ChatFormat::Plain => "plain",
         }
     }
@@ -159,6 +174,7 @@ impl ChatFormat {
             ChatFormat::Qwen => Box::new(ChatMlTemplate),
             ChatFormat::Gemma => Box::new(GemmaTemplate),
             ChatFormat::Mistral => Box::new(MistralTemplate),
+            ChatFormat::Glm => Box::new(GlmTemplate),
             ChatFormat::Plain => Box::new(PlainTemplate),
         }
     }
@@ -439,8 +455,7 @@ fn cited_xbrl_tags(answer: &str) -> Vec<String> {
         let Some((_, after)) = line.split_once("XBRL tag") else {
             continue;
         };
-        let after = after
-            .trim_start_matches(|c: char| c == ':' || c == 's' || c == ' ' || c == '(' || c == '[');
+        let after = after.trim_start_matches([':', 's', ' ', '(', '[']);
         for token in after.split(|c: char| {
             c.is_whitespace()
                 || matches!(c, ',' | ';' | ')' | '(' | '.' | ']' | '[' | ':' | '`' | '*')

@@ -84,6 +84,31 @@ The portable contract (what the later Haskell study reasons about):
 EOS ids are read from `config.json` / `generation_config.json` (a *set*, e.g.
 DeepSeek's `<｜end▁of▁sentence｜>` = 151643) — never hard-coded strings.
 
+### Prefill scheduling
+
+The first generation step can either feed the whole prompt to the model at once
+or split it into bounded prefill chunks. The public knob is
+`GenOpts::prefill_chunk`:
+
+- `None` — use the model/backend default.
+- `Some(0)` — force one full-prompt prefill.
+- `Some(n)` — feed at most `n` prompt tokens per prefill forward pass.
+
+Chunking does not change the logical prompt or the generated-token loop: each
+chunk advances the same KV cache with the correct `start_pos`, and the final
+prefill logits are taken from the last prompt token. It is therefore a scheduling
+choice, not a prompt transformation.
+
+Why it exists: GLM-4-32B GGUF on Metal was observed to produce incoherent output
+on a long structured SEC research prompt when evaluated as one full prefill.
+The same model, prompt, tokenizer, and sampler produced coherent output when the
+prefill was bounded; forcing `prefill_chunk = 0` reproduced the bad output.
+Source comparison with llama.cpp suggests this is the same broad concern that
+llama.cpp avoids through bounded batch/ubatch evaluation rather than requiring a
+single giant prompt prefill. Yatima therefore defaults GLM-4 GGUF on Metal to a
+64-token prefill chunk, while preserving the explicit override for benchmarking,
+diagnosis, and future Candle-side fixes.
+
 **North star — a hylomorphism.** Generation *unfolds* a fragment stream (a
 coalgebra deciding termination on EOS/max/break) and *folds* it with the caller's
 `step` algebra: `generate = ana ; cata = hylo`. The hot loop stays imperative;

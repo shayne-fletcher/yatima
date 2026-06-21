@@ -59,6 +59,10 @@ struct GenerateArgs {
     temperature: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Prompt prefill chunk size in tokens. Omit for model/backend default; use
+    /// 0 to force one full-prompt prefill.
+    #[arg(long)]
+    prefill_chunk: Option<usize>,
     /// Force CPU instead of the GPU.
     #[arg(long)]
     cpu: bool,
@@ -100,6 +104,10 @@ struct AgentArgs {
     temperature: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Prompt prefill chunk size in tokens. Omit for model/backend default; use
+    /// 0 to force one full-prompt prefill.
+    #[arg(long)]
+    prefill_chunk: Option<usize>,
     /// Force CPU instead of the GPU.
     #[arg(long)]
     cpu: bool,
@@ -174,6 +182,10 @@ struct ChatArgs {
     temperature: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Prompt prefill chunk size in tokens. Omit for model/backend default; use
+    /// 0 to force one full-prompt prefill.
+    #[arg(long)]
+    prefill_chunk: Option<usize>,
     /// Force CPU instead of the GPU.
     #[arg(long)]
     cpu: bool,
@@ -227,6 +239,7 @@ fn chat(args: ChatArgs) -> Result<()> {
     let opts = GenOpts {
         max_tokens: args.max_tokens,
         sampling: sampling_of(args.temperature, args.seed),
+        prefill_chunk: args.prefill_chunk,
         ..Default::default()
     };
 
@@ -320,6 +333,7 @@ fn agent(args: AgentArgs) -> Result<()> {
     let opts = GenOpts {
         max_tokens: args.max_tokens,
         sampling: sampling_of(args.temperature, args.seed),
+        prefill_chunk: args.prefill_chunk,
         // Keep the default repetition penalty: prose answers degenerate
         // (repeated words) without it. The penalty can mangle a tool call's JSON
         // punctuation, but the tolerant tool-call parser recovers those.
@@ -422,6 +436,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
     let opts = GenOpts {
         max_tokens: args.max_tokens,
         sampling: sampling_of(args.temperature, args.seed),
+        prefill_chunk: args.prefill_chunk,
         ..Default::default()
     };
     let mut stdout = std::io::stdout();

@@ -121,6 +121,23 @@ cargo run -p yatima-cli --release --bin yatima --features metal -- agent \
 A missing model is fetched on demand (the `fetch` feature) via `possum`;
 `--offline` never touches the network.
 
+### Prefill chunking
+
+`yatima generate`, `yatima chat`, and `yatima agent` accept
+`--prefill-chunk <n>` to bound how many prompt tokens are evaluated in one
+prefill step. Omit it for the model/backend default; use `--prefill-chunk 0` to
+force one full-prompt prefill.
+
+This is mostly invisible, but it matters for some large quantized Metal models.
+GLM-4 GGUF on Metal defaults to a 64-token prefill chunk because full-prompt
+prefill on the 32B GGUF path can destabilize generation on long structured
+prompts, while bounded prefill preserves the same KV-cache semantics and keeps
+output coherent. The override is there for benchmarking and diagnosis.
+
+For a cheap reproducer that compares next-token logits without running a long
+generation, see [`notes/glm4-prefill-reproducer.md`](notes/glm4-prefill-reproducer.md)
+and `cargo run -p yatima-lib --release --example prefill_compare --features metal`.
+
 ## Embedding
 
 The CLI is just one consumer — `yatima-lib` is meant to be called *as a library*,
@@ -163,6 +180,8 @@ expected to cite the SEC accession, filing period/date, and XBRL tag it came
 from. A small example-local validator warns when the model cites unknown tags or
 accessions, drifts from the normalized `value_text`, omits citation fields on a
 quantity-bearing line, or uses trend language when only one period was supplied.
+For GLM-4 GGUF, pass `glm` as the third argument; an optional fourth argument
+sets the prefill chunk (`0` means full-prompt prefill).
 
 ## Notes
 

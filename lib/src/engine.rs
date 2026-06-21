@@ -32,6 +32,7 @@ use crate::token_output_stream::TokenOutputStream;
 /// calls — so it is a per-call [`GenOpts`] knob the agent turns off.
 const DEFAULT_REPEAT_PENALTY: f32 = 1.1;
 const REPEAT_LAST_N: usize = 64;
+const GLM4_METAL_PREFILL_CHUNK: usize = 64;
 
 /// How the next token is chosen. Replaces the old `temperature <= 0` sentinel
 /// with an explicit choice — greedy carries no temperature, and seed is
@@ -67,6 +68,13 @@ pub struct GenOpts {
     /// Repetition penalty over the last `REPEAT_LAST_N` tokens. `1.0` disables
     /// it (the right choice for structured/tool-call output); ~`1.1` suits prose.
     pub repeat_penalty: f32,
+    /// Prompt prefill chunk size in tokens.
+    ///
+    /// `None` uses the model/backend default. `Some(0)` explicitly feeds the
+    /// whole prompt in one prefill. `Some(n)` feeds chunks of at most `n`
+    /// tokens. This is useful for diagnosing or avoiding backend-specific
+    /// prefill kernels while preserving the same public generation loop.
+    pub prefill_chunk: Option<usize>,
 }
 
 impl Default for GenOpts {
@@ -75,6 +83,7 @@ impl Default for GenOpts {
             max_tokens: 256,
             sampling: Sampling::Greedy,
             repeat_penalty: DEFAULT_REPEAT_PENALTY,
+            prefill_chunk: None,
         }
     }
 }
@@ -95,6 +104,38 @@ pub enum StopReason {
 pub struct Generation {
     pub tokens: usize,
     pub stop: StopReason,
+}
+
+/// One decoded candidate from a diagnostic logit ranking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogit {
+    pub id: u32,
+    pub text: String,
+    pub logit: f32,
+}
+
+/// Diagnostic logits for the next token after prompt prefill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillLogits {
+    pub token_count: usize,
+    pub logits: Vec<f32>,
+}
+
+/// Progress for diagnostic prompt prefill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillProgress {
+    /// Zero-based chunk index.
+    pub chunk_index: usize,
+    /// Total chunks for this prefill schedule.
+    pub chunk_count: usize,
+    /// Inclusive token offset fed to the model for this chunk.
+    pub start_pos: usize,
+    /// Exclusive token offset fed to the model for this chunk.
+    pub end_pos: usize,
+    /// Total prompt tokens.
+    pub token_count: usize,
+    /// `false` just before the model call, `true` just after it returns.
+    pub finished: bool,
 }
 
 /// A causal language model behind one uniform interface, so the generation loop
@@ -181,6 +222,13 @@ fn last_token_logits(logits: &Tensor) -> Result<Tensor> {
     Ok(logits.flatten_all()?.to_dtype(DType::F32)?)
 }
 
+fn effective_prefill_chunk(configured: Option<usize>, default: Option<usize>, len: usize) -> usize {
+    match configured.or(default) {
+        Some(0) | None => len,
+        Some(n) => n,
+    }
+}
+
 /// The model architectures the runtime can load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arch {
@@ -258,6 +306,7 @@ pub struct Engine {
     device: Device,
     eos: HashSet<u32>,
     dtype: DType,
+    prefill_chunk: Option<usize>,
 }
 
 impl Engine {
@@ -367,6 +416,7 @@ impl Engine {
             device,
             eos,
             dtype,
+            prefill_chunk: None,
         })
     }
 
@@ -402,6 +452,16 @@ impl Engine {
         // GGUF weights carry their own quantized dtype; report q-on-device.
         let dtype = DType::F32;
 
+        let prefill_chunk = match arch.as_str() {
+            // llama.cpp evaluates prompts through bounded micro-batches
+            // (`n_ubatch`). Feeding GLM4 GGUF a long prompt as one Metal
+            // prefill can destabilize generation on Candle; chunking keeps the
+            // attention/prefill kernels in the stable regime while preserving
+            // the same KV-cache semantics.
+            "glm4" | "chatglm" if device.is_metal() => Some(GLM4_METAL_PREFILL_CHUNK),
+            _ => None,
+        };
+
         let model: Box<dyn CausalLm> = match arch.as_str() {
             "qwen2" => Box::new(quantized_qwen2::ModelWeights::from_gguf(
                 content, &mut file, &device,
@@ -423,6 +483,7 @@ impl Engine {
             device,
             eos,
             dtype,
+            prefill_chunk,
         })
     }
 
@@ -434,6 +495,134 @@ impl Engine {
             Device::Metal(_) => "metal",
         };
         format!("{dev}/{:?}", self.dtype)
+    }
+
+    fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>> {
+        let tokens = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| anyhow!("tokenizing prompt: {e}"))?
+            .get_ids()
+            .to_vec();
+        if tokens.is_empty() {
+            bail!("tokenized prompt is empty");
+        }
+        Ok(tokens)
+    }
+
+    fn prefill_last_logits_for_tokens(
+        &mut self,
+        tokens: &[u32],
+        configured: Option<usize>,
+    ) -> Result<Tensor> {
+        self.prefill_last_logits_for_tokens_with_progress(tokens, configured, &mut |_| {})
+    }
+
+    fn prefill_last_logits_for_tokens_with_progress(
+        &mut self,
+        tokens: &[u32],
+        configured: Option<usize>,
+        on_progress: &mut impl FnMut(PrefillProgress),
+    ) -> Result<Tensor> {
+        let chunk = effective_prefill_chunk(configured, self.prefill_chunk, tokens.len());
+        let chunk_count = tokens.len().div_ceil(chunk);
+        let mut logits = None;
+        for (chunk_index, start_pos) in (0..tokens.len()).step_by(chunk).enumerate() {
+            let end = (start_pos + chunk).min(tokens.len());
+            on_progress(PrefillProgress {
+                chunk_index,
+                chunk_count,
+                start_pos,
+                end_pos: end,
+                token_count: tokens.len(),
+                finished: false,
+            });
+            let input = Tensor::new(&tokens[start_pos..end], &self.device)?.unsqueeze(0)?;
+            logits = Some(self.model.forward(&input, start_pos)?);
+            on_progress(PrefillProgress {
+                chunk_index,
+                chunk_count,
+                start_pos,
+                end_pos: end,
+                token_count: tokens.len(),
+                finished: true,
+            });
+        }
+        logits.ok_or_else(|| anyhow!("tokenized prompt is empty"))
+    }
+
+    /// Return the next-token logits after prompt prefill without sampling or
+    /// generating. This is a diagnostic hook for backend/scheduling work: it
+    /// exercises the same prefill path as [`generate_with`](Engine::generate_with)
+    /// and then stops before decode.
+    ///
+    /// `prefill_chunk` has the same meaning as [`GenOpts::prefill_chunk`]:
+    /// `None` uses the model/backend default, `Some(0)` forces one full-prompt
+    /// prefill, and `Some(n)` feeds chunks of at most `n` tokens.
+    pub fn prefill_logits(
+        &mut self,
+        prompt: &str,
+        prefill_chunk: Option<usize>,
+    ) -> Result<PrefillLogits> {
+        self.prefill_logits_with_progress(prompt, prefill_chunk, |_| {})
+    }
+
+    /// Like [`prefill_logits`](Engine::prefill_logits), but reports each prefill
+    /// chunk before and after the model call.
+    pub fn prefill_logits_with_progress(
+        &mut self,
+        prompt: &str,
+        prefill_chunk: Option<usize>,
+        mut on_progress: impl FnMut(PrefillProgress),
+    ) -> Result<PrefillLogits> {
+        self.model.reset()?;
+        let tokens = self.encode_prompt(prompt)?;
+        let logits = self.prefill_last_logits_for_tokens_with_progress(
+            &tokens,
+            prefill_chunk,
+            &mut on_progress,
+        )?;
+        let logits = last_token_logits(&logits)?.to_vec1::<f32>()?;
+        Ok(PrefillLogits {
+            token_count: tokens.len(),
+            logits,
+        })
+    }
+
+    /// Decode the top `k` logits with the model tokenizer for diagnostics.
+    pub fn topk_from_logits(&self, logits: &[f32], k: usize) -> Vec<TokenLogit> {
+        let mut ranked: Vec<(usize, f32)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked
+            .into_iter()
+            .take(k)
+            .map(|(id, logit)| {
+                let id = id as u32;
+                let text = self
+                    .tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_else(|_| format!("<decode-error:{id}>"));
+                TokenLogit { id, text, logit }
+            })
+            .collect()
+    }
+
+    /// Convenience wrapper around [`prefill_logits`](Engine::prefill_logits)
+    /// plus [`topk_from_logits`](Engine::topk_from_logits).
+    pub fn prefill_topk(
+        &mut self,
+        prompt: &str,
+        prefill_chunk: Option<usize>,
+        k: usize,
+    ) -> Result<(usize, Vec<TokenLogit>)> {
+        let prefill = self.prefill_logits(prompt, prefill_chunk)?;
+        let topk = self.topk_from_logits(&prefill.logits, k);
+        Ok((prefill.token_count, topk))
     }
 
     /// Generate, folding each decoded text fragment into an accumulator — the
@@ -457,12 +646,7 @@ impl Engine {
         self.model.reset()?;
 
         let mut stream = TokenOutputStream::new(self.tokenizer.clone());
-        let mut tokens = self
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| anyhow!("tokenizing prompt: {e}"))?
-            .get_ids()
-            .to_vec();
+        let mut tokens = self.encode_prompt(prompt)?;
 
         let mut logits_processor = opts.sampling.logits_processor();
         let mut acc = init;
@@ -470,13 +654,20 @@ impl Engine {
         let mut stop = StopReason::MaxTokens;
 
         for index in 0..opts.max_tokens {
-            // Prefill the whole prompt on the first step, then feed one token
-            // at a time; the model advances its own KV cache via `start_pos`.
-            let context_size = if index > 0 { 1 } else { tokens.len() };
-            let start_pos = tokens.len().saturating_sub(context_size);
-            let ctxt = &tokens[start_pos..];
-            let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-            let logits = self.model.forward(&input, start_pos)?;
+            // Prefill the prompt on the first step, then feed one token at a
+            // time; the model advances its own KV cache via `start_pos`.
+            //
+            // Some quantized Metal backends are less stable on large prefill
+            // matrix-matrix kernels than on the decode-style matrix-vector
+            // path. `prefill_chunk` lets those models use smaller prefill
+            // chunks without changing the public API.
+            let logits = if index == 0 {
+                self.prefill_last_logits_for_tokens(&tokens, opts.prefill_chunk)?
+            } else {
+                let start_pos = tokens.len().saturating_sub(1);
+                let input = Tensor::new(&tokens[start_pos..], &self.device)?.unsqueeze(0)?;
+                self.model.forward(&input, start_pos)?
+            };
             let logits = last_token_logits(&logits)?;
             let logits = if opts.repeat_penalty == 1.0 {
                 logits

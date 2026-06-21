@@ -66,7 +66,10 @@ pub use chat::ChatSession;
 pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
 pub use engine::ensure_model_blocking;
-pub use engine::{device, is_model_present, Engine, GenOpts, Generation, Sampling, StopReason};
+pub use engine::{
+    device, is_model_present, Engine, GenOpts, Generation, PrefillLogits, PrefillProgress,
+    Sampling, StopReason, TokenLogit,
+};
 pub use template::{
     ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
 };
