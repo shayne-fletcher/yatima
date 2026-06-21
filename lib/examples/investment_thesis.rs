@@ -1,8 +1,8 @@
 //! Embed a local model to turn public SEC facts into a cited research note.
 //!
-//! This is the next slice after `sec_metrics`: Rust fetches and normalizes real
-//! public evidence, then an in-process chat model writes a thesis constrained to
-//! that evidence.
+//! Rust fetches and normalizes real public evidence, an in-process chat model
+//! writes a thesis constrained to that evidence, and Rust audits the result for
+//! unsupported citations and claims.
 //!
 //! ```bash
 //! SEC_USER_AGENT="your-name your-email@example.com" \
@@ -22,7 +22,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use yatima_lib::{device, ChatMlTemplate, ChatSession, Engine, GenOpts, Sampling};
@@ -99,7 +99,15 @@ SEC evidence JSON:
     let mut chat = ChatSession::new(&mut engine, ChatMlTemplate)
         .with_system(SYSTEM)
         .with_opts(opts);
-    println!("{}", chat.turn(&prompt)?);
+    let answer = chat.turn(&prompt)?.to_string();
+    let check = check_thesis(&answer, &report);
+    if !check.is_clean() {
+        eprintln!("\nvalidation warnings:");
+        for warning in &check.warnings {
+            eprintln!("- {warning}");
+        }
+    }
+    println!("{answer}");
     Ok(())
 }
 
@@ -264,6 +272,170 @@ fn scaled_text(n: f64, unit: &str) -> String {
     } else {
         format!("{n:.0} {unit}")
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ThesisCheck {
+    warnings: Vec<String>,
+}
+
+impl ThesisCheck {
+    fn warn(&mut self, warning: impl Into<String>) {
+        self.warnings.push(warning.into());
+    }
+
+    fn is_clean(&self) -> bool {
+        self.warnings.is_empty()
+    }
+}
+
+fn check_thesis(answer: &str, report: &MetricsReport) -> ThesisCheck {
+    let mut check = ThesisCheck::default();
+    let known_tags: HashSet<&str> = report.metrics.iter().map(|m| m.xbrl_tag.as_str()).collect();
+    let known_accessions: HashSet<&str> = report
+        .metrics
+        .iter()
+        .filter_map(|m| m.accession.as_deref())
+        .collect();
+
+    for accession in cited_accessions(answer) {
+        if !known_accessions.contains(accession.as_str()) {
+            check.warn(format!("unknown accession cited: {accession}"));
+        }
+    }
+
+    for tag in cited_xbrl_tags(answer) {
+        if !known_tags.contains(tag.as_str()) {
+            check.warn(format!("unknown XBRL tag cited: {tag}"));
+        }
+    }
+
+    for line in answer.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        check_value_line(trimmed, report, &mut check);
+        check_missing_citation(trimmed, &known_tags, &known_accessions, &mut check);
+    }
+
+    if has_single_period_per_metric(report) && contains_trend_language(answer) {
+        check.warn(
+            "trend language appears, but the supplied evidence has only one period per metric",
+        );
+    }
+
+    check
+}
+
+fn check_value_line(line: &str, report: &MetricsReport, check: &mut ThesisCheck) {
+    let lower = line.to_ascii_lowercase();
+    for metric in &report.metrics {
+        if lower.contains(&metric.metric.to_ascii_lowercase())
+            && mentions_quantity(line)
+            && !line.contains(&metric.value_text)
+        {
+            check.warn(format!(
+                "line mentions {} with a quantity but not exact value_text `{}`: {}",
+                metric.metric, metric.value_text, line
+            ));
+        }
+    }
+}
+
+fn check_missing_citation(
+    line: &str,
+    known_tags: &HashSet<&str>,
+    known_accessions: &HashSet<&str>,
+    check: &mut ThesisCheck,
+) {
+    if !mentions_quantity(line) {
+        return;
+    }
+    let has_tag = known_tags.iter().any(|tag| line.contains(*tag));
+    let has_accession = known_accessions.iter().any(|accn| line.contains(*accn));
+    if !(has_tag && has_accession) {
+        check.warn(format!(
+            "quantity-bearing line lacks a known accession and XBRL tag: {line}"
+        ));
+    }
+}
+
+fn mentions_quantity(line: &str) -> bool {
+    line.contains('$') || line.to_ascii_lowercase().contains(" shares")
+}
+
+fn cited_accessions(answer: &str) -> Vec<String> {
+    answer
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ';' | ',' | '.'))
+        .filter(|token| {
+            let parts: Vec<_> = token.split('-').collect();
+            parts.len() == 3
+                && parts[0].len() == 10
+                && parts[1].len() == 2
+                && parts[2].len() == 6
+                && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn cited_xbrl_tags(answer: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    for line in answer.lines() {
+        let Some((_, after)) = line.split_once("XBRL tag") else {
+            continue;
+        };
+        let after = after
+            .trim_start_matches(|c: char| c == ':' || c == 's' || c == ' ' || c == '(' || c == '[');
+        for token in after.split(|c: char| {
+            c.is_whitespace()
+                || matches!(c, ',' | ';' | ')' | '(' | '.' | ']' | '[' | ':' | '`' | '*')
+        }) {
+            let token = token.trim();
+            if looks_like_xbrl_tag(token) {
+                tags.push(token.to_string());
+            }
+        }
+    }
+    tags
+}
+
+fn looks_like_xbrl_tag(token: &str) -> bool {
+    token.len() > 5
+        && token.chars().all(|c| c.is_ascii_alphanumeric())
+        && token.chars().any(|c| c.is_ascii_uppercase())
+        && token != "XBRL"
+        && token != "Tag"
+        && token != "Tags"
+}
+
+fn has_single_period_per_metric(report: &MetricsReport) -> bool {
+    let mut periods_by_metric: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for metric in &report.metrics {
+        periods_by_metric
+            .entry(metric.metric.as_str())
+            .or_default()
+            .insert(metric.period.as_str());
+    }
+    periods_by_metric.values().all(|periods| periods.len() <= 1)
+}
+
+fn contains_trend_language(answer: &str) -> bool {
+    let lower = answer.to_ascii_lowercase();
+    [
+        " growth",
+        " grew",
+        " increase",
+        " increased",
+        " decline",
+        " declined",
+        " improve",
+        " improved",
+        " deceleration",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn metric_specs() -> &'static [MetricSpec] {
@@ -480,5 +652,84 @@ mod tests {
                 && m.label.is_none()
                 && m.accession.as_deref() == Some("shares-accn")
         }));
+    }
+
+    #[test]
+    fn validator_accepts_grounded_citations() {
+        let report = sample_report();
+        let answer = "\
+- Revenue was $111.184 billion (period: fy 2026, fp Q2, end 2026-03-28, filed 2026-05-01; accession: 0000320193-26-000013; XBRL tag: RevenueFromContractWithCustomerExcludingAssessedTax).
+- NetIncome was $29.578 billion (period: fy 2026, fp Q2, end 2026-03-28, filed 2026-05-01; accession: 0000320193-26-000013; XBRL tag: NetIncomeLoss).";
+
+        assert!(check_thesis(answer, &report).is_clean());
+    }
+
+    #[test]
+    fn validator_warns_on_unknown_citation_and_value_drift() {
+        let report = sample_report();
+        let answer = "\
+- Revenue growth was $11.184 billion (accession: 0000000000-00-000000; XBRL tag: MadeUpRevenueTag).
+- NetIncome was $29.578 billion without a citation.";
+
+        let check = check_thesis(answer, &report);
+        assert!(check
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown accession")));
+        assert!(check
+            .warnings
+            .iter()
+            .any(|w| w.contains("unknown XBRL tag")));
+        assert!(check
+            .warnings
+            .iter()
+            .any(|w| w.contains("not exact value_text")));
+        assert!(check.warnings.iter().any(|w| w.contains("trend language")));
+    }
+
+    fn sample_report() -> MetricsReport {
+        MetricsReport {
+            ticker: "AAPL".into(),
+            cik: "0000320193".into(),
+            company: "Apple Inc.".into(),
+            entity_name: "Apple Inc.".into(),
+            source: "SEC EDGAR companyfacts".into(),
+            metrics: vec![
+                MetricFact {
+                    metric: "Revenue".into(),
+                    value: Number::from(111_184_000_000_i64),
+                    value_text: "$111.184 billion".into(),
+                    unit: "USD".into(),
+                    fy: Some(2026),
+                    fp: Some("Q2".into()),
+                    form: Some("10-Q".into()),
+                    filed: Some("2026-05-01".into()),
+                    end: Some("2026-03-28".into()),
+                    period: "fy 2026, fp Q2, end 2026-03-28, filed 2026-05-01".into(),
+                    frame: Some("CY2026Q1".into()),
+                    accession: Some("0000320193-26-000013".into()),
+                    taxonomy: "us-gaap".into(),
+                    xbrl_tag: "RevenueFromContractWithCustomerExcludingAssessedTax".into(),
+                    label: Some("Revenue".into()),
+                },
+                MetricFact {
+                    metric: "NetIncome".into(),
+                    value: Number::from(29_578_000_000_i64),
+                    value_text: "$29.578 billion".into(),
+                    unit: "USD".into(),
+                    fy: Some(2026),
+                    fp: Some("Q2".into()),
+                    form: Some("10-Q".into()),
+                    filed: Some("2026-05-01".into()),
+                    end: Some("2026-03-28".into()),
+                    period: "fy 2026, fp Q2, end 2026-03-28, filed 2026-05-01".into(),
+                    frame: Some("CY2026Q1".into()),
+                    accession: Some("0000320193-26-000013".into()),
+                    taxonomy: "us-gaap".into(),
+                    xbrl_tag: "NetIncomeLoss".into(),
+                    label: Some("Net Income".into()),
+                },
+            ],
+        }
     }
 }

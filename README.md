@@ -138,28 +138,26 @@ for a label and `match` on a Rust `enum`, no serialization or service boundary.
 See [`lib/examples/embed.rs`](lib/examples/embed.rs) (a conversation **and** a
 classify-then-branch triage loop): `cargo run --example embed --features metal`.
 
-## Auditable research data
+## Auditable research
 
-The first small investment-research example keeps the model out of the loop and
-proves the evidence layer: resolve a ticker through SEC EDGAR, fetch public XBRL
-company facts, and normalize a few metrics into cited JSON records.
-
-```bash
-SEC_USER_AGENT="your-name your-email@example.com" \
-  cargo run -p yatima-lib --example sec_metrics -- AAPL
-```
-
-The output includes CIK, company name, metric value, period, form, filing date,
-accession, and XBRL tag. That is the shape a later `yatima agent` tool can expose
-to an LLM for cited thesis generation.
-
-The next example embeds a local chat model and asks it to write a concise
-research note from those facts only:
+The investment-research example is the most complete demonstration of the
+library shape: Rust resolves a ticker through SEC EDGAR, fetches public XBRL
+company facts, normalizes them into cited evidence records, embeds a local chat
+model, asks for a concise research note, then audits the generated thesis against
+the evidence it supplied.
 
 ```bash
 SEC_USER_AGENT="your-name your-email@example.com" \
   cargo run -p yatima-lib --release --example investment_thesis --features metal -- AAPL
 ```
+
+The example defaults to the local Qwen 32B GGUF path used in the agent demo; pass
+a model directory as the second argument to override it. The generated note is
+not investment advice. It is a grounded-output demo: every factual claim is
+expected to cite the SEC accession, filing period/date, and XBRL tag it came
+from. A small example-local validator warns when the model cites unknown tags or
+accessions, drifts from the normalized `value_text`, omits citation fields on a
+quantity-bearing line, or uses trend language when only one period was supplied.
 
 ## Notes
 
