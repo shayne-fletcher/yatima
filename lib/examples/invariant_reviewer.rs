@@ -7,7 +7,7 @@
 //!
 //! ```bash
 //! cargo run -p yatima-lib --release --example invariant_reviewer --features metal -- \
-//!   --profile qwen32b --diff
+//!   --profile mistral --diff
 //! ```
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use yatima_lib::{
-    device, resolve_format, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile, Sampling,
+    device, resolve_format, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile, PromptTemplate,
+    Role, Sampling, Turn,
 };
 
 const SYSTEM: &str = "\
@@ -27,7 +28,10 @@ missing tests, wrong invariant citations, observability/security leaks, and \
 documentation drift. Every finding must cite the supplied file path and line or \
 section marker when available. Prefer a short report with actionable findings. \
 If no blocking issue is apparent, say so and suggest at most three useful \
-follow-ups. Do not invent files or invariants not present in the context.";
+follow-ups. Do not invent files or invariants not present in the context. Do not \
+use Markdown code fences in your answer. The supplied context may be truncated: \
+do not claim that code or tests are absent unless the supplied citation counts \
+also support that claim. If evidence is insufficient, say so.";
 
 #[derive(Debug, Parser)]
 #[command(about, long_about = None)]
@@ -44,8 +48,11 @@ struct Args {
     /// Additional files to include, relative to --root.
     #[arg(long)]
     file: Vec<PathBuf>,
+    /// Include notes/design.md in the review context.
+    #[arg(long)]
+    design: bool,
     /// Built-in profile name.
-    #[arg(long, default_value = "qwen32b")]
+    #[arg(long, default_value = "mistral")]
     profile: String,
     /// Explicit model directory (overrides --profile's source).
     #[arg(long)]
@@ -71,12 +78,21 @@ struct Args {
     temperature: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Prompt prefill chunk size; 0 forces one full-prompt prefill.
+    #[arg(long, default_value_t = 64)]
+    prefill_chunk: usize,
     /// Maximum bytes to include for any one file.
-    #[arg(long, default_value_t = 24_000)]
+    #[arg(long, default_value_t = 6_000)]
     max_file_bytes: usize,
     /// Maximum bytes to include from git diff output.
-    #[arg(long, default_value_t = 80_000)]
+    #[arg(long, default_value_t = 24_000)]
     max_diff_bytes: usize,
+    /// Maximum rendered chat prompt tokens before context is trimmed.
+    #[arg(long, default_value_t = 3_500)]
+    max_prompt_tokens: usize,
+    /// Maximum `upholds:` test-citation lines to include.
+    #[arg(long, default_value_t = 48)]
+    upholds_limit: usize,
 }
 
 fn chat_format_parser() -> impl TypedValueParser<Value = ChatFormat> {
@@ -132,6 +148,7 @@ fn main() -> Result<()> {
     let opts = profile.apply_gen_overrides(GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::from_temperature(args.temperature, args.seed),
+        prefill_chunk: Some(args.prefill_chunk),
         ..Default::default()
     });
     eprintln!(
@@ -143,9 +160,15 @@ fn main() -> Result<()> {
         opts.max_tokens
     );
 
-    let prompt = build_prompt(&context);
-    let prompt_tokens = engine.token_count(&prompt).unwrap_or(0);
-    eprintln!("prompt tokens: {prompt_tokens}");
+    let (prompt, prompt_tokens, trimmed) =
+        build_prompt_with_budget(&context, &engine, format, args.max_prompt_tokens)?;
+    if trimmed {
+        eprintln!(
+            "trimmed review context to fit {} rendered prompt tokens",
+            args.max_prompt_tokens
+        );
+    }
+    eprintln!("rendered prompt tokens: {prompt_tokens}");
     let mut chat = ChatSession::new(&mut engine, format.template())
         .with_system(SYSTEM)
         .with_opts(opts);
@@ -153,12 +176,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ReviewContext {
     root: PathBuf,
     diff: Option<String>,
     files: BTreeMap<PathBuf, String>,
     invariant_ids: BTreeSet<String>,
+    upheld_counts: BTreeMap<String, usize>,
     upheld_refs: Vec<String>,
 }
 
@@ -166,6 +190,7 @@ impl ReviewContext {
     fn prompt_bytes(&self) -> usize {
         self.diff.as_ref().map_or(0, String::len)
             + self.files.values().map(String::len).sum::<usize>()
+            + self.upheld_counts.len() * 16
             + self.upheld_refs.iter().map(String::len).sum::<usize>()
     }
 }
@@ -184,8 +209,10 @@ fn gather_context(root: &Path, args: &Args) -> Result<ReviewContext> {
     let mut files = BTreeSet::from([
         PathBuf::from("lib/src/lib.rs"),
         PathBuf::from("cli/src/main.rs"),
-        PathBuf::from("notes/design.md"),
     ]);
+    if args.design {
+        files.insert(PathBuf::from("notes/design.md"));
+    }
     files.extend(args.file.iter().cloned());
     if args.diff || args.staged {
         files.extend(git_changed_files(root, args.staged)?);
@@ -217,13 +244,16 @@ fn gather_context(root: &Path, args: &Args) -> Result<ReviewContext> {
     if let Some(cli) = file_text.get(Path::new("cli/src/main.rs")) {
         all_ids.extend(extract_invariant_ids(cli));
     }
-    let upheld_refs = collect_upholds(root)?;
+    let all_upheld_refs = collect_upholds(root)?;
+    let upheld_counts = count_upholds(&all_upheld_refs, &all_ids);
+    let upheld_refs = limit_upholds(all_upheld_refs, args.upholds_limit);
 
     Ok(ReviewContext {
         root: root.to_path_buf(),
         diff,
         files: file_text,
         invariant_ids: all_ids,
+        upheld_counts,
         upheld_refs,
     })
 }
@@ -273,6 +303,29 @@ fn collect_upholds(root: &Path) -> Result<Vec<String>> {
     Ok(refs)
 }
 
+fn limit_upholds(mut refs: Vec<String>, limit: usize) -> Vec<String> {
+    if limit > 0 && refs.len() > limit {
+        let total = refs.len();
+        refs.truncate(limit);
+        refs.push(format!("[truncated upholds refs: kept {limit} of {total}]"));
+    }
+    refs
+}
+
+fn count_upholds(refs: &[String], ids: &BTreeSet<String>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for id in ids {
+        let count = refs
+            .iter()
+            .filter(|line| line.contains(id.as_str()))
+            .count();
+        if count > 0 {
+            counts.insert(id.clone(), count);
+        }
+    }
+    counts
+}
+
 fn collect_upholds_under(root: &Path, rel: &Path, refs: &mut Vec<String>) -> Result<()> {
     let dir = root.join(rel);
     if !dir.exists() {
@@ -307,6 +360,11 @@ fn build_prompt(context: &ReviewContext) -> String {
     for id in &context.invariant_ids {
         s.push_str(&format!("- {id}\n"));
     }
+    s.push_str("\nTest citation counts by invariant id:\n");
+    for id in &context.invariant_ids {
+        let count = context.upheld_counts.get(id).copied().unwrap_or(0);
+        s.push_str(&format!("- {id}: {count}\n"));
+    }
     s.push_str("\nKnown test citations (`upholds:`):\n");
     for line in &context.upheld_refs {
         s.push_str("- ");
@@ -314,15 +372,15 @@ fn build_prompt(context: &ReviewContext) -> String {
         s.push('\n');
     }
     if let Some(diff) = &context.diff {
-        s.push_str("\n# Git Diff\n\n```diff\n");
+        s.push_str("\n<git_diff>\n");
         s.push_str(diff);
-        s.push_str("\n```\n");
+        s.push_str("\n</git_diff>\n");
     }
     s.push_str("\n# Files\n");
     for (path, text) in &context.files {
-        s.push_str(&format!("\n## {}\n\n```text\n", path.display()));
+        s.push_str(&format!("\n<file path=\"{}\">\n", path.display()));
         s.push_str(text);
-        s.push_str("\n```\n");
+        s.push_str("\n</file>\n");
     }
     s.push_str(
         "\n# Requested Output\n\n\
@@ -333,6 +391,68 @@ fn build_prompt(context: &ReviewContext) -> String {
          If the change is sound, say so directly.\n",
     );
     s
+}
+
+fn build_prompt_with_budget(
+    context: &ReviewContext,
+    engine: &Engine,
+    format: ChatFormat,
+    max_prompt_tokens: usize,
+) -> Result<(String, usize, bool)> {
+    let mut context = context.clone();
+    let mut trimmed = false;
+    for _ in 0..12 {
+        let prompt = build_prompt(&context);
+        let tokens = rendered_chat_tokens(engine, format, &prompt)?;
+        if max_prompt_tokens == 0 || tokens <= max_prompt_tokens {
+            return Ok((prompt, tokens, trimmed));
+        }
+        let factor = ((max_prompt_tokens as f64 / tokens as f64) * 0.85).clamp(0.2, 0.85);
+        shrink_context(&mut context, factor);
+        trimmed = true;
+    }
+    let prompt = build_prompt(&context);
+    let tokens = rendered_chat_tokens(engine, format, &prompt)?;
+    bail!(
+        "rendered prompt is still {tokens} tokens after trimming; raise \
+         --max-prompt-tokens, lower --max-file-bytes/--max-diff-bytes, or pass fewer --file inputs"
+    )
+}
+
+fn rendered_chat_tokens(engine: &Engine, format: ChatFormat, user_prompt: &str) -> Result<usize> {
+    let template = format.template();
+    let rendered = template.render(&[
+        Turn {
+            role: Role::System,
+            content: SYSTEM.to_string(),
+        },
+        Turn {
+            role: Role::User,
+            content: user_prompt.to_string(),
+        },
+    ]);
+    engine.token_count(&rendered)
+}
+
+fn shrink_context(context: &mut ReviewContext, factor: f64) {
+    if let Some(diff) = context.diff.as_mut() {
+        *diff = truncate(diff, scaled_len(diff.len(), factor), "git diff");
+    }
+    for text in context.files.values_mut() {
+        *text = truncate(text, scaled_len(text.len(), factor), "file");
+    }
+    let refs_len = context.upheld_refs.len();
+    if refs_len > 24 {
+        let keep = scaled_len(refs_len, factor).clamp(24, refs_len);
+        context.upheld_refs.truncate(keep);
+        context.upheld_refs.push(format!(
+            "[truncated upholds refs: kept {keep} of {refs_len}]"
+        ));
+    }
+}
+
+fn scaled_len(len: usize, factor: f64) -> usize {
+    ((len as f64) * factor).floor().max(512.0) as usize
 }
 
 fn with_line_numbers(text: &str) -> String {

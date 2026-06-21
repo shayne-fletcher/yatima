@@ -1079,6 +1079,8 @@ mod tests {
 
     #[test]
     fn detect_arch_maps_class_names() {
+        // upholds: ARCH-1 — safetensors loading normalizes supported class names
+        // onto the single public architecture enum before dispatch.
         for (class, want) in [
             ("Qwen2ForCausalLM", Arch::Qwen2),
             ("LlamaForCausalLM", Arch::Llama),
@@ -1094,6 +1096,8 @@ mod tests {
 
     #[test]
     fn detect_arch_falls_back_to_model_type() {
+        // upholds: ARCH-1 — the fallback path still normalizes to the same
+        // public architecture enum.
         // No `architectures`, only the short `model_type` form — the fallback
         // must be real for every family.
         for (mt, want) in [
@@ -1149,7 +1153,9 @@ mod tests {
 
     #[test]
     fn sampling_from_temperature_maps_greedy_and_sample() {
-        // upholds: SAM-2 — non-positive temperature is greedy (seed ignored).
+        // upholds: SAM-1, SAM-2 — every user-facing temperature maps to one
+        // explicit sampling algebra; non-positive temperature is greedy (seed
+        // ignored).
         assert_eq!(Sampling::from_temperature(0.0, 7), Sampling::Greedy);
         assert_eq!(Sampling::from_temperature(-1.0, 7), Sampling::Greedy);
         assert_eq!(
@@ -1276,7 +1282,8 @@ mod tests {
 
     #[test]
     fn presence_reports_missing_shards() {
-        // upholds: MD-3
+        // upholds: MD-3, FETCH-1 — the completeness predicate used after fetch
+        // rejects a partial shard set before it can reach Engine::load.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(p.join("config.json"), "{}").unwrap();

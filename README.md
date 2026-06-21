@@ -171,8 +171,34 @@ and a bounded git diff, then asks a local chat model for a cited review:
 
 ```bash
 cargo run -p yatima-lib --release --example invariant_reviewer --features metal -- \
+  --profile mistral \
+  --max-tokens 450 \
+  --max-prompt-tokens 2500
+```
+
+To include the current working-tree diff, keep the evidence bounded:
+
+```bash
+cargo run -p yatima-lib --release --example invariant_reviewer --features metal -- \
+  --profile mistral \
+  --diff \
+  --max-tokens 350 \
+  --max-prompt-tokens 4000 \
+  --max-file-bytes 1200 \
+  --max-diff-bytes 5000 \
+  --upholds-limit 8
+```
+
+For Qwen 32B on Metal, keep the first pass smaller and chunk prefill:
+
+```bash
+cargo run -p yatima-lib --release --example invariant_reviewer --features metal -- \
   --profile qwen32b \
-  --diff
+  --max-tokens 350 \
+  --max-prompt-tokens 2200 \
+  --max-file-bytes 3000 \
+  --upholds-limit 16 \
+  --prefill-chunk 64
 ```
 
 This is deliberately advisory: the model does not edit files. It produces a
