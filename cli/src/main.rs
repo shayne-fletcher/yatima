@@ -4,6 +4,8 @@
 //! rest). Protected by tests that cite the id (`// upholds: <id>`):
 //! - **CLI-1** generation has exactly one model source (`--model` xor `--repo`).
 //! - **CLI-2** `--offline` never fetches; an absent model is a clear error.
+//! - **CLI-3** the CLI owns tracing subscriber setup and initializes it
+//!   idempotently; `yatima-lib` only emits events.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -11,6 +13,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
 use yatima_lib::{
     device, model_dir, models_root, resolve_format, Agent, ChatFormat, ChatMlTemplate, ChatSession,
     Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId, ModelSource, PlainTemplate,
@@ -184,6 +187,7 @@ const DEFAULT_AGENT_SYSTEM: &str =
      using the provided tools. Call a tool when it helps, then answer.";
 
 fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Command::ModelsDir { repo } => {
@@ -199,6 +203,17 @@ fn main() -> Result<()> {
         Command::Agent(args) => agent(args)?,
     }
     Ok(())
+}
+
+fn init_tracing() {
+    // upholds: CLI-3 / OBS-1 — the application edge owns collection. `try_init`
+    // makes this tolerant of tests or embedders that installed a subscriber.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,yatima_lib=info,yatima_cli=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 /// Chat: apply the model's chat template (no tools) — the layer between raw
@@ -521,5 +536,13 @@ mod tests {
     fn agent_requires_a_prompt() {
         // clap rejects a missing required --prompt before any work happens.
         assert!(Cli::try_parse_from(["yatima", "agent", "--repo", "org/name"]).is_err());
+    }
+
+    #[test]
+    fn tracing_init_is_idempotent() {
+        // upholds: CLI-3 / OBS-1 — subscriber setup lives at the CLI edge and
+        // repeated initialization is tolerated rather than panicking.
+        init_tracing();
+        init_tracing();
     }
 }

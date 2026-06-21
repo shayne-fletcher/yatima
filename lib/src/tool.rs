@@ -26,6 +26,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 const DEFAULT_READ_URL_MAX_BYTES: usize = 1_000_000;
 
@@ -296,6 +297,7 @@ impl Tools {
     /// use [`Tools::dispatch`] from synchronous code.
     pub fn spawn(&self, call: ToolCall) -> ToolTask {
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let tool_name = call.name.clone();
         let (events_tx, events_rx) = broadcast::channel(32);
         let cancel = CancellationToken::new();
         let ctx = ToolCtx::new(call_id, cancel.clone(), events_tx.clone());
@@ -305,40 +307,53 @@ impl Tools {
             .find(|t| t.spec().name == call.name)
             .cloned();
         let task_call = call.clone();
-        let join = tokio::spawn(async move {
-            let _ = events_tx.send(ToolEvent::Started {
-                call_id,
-                call: task_call.clone(),
-            });
-            let outcome = match tool {
-                None => ToolOutcome::Rejected(ToolRejection::UnknownTool {
-                    name: task_call.name.clone(),
-                }),
-                Some(tool) => {
-                    let fut = tool.call(task_call.args.clone(), ctx.clone());
-                    tokio::select! {
-                        _ = ctx.cancelled() => ToolOutcome::Cancelled { reason: None },
-                        result = fut => match result {
-                            Ok(content) => ToolOutcome::success(content),
-                            Err(e) => classify_tool_error(e),
+        let span = tracing::debug_span!("tool.call", call_id, tool = %tool_name);
+        // upholds: OBS-3 — attach the span to the future; do not hold an entered
+        // span guard across await points inside the task.
+        let join = tokio::spawn(
+            async move {
+                tracing::debug!(call_id, tool = %task_call.name, "tool started");
+                let _ = events_tx.send(ToolEvent::Started {
+                    call_id,
+                    call: task_call.clone(),
+                });
+                let outcome = match tool {
+                    None => ToolOutcome::Rejected(ToolRejection::UnknownTool {
+                        name: task_call.name.clone(),
+                    }),
+                    Some(tool) => {
+                        let fut = tool.call(task_call.args.clone(), ctx.clone());
+                        tokio::select! {
+                            _ = ctx.cancelled() => ToolOutcome::Cancelled { reason: None },
+                            result = fut => match result {
+                                Ok(content) => ToolOutcome::success(content),
+                                Err(e) => classify_tool_error(e),
+                            }
                         }
                     }
+                };
+                let outcome = if ctx.is_cancelled() && outcome.is_success() {
+                    ToolOutcome::Cancelled { reason: None }
+                } else {
+                    outcome
+                };
+                if ctx.is_cancelled() {
+                    let _ = events_tx.send(ToolEvent::Cancelled { call_id });
                 }
-            };
-            let outcome = if ctx.is_cancelled() && outcome.is_success() {
-                ToolOutcome::Cancelled { reason: None }
-            } else {
+                tracing::debug!(
+                    call_id,
+                    tool = %task_call.name,
+                    outcome = ?outcome,
+                    "tool finished"
+                );
+                let _ = events_tx.send(ToolEvent::Finished {
+                    call_id,
+                    outcome: outcome.clone(),
+                });
                 outcome
-            };
-            if ctx.is_cancelled() {
-                let _ = events_tx.send(ToolEvent::Cancelled { call_id });
             }
-            let _ = events_tx.send(ToolEvent::Finished {
-                call_id,
-                outcome: outcome.clone(),
-            });
-            outcome
-        });
+            .instrument(span),
+        );
         ToolTask {
             call_id,
             cancel,
@@ -961,12 +976,73 @@ impl Tool for ListDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::Layer;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn json(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedTracing {
+        events: Arc<Mutex<Vec<CapturedRecord>>>,
+    }
+
+    impl CapturedTracing {
+        fn records(&self) -> Vec<CapturedRecord> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CapturedRecord {
+        name: String,
+        fields: BTreeSet<String>,
+    }
+
+    impl<S> Layer<S> for CapturedTracing
+    where
+        S: Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            let mut fields = FieldNames::default();
+            attrs.record(&mut fields);
+            self.events.lock().unwrap().push(CapturedRecord {
+                name: attrs.metadata().name().to_string(),
+                fields: fields.0,
+            });
+        }
+
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut fields = FieldNames::default();
+            event.record(&mut fields);
+            self.events.lock().unwrap().push(CapturedRecord {
+                name: event.metadata().name().to_string(),
+                fields: fields.0,
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldNames(BTreeSet<String>);
+
+    impl Visit for FieldNames {
+        fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string());
+        }
     }
 
     #[test]
@@ -1460,6 +1536,52 @@ mod tests {
             ToolOutcome::Success {
                 content: "done".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn tool_tracing_records_bounded_structured_fields() {
+        // upholds: OBS-1, OBS-2, OBS-3, OBS-4 — the library emits structured
+        // tool telemetry through a caller-supplied subscriber, attaches the
+        // span to the async task, and records bounded fields rather than args.
+        let captured = CapturedTracing::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let tools = Tools::new().with(ProgressTool);
+                let result = tools
+                    .dispatch_async(&ToolCall {
+                        name: "progress".to_string(),
+                        args: serde_json::json!({ "secret": "not a field" }),
+                    })
+                    .await;
+                assert_eq!(
+                    result,
+                    ToolOutcome::Success {
+                        content: "done".to_string()
+                    }
+                );
+            });
+        });
+
+        let records = captured.records();
+        let tool_span = records
+            .iter()
+            .find(|record| record.name == "tool.call")
+            .expect("tool span was recorded");
+        assert!(tool_span.fields.contains("call_id"));
+        assert!(tool_span.fields.contains("tool"));
+        assert!(!tool_span.fields.contains("args"));
+
+        assert!(
+            records.iter().all(|record| !record.fields.contains("args")),
+            "tool telemetry must not expose tool args as fields: {records:#?}"
         );
     }
 

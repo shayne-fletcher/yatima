@@ -19,6 +19,7 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "macros", "rt", "rt-multi-thread", "sync"] }
 tokio-util = "0.7"
+tracing = "0.1"
 
 # Auto-fetch (the `fetch` feature) embeds possum's downloader as a library,
 # pinned to the rev where its model commands moved into possum-lib.
@@ -37,3 +38,4 @@ tempfile = "3"
 proptest = "1"
 clap = { version = "4.5", features = ["derive"] }
 wiremock = "0.6"
+tracing-subscriber = "0.3"

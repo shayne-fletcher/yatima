@@ -360,6 +360,8 @@ impl Engine {
     /// by `detect_arch`. EOS ids come from the config / GGUF metadata, never
     /// hard-coded.
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
+        let span = tracing::info_span!("model.load", model = %model_dir.display());
+        let _enter = span.enter();
         if let Some(gguf) = gguf_in(model_dir) {
             return Self::load_gguf(model_dir, &gguf, device);
         }
@@ -451,7 +453,7 @@ impl Engine {
             }
         };
 
-        Ok(Self {
+        let engine = Self {
             model,
             tokenizer,
             device,
@@ -459,7 +461,15 @@ impl Engine {
             dtype,
             arch,
             prefill_chunk: None,
-        })
+        };
+        tracing::info!(
+            model = %model_dir.display(),
+            arch = ?engine.arch(),
+            backend = %engine.backend(),
+            prefill_chunk = ?engine.default_prefill_chunk(),
+            "loaded model"
+        );
+        Ok(engine)
     }
 
     /// Load a quantized model from a GGUF file. A GGUF carries its own metadata
@@ -468,6 +478,12 @@ impl Engine {
     /// `tokenizer.json` is present (which then wins). Quantized weights run on
     /// the device (Metal-quantized is supported).
     fn load_gguf(model_dir: &Path, gguf_path: &Path, device: Device) -> Result<Self> {
+        let span = tracing::info_span!(
+            "model.load_gguf",
+            model = %model_dir.display(),
+            gguf = %gguf_path.display()
+        );
+        let _enter = span.enter();
         let mut file = std::fs::File::open(gguf_path)?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow!("reading GGUF {}: {e}", gguf_path.display()))?;
@@ -517,7 +533,7 @@ impl Engine {
             other => unreachable!("GGUF arch {other:?} has no quantized loader"),
         };
 
-        Ok(Self {
+        let engine = Self {
             model,
             tokenizer,
             device,
@@ -525,7 +541,16 @@ impl Engine {
             dtype,
             arch,
             prefill_chunk,
-        })
+        };
+        tracing::info!(
+            model = %model_dir.display(),
+            gguf = %gguf_path.display(),
+            arch = ?engine.arch(),
+            backend = %engine.backend(),
+            prefill_chunk = ?engine.default_prefill_chunk(),
+            "loaded model"
+        );
+        Ok(engine)
     }
 
     /// A short "backend/dtype" label for diagnostics, e.g. `metal/BF16`.
@@ -591,6 +616,14 @@ impl Engine {
         let mut logits = None;
         for (chunk_index, start_pos) in (0..tokens.len()).step_by(chunk).enumerate() {
             let end = (start_pos + chunk).min(tokens.len());
+            tracing::debug!(
+                chunk_index,
+                chunk_count,
+                start_pos,
+                end_pos = end,
+                prompt_tokens = tokens.len(),
+                "prefill chunk started"
+            );
             on_progress(PrefillProgress {
                 chunk_index,
                 chunk_count,
@@ -601,6 +634,14 @@ impl Engine {
             });
             let input = Tensor::new(&tokens[start_pos..end], &self.device)?.unsqueeze(0)?;
             logits = Some(self.model.forward(&input, start_pos)?);
+            tracing::debug!(
+                chunk_index,
+                chunk_count,
+                start_pos,
+                end_pos = end,
+                prompt_tokens = tokens.len(),
+                "prefill chunk finished"
+            );
             on_progress(PrefillProgress {
                 chunk_index,
                 chunk_count,
@@ -705,10 +746,22 @@ impl Engine {
         init: A,
         mut step: impl FnMut(A, &str) -> Result<ControlFlow<A, A>>,
     ) -> Result<(A, Generation)> {
+        let span = tracing::info_span!(
+            "engine.generate",
+            arch = ?self.arch(),
+            backend = %self.backend(),
+            max_tokens = opts.max_tokens,
+            sampling = ?opts.sampling,
+            repeat_penalty = opts.repeat_penalty,
+            prefill_chunk = ?opts.prefill_chunk,
+            default_prefill_chunk = ?self.default_prefill_chunk()
+        );
+        let _enter = span.enter();
         self.model.reset()?;
 
         let mut stream = TokenOutputStream::new(self.tokenizer.clone());
         let mut tokens = self.encode_prompt(prompt)?;
+        let prompt_tokens = tokens.len();
 
         let mut logits_processor = opts.sampling.logits_processor();
         let mut acc = init;
@@ -768,13 +821,17 @@ impl Engine {
             };
         }
 
-        Ok((
-            acc,
-            Generation {
-                tokens: generated,
-                stop,
-            },
-        ))
+        let generation = Generation {
+            tokens: generated,
+            stop,
+        };
+        tracing::info!(
+            prompt_tokens,
+            generated_tokens = generation.tokens,
+            stop = ?generation.stop,
+            "generation finished"
+        );
+        Ok((acc, generation))
     }
 
     /// Run inference, streaming decoded text fragments to `on_token` (the

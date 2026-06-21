@@ -1,13 +1,17 @@
 # yatima — design notes
 
+This is the deep architecture record. The README is the public front door; this
+note keeps the contracts, invariants, state machines, and hard-won design
+details close to the code.
+
 `yatima` is a small Rust runtime for **language-integrated LLMs**: calling a
-local model as an ordinary in-process function. That's a *building block*, not a
-fixed product shape — embed it in an app, wrap it in a service, drive it from a
-TUI, compose it however the work demands; the in-process function is the
-foundation those are built on, not an alternative to them. We **own the runtime,
-rent the engine** — `yatima-lib` owns loading, the generation loop, and
-capability-scoped tools; the inference engine
-([candle](https://github.com/huggingface/candle)) is a swappable dependency.
+local model as an ordinary in-process function and letting it act only through
+explicit capabilities. That's a *building block*, not a fixed product shape —
+embed it in an app, wrap it in a service, drive it from a TUI, compose it however
+the work demands. We **own the runtime, rent the engine** — `yatima-lib` owns
+loading, the generation loop, chat/session state, and capability-scoped tools;
+the inference engine ([candle](https://github.com/huggingface/candle)) is a
+swappable dependency.
 
 ## Crates
 
@@ -83,6 +87,35 @@ The portable contract (what the later Haskell study reasons about):
 
 EOS ids are read from `config.json` / `generation_config.json` (a *set*, e.g.
 DeepSeek's `<｜end▁of▁sentence｜>` = 151643) — never hard-coded strings.
+
+## Observability
+
+`yatima-lib` emits structured `tracing` spans and events; applications decide how
+to collect them. The CLI installs a small `tracing-subscriber` layer driven by
+`RUST_LOG`, but the library never installs a global subscriber. This keeps Yatima
+embeddable: a service, TUI, notebook bridge, or Python wrapper can attach its
+own subscriber without fighting the runtime.
+
+The discipline is borrowed from Hyperactor:
+
+- **Fields, not prose.** Use typed fields such as `arch = ?engine.arch()`,
+  `backend = %engine.backend()`, `tool = %call.name`, `outcome = ?outcome`,
+  `prompt_tokens`, and `prefill_chunk`. The message string names the event; the
+  fields carry the data.
+- **No accidental payload capture.** Instrumented functions should use
+  `skip_all` or explicit spans/fields. Do not log prompts, generated text,
+  tool arguments, SEC payloads, auth tokens, or whole structs at info level.
+- **Spans for duration, events for facts.** `model.load`, `engine.generate`,
+  prefill chunks, and `tool.call` are duration-bearing operations. `loaded
+  model`, `generation finished`, `tool finished`, and `agent run finished` are
+  facts about those operations.
+- **Async spans must be attached to futures.** Do not hold a `span.enter()` guard
+  across `.await`; use `#[tracing::instrument(skip_all, fields(...))]` or
+  `future.instrument(span).await`.
+- **Info stays sparse.** Per-chunk and per-tool-detail records are debug-level;
+  per-token tracing is deferred until there is a concrete profiling need.
+- **Perfetto later, same events.** Perfetto should arrive as a subscriber/layer
+  over this field vocabulary, not as a second ad-hoc instrumentation system.
 
 ### Prefill scheduling
 
@@ -316,14 +349,15 @@ awaitable/watchable today.
 ## Registries
 
 The **canonical** invariant & law registry lives in the crate docs — see the
-`yatima-lib` crate doc (`lib.rs`: model store/discovery + generation) and the
-`yatima-cli` `main.rs` doc (`CLI-1`/`CLI-2`). Each is protected by a test that
-cites its id in an `// upholds: <id>` comment (`grep -r 'upholds:'`).
+`yatima-lib` crate doc and the `yatima-cli` `main.rs` doc. Each is protected by
+a test that cites its id in an `// upholds: <id>` comment (`grep -r
+'upholds:'`).
 
 In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
 **GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1/2**, **CAP-1/2**,
-**PROTO-1**); chat templates (**TMPL-1/2**); CLI (**CLI-1/2**).
+**PROTO-1**); observability (**OBS-1/2/3/4**); chat templates
+(**TMPL-1/2**); CLI (**CLI-1/2/3**).
 
 ## State machines
 

@@ -73,6 +73,17 @@
 //!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
 //!   from, never a silent mis-execution.
 //!
+//! Observability:
+//! - **OBS-1** `yatima-lib` emits `tracing` spans/events but never installs a
+//!   global subscriber; hosts own collection and formatting.
+//! - **OBS-2** info-level tracing never records prompts, generated text, tool
+//!   arguments, fetched payloads, auth tokens, or whole user structs.
+//! - **OBS-3** async spans are attached to futures; span guards are not held
+//!   across `.await`.
+//! - **OBS-4** telemetry data is structured and bounded: event messages name
+//!   facts, while fields carry typed dimensions such as model, backend, tool,
+//!   call id, token counts, stop reason, and outcome.
+//!
 //! Chat templates (instruction-following prompt rendering):
 //! - **TMPL-1** a [`PromptTemplate`] emits no literal BOS when the model's
 //!   tokenizer adds one (Gemma `<bos>`, Mistral `<s>`) — never double-BOS.

@@ -14,64 +14,58 @@
   </a>
 </p>
 
-`yatima` is a Rust runtime for language-integrated LLMs — calling a local model
-as an ordinary in-process function, and letting it *act* through tools whose
-authority is bounded by construction. It's a building block to compose freely,
-not a fixed product shape: weights are acquired by
-[`possum`](https://github.com/shayne-fletcher/possum) and loaded by `yatima`,
-which owns the runtime (loading, generation, and capability-scoped tools) while
-renting the inference engine ([candle](https://github.com/huggingface/candle)).
+`yatima` is a Rust runtime for using local LLMs inside typed programs. It loads
+models in-process, renders the right chat template for each family, and lets
+tool-trained models act only through explicit capabilities.
 
-## What it does
+The point is not to wrap an LLM service. The point is to make model calls part
+of ordinary Rust control flow: fetch public evidence, normalize it into typed
+values, ask a local model for a thesis or decision, then validate what it said
+against the data your program actually supplied.
 
-Three layers, increasing in capability:
+Weights are acquired by [`possum`](https://github.com/shayne-fletcher/possum)
+and loaded by `yatima`. `yatima` owns the runtime surface — loading, generation,
+chat, tools, capabilities, examples — while renting the inference engine from
+[candle](https://github.com/huggingface/candle).
 
-- **`generate`** — raw completion. `Engine::{load, generate, generate_with}` runs
-  a stateless loop streaming decoded fragments to a fold; the contract is stated
-  as laws and protected by tests. The loader dispatches on architecture — Qwen2,
-  Llama, Mistral, Phi-3, Gemma-2, StarCoder2, GLM-4 — and loads **GGUF/quantized**
-  weights too (self-contained: the tokenizer is built from the GGUF), so a 32B
-  runs on a Mac.
-- **`chat`** — instruction-following, no tools. Applies a model's native chat
-  template (`--format qwen|gemma|mistral|glm|plain`) so an instruct model behaves
-  as trained. Works for any instruct model.
-- **`agent`** — a tool loop for **tool-trained** models (currently Qwen/ChatML).
+Kindred in spirit to Anil Madhavapeddy's
+[*Language Integrated LLMs as an OCaml Function*](https://anil.recoil.org/notes/language-integrated-llms).
 
-**Capability matrix** (what each model can do):
+## What You Can Do
+
+- **Generate** raw completions with local safetensors or GGUF/quantized weights.
+- **Chat** with instruction-tuned models using their native prompt templates.
+- **Run agents** where tool-trained models act through capability-scoped tools.
+- **Embed** the runtime in Rust programs instead of crossing a service boundary.
+- **Audit outputs** by keeping public evidence, model claims, and validation in
+  the same typed program.
+
+Supported loading/generation covers Qwen2, Llama, Mistral, Phi-3, Gemma-2,
+StarCoder2, and GLM-4, with GGUF support for quantized Qwen2, Llama, and GLM-4.
+The agent/tool path is narrower by design: it requires a model trained to emit
+tool calls, and today the practical default is Qwen/ChatML.
 
 | Model family      | generate | chat  | agent/tools |
 |-------------------|----------|-------|-------------|
 | Qwen2.5-Instruct  | yes      | yes   | yes         |
 | GLM-4 (9B / 32B)  | yes      | yes   | no          |
 | Gemma-2-it        | yes      | yes   | no          |
-| Mistral-v0.3      | yes      | yes   | later/complex |
+| Mistral-v0.3      | yes      | yes   | later       |
 | TinyLlama-chat    | yes      | yes   | no          |
 | StarCoder2        | yes      | maybe | no          |
-- **Capability-scoped tools** — a tool *holds* its authority (e.g. a `Dir`
-  rooted at one directory); the file tools cannot reach outside it, a tool not in
-  the agent's set is uncallable, and a malformed or unknown call becomes an error
-  the model can recover from — never a silent mis-execution.
-- **An agent loop** — `Agent::run_async` / `run_with_async` fold model turns:
-  the model emits a tool call, a capability-scoped async tool runs, the result is
-  fed back, bounded by `max_steps`. Tool calls are awaitable, joinable,
-  watchable, and cooperatively cancellable; the synchronous `run` wrappers remain
-  for simple callers.
 
-Kindred in spirit to Anil Madhavapeddy's
-[*Language Integrated LLMs as an OCaml Function*](https://anil.recoil.org/notes/language-integrated-llms).
+## Try It
 
-## Building
+Build and test:
 
 ```bash
-cargo build                            # build
-cargo test                             # the whole suite (no GPU needed)
-cargo run --bin yatima -- --help       # explore the CLI
+cargo build
+cargo test
+cargo run --bin yatima -- --help
 ```
 
-## Try it
-
-The most compact demo is an agent that can read only the directory you grant it,
-then asks a local Qwen-format model to summarize this README:
+Ask a local Qwen-format model to read only the directory you grant it and
+summarize this README:
 
 ```bash
 cargo run -p yatima-cli --release --bin yatima --features metal -- agent \
@@ -91,124 +85,133 @@ models to be called as in-process functions. ...
 [1 steps, Final]
 ```
 
-That one command exercises the core path: local model load, an agent turn, a
-capability-scoped `read_file` tool call under `--root`, and a grounded final
-answer.
+That command exercises the core path: local model load, prompt rendering, an
+agent turn, a capability-scoped `read_file` tool call under `--root`, and a
+grounded final answer.
 
-The library tool set now includes read/list directory tools, a separate
-`WriteDir`-scoped `write_file`, `WebOrigin`-scoped `read_url`, and
-`NtfyTopic`-scoped `send_notification`. Each tool holds its own authority; the
-model supplies only arguments within that authority.
-
-Tools execute as async tasks. A caller can use `Tools::dispatch_async` when it
-only needs the typed `ToolOutcome`, or `Tools::spawn` to receive `ToolEvent`s,
-join the task, and request cooperative cancellation. `ToolResult` remains the
-model-facing projection used in transcripts. This is the intended foundation for
-TUIs, supervising agents, long-running downloads, process tools, and network
-effects.
-
-There is also an opt-in live test for the notification tool. Subscribe your
-phone to an ntfy topic first, then run:
+Other useful commands:
 
 ```bash
-YATIMA_NTFY_TOPIC=we-could-be-coding-haskell \
-  cargo test -p yatima-lib e2e_send_notification_to_phone -- --ignored
-```
-
-The normal test suite never publishes to ntfy.sh; this ignored test exists so
-you can prove the `NtfyTopic` capability and `send_notification` tool end to end.
-
-```bash
-# generate a completion (raw)
+# raw completion
 cargo run -p yatima-cli --release --bin yatima --features metal -- generate \
   --repo deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
   --prompt "Rust is"
 
-# chat — one-shot (applies the model's chat template)
+# one-shot chat with a chat-only instruct model
 cargo run -p yatima-cli --release --bin yatima --features metal -- chat \
   --repo google/gemma-2-2b-it --format gemma \
   --prompt "Explain Rust in two sentences."
 
-# chat — interactive multi-turn (omit --prompt); /exit quits, /reset clears
+# interactive multi-turn chat; /exit quits, /reset clears history
 cargo run -p yatima-cli --release --bin yatima --features metal -- chat \
   --repo Qwen/Qwen2.5-7B-Instruct --format qwen
-
-# run an agent with read-only file tools scoped to a directory
-cargo run -p yatima-cli --release --bin yatima --features metal -- agent \
-  --model ~/.cache/yatima/models/bartowski/Qwen2.5-32B-Instruct-GGUF \
-  --format qwen \
-  --root . \
-  --prompt "What's in README.md?" \
-  --verbose
 ```
 
-A missing model is fetched on demand (the `fetch` feature) via `possum`;
+A missing model is fetched on demand when the `fetch` feature is enabled;
 `--offline` never touches the network.
 
-### Prefill chunking
+## Auditable Research
 
-`yatima generate`, `yatima chat`, and `yatima agent` accept
-`--prefill-chunk <n>` to bound how many prompt tokens are evaluated in one
-prefill step. Omit it for the model/backend default; use `--prefill-chunk 0` to
-force one full-prompt prefill.
-
-This is mostly invisible, but it matters for some large quantized Metal models.
-GLM-4 GGUF on Metal defaults to a 64-token prefill chunk because full-prompt
-prefill on the 32B GGUF path can destabilize generation on long structured
-prompts, while bounded prefill preserves the same KV-cache semantics and keeps
-output coherent. The override is there for benchmarking and diagnosis.
-
-For a cheap reproducer that compares next-token logits without running a long
-generation, see [`notes/glm4-prefill-reproducer.md`](notes/glm4-prefill-reproducer.md)
-and `cargo run -p yatima-lib --release --example prefill_compare --features metal`.
-
-## Embedding
-
-The CLI is just one consumer — `yatima-lib` is meant to be called *as a library*,
-the model as an ordinary in-process function woven into your own control flow:
-
-```rust
-use yatima_lib::{ChatSession, ChatMlTemplate, Engine, device};
-
-let mut engine = Engine::load(model_dir, device(false)?)?;
-let mut chat = ChatSession::new(&mut engine, ChatMlTemplate).with_system("Be brief.");
-let answer = chat.turn("My name is Ada.")?;        // remembers across turns
-let recall = chat.turn("What is my name?")?;       // -> "Your name is Ada."
-
-// …or stream the reply token-by-token for a live UI:
-chat.turn_streaming("Tell me a joke.", &mut |piece| print!("{piece}"))?;
-```
-
-Because it's in-process, model output flows straight into native code — e.g. ask
-for a label and `match` on a Rust `enum`, no serialization or service boundary.
-See [`lib/examples/embed.rs`](lib/examples/embed.rs) (a conversation **and** a
-classify-then-branch triage loop): `cargo run --example embed --features metal`.
-
-## Auditable research
-
-The investment-research example is the most complete demonstration of the
-library shape: Rust resolves a ticker through SEC EDGAR, fetches public XBRL
+The investment-research example is the clearest demonstration of why this shape
+is interesting. Rust resolves a ticker through SEC EDGAR, fetches public XBRL
 company facts, normalizes them into cited evidence records, embeds a local chat
 model, asks for a concise research note, then audits the generated thesis against
 the evidence it supplied.
 
 ```bash
 SEC_USER_AGENT="your-name your-email@example.com" \
-  cargo run -p yatima-lib --release --example investment_thesis --features metal -- AAPL
+  cargo run -p yatima-lib --release --example investment_thesis --features metal -- \
+    --ticker AAPL
 ```
 
-The example defaults to the local Qwen 32B GGUF path used in the agent demo; pass
-a model directory as the second argument to override it. The generated note is
-not investment advice. It is a grounded-output demo: every factual claim is
-expected to cite the SEC accession, filing period/date, and XBRL tag it came
-from. A small example-local validator warns when the model cites unknown tags or
-accessions, drifts from the normalized `value_text`, omits citation fields on a
-quantity-bearing line, or uses trend language when only one period was supplied.
-For GLM-4 GGUF, pass `glm` as the third argument; an optional fourth argument
-sets the prefill chunk (`0` means full-prompt prefill).
+Compare several models on the same evidence:
 
-## Notes
+```bash
+SEC_USER_AGENT="yatima research example shayne@shayne-fletcher.org" \
+cargo run -p yatima-lib --release --example investment_thesis --features metal -- \
+  --ticker META \
+  --compare qwen32b,gemma2,mistral \
+  --temperature 0 \
+  --max-tokens 900
+```
 
-- [Design](notes/design.md) — the `generate` contract, model storage and
-  auto-fetch, the capability-scoped tool and agent layer, and the concurrency
-  model.
+The generated note is not investment advice. It is a grounded-output demo:
+quantity-bearing claims are expected to cite the SEC accession, period/filed
+date, and XBRL tag they came from. The example-local validator warns when the
+model cites unknown tags or accessions, drifts from normalized `value_text`,
+omits citation fields, or uses trend language when only one period was supplied.
+
+## Embedding
+
+The CLI is just one consumer. `yatima-lib` is meant to be called as a library,
+with model output flowing into native Rust values and branches:
+
+```rust
+use yatima_lib::{device, ChatMlTemplate, ChatSession, Engine};
+
+let mut engine = Engine::load(model_dir, device(false)?)?;
+let mut chat = ChatSession::new(&mut engine, ChatMlTemplate).with_system("Be brief.");
+
+let answer = chat.turn("My name is Ada.")?;
+let recall = chat.turn("What is my name?")?;
+
+chat.turn_streaming("Tell me a joke.", &mut |piece| print!("{piece}"))?;
+```
+
+See [`lib/examples/embed.rs`](lib/examples/embed.rs) for a conversation and a
+classify-then-branch triage loop:
+
+```bash
+cargo run -p yatima-lib --release --example embed --features metal
+```
+
+## Tools And Capabilities
+
+Tools hold their authority. A `ReadFile` tool constructed with a `Dir` can only
+read under that root; `WriteFile` uses a separate `WriteDir`; `ReadUrl` is scoped
+to a `WebOrigin`; `SendNotification` is scoped to a pre-shared `NtfyTopic`.
+The model supplies arguments, not authority.
+
+Tool execution is async and observable. Runtime code sees a typed `ToolOutcome`
+algebra; the model sees only the projected `ToolResult` turn. A caller can use
+`Tools::dispatch_async` for a result, or `Tools::spawn` to watch `ToolEvent`s,
+join the task, and request cooperative cancellation.
+
+There is an opt-in live test for the notification tool. Subscribe your phone to
+an ntfy topic first, then run:
+
+```bash
+YATIMA_NTFY_TOPIC=we-could-be-coding-haskell \
+  cargo test -p yatima-lib e2e_send_notification_to_phone -- --ignored
+```
+
+The normal test suite never publishes to ntfy.sh.
+
+## Architecture Notes
+
+`generate_with` is the primitive: an effectful fold over decoded text fragments.
+`chat` adds native prompt templates and transcript memory. `agent` adds a
+tool-call protocol, capability-scoped async tools, and typed outcomes.
+
+Generation itself remains synchronous and compute-bound: token `n + 1` depends
+on token `n`, and the current `Engine` owns mutable model state. Async belongs at
+the effect and UX boundaries: tool calls, future service/TUI/Python wrappers,
+and an eventual engine actor that owns the blocking kernel.
+
+`yatima-lib` emits structured `tracing` fields; `yatima-cli` installs the
+subscriber. For diagnostics:
+
+```bash
+RUST_LOG=yatima_lib=debug,yatima_cli=info \
+  cargo run -p yatima-cli --release --bin yatima -- chat ...
+```
+
+The library does not log prompts, generated text, tool arguments, or fetched
+payloads at info level. Perfetto support should layer over the same structured
+events later.
+
+For the full invariant registry, state machines, model-loading contract,
+concurrency discussion, and deferred work, see [notes/design.md](notes/design.md).
+
+For the GLM-4 GGUF Metal prefill investigation and reproducer, see
+[notes/glm4-prefill-reproducer.md](notes/glm4-prefill-reproducer.md).

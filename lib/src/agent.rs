@@ -151,6 +151,11 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         init: A,
         mut step: impl FnMut(A, AgentEvent) -> Result<ControlFlow<A, A>>,
     ) -> Result<(A, Run)> {
+        tracing::info!(
+            max_steps = self.max_steps,
+            tool_count = self.tools.specs().len(),
+            "agent run started"
+        );
         let system = format!(
             "{}\n\n{}",
             self.system,
@@ -217,6 +222,11 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                             ControlFlow::Break(a) => {
                                                 task.cancel();
                                                 let _ = task.join().await;
+                                                tracing::info!(
+                                                    steps,
+                                                    stop = ?AgentStop::Stopped,
+                                                    "agent run finished"
+                                                );
                                                 return Ok((
                                                     a,
                                                     Run {
@@ -235,6 +245,11 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                             ControlFlow::Break(a) => {
                                                 task.cancel();
                                                 let _ = task.join().await;
+                                                tracing::info!(
+                                                    steps,
+                                                    stop = ?AgentStop::Stopped,
+                                                    "agent run finished"
+                                                );
                                                 return Ok((
                                                     a,
                                                     Run {
@@ -285,6 +300,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             }
         }
 
+        tracing::info!(steps, stop = ?stop, "agent run finished");
         Ok((
             acc,
             Run {
