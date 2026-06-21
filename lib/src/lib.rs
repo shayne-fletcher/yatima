@@ -48,6 +48,11 @@
 //!   mis-rendered.
 //! - **CAPS-1** the agent/tool path is gated by host capability
 //!   ([`ChatFormat::supports_tools`]); a chat-only format cannot enter it.
+//! - **PROFILE-1** generation-option precedence is explicit and pure
+//!   ([`ModelProfile::apply_gen_overrides`]): profile fields override a caller
+//!   base `GenOpts`, and an unset `prefill_chunk` defers to the engine default.
+//! - **PROFILE-2** a [`ModelProfile`] resolves to exactly one source (`repo`
+//!   xor `dir`) before load.
 //!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
@@ -88,7 +93,9 @@ pub use engine::{
     device, is_model_present, Arch, Engine, GenOpts, Generation, PrefillLogits, PrefillProgress,
     Sampling, StopReason, TokenLogit,
 };
-pub use host::{caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelSource};
+pub use host::{
+    caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelProfile, ModelSource,
+};
 pub use template::{
     ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
 };

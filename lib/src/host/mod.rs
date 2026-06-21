@@ -9,7 +9,9 @@
 //! runtime policy (prefill) lives on `Arch`.
 
 mod format;
+mod profile;
 mod source;
 
 pub use format::{caps_for, resolve_format, Caps, ChatFormat, FormatMismatch};
+pub use profile::ModelProfile;
 pub use source::ModelSource;
