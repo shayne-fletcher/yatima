@@ -458,6 +458,12 @@ and deliberately shelved — the note records why so we don't repeat them.
 - A worked **service/TUI** embedder — the next consumer after the example.
 
 ### Architecture / research
+- **Invariant reviewer example — done.** `lib/examples/invariant_reviewer.rs`
+  gathers bounded git/file/test-citation context in Rust and asks an in-process
+  chat model for a cited report. This is the first "Yatima helps improve Yatima"
+  slice: advisory, not patch-writing. Git is host-side evidence gathering here;
+  a future interactive agent should get explicit `GitStatus`/`GitDiff`
+  capabilities rather than ambient shell access.
 - **Async engine-actor** owning the `Engine` and wrapping `run_with_async` — the
   home for cross-request concurrency and KV-cache reuse (see Concurrency).
 - **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the

@@ -165,6 +165,20 @@ classify-then-branch triage loop:
 cargo run -p yatima-lib --release --example embed --features metal
 ```
 
+Yatima can also inspect its own invariant discipline. The invariant reviewer
+example gathers the crate registries, `upholds:` test citations, changed files,
+and a bounded git diff, then asks a local chat model for a cited review:
+
+```bash
+cargo run -p yatima-lib --release --example invariant_reviewer --features metal -- \
+  --profile qwen32b \
+  --diff
+```
+
+This is deliberately advisory: the model does not edit files. It produces a
+short report about missing invariants, weak tests, wrong citations, or docs drift
+for a human to judge.
+
 ## Tools And Capabilities
 
 Tools hold their authority. A `ReadFile` tool constructed with a `Dir` can only
