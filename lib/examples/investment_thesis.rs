@@ -9,13 +9,14 @@
 //!   cargo run -p yatima-lib --release --example investment_thesis --features metal -- AAPL
 //! ```
 //!
-//! Pass an explicit model directory as the second argument if you do not want the
+//! Pass an explicit model directory as the second argument and chat format as
+//! the third (`qwen`, `gemma`, `mistral`, or `plain`) if you do not want the
 //! default Qwen 32B GGUF path:
 //!
 //! ```bash
 //! SEC_USER_AGENT="your-name your-email@example.com" \
 //!   cargo run -p yatima-lib --release --example investment_thesis --features metal -- \
-//!     MSFT ~/.cache/yatima/models/bartowski/Qwen2.5-32B-Instruct-GGUF
+//!     MSFT ~/.cache/yatima/models/google/gemma-2-2b-it gemma
 //! ```
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -25,7 +26,10 @@ use serde_json::Number;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
-use yatima_lib::{device, ChatMlTemplate, ChatSession, Engine, GenOpts, Sampling};
+use yatima_lib::{
+    device, ChatMlTemplate, ChatSession, Engine, GemmaTemplate, GenOpts, MistralTemplate,
+    PlainTemplate, PromptTemplate, Sampling,
+};
 
 const COMPANY_TICKERS_URL: &str = "https://www.sec.gov/files/company_tickers.json";
 const COMPANYFACTS_BASE_URL: &str = "https://data.sec.gov/api/xbrl/companyfacts";
@@ -51,6 +55,12 @@ fn main() -> Result<()> {
         .next()
         .map(PathBuf::from)
         .unwrap_or_else(default_qwen_32b_dir);
+    let format = args
+        .next()
+        .as_deref()
+        .map(ChatFormat::parse)
+        .transpose()?
+        .unwrap_or(ChatFormat::Qwen);
 
     let user_agent = std::env::var("SEC_USER_AGENT").context(
         "set SEC_USER_AGENT to a descriptive value with contact info, \
@@ -73,7 +83,12 @@ fn main() -> Result<()> {
 
     let mut engine = Engine::load(&model_dir, device(false)?)
         .with_context(|| format!("loading model {}", model_dir.display()))?;
-    eprintln!("loaded {} [{}]", model_dir.display(), engine.backend());
+    eprintln!(
+        "loaded {} [{}]; format {}",
+        model_dir.display(),
+        engine.backend(),
+        format.name()
+    );
 
     let prompt = format!(
         "\
@@ -96,7 +111,7 @@ SEC evidence JSON:
         sampling: Sampling::Greedy,
         ..Default::default()
     };
-    let mut chat = ChatSession::new(&mut engine, ChatMlTemplate)
+    let mut chat = ChatSession::new(&mut engine, format.template())
         .with_system(SYSTEM)
         .with_opts(opts);
     let answer = chat.turn(&prompt)?.to_string();
@@ -109,6 +124,44 @@ SEC evidence JSON:
     }
     println!("{answer}");
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatFormat {
+    Qwen,
+    Gemma,
+    Mistral,
+    Plain,
+}
+
+impl ChatFormat {
+    fn parse(s: &str) -> Result<ChatFormat> {
+        match s {
+            "qwen" => Ok(ChatFormat::Qwen),
+            "gemma" => Ok(ChatFormat::Gemma),
+            "mistral" => Ok(ChatFormat::Mistral),
+            "plain" => Ok(ChatFormat::Plain),
+            other => bail!("unknown chat format {other:?}; expected qwen|gemma|mistral|plain"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ChatFormat::Qwen => "qwen",
+            ChatFormat::Gemma => "gemma",
+            ChatFormat::Mistral => "mistral",
+            ChatFormat::Plain => "plain",
+        }
+    }
+
+    fn template(self) -> Box<dyn PromptTemplate> {
+        match self {
+            ChatFormat::Qwen => Box::new(ChatMlTemplate),
+            ChatFormat::Gemma => Box::new(GemmaTemplate),
+            ChatFormat::Mistral => Box::new(MistralTemplate),
+            ChatFormat::Plain => Box::new(PlainTemplate),
+        }
+    }
 }
 
 fn default_qwen_32b_dir() -> PathBuf {
@@ -490,6 +543,16 @@ fn metric_specs() -> &'static [MetricSpec] {
             name: "OperatingCashFlow",
             taxonomy: "us-gaap",
             tags: &["NetCashProvidedByUsedInOperatingActivities"],
+            units: &["USD"],
+        },
+        MetricSpec {
+            name: "CapitalExpenditures",
+            taxonomy: "us-gaap",
+            tags: &[
+                "PaymentsToAcquirePropertyPlantAndEquipment",
+                "PaymentsToAcquireProductiveAssets",
+                "CapitalExpendituresIncurredButNotYetPaid",
+            ],
             units: &["USD"],
         },
         MetricSpec {
