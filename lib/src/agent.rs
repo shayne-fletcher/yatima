@@ -12,7 +12,9 @@
 
 use crate::completer::Completer;
 use crate::template::PromptTemplate;
-use crate::tool::{ToolCall, ToolCallCodec, ToolEvent, ToolResult, Tools};
+use crate::tool::{
+    ToolCall, ToolCallCodec, ToolEvent, ToolOutcome, ToolRejection, ToolResult, Tools,
+};
 use crate::GenOpts;
 use anyhow::Result;
 use std::ops::ControlFlow;
@@ -40,7 +42,7 @@ pub enum AgentEvent {
     ToolCall(ToolCall),
     ToolStarted(ToolCall),
     ToolProgress(String),
-    ToolResult(ToolResult),
+    ToolOutcome(ToolOutcome),
     Final(String),
 }
 
@@ -195,7 +197,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 // A tool call (well-formed or not): dispatch / make an error
                 // result, feed it back, and continue under the step budget.
                 Some(parsed) => {
-                    let result = match parsed {
+                    let (tool_name, outcome) = match parsed {
                         Ok(call) => {
                             match step(acc, AgentEvent::ToolCall(call.clone()))? {
                                 ControlFlow::Continue(a) => acc = a,
@@ -205,8 +207,9 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                     break;
                                 }
                             }
+                            let tool_name = call.name.clone();
                             let mut task = self.tools.spawn(call);
-                            let result = loop {
+                            let outcome = loop {
                                 match task.recv().await {
                                     Some(ToolEvent::Started { call, .. }) => {
                                         match step(acc, AgentEvent::ToolStarted(call))? {
@@ -244,25 +247,27 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                             }
                                         }
                                     }
-                                    Some(ToolEvent::Finished { result, .. }) => break result,
+                                    Some(ToolEvent::Finished { outcome, .. }) => break outcome,
                                     Some(ToolEvent::Cancelled { .. }) => {}
                                     None => break task.join().await,
                                 }
                             };
-                            result
+                            (tool_name, outcome)
                         }
-                        Err(e) => ToolResult {
-                            name: String::new(),
-                            content: format!("malformed tool call: {e}"),
-                            is_error: true,
-                        },
+                        Err(e) => (
+                            String::new(),
+                            ToolOutcome::Rejected(ToolRejection::InvalidArgs {
+                                message: format!("malformed tool call: {e}"),
+                            }),
+                        ),
                     };
 
+                    let result = outcome.render_for_model(&tool_name);
                     transcript.push(Turn {
                         role: Role::Tool,
                         content: render_result(&result),
                     });
-                    match step(acc, AgentEvent::ToolResult(result))? {
+                    match step(acc, AgentEvent::ToolOutcome(outcome))? {
                         ControlFlow::Continue(a) => acc = a,
                         ControlFlow::Break(a) => {
                             acc = a;
@@ -477,10 +482,10 @@ mod tests {
         assert_eq!(run_plain.stop, run_folded.stop);
         assert_eq!(run_plain.transcript.len(), run_folded.transcript.len());
 
-        // and run_with saw ToolCall, ToolStarted, ToolResult, Final in order
+        // and run_with saw ToolCall, ToolStarted, ToolOutcome, Final in order
         assert!(matches!(events[0], AgentEvent::ToolCall(_)));
         assert!(matches!(events[1], AgentEvent::ToolStarted(_)));
-        assert!(matches!(events[2], AgentEvent::ToolResult(_)));
+        assert!(matches!(events[2], AgentEvent::ToolOutcome(_)));
         assert!(matches!(events[3], AgentEvent::Final(_)));
     }
 
@@ -497,7 +502,7 @@ mod tests {
         let (observed, run) = agent
             .run_with("q", 0usize, |n, event| {
                 Ok(match event {
-                    AgentEvent::ToolResult(_) => ControlFlow::Break(n + 1),
+                    AgentEvent::ToolOutcome(_) => ControlFlow::Break(n + 1),
                     _ => ControlFlow::Continue(n + 1),
                 })
             })

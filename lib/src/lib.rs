@@ -61,14 +61,17 @@
 //! - **TOOL-1** tool calls are async task executions: they can be awaited,
 //!   joined, watched through [`ToolEvent`], and cooperatively cancelled without
 //!   changing their argument schema.
+//! - **TOOL-2** [`ToolOutcome`] is the runtime truth of tool execution; the
+//!   model-facing [`ToolResult`] is a projection at the protocol boundary.
 //! - **CAP-1** a [`Dir`]-scoped tool cannot reach paths outside its root
 //!   (containment, reusing `is_safe_relative` / MS-3).
 //! - **CAP-2** the agent's effects ⊆ the union of its tools' capabilities —
 //!   enforced for omission (AGENT-2) and containment (CAP-1); by construction
 //!   otherwise (tools hold their caps, no ambient `std::fs` or arbitrary
 //!   network destination). Stated, not compiler-absolute — see `notes/design.md`.
-//! - **PROTO-1** a malformed/unknown tool call becomes an `is_error` result the
-//!   model can recover from, never a silent mis-execution.
+//! - **PROTO-1** a malformed/unknown tool call becomes a typed non-success
+//!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
+//!   from, never a silent mis-execution.
 //!
 //! Chat templates (instruction-following prompt rendering):
 //! - **TMPL-1** a [`PromptTemplate`] emits no literal BOS when the model's
@@ -104,8 +107,8 @@ pub use template::{
 };
 pub use tool::{
     JsonToolCall, ListDir, QwenToolCall, ReadFile, ReadUrl, SendNotification, Tool, ToolCall,
-    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolResult, ToolSpec, ToolTask, Tools,
-    WriteFile,
+    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolFailure, ToolOutcome, ToolRejection,
+    ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
 };
 
 use anyhow::{bail, Result};

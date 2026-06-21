@@ -101,9 +101,11 @@ The library tool set now includes read/list directory tools, a separate
 model supplies only arguments within that authority.
 
 Tools execute as async tasks. A caller can use `Tools::dispatch_async` when it
-only needs the result, or `Tools::spawn` to receive `ToolEvent`s, join the task,
-and request cooperative cancellation. This is the intended foundation for TUIs,
-supervising agents, long-running downloads, process tools, and network effects.
+only needs the typed `ToolOutcome`, or `Tools::spawn` to receive `ToolEvent`s,
+join the task, and request cooperative cancellation. `ToolResult` remains the
+model-facing projection used in transcripts. This is the intended foundation for
+TUIs, supervising agents, long-running downloads, process tools, and network
+effects.
 
 There is also an opt-in live test for the notification tool. Subscribe your
 phone to an ntfy topic first, then run:

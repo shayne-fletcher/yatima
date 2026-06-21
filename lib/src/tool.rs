@@ -3,9 +3,9 @@
 //! A [`Tool`] is a Rust function the model may invoke; it *holds* its
 //! capabilities (it is constructed with them), so its authority is bounded by
 //! construction — we never hand it ambient `std::fs`. [`Tools`] is the set an
-//! agent may use; [`Tools::dispatch`] never hard-errors — an unknown name
-//! (AGENT-2) or a tool failure becomes an `is_error` [`ToolResult`] the model
-//! can see and recover from (PROTO-1).
+//! agent may use; [`Tools::dispatch_async`] never hard-errors — an unknown name
+//! (AGENT-2), invalid arguments, cancellation, or a tool failure becomes a typed
+//! [`ToolOutcome`]. The model sees only the projected [`ToolResult`] (PROTO-1).
 //!
 //! [`ToolCallCodec`] is the wire format between model text and a [`ToolCall`].
 //! A real model uses its native codec ([`QwenToolCall`]); [`JsonToolCall`] is a
@@ -22,6 +22,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -44,9 +45,8 @@ pub struct ToolCall {
     pub args: Value,
 }
 
-/// The outcome of a tool call, fed back to the model. `is_error` distinguishes
-/// a recoverable failure (unknown tool, bad args, IO error) from a result, so
-/// the model can react — the failure is never silent (PROTO-1).
+/// The model-facing projection of a tool call. Runtime code should reason over
+/// [`ToolOutcome`]; this is the protocol value fed back to the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
     pub name: String,
@@ -70,6 +70,62 @@ impl ToolResult {
             is_error: true,
         }
     }
+}
+
+/// Runtime truth of a tool call. This is the algebra agents and supervisors
+/// should reason over; [`ToolResult`] is only the model-facing projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Success { content: String },
+    Rejected(ToolRejection),
+    Failed(ToolFailure),
+    Cancelled { reason: Option<String> },
+    TimedOut { after: Duration },
+}
+
+impl ToolOutcome {
+    pub fn success(content: impl Into<String>) -> ToolOutcome {
+        ToolOutcome::Success {
+            content: content.into(),
+        }
+    }
+
+    pub fn render_for_model(&self, name: &str) -> ToolResult {
+        match self {
+            ToolOutcome::Success { content } => ToolResult::ok(name, content.clone()),
+            ToolOutcome::Rejected(reason) => ToolResult::error(name, reason.to_string()),
+            ToolOutcome::Failed(error) => ToolResult::error(name, error.to_string()),
+            ToolOutcome::Cancelled { reason } => {
+                let content = reason
+                    .clone()
+                    .unwrap_or_else(|| "tool call cancelled".to_string());
+                ToolResult::error(name, content)
+            }
+            ToolOutcome::TimedOut { after } => {
+                ToolResult::error(name, format!("tool call timed out after {after:?}"))
+            }
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, ToolOutcome::Success { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ToolRejection {
+    #[error("unknown tool '{name}'")]
+    UnknownTool { name: String },
+    #[error("invalid arguments: {message}")]
+    InvalidArgs { message: String },
+    #[error("capability denied: {message}")]
+    CapabilityDenied { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("tool failed: {message}")]
+pub struct ToolFailure {
+    pub message: String,
 }
 
 pub type ToolCallId = u64;
@@ -130,7 +186,7 @@ pub enum ToolEvent {
     },
     Finished {
         call_id: ToolCallId,
-        result: ToolResult,
+        outcome: ToolOutcome,
     },
     Cancelled {
         call_id: ToolCallId,
@@ -143,7 +199,7 @@ pub struct ToolTask {
     call_id: ToolCallId,
     cancel: CancellationToken,
     events: broadcast::Receiver<ToolEvent>,
-    join: JoinHandle<ToolResult>,
+    join: JoinHandle<ToolOutcome>,
 }
 
 impl ToolTask {
@@ -169,10 +225,12 @@ impl ToolTask {
         }
     }
 
-    pub async fn join(self) -> ToolResult {
+    pub async fn join(self) -> ToolOutcome {
         match self.join.await {
             Ok(result) => result,
-            Err(e) => ToolResult::error("", format!("tool task failed: {e}")),
+            Err(e) => ToolOutcome::Failed(ToolFailure {
+                message: format!("tool task failed: {e}"),
+            }),
         }
     }
 }
@@ -183,8 +241,8 @@ impl ToolTask {
 pub trait Tool: Send + Sync {
     /// What the model is told about this tool.
     fn spec(&self) -> ToolSpec;
-    /// Run the tool. Returning `Err` is fine — [`Tools::dispatch`] turns it into
-    /// an `is_error` [`ToolResult`]; the tool need not format failures itself.
+    /// Run the tool. Returning `Err` is fine — [`Tools::dispatch_async`] turns it
+    /// into a typed [`ToolOutcome`]; the tool need not format failures itself.
     async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String>;
 }
 
@@ -212,11 +270,11 @@ impl Tools {
         self.tools.iter().map(|t| t.spec()).collect()
     }
 
-    /// Dispatch a call to the named tool. Never hard-errors: an unknown name or
-    /// a tool-level failure becomes an `is_error` [`ToolResult`] (AGENT-2 /
-    /// PROTO-1).
+    /// Dispatch a call to the named tool from synchronous code. This returns the
+    /// model-facing projection for compatibility; async/runtime callers should
+    /// prefer [`Tools::dispatch_async`] to get the full [`ToolOutcome`] algebra.
     pub fn dispatch(&self, call: &ToolCall) -> ToolResult {
-        match tokio::runtime::Handle::try_current() {
+        let outcome = match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 tokio::task::block_in_place(|| handle.block_on(self.dispatch_async(call)))
             }
@@ -225,11 +283,12 @@ impl Tools {
                 .build()
                 .expect("build tokio runtime for tool dispatch")
                 .block_on(self.dispatch_async(call)),
-        }
+        };
+        outcome.render_for_model(&call.name)
     }
 
     /// Async dispatch for callers already in a Tokio runtime.
-    pub async fn dispatch_async(&self, call: &ToolCall) -> ToolResult {
+    pub async fn dispatch_async(&self, call: &ToolCall) -> ToolOutcome {
         self.spawn(call.clone()).join().await
     }
 
@@ -251,35 +310,34 @@ impl Tools {
                 call_id,
                 call: task_call.clone(),
             });
-            let result = match tool {
-                None => ToolResult::error(
-                    &task_call.name,
-                    format!("unknown tool '{}'", task_call.name),
-                ),
+            let outcome = match tool {
+                None => ToolOutcome::Rejected(ToolRejection::UnknownTool {
+                    name: task_call.name.clone(),
+                }),
                 Some(tool) => {
                     let fut = tool.call(task_call.args.clone(), ctx.clone());
                     tokio::select! {
-                        _ = ctx.cancelled() => ToolResult::error(&task_call.name, "tool call cancelled".to_string()),
+                        _ = ctx.cancelled() => ToolOutcome::Cancelled { reason: None },
                         result = fut => match result {
-                            Ok(content) => ToolResult::ok(&task_call.name, content),
-                            Err(e) => ToolResult::error(&task_call.name, e.to_string()),
+                            Ok(content) => ToolOutcome::success(content),
+                            Err(e) => classify_tool_error(e),
                         }
                     }
                 }
             };
-            let result = if ctx.is_cancelled() && !result.is_error {
-                ToolResult::error(&task_call.name, "tool call cancelled".to_string())
+            let outcome = if ctx.is_cancelled() && outcome.is_success() {
+                ToolOutcome::Cancelled { reason: None }
             } else {
-                result
+                outcome
             };
             if ctx.is_cancelled() {
                 let _ = events_tx.send(ToolEvent::Cancelled { call_id });
             }
             let _ = events_tx.send(ToolEvent::Finished {
                 call_id,
-                result: result.clone(),
+                outcome: outcome.clone(),
             });
-            result
+            outcome
         });
         ToolTask {
             call_id,
@@ -287,6 +345,15 @@ impl Tools {
             events: events_rx,
             join,
         }
+    }
+}
+
+fn classify_tool_error(error: anyhow::Error) -> ToolOutcome {
+    match error.downcast::<ToolRejection>() {
+        Ok(rejection) => ToolOutcome::Rejected(rejection),
+        Err(error) => ToolOutcome::Failed(ToolFailure {
+            message: error.to_string(),
+        }),
     }
 }
 
@@ -541,7 +608,7 @@ impl Tool for ReadFile {
         let path = args
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("read_file: missing string argument 'path'"))?;
+            .ok_or_else(|| invalid_args("read_file: missing string argument 'path'"))?;
         let full = self.dir.resolve(path)?; // CAP-1
         Ok(tokio::fs::read_to_string(&full).await?)
     }
@@ -735,7 +802,7 @@ impl Notification {
     fn from_args(args: &Value) -> Result<Notification> {
         let message = required_string(args, "send_notification", "message")?.to_string();
         if message.is_empty() {
-            bail!("send_notification: message must not be empty");
+            return Err(invalid_args("send_notification: message must not be empty"));
         }
         let title = optional_string(args, "title")?.map(str::to_string);
         let priority = optional_string(args, "priority")?.map(str::to_string);
@@ -794,14 +861,16 @@ impl NtfyPublisher {
 fn required_string<'a>(args: &'a Value, tool: &str, field: &str) -> Result<&'a str> {
     args.get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{tool}: missing string argument '{field}'"))
+        .ok_or_else(|| invalid_args(format!("{tool}: missing string argument '{field}'")))
 }
 
 fn optional_string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>> {
     match args.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
-        Some(_) => bail!("send_notification: optional argument '{field}' must be a string"),
+        Some(_) => Err(invalid_args(format!(
+            "send_notification: optional argument '{field}' must be a string"
+        ))),
     }
 }
 
@@ -809,14 +878,18 @@ fn optional_bool(args: &Value, tool: &str, field: &str) -> Result<Option<bool>> 
     match args.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
-        Some(_) => bail!("{tool}: optional argument '{field}' must be a boolean"),
+        Some(_) => Err(invalid_args(format!(
+            "{tool}: optional argument '{field}' must be a boolean"
+        ))),
     }
 }
 
 fn validate_ntfy_priority(priority: &str) -> Result<()> {
     match priority {
         "min" | "low" | "default" | "high" | "urgent" | "1" | "2" | "3" | "4" | "5" => Ok(()),
-        _ => bail!("send_notification: invalid priority {priority:?}"),
+        _ => Err(invalid_args(format!(
+            "send_notification: invalid priority {priority:?}"
+        ))),
     }
 }
 
@@ -828,16 +901,27 @@ fn optional_tags(args: &Value) -> Result<Option<Vec<String>>> {
             .map(|v| {
                 let tag = v
                     .as_str()
-                    .ok_or_else(|| anyhow!("send_notification: tags must be strings"))?;
+                    .ok_or_else(|| invalid_args("send_notification: tags must be strings"))?;
                 if tag.contains(',') || tag.contains('\n') || tag.contains('\r') {
-                    bail!("send_notification: tags must not contain commas or newlines");
+                    return Err(invalid_args(
+                        "send_notification: tags must not contain commas or newlines",
+                    ));
                 }
                 Ok(tag.to_string())
             })
             .collect::<Result<Vec<_>>>()
             .map(Some),
-        Some(_) => bail!("send_notification: optional argument 'tags' must be an array"),
+        Some(_) => Err(invalid_args(
+            "send_notification: optional argument 'tags' must be an array",
+        )),
     }
+}
+
+fn invalid_args(message: impl Into<String>) -> anyhow::Error {
+    ToolRejection::InvalidArgs {
+        message: message.into(),
+    }
+    .into()
 }
 
 #[async_trait]
@@ -862,7 +946,7 @@ impl Tool for ListDir {
         let path = args
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("list_dir: missing string argument 'path'"))?;
+            .ok_or_else(|| invalid_args("list_dir: missing string argument 'path'"))?;
         let full = self.dir.resolve(path)?; // CAP-1
         let mut names = Vec::new();
         let mut entries = tokio::fs::read_dir(&full).await?;
@@ -1009,12 +1093,24 @@ mod tests {
         // upholds: AGENT-2 — a name not in the set is uncallable, surfaced as an
         // error result rather than ambient execution.
         let tools = Tools::new();
-        let result = tools.dispatch(&ToolCall {
+        let call = ToolCall {
             name: "rm_rf".to_string(),
             args: Value::Null,
-        });
+        };
+        let result = tools.dispatch(&call);
         assert!(result.is_error);
         assert!(result.content.contains("unknown tool"));
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tools.dispatch_async(&call));
+        assert_eq!(
+            outcome,
+            ToolOutcome::Rejected(ToolRejection::UnknownTool {
+                name: "rm_rf".to_string()
+            })
+        );
     }
 
     #[test]
@@ -1023,16 +1119,29 @@ mod tests {
         // error result, not a panic.
         let tmp = tempfile::tempdir().unwrap();
         let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
-        let r = tools.dispatch(&ToolCall {
+        let call = ToolCall {
             name: "read_file".to_string(),
             args: json("{}"),
-        });
+        };
+        let r = tools.dispatch(&call);
         assert!(r.is_error);
         let r2 = tools.dispatch(&ToolCall {
             name: "read_file".to_string(),
             args: Value::Null,
         });
         assert!(r2.is_error);
+
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tools.dispatch_async(&call));
+        assert_eq!(
+            outcome,
+            ToolOutcome::Rejected(ToolRejection::InvalidArgs {
+                message: "read_file: missing string argument 'path'".to_string()
+            })
+        );
     }
 
     #[test]
@@ -1163,8 +1272,10 @@ mod tests {
             })
             .await;
 
-        assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains(r#""event":"message""#));
+        let ToolOutcome::Success { content } = result else {
+            panic!("unexpected outcome: {result:?}");
+        };
+        assert!(content.contains(r#""event":"message""#));
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
@@ -1195,8 +1306,12 @@ mod tests {
                 args: json(r#"{"url": "/doc"}"#),
             })
             .await;
-        assert!(!result.is_error, "{}", result.content);
-        assert_eq!(result.content, "hello web");
+        assert_eq!(
+            result,
+            ToolOutcome::Success {
+                content: "hello web".to_string()
+            }
+        );
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -1261,6 +1376,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tool_outcome_projects_to_model_result() {
+        let ok = ToolOutcome::Success {
+            content: "42".to_string(),
+        }
+        .render_for_model("calc");
+        assert_eq!(ok, ToolResult::ok("calc", "42".to_string()));
+
+        let rejected = ToolOutcome::Rejected(ToolRejection::CapabilityDenied {
+            message: "outside root".to_string(),
+        })
+        .render_for_model("read_file");
+        assert_eq!(rejected.name, "read_file");
+        assert!(rejected.is_error);
+        assert_eq!(rejected.content, "capability denied: outside root");
+
+        let failed = ToolOutcome::Failed(ToolFailure {
+            message: "disk full".to_string(),
+        })
+        .render_for_model("write_file");
+        assert!(failed.is_error);
+        assert_eq!(failed.content, "tool failed: disk full");
+
+        let timed_out = ToolOutcome::TimedOut {
+            after: Duration::from_secs(3),
+        }
+        .render_for_model("read_url");
+        assert!(timed_out.is_error);
+        assert_eq!(timed_out.content, "tool call timed out after 3s");
+    }
+
     struct ProgressTool;
 
     #[async_trait]
@@ -1303,17 +1449,18 @@ mod tests {
         assert!(matches!(
             finished,
             ToolEvent::Finished {
-                result: ToolResult {
-                    is_error: false,
-                    ..
-                },
+                outcome: ToolOutcome::Success { .. },
                 ..
             }
         ));
 
         let result = task.join().await;
-        assert_eq!(result.content, "done");
-        assert!(!result.is_error);
+        assert_eq!(
+            result,
+            ToolOutcome::Success {
+                content: "done".to_string()
+            }
+        );
     }
 
     struct CancelTool;
@@ -1350,8 +1497,7 @@ mod tests {
         ));
         task.cancel();
         let result = task.join().await;
-        assert!(result.is_error);
-        assert!(result.content.contains("cancelled"));
+        assert_eq!(result, ToolOutcome::Cancelled { reason: None });
     }
 
     fn header_value<'a>(request: &'a wiremock::Request, name: &str) -> &'a str {
@@ -1388,6 +1534,6 @@ mod tests {
             })
             .await;
 
-        assert!(!result.is_error, "{}", result.content);
+        assert!(matches!(result, ToolOutcome::Success { .. }), "{result:?}");
     }
 }

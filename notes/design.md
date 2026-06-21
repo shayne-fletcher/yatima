@@ -138,11 +138,12 @@ The design is **small composable seams**, simplest concrete impl behind each:
   ambient `std::fs`.
 - **`Tool` / `Tools`** — a tool advertises a `ToolSpec` (JSON-Schema params, the
   de-facto standard) and runs `async call(args, ctx)`. `Tools::dispatch_async`
-  **never hard-errors**: an unknown name (AGENT-2) or a tool failure becomes an
-  `is_error` `ToolResult` the model can recover from (PROTO-1). `Tools::spawn`
-  returns a `ToolTask` with `ToolEvent`s, `join`, and cooperative cancellation.
-  Current tools: `ReadFile`, `ListDir`, `WriteFile`, `ReadUrl`, and
-  `SendNotification`, each holding its own capability.
+  **never hard-errors**: an unknown name (AGENT-2), invalid arguments,
+  cancellation, or a tool failure becomes a typed `ToolOutcome`; `ToolResult` is
+  only the model-facing projection the transcript receives (PROTO-1).
+  `Tools::spawn` returns a `ToolTask` with `ToolEvent`s, `join`, and cooperative
+  cancellation. Current tools: `ReadFile`, `ListDir`, `WriteFile`, `ReadUrl`,
+  and `SendNotification`, each holding its own capability.
 - **`PromptTemplate`** (the chat format) — renders the transcript into the
   model's *native* prompt string. `ChatMlTemplate` (Qwen2.5), `PlainTemplate`
   (fallback/tests). A model is acutely sensitive to its trained format; the wrong
@@ -302,8 +303,9 @@ one-generation-at-a-time.
 Tool execution is different: tools are effectful boundary calls (filesystem,
 HTTP, notifications, future process/MCP adapters), so the tool core is async.
 `ToolCtx` carries lifecycle emission and cooperative cancellation; `Tools::spawn`
-is the join/watch/cancel surface, while the agent normally awaits each tool
-result before the next model turn.
+is the join/watch/cancel surface, while the agent normally awaits each typed
+`ToolOutcome`, projects it to a model-facing `ToolResult`, and then proceeds to
+the next model turn.
 
 **Deferred**: the durable engine-side shape is an **engine actor** owning the
 `Engine` and serving `(prompt, opts, reply)` requests over a channel — also the
@@ -320,7 +322,7 @@ cites its id in an `// upholds: <id>` comment (`grep -r 'upholds:'`).
 
 In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
-**GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1**, **CAP-1/2**,
+**GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1/2**, **CAP-1/2**,
 **PROTO-1**); chat templates (**TMPL-1/2**); CLI (**CLI-1/2**).
 
 ## State machines
