@@ -90,6 +90,24 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         Ok(&self.turns.last().expect("just pushed").content)
     }
 
+    /// Like [`turn`](ChatSession::turn), but streams the reply to `on_token` as
+    /// it is produced (live chat UIs). Same transcript bookkeeping.
+    pub fn turn_streaming(&mut self, user: &str, on_token: &mut dyn FnMut(&str)) -> Result<&str> {
+        self.turns.push(Turn {
+            role: Role::User,
+            content: user.to_string(),
+        });
+        let prompt = self.template.render(&self.turns);
+        let completion = self
+            .completer
+            .complete_streaming(&prompt, &self.opts, &[], on_token)?;
+        self.turns.push(Turn {
+            role: Role::Assistant,
+            content: completion.text.trim().to_string(),
+        });
+        Ok(&self.turns.last().expect("just pushed").content)
+    }
+
     /// Clear the conversation back to the seeded system prompt.
     pub fn reset(&mut self) {
         self.turns.truncate(self.system_len);
@@ -158,6 +176,20 @@ mod tests {
         assert_eq!(chat.history().len(), 4);
         assert_eq!(chat.history()[0].role, Role::User);
         assert_eq!(chat.history()[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn turn_streaming_delivers_and_accumulates() {
+        let mut model = Scripted::new(&["streamed reply"]);
+        let mut chat = ChatSession::new(&mut model, PlainTemplate);
+        let mut got = String::new();
+        let answer = chat
+            .turn_streaming("hi", &mut |piece| got.push_str(piece))
+            .unwrap()
+            .to_string();
+        assert_eq!(answer, "streamed reply");
+        assert_eq!(got, "streamed reply"); // delivered via the callback
+        assert_eq!(chat.history().len(), 2); // user + assistant
     }
 
     #[test]

@@ -13,8 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use yatima_lib::{
     device, model_dir, models_root, Agent, ChatMlTemplate, ChatSession, Completer, Dir, Engine,
     GemmaTemplate, GenOpts, GlmTemplate, JsonToolCall, ListDir, MistralTemplate, ModelId,
-    PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, Role, Sampling, ToolCallCodec, Tools,
-    Turn,
+    PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec, Tools,
 };
 
 #[derive(Parser)]
@@ -232,68 +231,28 @@ fn chat(args: ChatArgs) -> Result<()> {
     };
 
     let system = args.system;
+    let mut session = ChatSession::new(&mut engine, template).with_opts(opts);
+    if let Some(sys) = system {
+        session = session.with_system(sys);
+    }
     match args.prompt {
         // One-shot: dogfood the library `ChatSession` (batch). Memory isn't
         // needed for a single turn, but this exercises the public embedding API.
         Some(prompt) => {
-            let mut session = ChatSession::new(&mut engine, template).with_opts(opts);
-            if let Some(sys) = system {
-                session = session.with_system(sys);
-            }
             println!("{}", session.turn(&prompt)?);
         }
-        // Interactive: a streaming REPL that accumulates the transcript (the live
-        // UX wants token streaming, which `ChatSession`'s batch `turn` doesn't do
-        // yet — see the streaming-`Completer` roadmap item).
-        None => {
-            let mut turns: Vec<Turn> = Vec::new();
-            if let Some(sys) = system {
-                turns.push(Turn {
-                    role: Role::System,
-                    content: sys,
-                });
-            }
-            chat_repl(&mut engine, template.as_ref(), &opts, turns)?;
-        }
+        // Interactive: stream each turn through the same `ChatSession`, fully
+        // dogfooding the library's streaming seam (`turn_streaming`).
+        None => chat_repl(session)?,
     }
     Ok(())
 }
 
-/// Render the transcript, stream the model's answer to stdout, and append it to
-/// the transcript as an assistant turn (so the next turn remembers it).
-fn respond(
-    engine: &mut Engine,
-    template: &dyn PromptTemplate,
-    opts: &GenOpts,
-    turns: &mut Vec<Turn>,
-) -> Result<()> {
-    let prompt = template.render(turns);
-    let mut stdout = std::io::stdout();
-    let mut answer = String::new();
-    engine.generate(&prompt, opts, |piece| {
-        stdout.write_all(piece.as_bytes())?;
-        stdout.flush()?;
-        answer.push_str(piece);
-        Ok(())
-    })?;
-    println!();
-    turns.push(Turn {
-        role: Role::Assistant,
-        content: answer.trim().to_string(),
-    });
-    Ok(())
-}
-
-/// Interactive multi-turn loop: `you> ` prompt, stdin line by line. EOF (Ctrl-D)
-/// or `/exit` ends the session; `/reset` clears the conversation (keeping the
-/// system turn).
-fn chat_repl(
-    engine: &mut Engine,
-    template: &dyn PromptTemplate,
-    opts: &GenOpts,
-    mut turns: Vec<Turn>,
-) -> Result<()> {
-    let system_turns = turns.len(); // the seeded system turn(s) to keep on /reset
+/// Interactive multi-turn loop over a library [`ChatSession`]: `you> ` prompt,
+/// stdin line by line, the answer streamed to stdout token-by-token via
+/// [`ChatSession::turn_streaming`]. EOF (Ctrl-D) or `/exit` ends the session;
+/// `/reset` clears the conversation (keeping the system turn).
+fn chat_repl<C: Completer, T: PromptTemplate>(mut session: ChatSession<'_, C, T>) -> Result<()> {
     let stdin = std::io::stdin();
     eprintln!("entering chat — /exit to quit, /reset to clear history");
     loop {
@@ -312,17 +271,19 @@ fn chat_repl(
                 break;
             }
             "/reset" => {
-                turns.truncate(system_turns);
+                session.reset();
                 eprintln!("(history cleared)");
                 continue;
             }
             _ => {}
         }
-        turns.push(Turn {
-            role: Role::User,
-            content: line.to_string(),
-        });
-        respond(engine, template, opts, &mut turns)?;
+        let mut stdout = std::io::stdout();
+        session.turn_streaming(line, &mut |piece| {
+            // best-effort live echo; a write failure just drops the fragment.
+            let _ = stdout.write_all(piece.as_bytes());
+            let _ = stdout.flush();
+        })?;
+        println!();
     }
     Ok(())
 }
@@ -560,6 +521,7 @@ fn fetch_model(id: &ModelId, _root: &std::path::Path, _gguf: Option<&str>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yatima_lib::{Role, Turn};
 
     #[test]
     fn source_directory() {

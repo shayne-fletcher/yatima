@@ -1043,4 +1043,44 @@ mod tests {
         eprintln!("e2e ran {ran}/6 families");
         Ok(())
     }
+
+    // Proves the Engine's `complete_streaming` override is *real* streaming: a
+    // multi-token answer must reach `on_token` in more than one call (the trait's
+    // default impl would deliver the whole text in a single call). Gated, skips
+    // fast if the weights aren't cached.
+    #[test]
+    fn e2e_engine_streams_in_multiple_chunks() -> Result<()> {
+        use crate::completer::Completer;
+        if std::env::var_os("YATIMA_E2E").is_none() {
+            eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+            return Ok(());
+        }
+        let repo = crate::ModelId::parse("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B").unwrap();
+        let dir = crate::model_dir(&crate::models_root(), &repo);
+        if !is_model_present(&dir) {
+            eprintln!("skipping e2e: weights absent at {}", dir.display());
+            return Ok(());
+        }
+
+        let mut engine = Engine::load(&dir, device(false)?)?;
+        let opts = GenOpts {
+            max_tokens: 16,
+            sampling: Sampling::Greedy,
+            ..Default::default()
+        };
+        let mut calls = 0usize;
+        let mut acc = String::new();
+        let completion = engine.complete_streaming(
+            "Rust is a systems programming language that",
+            &opts,
+            &[],
+            &mut |piece| {
+                calls += 1;
+                acc.push_str(piece);
+            },
+        )?;
+        assert!(calls > 1, "expected >1 streamed chunk, got {calls}");
+        assert_eq!(acc, completion.text, "streamed pieces reconstruct the text");
+        Ok(())
+    }
 }

@@ -28,6 +28,22 @@ pub trait Completer {
     /// soon as any string in `stops` appears in the output. The returned
     /// [`Completion::text`] includes the matched stop string.
     fn complete(&mut self, prompt: &str, opts: &GenOpts, stops: &[String]) -> Result<Completion>;
+
+    /// Like [`complete`](Completer::complete), but delivers text to `on_token` as
+    /// it is produced (for live UIs / streaming chat). The default emits the whole
+    /// completion once — so every `Completer` works unchanged; backends that can
+    /// stream (e.g. [`Engine`]) override this to forward fragments incrementally.
+    fn complete_streaming(
+        &mut self,
+        prompt: &str,
+        opts: &GenOpts,
+        stops: &[String],
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        let completion = self.complete(prompt, opts, stops)?;
+        on_token(&completion.text);
+        Ok(completion)
+    }
 }
 
 /// The real engine as a [`Completer`]: a thin adapter over `generate_with` that
@@ -46,6 +62,41 @@ impl Completer for Engine {
                     }
                     None => Ok(ControlFlow::Continue(acc)),
                 }
+            })?;
+        Ok(Completion {
+            text,
+            stop: generation.stop,
+        })
+    }
+
+    fn complete_streaming(
+        &mut self,
+        prompt: &str,
+        opts: &GenOpts,
+        stops: &[String],
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        // Stream each newly-committed slice as it is decoded; never emit past a
+        // stop marker (truncate to it, like `complete`).
+        let mut emitted = 0usize;
+        let (text, generation) =
+            self.generate_with(prompt, opts, String::new(), |mut acc, fragment| {
+                acc.push_str(fragment);
+                let flow = match first_stop_end(&acc, stops) {
+                    Some(end) => {
+                        acc.truncate(end);
+                        ControlFlow::Break(())
+                    }
+                    None => ControlFlow::Continue(()),
+                };
+                if acc.len() > emitted {
+                    on_token(&acc[emitted..]);
+                    emitted = acc.len();
+                }
+                Ok(match flow {
+                    ControlFlow::Break(()) => ControlFlow::Break(acc),
+                    ControlFlow::Continue(()) => ControlFlow::Continue(acc),
+                })
             })?;
         Ok(Completion {
             text,

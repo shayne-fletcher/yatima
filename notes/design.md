@@ -376,10 +376,13 @@ and deliberately shelved — the note records why so we don't repeat them.
   `Agent`), exercised by `lib/examples/embed.rs` (a real non-CLI consumer:
   conversation + model→`enum`→native branch) and dogfooded by the CLI's one-shot
   `chat`. This is what makes "language-integrated" a demonstrated fact.
-- **Streaming `Completer`** — the next API step: a token-callback variant so
-  `ChatSession` can stream too (today streaming is `Engine::generate`-only, so the
-  interactive REPL keeps its own loop). Would let the CLI fully dogfood
-  `ChatSession`.
+- **Streaming `Completer` — done.** `Completer::complete_streaming` adds a
+  token-callback variant with a default impl (emit the whole completion once, so
+  every existing `Completer` keeps working); `Engine` overrides it to forward each
+  decoded fragment as it arrives. `ChatSession::turn_streaming` streams a turn
+  through it, and the CLI's interactive `chat` REPL now drives a `ChatSession`
+  end-to-end (the hand-rolled loop is gone) — so the CLI fully dogfoods the
+  library on both the one-shot and streaming paths.
 - A worked **service/TUI** embedder — the next consumer after the example.
 
 ### Architecture / research

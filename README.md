@@ -133,6 +133,9 @@ let mut engine = Engine::load(model_dir, device(false)?)?;
 let mut chat = ChatSession::new(&mut engine, ChatMlTemplate).with_system("Be brief.");
 let answer = chat.turn("My name is Ada.")?;        // remembers across turns
 let recall = chat.turn("What is my name?")?;       // -> "Your name is Ada."
+
+// …or stream the reply token-by-token for a live UI:
+chat.turn_streaming("Tell me a joke.", &mut |piece| print!("{piece}"))?;
 ```
 
 Because it's in-process, model output flows straight into native code — e.g. ask
