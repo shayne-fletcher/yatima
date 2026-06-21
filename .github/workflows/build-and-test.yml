@@ -2,6 +2,9 @@ name: build and test
 on:
   push:
   pull_request:
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"   # HTTP/1.1; sidesteps the crates.io HTTP/2 framing flake
 jobs:
   build:
     runs-on: ubuntu-latest
