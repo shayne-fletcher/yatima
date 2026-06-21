@@ -41,6 +41,13 @@
 //! - **PREFILL-1** device-sensitive prefill defaults are owned by the loaded
 //!   engine ([`Engine::default_prefill_chunk`], from [`Arch::metal_prefill_chunk`]
 //!   gated on the device); profiles and CLI flags only override deliberately.
+//! - **HOST-1** an omitted chat format resolves to the architecture default
+//!   ([`ChatFormat::default_for`] / [`resolve_format`], from [`caps_for`]).
+//! - **HOST-2** a supplied format differing from the architecture default is
+//!   honored but surfaced as a [`FormatMismatch`] warning, never silently
+//!   mis-rendered.
+//! - **CAPS-1** the agent/tool path is gated by host capability
+//!   ([`ChatFormat::supports_tools`]); a chat-only format cannot enter it.
 //!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
@@ -66,6 +73,7 @@ mod capability;
 mod chat;
 mod completer;
 mod engine;
+mod host;
 mod template;
 mod token_output_stream;
 mod tool;
@@ -80,6 +88,7 @@ pub use engine::{
     device, is_model_present, Arch, Engine, GenOpts, Generation, PrefillLogits, PrefillProgress,
     Sampling, StopReason, TokenLogit,
 };
+pub use host::{caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelSource};
 pub use template::{
     ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
 };

@@ -9,12 +9,21 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::{Parser, Subcommand};
 use yatima_lib::{
-    device, model_dir, models_root, Agent, ChatMlTemplate, ChatSession, Completer, Dir, Engine,
-    GemmaTemplate, GenOpts, GlmTemplate, JsonToolCall, ListDir, MistralTemplate, ModelId,
-    PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec, Tools,
+    device, model_dir, models_root, resolve_format, Agent, ChatFormat, ChatMlTemplate, ChatSession,
+    Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId, ModelSource, PlainTemplate,
+    PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec, Tools,
 };
+
+/// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
+/// parsed back into the lib enum. (clap can't derive `ValueEnum` on a foreign
+/// type, so we wrap `FromStr` over the published `NAMES`.)
+fn chat_format_parser() -> impl TypedValueParser<Value = ChatFormat> {
+    PossibleValuesParser::new(ChatFormat::NAMES)
+        .map(|s| s.parse::<ChatFormat>().expect("NAMES are valid formats"))
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -118,41 +127,13 @@ struct AgentArgs {
     /// safetensors shards.
     #[arg(long)]
     gguf: Option<String>,
-    /// The model's chat / tool-call format.
-    #[arg(long, value_enum, default_value_t = ChatFormat::Qwen)]
-    format: ChatFormat,
+    /// The model's chat / tool-call format. Omit to infer from the model's
+    /// architecture; a value that contradicts the model is honored but warned.
+    #[arg(long, value_parser = chat_format_parser())]
+    format: Option<ChatFormat>,
     /// Print the full transcript (to stderr), not just the final answer.
     #[arg(long)]
     verbose: bool,
-}
-
-/// Which model-native chat format to speak. `Qwen`/`Plain` also carry a
-/// tool-call codec (usable by `agent`); `Gemma`/`Mistral` are chat-only.
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ChatFormat {
-    /// Qwen2.5-Instruct: ChatML (+ `<tool_call>` tools).
-    Qwen,
-    /// Gemma-2-it: `<start_of_turn>` (chat only).
-    Gemma,
-    /// Mistral-v0.3: `[INST] … [/INST]` (chat only).
-    Mistral,
-    /// GLM-4: `[gMASK]<sop><|role|>` (chat only).
-    Glm,
-    /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
-    Plain,
-}
-
-impl ChatFormat {
-    /// The prompt template for this format (used by `chat`).
-    fn template(self) -> Box<dyn PromptTemplate> {
-        match self {
-            ChatFormat::Qwen => Box::new(ChatMlTemplate),
-            ChatFormat::Gemma => Box::new(GemmaTemplate),
-            ChatFormat::Mistral => Box::new(MistralTemplate),
-            ChatFormat::Glm => Box::new(GlmTemplate),
-            ChatFormat::Plain => Box::new(PlainTemplate),
-        }
-    }
 }
 
 #[derive(clap::Args)]
@@ -173,9 +154,10 @@ struct ChatArgs {
     /// Optional system instruction (applies for the whole session).
     #[arg(long)]
     system: Option<String>,
-    /// The model's chat format.
-    #[arg(long, value_enum, default_value_t = ChatFormat::Qwen)]
-    format: ChatFormat,
+    /// The model's chat format. Omit to infer from the model's architecture; a
+    /// value that contradicts the model is honored but warned.
+    #[arg(long, value_parser = chat_format_parser())]
+    format: Option<ChatFormat>,
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
     #[arg(long, default_value_t = 0.0)]
@@ -235,10 +217,16 @@ fn chat(args: ChatArgs) -> Result<()> {
     let mut engine = Engine::load(&dir, device(args.cpu)?)?;
     eprintln!("loaded {} [{}]", dir.display(), engine.backend());
 
-    let template = args.format.template();
+    // Infer the chat format from the model's architecture unless overridden
+    // (HOST-1); warn on a contradicting override rather than mis-render (HOST-2).
+    let (format, mismatch) = resolve_format(engine.arch(), args.format);
+    if let Some(m) = mismatch {
+        eprintln!("warning: {m}");
+    }
+    let template = format.template();
     let opts = GenOpts {
         max_tokens: args.max_tokens,
-        sampling: sampling_of(args.temperature, args.seed),
+        sampling: Sampling::from_temperature(args.temperature, args.seed),
         prefill_chunk: args.prefill_chunk,
         ..Default::default()
     };
@@ -301,16 +289,6 @@ fn chat_repl<C: Completer, T: PromptTemplate>(mut session: ChatSession<'_, C, T>
     Ok(())
 }
 
-/// Map the CLI's `temperature`/`seed` flags to a [`Sampling`] policy: a
-/// non-positive temperature means deterministic greedy (no seed).
-fn sampling_of(temperature: f64, seed: u64) -> Sampling {
-    if temperature <= 0.0 {
-        Sampling::Greedy
-    } else {
-        Sampling::Sample { temperature, seed }
-    }
-}
-
 fn agent(args: AgentArgs) -> Result<()> {
     let dir = ModelSource::from_args(
         args.model,
@@ -332,7 +310,7 @@ fn agent(args: AgentArgs) -> Result<()> {
 
     let opts = GenOpts {
         max_tokens: args.max_tokens,
-        sampling: sampling_of(args.temperature, args.seed),
+        sampling: Sampling::from_temperature(args.temperature, args.seed),
         prefill_chunk: args.prefill_chunk,
         // Keep the default repetition penalty: prose answers degenerate
         // (repeated words) without it. The penalty can mangle a tool call's JSON
@@ -352,8 +330,14 @@ fn agent(args: AgentArgs) -> Result<()> {
         .system
         .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
 
-    // The codec/template pair is the model's native format, chosen by --format.
-    match args.format {
+    // Infer the format from the model unless overridden (HOST-1/HOST-2), then
+    // pick the codec/template pair. Chat-only formats can't enter the tool loop
+    // (CAPS-1): the match's fallthrough rejects them.
+    let (format, mismatch) = resolve_format(engine.arch(), args.format);
+    if let Some(m) = mismatch {
+        eprintln!("warning: {m}");
+    }
+    match format {
         ChatFormat::Qwen => run_agent(
             &mut engine,
             &tools,
@@ -376,9 +360,9 @@ fn agent(args: AgentArgs) -> Result<()> {
             &args.prompt,
             args.verbose,
         ),
-        ChatFormat::Gemma | ChatFormat::Mistral | ChatFormat::Glm => bail!(
-            "--format gemma/mistral/glm is chat-only (not tool-trained); use `yatima chat` \
-             for those models, or --format qwen for the agent"
+        other => bail!(
+            "--format {other} is chat-only (not tool-trained); use `yatima chat` for it, \
+             or --format qwen for the agent"
         ),
     }
 }
@@ -435,7 +419,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
 
     let opts = GenOpts {
         max_tokens: args.max_tokens,
-        sampling: sampling_of(args.temperature, args.seed),
+        sampling: Sampling::from_temperature(args.temperature, args.seed),
         prefill_chunk: args.prefill_chunk,
         ..Default::default()
     };
@@ -450,103 +434,12 @@ fn generate(args: GenerateArgs) -> Result<()> {
     Ok(())
 }
 
-/// Where a model's files come from — exactly one source, parsed at the edge so
-/// the rest of the program never sees an invalid combination (CLI-1).
-enum ModelSource {
-    Directory(PathBuf),
-    Repository {
-        id: ModelId,
-        root: PathBuf,
-        fetch: FetchPolicy,
-        /// A single GGUF file to fetch instead of safetensors shards.
-        gguf: Option<String>,
-    },
-}
-
-enum FetchPolicy {
-    Online,
-    Offline,
-}
-
-impl ModelSource {
-    fn from_args(
-        model: Option<PathBuf>,
-        repo: Option<String>,
-        models_dir: Option<PathBuf>,
-        offline: bool,
-        gguf: Option<String>,
-    ) -> Result<ModelSource> {
-        match (model, repo) {
-            (Some(dir), None) => Ok(ModelSource::Directory(dir)),
-            (None, Some(repo)) => Ok(ModelSource::Repository {
-                id: ModelId::parse(&repo)?,
-                gguf,
-                root: models_dir.unwrap_or_else(models_root),
-                fetch: if offline {
-                    FetchPolicy::Offline
-                } else {
-                    FetchPolicy::Online
-                },
-            }),
-            (Some(_), Some(_)) => bail!("pass only one of --model / --repo"),
-            (None, None) => bail!("specify --model <dir> or --repo <id>"),
-        }
-    }
-
-    /// Resolve to a concrete model directory, fetching on a cache miss when the
-    /// policy is `Online` (CLI-2: `Offline` never touches the network).
-    fn resolve(self) -> Result<PathBuf> {
-        match self {
-            ModelSource::Directory(dir) => Ok(dir),
-            ModelSource::Repository {
-                id,
-                root,
-                fetch,
-                gguf,
-            } => {
-                let dir = model_dir(&root, &id);
-                if yatima_lib::is_model_present(&dir) {
-                    return Ok(dir);
-                }
-                match fetch {
-                    FetchPolicy::Offline => bail!(
-                        "model '{id}' not present at {} (drop --offline to fetch, or run: \
-                         possum model download --repository {id} --to {})",
-                        dir.display(),
-                        root.display()
-                    ),
-                    FetchPolicy::Online => fetch_model(&id, &root, gguf.as_deref()),
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "fetch")]
-fn fetch_model(id: &ModelId, root: &std::path::Path, gguf: Option<&str>) -> Result<PathBuf> {
-    eprintln!("fetching {id} …");
-    yatima_lib::ensure_model_blocking(id, root, gguf)
-}
-
-#[cfg(not(feature = "fetch"))]
-fn fetch_model(id: &ModelId, _root: &std::path::Path, _gguf: Option<&str>) -> Result<PathBuf> {
-    bail!("model '{id}' not present and yatima was built without the `fetch` feature")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yatima_lib::{Role, Turn};
 
     #[test]
-    fn source_directory() {
-        // upholds: CLI-1
-        let s = ModelSource::from_args(Some(PathBuf::from("/m")), None, None, false, None).unwrap();
-        assert!(matches!(s, ModelSource::Directory(_)));
-    }
-
-    #[test]
-    fn chat_command_parses_with_format() {
+    fn chat_command_parses_optional_format() {
         let cli = Cli::try_parse_from([
             "yatima",
             "chat",
@@ -562,15 +455,17 @@ mod tests {
             panic!("expected the chat subcommand");
         };
         assert_eq!(args.prompt.as_deref(), Some("explain rust"));
-        assert!(matches!(args.format, ChatFormat::Gemma));
-        // chat accepts the chat-only formats; the template registry covers all four.
-        assert!(matches!(
-            ChatFormat::Mistral.template().render(&[Turn {
-                role: Role::User,
-                content: "x".into()
-            }]),
-            s if s.contains("[INST]")
-        ));
+        assert_eq!(args.format, Some(ChatFormat::Gemma));
+    }
+
+    #[test]
+    fn chat_format_is_optional_for_inference() {
+        // Omitting --format is valid: the format is inferred from the model.
+        let cli = Cli::try_parse_from(["yatima", "chat", "--repo", "x/y"]).unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected the chat subcommand");
+        };
+        assert_eq!(args.format, None);
     }
 
     #[test]
@@ -584,44 +479,11 @@ mod tests {
     }
 
     #[test]
-    fn source_repository_online_and_offline() {
-        // upholds: CLI-1
-        let on = ModelSource::from_args(None, Some("org/name".into()), None, false, None).unwrap();
-        assert!(matches!(
-            on,
-            ModelSource::Repository {
-                fetch: FetchPolicy::Online,
-                ..
-            }
-        ));
-        let off = ModelSource::from_args(None, Some("org/name".into()), None, true, None).unwrap();
-        assert!(matches!(
-            off,
-            ModelSource::Repository {
-                fetch: FetchPolicy::Offline,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn source_is_exclusive_and_required() {
-        // upholds: CLI-1 — exactly one model source.
-        assert!(ModelSource::from_args(
-            Some(PathBuf::from("/m")),
-            Some("org/name".into()),
-            None,
-            false,
-            None
-        )
-        .is_err());
-        assert!(ModelSource::from_args(None, None, None, false, None).is_err());
-    }
-
-    #[test]
-    fn source_rejects_escaping_model_id() {
-        // upholds: MS-3
-        assert!(ModelSource::from_args(None, Some("../escape".into()), None, false, None).is_err());
+    fn chat_rejects_unknown_format() {
+        // clap's PossibleValuesParser rejects a name outside ChatFormat::NAMES.
+        assert!(
+            Cli::try_parse_from(["yatima", "chat", "--repo", "x/y", "--format", "llama3"]).is_err()
+        );
     }
 
     #[test]
@@ -644,47 +506,20 @@ mod tests {
         };
         assert_eq!(args.prompt, "do a thing");
         assert_eq!(args.max_steps, 3);
-        // the model source is parsed by the same checked path as `generate`.
-        let src = ModelSource::from_args(
+        // the model source is parsed by the same checked library path as `generate`.
+        assert!(ModelSource::from_args(
             args.model,
             args.repo,
             args.models_dir,
             args.offline,
-            args.gguf,
+            args.gguf
         )
-        .unwrap();
-        assert!(matches!(src, ModelSource::Repository { .. }));
+        .is_ok());
     }
 
     #[test]
     fn agent_requires_a_prompt() {
         // clap rejects a missing required --prompt before any work happens.
         assert!(Cli::try_parse_from(["yatima", "agent", "--repo", "org/name"]).is_err());
-    }
-
-    #[test]
-    fn sampling_zero_temp_is_greedy() {
-        assert_eq!(sampling_of(0.0, 7), Sampling::Greedy);
-        assert!(matches!(
-            sampling_of(0.8, 7),
-            Sampling::Sample {
-                temperature,
-                seed: 7
-            } if temperature == 0.8
-        ));
-    }
-
-    #[test]
-    fn offline_absent_errors_without_network() {
-        // upholds: CLI-2 — offline + absent model errors, never fetches.
-        let src = ModelSource::from_args(
-            None,
-            Some("org/name".into()),
-            Some(PathBuf::from("/nonexistent-yatima-models-xyzzy")),
-            true,
-            None,
-        )
-        .unwrap();
-        assert!(src.resolve().is_err());
     }
 }
