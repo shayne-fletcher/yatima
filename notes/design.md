@@ -43,6 +43,7 @@ first, not the second. Capability by model family:
 | Model family      | generate | chat  | agent/tools |
 |-------------------|----------|-------|-------------|
 | Qwen2.5-Instruct  | yes      | yes   | yes         |
+| GLM-4 (9B / 32B)  | yes      | yes   | no          |
 | Gemma-2-it        | yes      | yes   | no          |
 | Mistral-v0.3      | yes      | yes   | later/complex |
 | TinyLlama-chat    | yes      | yes   | no          |
@@ -205,10 +206,11 @@ returns last-token logits as `[1, vocab]` vs the others' `[1, 1, vocab]` — bot
 normalized by the single `last_token_logits` helper. Unsupported models fail with
 a clear "unsupported architecture" error, not a serde mismatch.
 
-Loadable today: **Qwen2, Llama, Mistral, Phi-3, Gemma-2, StarCoder2** (safetensors)
-plus **GGUF/quantized** Qwen2 and Llama. Note this covers *loading + `generate`*
-(raw completion) for all of them; the **agent** path still assumes the Qwen/ChatML
-tool format — per-model chat templates are a later slice.
+Loadable today: **Qwen2, Llama, Mistral, Phi-3, Gemma-2, StarCoder2, GLM-4**
+(safetensors) plus **GGUF/quantized** Qwen2, Llama, and GLM-4. Note this covers
+*loading + `generate`* (raw completion) for all of them, and `chat` for those with
+a chat template (Qwen/Gemma/Mistral/GLM); the **agent** path still assumes the
+Qwen/ChatML tool format.
 
 **GGUF / quantized.** A model dir with a single `*.gguf` takes the quantized
 path: `Engine::load_gguf` reads the file's metadata for the architecture

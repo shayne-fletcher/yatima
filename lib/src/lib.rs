@@ -67,7 +67,9 @@ pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
 pub use engine::ensure_model_blocking;
 pub use engine::{device, is_model_present, Engine, GenOpts, Generation, Sampling, StopReason};
-pub use template::{ChatMlTemplate, GemmaTemplate, MistralTemplate, PlainTemplate, PromptTemplate};
+pub use template::{
+    ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
+};
 pub use tool::{
     JsonToolCall, ListDir, QwenToolCall, ReadFile, Tool, ToolCall, ToolCallCodec, ToolResult,
     ToolSpec, Tools,

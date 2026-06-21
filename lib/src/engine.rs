@@ -17,7 +17,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::{
-    gemma2, llama, mistral, phi3, quantized_llama, quantized_qwen2, qwen2, starcoder2,
+    gemma2, glm4_new, llama, mistral, phi3, quantized_glm4, quantized_llama, quantized_qwen2,
+    qwen2, starcoder2,
 };
 use candle_transformers::utils::apply_repeat_penalty;
 use tokenizers::Tokenizer;
@@ -132,11 +133,24 @@ self_cache_causal_lm!(mistral::Model);
 self_cache_causal_lm!(phi3::Model);
 self_cache_causal_lm!(gemma2::Model);
 self_cache_causal_lm!(starcoder2::Model);
+self_cache_causal_lm!(glm4_new::ModelForCausalLM);
 
 // Quantized (GGUF) models fit the same self-cache shape: `forward(&mut self, x,
 // index_pos)` + `clear_kv_cache()`.
 self_cache_causal_lm!(quantized_qwen2::ModelWeights);
 self_cache_causal_lm!(quantized_llama::ModelWeights);
+
+// Quantized GLM-4 has the same `forward(input, offset)` but no public
+// `clear_kv_cache`: it auto-resets its KV cache when `offset == 0` (the prefill
+// our loop always hits first), so `reset` is a safe no-op.
+impl CausalLm for quantized_glm4::ModelWeights {
+    fn forward(&mut self, input: &Tensor, pos: usize) -> Result<Tensor> {
+        Ok(quantized_glm4::ModelWeights::forward(self, input, pos)?)
+    }
+    fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// Llama threads an external cache and has no `clear_kv_cache`; this wrapper
 /// holds the cache (and what's needed to rebuild it) so it fits [`CausalLm`].
@@ -176,6 +190,7 @@ enum Arch {
     Phi3,
     Gemma2,
     Starcoder2,
+    Glm4,
 }
 
 /// Detect the architecture from `config.json`, accepting both the
@@ -195,9 +210,10 @@ fn detect_arch(config: &serde_json::Value) -> Result<Arch> {
             "Phi3ForCausalLM" | "phi3" => Ok(Arch::Phi3),
             "Gemma2ForCausalLM" | "gemma2" => Ok(Arch::Gemma2),
             "Starcoder2ForCausalLM" | "starcoder2" => Ok(Arch::Starcoder2),
+            "Glm4ForCausalLM" | "glm4" => Ok(Arch::Glm4),
             other => bail!(
                 "unsupported architecture: {other} (supported: Qwen2, Llama, \
-                 Mistral, Phi3, Gemma2, Starcoder2)"
+                 Mistral, Phi3, Gemma2, Starcoder2, Glm4)"
             ),
         },
         None => bail!("config.json has no `architectures` or `model_type`"),
@@ -324,6 +340,11 @@ impl Engine {
                     serde_json::from_slice(&config_bytes).map_err(|_| parse("Starcoder2"))?;
                 Box::new(starcoder2::Model::new(&cfg, vb)?)
             }
+            Arch::Glm4 => {
+                let cfg: glm4_new::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Glm4"))?;
+                Box::new(glm4_new::ModelForCausalLM::new(&cfg, vb)?)
+            }
             Arch::Llama => {
                 let cfg: llama::LlamaConfig =
                     serde_json::from_slice(&config_bytes).map_err(|_| parse("Llama"))?;
@@ -388,7 +409,12 @@ impl Engine {
             "llama" => Box::new(quantized_llama::ModelWeights::from_gguf(
                 content, &mut file, &device,
             )?),
-            other => bail!("unsupported GGUF architecture: {other} (supported: qwen2, llama)"),
+            "glm4" | "chatglm" => Box::new(quantized_glm4::ModelWeights::from_gguf(
+                content, &mut file, &device, dtype,
+            )?),
+            other => {
+                bail!("unsupported GGUF architecture: {other} (supported: qwen2, llama, glm4)")
+            }
         };
 
         Ok(Self {
@@ -981,6 +1007,7 @@ mod tests {
             "microsoft/Phi-3-mini-4k-instruct",
             "google/gemma-2-2b-it",
             "bigcode/starcoder2-3b",
+            "zai-org/GLM-4-9B-0414",
             "bartowski/Qwen2.5-32B-Instruct-GGUF",
         ];
 

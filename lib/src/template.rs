@@ -157,6 +157,34 @@ impl PromptTemplate for MistralTemplate {
     }
 }
 
+/// GLM-4's chat format: a literal `[gMASK]<sop>` prefix, then
+/// `<|{role}|>\n{content}` turns (`system`/`user`/`assistant`, and
+/// `observation` for tool output), with an `<|assistant|>\n` generation cue.
+/// GLM **has a system role** (no folding). The `[gMASK]<sop>` prefix is emitted
+/// literally — GLM's tokenizer has `add_bos_token` unset, so nothing adds it
+/// otherwise (the emit-side of the no-double-BOS rule). Chat-only.
+pub struct GlmTemplate;
+
+impl PromptTemplate for GlmTemplate {
+    fn render(&self, turns: &[Turn]) -> String {
+        let mut s = String::from("[gMASK]<sop>");
+        for turn in turns {
+            let role = match turn.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "observation",
+            };
+            s.push_str("<|");
+            s.push_str(role);
+            s.push_str("|>\n");
+            s.push_str(&turn.content);
+        }
+        s.push_str("<|assistant|>\n");
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +252,18 @@ mod tests {
     fn mistral_plain_user_turn() {
         let s = MistralTemplate.render(&[turn(Role::User, "explain rust")]);
         assert_eq!(s, "[INST] explain rust[/INST]");
+    }
+
+    #[test]
+    fn glm_prefixes_gmask_and_keeps_system_role() {
+        // upholds: TMPL-1 — the [gMASK]<sop> prefix is emitted exactly once (GLM's
+        // tokenizer doesn't add it). GLM has a real system role (no folding).
+        let s = GlmTemplate.render(&[turn(Role::System, "Be brief."), turn(Role::User, "hi")]);
+        assert_eq!(
+            s,
+            "[gMASK]<sop><|system|>\nBe brief.<|user|>\nhi<|assistant|>\n"
+        );
+        assert_eq!(s.matches("[gMASK]").count(), 1, "exactly one gMASK prefix");
     }
 
     #[test]

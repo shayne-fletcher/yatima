@@ -12,8 +12,9 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use yatima_lib::{
     device, model_dir, models_root, Agent, ChatMlTemplate, ChatSession, Completer, Dir, Engine,
-    GemmaTemplate, GenOpts, JsonToolCall, ListDir, MistralTemplate, ModelId, PlainTemplate,
-    PromptTemplate, QwenToolCall, ReadFile, Role, Sampling, ToolCallCodec, Tools, Turn,
+    GemmaTemplate, GenOpts, GlmTemplate, JsonToolCall, ListDir, MistralTemplate, ModelId,
+    PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, Role, Sampling, ToolCallCodec, Tools,
+    Turn,
 };
 
 #[derive(Parser)]
@@ -128,6 +129,8 @@ enum ChatFormat {
     Gemma,
     /// Mistral-v0.3: `[INST] … [/INST]` (chat only).
     Mistral,
+    /// GLM-4: `[gMASK]<sop><|role|>` (chat only).
+    Glm,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
     Plain,
 }
@@ -139,6 +142,7 @@ impl ChatFormat {
             ChatFormat::Qwen => Box::new(ChatMlTemplate),
             ChatFormat::Gemma => Box::new(GemmaTemplate),
             ChatFormat::Mistral => Box::new(MistralTemplate),
+            ChatFormat::Glm => Box::new(GlmTemplate),
             ChatFormat::Plain => Box::new(PlainTemplate),
         }
     }
@@ -397,8 +401,8 @@ fn agent(args: AgentArgs) -> Result<()> {
             &args.prompt,
             args.verbose,
         ),
-        ChatFormat::Gemma | ChatFormat::Mistral => bail!(
-            "--format gemma/mistral is chat-only (not tool-trained); use `yatima chat` \
+        ChatFormat::Gemma | ChatFormat::Mistral | ChatFormat::Glm => bail!(
+            "--format gemma/mistral/glm is chat-only (not tool-trained); use `yatima chat` \
              for those models, or --format qwen for the agent"
         ),
     }

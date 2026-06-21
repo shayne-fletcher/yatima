@@ -29,11 +29,12 @@ Three layers, increasing in capability:
 - **`generate`** — raw completion. `Engine::{load, generate, generate_with}` runs
   a stateless loop streaming decoded fragments to a fold; the contract is stated
   as laws and protected by tests. The loader dispatches on architecture — Qwen2,
-  Llama, Mistral, Phi-3, Gemma-2, StarCoder2 — and loads **GGUF/quantized**
-  weights too, so a 32B-Q4 runs on a Mac.
+  Llama, Mistral, Phi-3, Gemma-2, StarCoder2, GLM-4 — and loads **GGUF/quantized**
+  weights too (self-contained: the tokenizer is built from the GGUF), so a 32B
+  runs on a Mac.
 - **`chat`** — instruction-following, no tools. Applies a model's native chat
-  template (`--format qwen|gemma|mistral|plain`) so an instruct model behaves as
-  trained. Works for any instruct model.
+  template (`--format qwen|gemma|mistral|glm|plain`) so an instruct model behaves
+  as trained. Works for any instruct model.
 - **`agent`** — a tool loop for **tool-trained** models (currently Qwen/ChatML).
 
 **Capability matrix** (what each model can do):
@@ -41,6 +42,7 @@ Three layers, increasing in capability:
 | Model family      | generate | chat  | agent/tools |
 |-------------------|----------|-------|-------------|
 | Qwen2.5-Instruct  | yes      | yes   | yes         |
+| GLM-4 (9B / 32B)  | yes      | yes   | no          |
 | Gemma-2-it        | yes      | yes   | no          |
 | Mistral-v0.3      | yes      | yes   | later/complex |
 | TinyLlama-chat    | yes      | yes   | no          |
