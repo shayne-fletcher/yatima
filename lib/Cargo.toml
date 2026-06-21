@@ -11,6 +11,7 @@ candle-core = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
 candle-nn = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
 candle-transformers = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
 tokenizers = "0.22"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 
@@ -30,3 +31,4 @@ fetch = ["dep:possum-lib", "dep:tokio"]
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
