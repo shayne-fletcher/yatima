@@ -32,6 +32,16 @@
 //! - **GE-1** stateless: repeated `Greedy` runs on the same engine + prompt are
 //!   byte-identical (gated e2e).
 //!
+//! Architecture & model configuration (single source of truth, no drift):
+//! - **ARCH-1** every loaded [`Engine`] has exactly one detected [`Arch`]; the
+//!   safetensors and GGUF load paths both normalize through that public enum.
+//! - **ARCH-2** GGUF `general.architecture` strings are normalized to [`Arch`]
+//!   at the load boundary (`glm4`/`chatglm` → `Glm4`, …); raw metadata strings
+//!   never leak into dispatch logic.
+//! - **PREFILL-1** device-sensitive prefill defaults are owned by the loaded
+//!   engine ([`Engine::default_prefill_chunk`], from [`Arch::metal_prefill_chunk`]
+//!   gated on the device); profiles and CLI flags only override deliberately.
+//!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
@@ -67,7 +77,7 @@ pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
 pub use engine::ensure_model_blocking;
 pub use engine::{
-    device, is_model_present, Engine, GenOpts, Generation, PrefillLogits, PrefillProgress,
+    device, is_model_present, Arch, Engine, GenOpts, Generation, PrefillLogits, PrefillProgress,
     Sampling, StopReason, TokenLogit,
 };
 pub use template::{

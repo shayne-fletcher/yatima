@@ -58,6 +58,17 @@ impl Sampling {
             }
         }
     }
+
+    /// Map a `(temperature, seed)` pair to a policy: a non-positive temperature
+    /// is deterministic [`Greedy`](Sampling::Greedy) (the seed is ignored, per
+    /// SAM-2); a positive temperature is seeded [`Sample`](Sampling::Sample).
+    pub fn from_temperature(temperature: f64, seed: u64) -> Sampling {
+        if temperature <= 0.0 {
+            Sampling::Greedy
+        } else {
+            Sampling::Sample { temperature, seed }
+        }
+    }
 }
 
 /// Options for a single generation.
@@ -229,9 +240,11 @@ fn effective_prefill_chunk(configured: Option<usize>, default: Option<usize>, le
     }
 }
 
-/// The model architectures the runtime can load.
+/// The model architectures the runtime can load. The single public spine both
+/// load paths normalize through (ARCH-1): safetensors via `detect_arch` and
+/// GGUF via `arch_from_gguf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Arch {
+pub enum Arch {
     Qwen2,
     Llama,
     Mistral,
@@ -239,6 +252,33 @@ enum Arch {
     Gemma2,
     Starcoder2,
     Glm4,
+}
+
+impl Arch {
+    /// The engine-native prefill-chunk default for this architecture **on
+    /// Metal** (`None` = one full-prompt prefill). Runtime policy only — it
+    /// names no host/format type, so the inference core never depends upward on
+    /// the hosting layer. GLM-4 GGUF degrades on a single long Metal prefill
+    /// (matrix-matrix kernel precision), so it is bounded; see
+    /// `notes/glm4-prefill-reproducer.md`. The caller gates on `device.is_metal`.
+    pub fn metal_prefill_chunk(self) -> Option<usize> {
+        match self {
+            Arch::Glm4 => Some(GLM4_METAL_PREFILL_CHUNK),
+            _ => None,
+        }
+    }
+}
+
+/// Normalize a GGUF `general.architecture` string to an [`Arch`] at the load
+/// boundary (ARCH-2), so raw metadata strings never leak into dispatch. Only the
+/// architectures with a quantized loader are accepted.
+fn arch_from_gguf(s: &str) -> Result<Arch> {
+    match s {
+        "qwen2" => Ok(Arch::Qwen2),
+        "llama" => Ok(Arch::Llama),
+        "glm4" | "chatglm" => Ok(Arch::Glm4),
+        other => bail!("unsupported GGUF architecture: {other} (supported: qwen2, llama, glm4)"),
+    }
 }
 
 /// Detect the architecture from `config.json`, accepting both the
@@ -306,6 +346,7 @@ pub struct Engine {
     device: Device,
     eos: HashSet<u32>,
     dtype: DType,
+    arch: Arch,
     prefill_chunk: Option<usize>,
 }
 
@@ -416,6 +457,7 @@ impl Engine {
             device,
             eos,
             dtype,
+            arch,
             prefill_chunk: None,
         })
     }
@@ -440,41 +482,39 @@ impl Engine {
                 .map_err(|e| anyhow!("building tokenizer from GGUF metadata: {e}"))?
         };
 
-        let arch = content
+        let arch_str = content
             .metadata
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
-            .map(String::as_str)
-            .map(str::to_string)
             .ok_or_else(|| anyhow!("GGUF metadata has no general.architecture"))?;
+        let arch = arch_from_gguf(arch_str)?;
 
         let eos = gguf_eos_ids(&content, &tokenizer);
         // GGUF weights carry their own quantized dtype; report q-on-device.
         let dtype = DType::F32;
 
-        let prefill_chunk = match arch.as_str() {
-            // llama.cpp evaluates prompts through bounded micro-batches
-            // (`n_ubatch`). Feeding GLM4 GGUF a long prompt as one Metal
-            // prefill can destabilize generation on Candle; chunking keeps the
-            // attention/prefill kernels in the stable regime while preserving
-            // the same KV-cache semantics.
-            "glm4" | "chatglm" if device.is_metal() => Some(GLM4_METAL_PREFILL_CHUNK),
-            _ => None,
+        // Engine-native, device-aware prefill default. llama.cpp evaluates
+        // prompts through bounded micro-batches (`n_ubatch`); feeding GLM-4 GGUF
+        // a long prompt as one Metal prefill destabilizes generation on Candle.
+        // The per-arch policy lives on `Arch`; we gate it on the actual device.
+        let prefill_chunk = if device.is_metal() {
+            arch.metal_prefill_chunk()
+        } else {
+            None
         };
 
-        let model: Box<dyn CausalLm> = match arch.as_str() {
-            "qwen2" => Box::new(quantized_qwen2::ModelWeights::from_gguf(
+        let model: Box<dyn CausalLm> = match arch {
+            Arch::Qwen2 => Box::new(quantized_qwen2::ModelWeights::from_gguf(
                 content, &mut file, &device,
             )?),
-            "llama" => Box::new(quantized_llama::ModelWeights::from_gguf(
+            Arch::Llama => Box::new(quantized_llama::ModelWeights::from_gguf(
                 content, &mut file, &device,
             )?),
-            "glm4" | "chatglm" => Box::new(quantized_glm4::ModelWeights::from_gguf(
+            Arch::Glm4 => Box::new(quantized_glm4::ModelWeights::from_gguf(
                 content, &mut file, &device, dtype,
             )?),
-            other => {
-                bail!("unsupported GGUF architecture: {other} (supported: qwen2, llama, glm4)")
-            }
+            // `arch_from_gguf` only yields the three above.
+            other => unreachable!("GGUF arch {other:?} has no quantized loader"),
         };
 
         Ok(Self {
@@ -483,6 +523,7 @@ impl Engine {
             device,
             eos,
             dtype,
+            arch,
             prefill_chunk,
         })
     }
@@ -495,6 +536,27 @@ impl Engine {
             Device::Metal(_) => "metal",
         };
         format!("{dev}/{:?}", self.dtype)
+    }
+
+    /// The architecture this engine loaded — the single detected [`Arch`]
+    /// (ARCH-1), so callers can infer chat format and capabilities from the
+    /// model itself rather than re-supplying them.
+    pub fn arch(&self) -> Arch {
+        self.arch
+    }
+
+    /// The **effective**, device-aware prefill-chunk default this engine applies
+    /// when [`GenOpts::prefill_chunk`] is `None` (PREFILL-1). Owned by the loaded
+    /// engine because the policy is device-specific (e.g. GLM-4 only chunks on
+    /// Metal); profiles and CLI flags layer their own override over this.
+    pub fn default_prefill_chunk(&self) -> Option<usize> {
+        self.prefill_chunk
+    }
+
+    /// The number of tokens `text` encodes to under this model's tokenizer — a
+    /// small helper for run metadata (reproducible comparisons).
+    pub fn token_count(&self, text: &str) -> Result<usize> {
+        Ok(self.encode_prompt(text)?.len())
     }
 
     fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>> {
@@ -995,6 +1057,51 @@ mod tests {
         assert!(detect_arch(&serde_json::json!({ "architectures": ["FooForCausalLM"] })).is_err());
         assert!(detect_arch(&serde_json::json!({ "model_type": "foo" })).is_err());
         assert!(detect_arch(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn arch_from_gguf_normalizes_at_the_boundary() {
+        // upholds: ARCH-2 — raw GGUF strings normalize to the public enum,
+        // including the `chatglm` alias; unsupported strings are rejected.
+        assert_eq!(arch_from_gguf("qwen2").unwrap(), Arch::Qwen2);
+        assert_eq!(arch_from_gguf("llama").unwrap(), Arch::Llama);
+        assert_eq!(arch_from_gguf("glm4").unwrap(), Arch::Glm4);
+        assert_eq!(arch_from_gguf("chatglm").unwrap(), Arch::Glm4);
+        assert!(arch_from_gguf("gemma2").is_err()); // no quantized loader
+        assert!(arch_from_gguf("nope").is_err());
+    }
+
+    #[test]
+    fn metal_prefill_chunk_is_glm4_only() {
+        // upholds: PREFILL-1 — only GLM-4 carries a bounded Metal prefill default.
+        assert_eq!(
+            Arch::Glm4.metal_prefill_chunk(),
+            Some(GLM4_METAL_PREFILL_CHUNK)
+        );
+        for arch in [
+            Arch::Qwen2,
+            Arch::Llama,
+            Arch::Mistral,
+            Arch::Phi3,
+            Arch::Gemma2,
+            Arch::Starcoder2,
+        ] {
+            assert_eq!(arch.metal_prefill_chunk(), None, "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn sampling_from_temperature_maps_greedy_and_sample() {
+        // upholds: SAM-2 — non-positive temperature is greedy (seed ignored).
+        assert_eq!(Sampling::from_temperature(0.0, 7), Sampling::Greedy);
+        assert_eq!(Sampling::from_temperature(-1.0, 7), Sampling::Greedy);
+        assert_eq!(
+            Sampling::from_temperature(0.8, 7),
+            Sampling::Sample {
+                temperature: 0.8,
+                seed: 7
+            }
+        );
     }
 
     #[test]
