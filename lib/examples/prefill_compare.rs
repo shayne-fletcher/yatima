@@ -21,8 +21,8 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use yatima_lib::{
-    device, resolve_format, ChatFormat, Engine, PrefillLogits, PrefillProgress, PromptTemplate,
-    Role, Turn,
+    device, resolve_format, run_blocking, ChatFormat, Engine, PrefillLogits, PrefillProgress,
+    PromptTemplate, Role, Turn,
 };
 
 const SYSTEM: &str = "\
@@ -63,7 +63,8 @@ fn chat_format_parser() -> impl TypedValueParser<Value = ChatFormat> {
         .map(|s| s.parse::<ChatFormat>().expect("NAMES are valid formats"))
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
     let chunk = args.chunk;
     let top_k = args.top_k;
@@ -81,7 +82,8 @@ fn main() -> Result<()> {
         },
     ];
 
-    let mut engine = Engine::load(&model_dir, device(args.cpu)?)
+    let dev = device(args.cpu)?;
+    let mut engine = run_blocking(|| Engine::load(&model_dir, dev))
         .with_context(|| format!("loading model {}", model_dir.display()))?;
     eprintln!("loaded {} [{}]", model_dir.display(), engine.backend());
 
@@ -105,14 +107,17 @@ fn main() -> Result<()> {
         prompt.len()
     );
 
-    let full = run_prefill(&mut engine, &prompt, Some(0), "full prefill")?;
+    // Prefill is synchronous compute; run it under run_blocking (RT-1).
+    let full = run_blocking(|| run_prefill(&mut engine, &prompt, Some(0), "full prefill"))?;
     eprintln!("full prefill complete; running chunked prefill ({chunk})");
-    let chunked = run_prefill(
-        &mut engine,
-        &prompt,
-        Some(chunk),
-        &format!("chunked prefill ({chunk})"),
-    )?;
+    let chunked = run_blocking(|| {
+        run_prefill(
+            &mut engine,
+            &prompt,
+            Some(chunk),
+            &format!("chunked prefill ({chunk})"),
+        )
+    })?;
     eprintln!("chunked prefill complete; printing comparison");
     if full.logits.len() != chunked.logits.len() {
         bail!(

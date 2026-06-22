@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use yatima_lib::{
-    device, resolve_format, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile, PromptTemplate,
-    Role, Sampling, Turn,
+    device, resolve_format, run_blocking, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile,
+    PromptTemplate, Role, Sampling, Turn,
 };
 
 const SYSTEM: &str = "\
@@ -100,7 +100,8 @@ fn chat_format_parser() -> impl TypedValueParser<Value = ChatFormat> {
         .map(|s| s.parse::<ChatFormat>().expect("NAMES are valid formats"))
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
     let root = args.root.canonicalize().with_context(|| {
         format!(
@@ -139,7 +140,8 @@ fn main() -> Result<()> {
     }
 
     let dir = profile.to_source(args.offline)?.resolve()?;
-    let mut engine = Engine::load(&dir, device(args.cpu)?)
+    let dev = device(args.cpu)?;
+    let mut engine = run_blocking(|| Engine::load(&dir, dev))
         .with_context(|| format!("loading {}", dir.display()))?;
     let (format, mismatch) = resolve_format(engine.arch(), profile.format);
     if let Some(m) = mismatch {
@@ -172,7 +174,7 @@ fn main() -> Result<()> {
     let mut chat = ChatSession::new(&mut engine, format.template())
         .with_system(SYSTEM)
         .with_opts(opts);
-    println!("{}", chat.turn(&prompt)?);
+    println!("{}", chat.turn_async(&prompt).await?);
     Ok(())
 }
 

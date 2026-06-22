@@ -40,7 +40,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use yatima_lib::{
-    device, resolve_format, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile, Sampling,
+    device, resolve_format, run_blocking, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile,
+    Sampling,
 };
 
 const COMPANY_TICKERS_URL: &str = "https://www.sec.gov/files/company_tickers.json";
@@ -113,7 +114,8 @@ struct RunSpec {
     profile: ModelProfile,
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
     let runs = plan_runs(&args)?;
 
@@ -126,7 +128,10 @@ fn main() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let report = fetch_metrics_report(&client, &args.ticker.to_uppercase())?;
+    // Blocking reqwest I/O runs under run_blocking so it doesn't stall the
+    // executor (RT-1).
+    let ticker = args.ticker.to_uppercase();
+    let report = run_blocking(|| fetch_metrics_report(&client, &ticker))?;
     let evidence_json = serde_json::to_string_pretty(&report)?;
     eprintln!(
         "fetched {} SEC metrics for {} / CIK {}",
@@ -146,7 +151,7 @@ fn main() -> Result<()> {
                 spec.label
             );
         }
-        run_one(spec, &args, &prompt, &report)?;
+        run_one(spec, &args, &prompt, &report).await?;
     }
     Ok(())
 }
@@ -206,9 +211,10 @@ fn plan_runs(args: &Args) -> Result<Vec<RunSpec>> {
     Ok(vec![RunSpec { label, profile }])
 }
 
-fn run_one(spec: &RunSpec, args: &Args, prompt: &str, report: &MetricsReport) -> Result<()> {
+async fn run_one(spec: &RunSpec, args: &Args, prompt: &str, report: &MetricsReport) -> Result<()> {
     let dir = spec.profile.to_source(args.offline)?.resolve()?;
-    let mut engine = Engine::load(&dir, device(args.cpu)?)
+    let dev = device(args.cpu)?;
+    let mut engine = run_blocking(|| Engine::load(&dir, dev))
         .with_context(|| format!("loading {}", dir.display()))?;
 
     // Infer the format from the model unless the profile/flags pinned one.
@@ -232,10 +238,11 @@ fn run_one(spec: &RunSpec, args: &Args, prompt: &str, report: &MetricsReport) ->
         .with_opts(opts);
     let mut stdout = std::io::stdout();
     let answer = chat
-        .turn_streaming(prompt, &mut |piece| {
+        .turn_streaming_async(prompt, &mut |piece| {
             let _ = stdout.write_all(piece.as_bytes());
             let _ = stdout.flush();
-        })?
+        })
+        .await?
         .to_string();
     println!();
     if let Some(stop) = chat.last_stop() {

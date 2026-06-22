@@ -11,10 +11,12 @@
 //! `yatima generate --repo Qwen/Qwen2.5-7B-Instruct --prompt hi`).
 
 use yatima_lib::{
-    device, is_model_present, model_dir, models_root, ChatMlTemplate, ChatSession, Engine, ModelId,
+    device, is_model_present, model_dir, models_root, run_blocking, ChatMlTemplate, ChatSession,
+    Engine, ModelId,
 };
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> anyhow::Result<()> {
     // Resolve a cached model directory and load the engine once.
     let id = ModelId::parse("Qwen/Qwen2.5-7B-Instruct")?;
     let dir = model_dir(&models_root(), &id);
@@ -26,7 +28,8 @@ fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let mut engine = Engine::load(&dir, device(false)?)?;
+    let dev = device(false)?;
+    let mut engine = run_blocking(|| Engine::load(&dir, dev))?;
 
     // ── 1. A conversation with memory (ChatSession owns the transcript) ──
     // The session borrows the engine, so this scope releases it afterwards.
@@ -38,7 +41,7 @@ fn main() -> anyhow::Result<()> {
             "What is my name and language?",
         ] {
             println!("you> {user}");
-            println!("bot> {}\n", chat.turn(user)?);
+            println!("bot> {}\n", chat.turn_async(user).await?);
         }
     }
 
@@ -62,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     let mut other = 0;
     for ticket in inbox {
         clf.reset();
-        let category = Category::parse(clf.turn(ticket)?);
+        let category = Category::parse(clf.turn_async(ticket).await?);
         match category {
             Category::Bug => bugs += 1,
             Category::Billing => billing += 1,

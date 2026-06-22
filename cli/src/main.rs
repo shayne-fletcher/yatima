@@ -15,9 +15,10 @@ use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use yatima_lib::{
-    device, model_dir, models_root, resolve_format, Agent, ChatFormat, ChatMlTemplate, ChatSession,
-    Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId, ModelSource, PlainTemplate,
-    PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec, Tools,
+    device, model_dir, models_root, resolve_format, run_blocking, Agent, ChatFormat,
+    ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
+    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec,
+    Tools,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -186,7 +187,8 @@ const DEFAULT_AGENT_SYSTEM: &str =
     "You are a helpful assistant. You can read files under the working directory \
      using the provided tools. Call a tool when it helps, then answer.";
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
@@ -198,9 +200,9 @@ fn main() -> Result<()> {
             };
             println!("{}", path.display());
         }
-        Command::Generate(args) => generate(args)?,
-        Command::Chat(args) => chat(args)?,
-        Command::Agent(args) => agent(args)?,
+        Command::Generate(args) => generate(args).await?,
+        Command::Chat(args) => chat(args).await?,
+        Command::Agent(args) => agent(args).await?,
     }
     Ok(())
 }
@@ -219,7 +221,7 @@ fn init_tracing() {
 /// Chat: apply the model's chat template (no tools) — the layer between raw
 /// `generate` and the `agent` tool loop. `--prompt` gives one shot; omitting it
 /// opens an interactive multi-turn session that remembers the conversation.
-fn chat(args: ChatArgs) -> Result<()> {
+async fn chat(args: ChatArgs) -> Result<()> {
     let dir = ModelSource::from_args(
         args.model,
         args.repo,
@@ -229,7 +231,8 @@ fn chat(args: ChatArgs) -> Result<()> {
     )?
     .resolve()?;
 
-    let mut engine = Engine::load(&dir, device(args.cpu)?)?;
+    let dev = device(args.cpu)?;
+    let mut engine = run_blocking(|| Engine::load(&dir, dev))?;
     eprintln!("loaded {} [{}]", dir.display(), engine.backend());
 
     // Infer the chat format from the model's architecture unless overridden
@@ -255,11 +258,11 @@ fn chat(args: ChatArgs) -> Result<()> {
         // One-shot: dogfood the library `ChatSession` (batch). Memory isn't
         // needed for a single turn, but this exercises the public embedding API.
         Some(prompt) => {
-            println!("{}", session.turn(&prompt)?);
+            println!("{}", session.turn_async(&prompt).await?);
         }
         // Interactive: stream each turn through the same `ChatSession`, fully
-        // dogfooding the library's streaming seam (`turn_streaming`).
-        None => chat_repl(session)?,
+        // dogfooding the library's streaming seam (`turn_streaming_async`).
+        None => chat_repl(session).await?,
     }
     Ok(())
 }
@@ -268,7 +271,9 @@ fn chat(args: ChatArgs) -> Result<()> {
 /// stdin line by line, the answer streamed to stdout token-by-token via
 /// [`ChatSession::turn_streaming`]. EOF (Ctrl-D) or `/exit` ends the session;
 /// `/reset` clears the conversation (keeping the system turn).
-fn chat_repl<C: Completer, T: PromptTemplate>(mut session: ChatSession<'_, C, T>) -> Result<()> {
+async fn chat_repl<C: Completer, T: PromptTemplate>(
+    mut session: ChatSession<'_, C, T>,
+) -> Result<()> {
     let stdin = std::io::stdin();
     eprintln!("entering chat — /exit to quit, /reset to clear history");
     loop {
@@ -294,17 +299,19 @@ fn chat_repl<C: Completer, T: PromptTemplate>(mut session: ChatSession<'_, C, T>
             _ => {}
         }
         let mut stdout = std::io::stdout();
-        session.turn_streaming(line, &mut |piece| {
-            // best-effort live echo; a write failure just drops the fragment.
-            let _ = stdout.write_all(piece.as_bytes());
-            let _ = stdout.flush();
-        })?;
+        session
+            .turn_streaming_async(line, &mut |piece| {
+                // best-effort live echo; a write failure just drops the fragment.
+                let _ = stdout.write_all(piece.as_bytes());
+                let _ = stdout.flush();
+            })
+            .await?;
         println!();
     }
     Ok(())
 }
 
-fn agent(args: AgentArgs) -> Result<()> {
+async fn agent(args: AgentArgs) -> Result<()> {
     let dir = ModelSource::from_args(
         args.model,
         args.repo,
@@ -333,7 +340,8 @@ fn agent(args: AgentArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let mut engine = Engine::load(&dir, device(args.cpu)?)?;
+    let dev = device(args.cpu)?;
+    let mut engine = run_blocking(|| Engine::load(&dir, dev))?;
     eprintln!(
         "loaded {} [{}]; tools rooted at {}",
         dir.display(),
@@ -353,28 +361,34 @@ fn agent(args: AgentArgs) -> Result<()> {
         eprintln!("warning: {m}");
     }
     match format {
-        ChatFormat::Qwen => run_agent(
-            &mut engine,
-            &tools,
-            QwenToolCall,
-            ChatMlTemplate,
-            system,
-            args.max_steps,
-            opts,
-            &args.prompt,
-            args.verbose,
-        ),
-        ChatFormat::Plain => run_agent(
-            &mut engine,
-            &tools,
-            JsonToolCall,
-            PlainTemplate,
-            system,
-            args.max_steps,
-            opts,
-            &args.prompt,
-            args.verbose,
-        ),
+        ChatFormat::Qwen => {
+            run_agent(
+                &mut engine,
+                &tools,
+                QwenToolCall,
+                ChatMlTemplate,
+                system,
+                args.max_steps,
+                opts,
+                &args.prompt,
+                args.verbose,
+            )
+            .await
+        }
+        ChatFormat::Plain => {
+            run_agent(
+                &mut engine,
+                &tools,
+                JsonToolCall,
+                PlainTemplate,
+                system,
+                args.max_steps,
+                opts,
+                &args.prompt,
+                args.verbose,
+            )
+            .await
+        }
         other => bail!(
             "--format {other} is chat-only (not tool-trained); use `yatima chat` for it, \
              or --format qwen for the agent"
@@ -386,7 +400,7 @@ fn agent(args: AgentArgs) -> Result<()> {
 /// (full transcript to stderr when `verbose`). Generic so each `--format` arm
 /// keeps the concrete, monomorphic `Agent` types.
 #[allow(clippy::too_many_arguments)]
-fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
+async fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     engine: &mut C,
     tools: &Tools,
     codec: K,
@@ -398,7 +412,7 @@ fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     verbose: bool,
 ) -> Result<()> {
     let mut agent = Agent::new(engine, tools, codec, template, system, max_steps).with_opts(opts);
-    let run = agent.run(prompt)?;
+    let run = agent.run_async(prompt).await?;
 
     if verbose {
         for turn in &run.transcript {
@@ -410,7 +424,7 @@ fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     Ok(())
 }
 
-fn generate(args: GenerateArgs) -> Result<()> {
+async fn generate(args: GenerateArgs) -> Result<()> {
     let dir = ModelSource::from_args(
         args.model,
         args.repo,
@@ -429,7 +443,8 @@ fn generate(args: GenerateArgs) -> Result<()> {
         }
     };
 
-    let mut engine = Engine::load(&dir, device(args.cpu)?)?;
+    let dev = device(args.cpu)?;
+    let mut engine = run_blocking(|| Engine::load(&dir, dev))?;
     eprintln!("loaded {} [{}]", dir.display(), engine.backend());
 
     let opts = GenOpts {
@@ -439,10 +454,13 @@ fn generate(args: GenerateArgs) -> Result<()> {
         ..Default::default()
     };
     let mut stdout = std::io::stdout();
-    let generation = engine.generate(&prompt, &opts, |piece| {
-        stdout.write_all(piece.as_bytes())?;
-        stdout.flush()?;
-        Ok(())
+    // Generation is the synchronous compute island (RT-1).
+    let generation = run_blocking(|| {
+        engine.generate(&prompt, &opts, |piece| {
+            stdout.write_all(piece.as_bytes())?;
+            stdout.flush()?;
+            Ok(())
+        })
     })?;
     println!();
     eprintln!("[{} tokens, {:?}]", generation.tokens, generation.stop);
