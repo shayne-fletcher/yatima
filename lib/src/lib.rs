@@ -60,13 +60,21 @@
 //!   via the single `runtime::block_on` bridge (which panics, with direction, if
 //!   misused from a current-thread runtime); blocking compute (inference) runs
 //!   only under [`run_blocking`], never directly on an async worker.
+//! - **RT-2** local inference is synchronous, but an async caller may reach it
+//!   **only through the runtime's blocking island**: the `Engine` decode
+//!   primitives require a `BlockingIsland` witness that only `run_blocking_island`
+//!   mints, so the `Completer` impl cannot perform model decode on an async
+//!   worker — the executor-stalling path does not type-check. (Executor
+//!   *liveness* then follows from the multi-thread commitment, RT-1, and is
+//!   guarded by a liveness test. The low-level `generate_with` stays island-free
+//!   as the deliberate sync escape hatch.)
 //! - **CMP-1** [`Completer`] is a **native `async fn`** trait (not `async_trait`)
 //!   so `Send` is inferred per impl — the local [`Engine`] is `!Send` and runs
-//!   sync decode under [`run_blocking`], a remote completer is `Send` and awaits
-//!   I/O. It is generic-only (never `dyn`), awaited inline (never spawned), so no
-//!   global `Send` bound is imposed (`async_fn_in_trait` is `#[allow]`ed with
-//!   that rationale). Contrast [`Tool`], which is `dyn` + spawned, hence
-//!   `#[async_trait]` + `Send`.
+//!   sync decode under the blocking island (RT-2), a remote completer is `Send`
+//!   and awaits I/O. It is generic-only (never `dyn`), awaited inline (never
+//!   spawned), so no global `Send` bound is imposed (`async_fn_in_trait` is
+//!   `#[allow]`ed with that rationale). Contrast [`Tool`], which is `dyn` +
+//!   spawned, hence `#[async_trait]` + `Send`.
 //!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.

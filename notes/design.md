@@ -381,6 +381,22 @@ The binary edges (CLI + examples) are `#[tokio::main(flavor = "multi_thread")]`
 and call the async APIs directly, so they dogfood the runtime rather than hide a
 `block_on`; the sync shims exist for embedders that aren't async.
 
+**The blocking island is type-enforced (RT-2).** "Inference must not block the
+executor" is, stated literally, false — inference *does* block a thread. The
+enforceable invariant is sharper: *local inference may be reached by an async
+caller only through the runtime's blocking island.* We make that a compile-time
+obligation with a borrow-scoped **capability witness**. `run_blocking_island`
+mints a `BlockingIsland<'_>` (private field → unforgeable; HRTB lifetime → can't
+escape the closure), and the `Engine` decode primitives (`complete_on`,
+`complete_streaming_on`) *require* one. So `impl Completer for Engine` cannot be
+written to decode on an async worker — the executor-stalling version does not
+type-check. The low-level `generate_with` stays island-free on purpose: it is the
+honest synchronous escape hatch for advanced callers. Types fix the *path*; the
+operational *property* (liveness) rides on the multi-thread commitment and is
+pinned by a liveness test (a ticker task progresses while a completion is in
+flight). This is `Send`-gates-`spawn` for blocking: a witness that you are inside
+the island gates the call, exactly as `Send` gates a cross-thread move.
+
 ### The model seam is async, `Send` inferred per impl (CMP-1)
 
 `Completer` is the effect boundary: prompt → completion. It is an **async** trait

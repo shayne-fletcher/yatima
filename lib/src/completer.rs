@@ -28,12 +28,17 @@
 //!
 //! - **Each impl owns the *operational shape* of the effect.** `complete` is the
 //!   effect boundary; the impl chooses how it is discharged. The local engine
-//!   runs its synchronous decode under [`crate::run_blocking`] — native `async`
-//!   alone does **not** make candle inference non-blocking; without
-//!   `run_blocking` the sync decode would stall the executor (RT-1). A remote
-//!   completer instead `.await`s network I/O and blocks no thread. Callers
-//!   (`Agent`, `ChatSession`) just `.await` and assume nothing about whether
-//!   completion is CPU- or I/O-bound.
+//!   runs its synchronous decode inside the runtime's **blocking island** — and
+//!   this is **type-enforced** (RT-2): the decode primitives (`Engine::complete_on`)
+//!   require a `BlockingIsland` witness that only `run_blocking_island` mints, so
+//!   the impl below *cannot* be written to run decode on an async worker — native
+//!   `async` alone does not make candle non-blocking, and here the compiler will
+//!   not let you forget. A remote completer instead `.await`s network I/O and
+//!   blocks no thread. Callers (`Agent`, `ChatSession`) just `.await` and assume
+//!   nothing about whether completion is CPU- or I/O-bound. The operational
+//!   *property* (executor liveness) rides on the multi-thread commitment (RT-1)
+//!   and is pinned by a liveness test — types fix the path, the test fixes the
+//!   property.
 //!
 //! - **`Completer` is intentionally not `dyn`-compatible.** Native `async fn` in
 //!   trait cannot be made into a trait object, and that is fine: every consumer
@@ -56,6 +61,7 @@
 //! engine-actor ever needs to move a completion across threads, that is when to
 //! reach for return-type-notation or `trait_variant`, not now.
 
+use crate::runtime::{run_blocking_island, BlockingIsland};
 use crate::{Engine, GenOpts, StopReason};
 use anyhow::Result;
 use std::ops::ControlFlow;
@@ -110,10 +116,81 @@ pub trait Completer {
     }
 }
 
-/// The real engine as a [`Completer`]: a thin adapter over `generate_with` that
-/// accumulates decoded text and breaks at the first stop string, **including**
-/// that marker in the result (so a `ToolCallCodec` sees the whole block). This
-/// is the seam an alternate backend (mistral.rs / llama.cpp) would also fill.
+/// The synchronous, island-gated decode primitives behind the [`Engine`]
+/// [`Completer`] impl. Each takes a `BlockingIsland` witness, so they can only
+/// be called from inside `run_blocking_island` — making it a compile error to
+/// run model decode on an async worker without entering the blocking island
+/// (RT-2). `generate_with` itself stays island-free as the low-level sync escape
+/// hatch.
+impl Engine {
+    pub(crate) fn complete_on(
+        &mut self,
+        _island: BlockingIsland<'_>,
+        prompt: &str,
+        opts: &GenOpts,
+        stops: &[String],
+    ) -> Result<Completion> {
+        let (text, generation) =
+            self.generate_with(prompt, opts, String::new(), |mut acc, fragment| {
+                acc.push_str(fragment);
+                match first_stop_end(&acc, stops) {
+                    Some(end) => {
+                        acc.truncate(end);
+                        Ok(ControlFlow::Break(acc))
+                    }
+                    None => Ok(ControlFlow::Continue(acc)),
+                }
+            })?;
+        Ok(Completion {
+            text,
+            stop: generation.stop,
+        })
+    }
+
+    pub(crate) fn complete_streaming_on(
+        &mut self,
+        _island: BlockingIsland<'_>,
+        prompt: &str,
+        opts: &GenOpts,
+        stops: &[String],
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion> {
+        // Stream each newly-committed slice as it is decoded; never emit past a
+        // stop marker (truncate to it, like `complete_on`).
+        let mut emitted = 0usize;
+        let (text, generation) =
+            self.generate_with(prompt, opts, String::new(), |mut acc, fragment| {
+                acc.push_str(fragment);
+                let flow = match first_stop_end(&acc, stops) {
+                    Some(end) => {
+                        acc.truncate(end);
+                        ControlFlow::Break(())
+                    }
+                    None => ControlFlow::Continue(()),
+                };
+                if acc.len() > emitted {
+                    on_token(&acc[emitted..]);
+                    emitted = acc.len();
+                }
+                Ok(match flow {
+                    ControlFlow::Break(()) => ControlFlow::Break(acc),
+                    ControlFlow::Continue(()) => ControlFlow::Continue(acc),
+                })
+            })?;
+        Ok(Completion {
+            text,
+            stop: generation.stop,
+        })
+    }
+}
+
+/// The real engine as a [`Completer`]: a thin adapter over the island-gated
+/// decode primitives. The `Completer` obligation — "enter the blocking island
+/// before decoding" — is discharged here, once, and is **type-enforced**: the
+/// decode methods require the `BlockingIsland` that only `run_blocking_island`
+/// mints, so this impl cannot be written to stall the executor (RT-2). This is
+/// the seam an alternate backend (a remote/HTTP model) would also fill — by
+/// awaiting I/O instead, with no island.
 impl Completer for Engine {
     async fn complete(
         &mut self,
@@ -121,26 +198,7 @@ impl Completer for Engine {
         opts: &GenOpts,
         stops: &[String],
     ) -> Result<Completion> {
-        // candle decode is synchronous compute; `run_blocking` keeps it off the
-        // async executor's critical path (RT-1). Native `async fn` does not make
-        // it non-blocking — the impl owns that (CMP-1).
-        crate::run_blocking(|| {
-            let (text, generation) =
-                self.generate_with(prompt, opts, String::new(), |mut acc, fragment| {
-                    acc.push_str(fragment);
-                    match first_stop_end(&acc, stops) {
-                        Some(end) => {
-                            acc.truncate(end);
-                            Ok(ControlFlow::Break(acc))
-                        }
-                        None => Ok(ControlFlow::Continue(acc)),
-                    }
-                })?;
-            Ok(Completion {
-                text,
-                stop: generation.stop,
-            })
-        })
+        run_blocking_island(|island| self.complete_on(island, prompt, opts, stops))
     }
 
     async fn complete_streaming(
@@ -150,34 +208,8 @@ impl Completer for Engine {
         stops: &[String],
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion> {
-        // Stream each newly-committed slice as it is decoded; never emit past a
-        // stop marker (truncate to it, like `complete`). Runs under run_blocking
-        // (RT-1); `on_token` is called from within the blocking section.
-        crate::run_blocking(|| {
-            let mut emitted = 0usize;
-            let (text, generation) =
-                self.generate_with(prompt, opts, String::new(), |mut acc, fragment| {
-                    acc.push_str(fragment);
-                    let flow = match first_stop_end(&acc, stops) {
-                        Some(end) => {
-                            acc.truncate(end);
-                            ControlFlow::Break(())
-                        }
-                        None => ControlFlow::Continue(()),
-                    };
-                    if acc.len() > emitted {
-                        on_token(&acc[emitted..]);
-                        emitted = acc.len();
-                    }
-                    Ok(match flow {
-                        ControlFlow::Break(()) => ControlFlow::Break(acc),
-                        ControlFlow::Continue(()) => ControlFlow::Continue(acc),
-                    })
-                })?;
-            Ok(Completion {
-                text,
-                stop: generation.stop,
-            })
+        run_blocking_island(|island| {
+            self.complete_streaming_on(island, prompt, opts, stops, on_token)
         })
     }
 }
@@ -195,7 +227,7 @@ fn first_stop_end(text: &str, stops: &[String]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::first_stop_end;
+    use super::*;
 
     #[test]
     fn stop_end_includes_the_marker_and_picks_earliest() {
@@ -205,5 +237,54 @@ mod tests {
         assert_eq!(&text[..end], "call <tool_call>{}</tool_call>");
         assert!(first_stop_end("no markers here", &stops).is_none());
         assert!(first_stop_end("anything", &[]).is_none());
+    }
+
+    /// A completer that blocks the way the local engine does — synchronous work
+    /// inside the blocking island — so we can assert the operational property
+    /// (RT-2) without a GPU.
+    struct IslandBlockingCompleter;
+
+    impl Completer for IslandBlockingCompleter {
+        async fn complete(
+            &mut self,
+            _prompt: &str,
+            _opts: &GenOpts,
+            _stops: &[String],
+        ) -> Result<Completion> {
+            crate::runtime::run_blocking_island(|_island| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            });
+            Ok(Completion {
+                text: "ok".into(),
+                stop: StopReason::Eos,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_keeps_the_executor_live() {
+        // upholds: RT-2 — a completion that blocks inside the island must not
+        // starve other tasks: a concurrently spawned task makes progress on
+        // another worker while the completion is in flight.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let ticked = Arc::new(AtomicBool::new(false));
+        let flag = ticked.clone();
+        let ticker = tokio::spawn(async move {
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let _ = IslandBlockingCompleter
+            .complete("hi", &GenOpts::default(), &[])
+            .await
+            .unwrap();
+
+        // Checked before awaiting the ticker: it ran *during* the completion.
+        assert!(
+            ticked.load(Ordering::SeqCst),
+            "ticker did not progress while the completion was in flight"
+        );
+        ticker.await.unwrap();
     }
 }
