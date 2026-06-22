@@ -25,6 +25,44 @@ swappable dependency.
   agent`, and `yatima models-dir`, with model selection parsed into a
   `ModelSource` ADT at the edge.
 
+## Module layering (LAYER-1)
+
+One law underlies several boundary fixes: **dependencies point *down* this DAG,
+and a type lives at the lowest layer that needs it.** A lower layer never depends
+on a higher one. This is the rule that, stated, catches a whole class of
+organic-growth bug at review time — `template`/`chat` once imported `Turn` from
+`agent`; `engine` once carried a `ChatFormat`-shaped `Caps`. Both were *upward*
+dependencies; both are now fixed by moving the type to its altitude.
+
+```mermaid
+flowchart TD
+    edges["edges — cli / examples (#[tokio::main])"]
+    host["config — host (ChatFormat, ModelSource, ModelProfile, Caps)"]
+    action["action — capability · tool · agent · chat"]
+    seam["model seam — engine · completer · template"]
+    prim["primitives — transcript · runtime · token_output_stream · root ids/paths"]
+    edges --> host
+    edges --> action
+    host --> seam
+    action --> seam
+    seam --> prim
+```
+
+An arrow is "may depend on". Reading it: **primitives** (`transcript` = `Role`/
+`Turn`, `runtime` = the one bridge + island, `token_output_stream`, the
+`ModelId`/`model_dir` resolver) depend on nothing in-crate. The **model seam**
+(`engine`, `completer`, `template`) sits on primitives (`completer` over
+`engine`). **config** (`host`) and **action** (`capability` → `tool` →
+`agent`/`chat`) are *siblings* — both consume the seam, neither depends on the
+other (the agent never imports `host`; `host` never imports the agent). The
+**edges** (CLI, examples) sit on top and may use everything.
+
+Enforcement: within one crate the compiler permits any module to `use` any
+other, so LAYER-1 is a *stated* law — held by review and the cheap
+relocate-on-catch discipline (the `Turn` move was a single commit). A future
+multi-crate split (e.g. extracting `transcript`/`lexicon` — see Roadmap) would
+make it compiler-enforced; deferred until there is a real trigger.
+
 ## Three layers
 
 The runtime exposes three increasing-capability modes over the same `Engine`:

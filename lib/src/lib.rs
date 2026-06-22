@@ -8,6 +8,14 @@
 //! `invariant`/`law` comments in the test modules). `notes/design.md` explains
 //! them in prose. (CLI-level invariants `CLI-1`/`CLI-2` live in `yatima-cli`.)
 //!
+//! Library layering:
+//! - **LAYER-1** dependencies point *down* the module layer DAG
+//!   (primitives → model seam → {config, action} → edges); a type lives at the
+//!   lowest layer that needs it, and a lower layer never depends on a higher one
+//!   (`engine` names no `host`/`agent` type; `Role`/`Turn` live in `transcript`,
+//!   not `agent`). Stated, not compiler-enforced within one crate — see the
+//!   layer diagram in `notes/design.md`; a future crate split would enforce it.
+//!
 //! Model store & discovery:
 //! - **MS-1** `models_root` precedence: `$YATIMA_MODELS_DIR`, else
 //!   `${XDG_CACHE_HOME}/yatima/models`, else `$HOME/.cache/yatima/models`.
