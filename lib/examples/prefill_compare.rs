@@ -6,20 +6,23 @@
 //!
 //! ```bash
 //! cargo run -p yatima-lib --release --example prefill_compare --features metal -- \
-//!   ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF glm
+//!   --model ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF
 //!
 //! # smaller synthetic prompt, top-8 comparison
 //! cargo run -p yatima-lib --release --example prefill_compare --features metal -- \
-//!   ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF glm synthetic:64 64 8
+//!   --model ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF \
+//!   --prompt synthetic:64 --chunk 64 --top-k 8
 //! ```
 
 use anyhow::{bail, Context, Result};
+use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::Parser;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use yatima_lib::{
-    device, ChatMlTemplate, Engine, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate,
-    PrefillLogits, PrefillProgress, PromptTemplate, Role, Turn,
+    device, resolve_format, ChatFormat, Engine, PrefillLogits, PrefillProgress, PromptTemplate,
+    Role, Turn,
 };
 
 const SYSTEM: &str = "\
@@ -27,49 +30,47 @@ You are an investment research analyst producing an educational research note. \
 Use only the supplied evidence. Every factual claim must cite a metric id. \
 If evidence is insufficient, say so.";
 
-fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let model_dir = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(default_glm_32b_dir);
-    let format = args
-        .next()
-        .as_deref()
-        .map(ChatFormat::parse)
-        .transpose()?
-        .unwrap_or(ChatFormat::Glm);
-    let prompt_path = args.next().map(PathBuf::from);
-    let chunk = args
-        .next()
-        .map(|s| s.parse::<usize>().context("parsing chunk size"))
-        .transpose()?
-        .unwrap_or(64);
-    let top_k = args
-        .next()
-        .map(|s| s.parse::<usize>().context("parsing top-k"))
-        .transpose()?
-        .unwrap_or(12);
+/// Compare next-token logits after full vs chunked prefill (no generation).
+#[derive(Debug, Parser)]
+#[command(about, long_about = None)]
+struct Args {
+    /// Model directory (defaults to the local GLM-4-32B GGUF).
+    #[arg(long)]
+    model: Option<PathBuf>,
+    /// Chat format for rendering; omit to infer from the model's architecture.
+    #[arg(long, value_parser = chat_format_parser())]
+    format: Option<ChatFormat>,
+    /// Render the prompt raw (system + user joined), bypassing any chat template.
+    #[arg(long)]
+    raw: bool,
+    /// Prompt source: a file path, `-` for stdin, or `synthetic:N`.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Chunk size for the chunked prefill.
+    #[arg(long, default_value_t = 64)]
+    chunk: usize,
+    /// How many top tokens to compare.
+    #[arg(long, default_value_t = 12)]
+    top_k: usize,
+    /// Force CPU instead of the GPU.
+    #[arg(long)]
+    cpu: bool,
+}
 
-    let user_prompt = match prompt_path {
-        Some(path) if path.as_os_str() == "-" => {
-            let mut s = String::new();
-            std::io::stdin().read_to_string(&mut s)?;
-            s
-        }
-        Some(path) if path.to_string_lossy().starts_with("synthetic:") => {
-            let rows = path
-                .to_string_lossy()
-                .trim_start_matches("synthetic:")
-                .parse::<usize>()
-                .context("parsing synthetic row count")?;
-            synthetic_research_prompt(rows)
-        }
-        Some(path) => std::fs::read_to_string(&path)
-            .with_context(|| format!("reading prompt file {}", path.display()))?,
-        None => synthetic_research_prompt(96),
-    };
-    let prompt = format.render(&[
+/// A clap value parser for [`ChatFormat`] (names → enum).
+fn chat_format_parser() -> impl TypedValueParser<Value = ChatFormat> {
+    PossibleValuesParser::new(ChatFormat::NAMES)
+        .map(|s| s.parse::<ChatFormat>().expect("NAMES are valid formats"))
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let chunk = args.chunk;
+    let top_k = args.top_k;
+    let model_dir = args.model.clone().unwrap_or_else(default_glm_32b_dir);
+
+    let user_prompt = load_prompt(args.prompt.as_deref())?;
+    let turns = [
         Turn {
             role: Role::System,
             content: SYSTEM.to_string(),
@@ -78,20 +79,30 @@ fn main() -> Result<()> {
             role: Role::User,
             content: user_prompt,
         },
-    ]);
+    ];
 
-    eprintln!(
-        "loading {} with format {}; prompt chars {}; comparing full prefill vs chunk {chunk}",
-        model_dir.display(),
-        format.name(),
-        prompt.len()
-    );
-    let mut engine = Engine::load(&model_dir, device(false)?)
+    let mut engine = Engine::load(&model_dir, device(args.cpu)?)
         .with_context(|| format!("loading model {}", model_dir.display()))?;
+    eprintln!("loaded {} [{}]", model_dir.display(), engine.backend());
+
+    // Render with the model's inferred format unless --raw or an override.
+    let prompt = if args.raw {
+        turns
+            .iter()
+            .map(|t| t.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        let (format, mismatch) = resolve_format(engine.arch(), args.format);
+        if let Some(m) = mismatch {
+            eprintln!("warning: {m}");
+        }
+        eprintln!("rendering with format {format}");
+        format.template().render(&turns)
+    };
     eprintln!(
-        "loaded {} [{}]; running full prefill",
-        model_dir.display(),
-        engine.backend()
+        "prompt chars {}; comparing full prefill vs chunk {chunk}",
+        prompt.len()
     );
 
     let full = run_prefill(&mut engine, &prompt, Some(0), "full prefill")?;
@@ -169,53 +180,26 @@ fn print_progress(label: &str, p: PrefillProgress, last_line_len: &mut usize) {
     *last_line_len = line.len();
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatFormat {
-    Qwen,
-    Gemma,
-    Mistral,
-    Glm,
-    Plain,
-    Raw,
-}
-
-impl ChatFormat {
-    fn parse(s: &str) -> Result<ChatFormat> {
-        match s {
-            "qwen" => Ok(ChatFormat::Qwen),
-            "gemma" => Ok(ChatFormat::Gemma),
-            "mistral" => Ok(ChatFormat::Mistral),
-            "glm" => Ok(ChatFormat::Glm),
-            "plain" => Ok(ChatFormat::Plain),
-            "raw" => Ok(ChatFormat::Raw),
-            other => bail!("unknown format {other:?}; expected qwen|gemma|mistral|glm|plain|raw"),
+/// Load the user prompt: a file path, `-` for stdin, `synthetic:N`, or (when
+/// absent) a default synthetic SEC-like prompt.
+fn load_prompt(source: Option<&str>) -> Result<String> {
+    match source {
+        Some("-") => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            Ok(s)
         }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            ChatFormat::Qwen => "qwen",
-            ChatFormat::Gemma => "gemma",
-            ChatFormat::Mistral => "mistral",
-            ChatFormat::Glm => "glm",
-            ChatFormat::Plain => "plain",
-            ChatFormat::Raw => "raw",
+        Some(spec) if spec.starts_with("synthetic:") => {
+            let rows = spec
+                .trim_start_matches("synthetic:")
+                .parse::<usize>()
+                .context("parsing synthetic row count")?;
+            Ok(synthetic_research_prompt(rows))
         }
-    }
-
-    fn render(self, turns: &[Turn]) -> String {
-        match self {
-            ChatFormat::Qwen => ChatMlTemplate.render(turns),
-            ChatFormat::Gemma => GemmaTemplate.render(turns),
-            ChatFormat::Mistral => MistralTemplate.render(turns),
-            ChatFormat::Glm => GlmTemplate.render(turns),
-            ChatFormat::Plain => PlainTemplate.render(turns),
-            ChatFormat::Raw => turns
-                .iter()
-                .map(|t| t.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+        Some(path) => {
+            std::fs::read_to_string(path).with_context(|| format!("reading prompt file {path}"))
         }
+        None => Ok(synthetic_research_prompt(96)),
     }
 }
 

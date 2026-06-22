@@ -36,35 +36,38 @@ This is a mitigation, not a root-cause fix.
 `lib/examples/prefill_compare.rs` compares the next-token logits after full
 prefill and chunked prefill without generating any text.
 
-Default GLM4 run:
+Default GLM4 run (format inferred from the model):
 
 ```bash
 cargo run -p yatima-lib --release --example prefill_compare --features metal -- \
-  ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF glm
+  --model ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF
 ```
 
 Smaller synthetic prompt while the machine is memory-constrained:
 
 ```bash
 cargo run -p yatima-lib --release --example prefill_compare --features metal -- \
-  ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF glm synthetic:64 64 8
+  --model ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF \
+  --prompt synthetic:64 --chunk 64 --top-k 8
 ```
 
 With an explicit prompt file:
 
 ```bash
 cargo run -p yatima-lib --release --example prefill_compare --features metal -- \
-  ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF glm /tmp/prompt.txt 64 20
+  --model ~/.cache/yatima/models/bartowski/THUDM_GLM-4-32B-0414-GGUF \
+  --prompt /tmp/prompt.txt --chunk 64 --top-k 20
 ```
 
-Arguments:
+Flags:
 
-1. model directory
-2. format: `qwen`, `gemma`, `mistral`, `glm`, `plain`, or `raw`
-3. optional prompt file, `-` for stdin, or `synthetic:N` for an N-row synthetic
-   SEC-like prompt
-4. optional chunk size, default `64`
-5. optional top-k count, default `12`
+- `--model <dir>` — model directory (defaults to the local GLM-4-32B GGUF)
+- `--format <name>` — chat format; omit to infer from the model's architecture
+  (`--raw` joins system+user and bypasses the template)
+- `--prompt <src>` — a file path, `-` for stdin, or `synthetic:N` for an N-row
+  synthetic SEC-like prompt (default: `synthetic:96`)
+- `--chunk <n>` — chunked-prefill chunk size (default `64`)
+- `--top-k <n>` — how many top tokens to compare (default `12`)
 
 The example prints:
 

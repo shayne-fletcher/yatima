@@ -19,6 +19,15 @@
 //! SEC_USER_AGENT="…" cargo run … --example investment_thesis --features metal -- \
 //!   --ticker META --compare qwen32b,glm4-32b
 //! ```
+//!
+//! Example-level invariants (cited in tests with `// upholds: <id>`, like the
+//! CLI's `CLI-*`; the library's contracts live in `yatima-lib`'s crate doc):
+//! - **COMPARE-1** a comparison is a pure vector of run specs ([`plan_runs`]),
+//!   planned without loading any model, and executed sequentially — one
+//!   [`Engine`] in memory at a time.
+//! - **META-1** each run prints enough metadata to reproduce it: profile/source,
+//!   detected arch, format, backend, effective prefill chunk, sampling, prompt
+//!   token count, and stop reason.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::builder::{PossibleValuesParser, TypedValueParser};
@@ -771,6 +780,59 @@ struct MetricFact {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn compare_plans_one_run_per_profile() {
+        // upholds: COMPARE-1 — compare is a pure vector of run specs, planned
+        // without loading any model.
+        let args = Args::parse_from([
+            "investment_thesis",
+            "--ticker",
+            "META",
+            "--compare",
+            "qwen32b,glm4-32b",
+        ]);
+        let runs = plan_runs(&args).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].label, "qwen32b");
+        assert_eq!(runs[1].label, "glm4-32b");
+        assert_eq!(runs[1].profile.format, Some(ChatFormat::Glm));
+    }
+
+    #[test]
+    fn single_run_defaults_to_local_qwen() {
+        // upholds: COMPARE-1 — no --compare / --profile / source means a single
+        // run against the default local model.
+        let args = Args::parse_from(["investment_thesis", "--ticker", "AAPL"]);
+        let runs = plan_runs(&args).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].profile.dir.is_some());
+        assert!(runs[0].profile.repo.is_none());
+    }
+
+    #[test]
+    fn explicit_source_flag_overrides_profile() {
+        // --model overrides a --profile's repo source (single-run overlay).
+        let args = Args::parse_from([
+            "investment_thesis",
+            "--profile",
+            "gemma2",
+            "--model",
+            "/models/x",
+        ]);
+        let runs = plan_runs(&args).unwrap();
+        assert_eq!(
+            runs[0].profile.dir.as_deref(),
+            Some(std::path::Path::new("/models/x"))
+        );
+        assert!(runs[0].profile.repo.is_none());
+    }
+
+    #[test]
+    fn compare_rejects_unknown_profile() {
+        let args = Args::parse_from(["investment_thesis", "--compare", "qwen32b,nope"]);
+        assert!(plan_runs(&args).is_err());
+    }
 
     #[test]
     fn pads_cik_to_ten_digits() {
