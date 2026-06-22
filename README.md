@@ -158,6 +158,17 @@ let recall = chat.turn("What is my name?")?;
 chat.turn_streaming("Tell me a joke.", &mut |piece| print!("{piece}"))?;
 ```
 
+yatima is async-first: the agent loop and tool dispatch are async, and inference
+runs as a synchronous compute island that never stalls the executor. From an
+async program, call the `_async` APIs (`turn_async`, `Agent::run_async`,
+`Tools::dispatch_async`) directly; the synchronous methods above are thin shims
+over them for non-async embedders.
+
+```rust
+// inside #[tokio::main(flavor = "multi_thread")]
+let answer = chat.turn_async("My name is Ada.").await?;
+```
+
 See [`lib/examples/embed.rs`](lib/examples/embed.rs) for a conversation and a
 classify-then-branch triage loop:
 

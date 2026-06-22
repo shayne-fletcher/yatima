@@ -346,6 +346,41 @@ home for conversation/KV-cache reuse and cross-request scheduling. That actor ca
 compose with the async tool runtime, but it is not required to make tools
 awaitable/watchable today.
 
+### Runtime ownership & the sync↔async bridge (RT-1)
+
+The library is **async-first** (the agent loop and tool dispatch are async) but
+still offers thin **synchronous shims** for non-async embedders, and runs a
+**synchronous inference core**. Rather than scatter `Handle::try_current` dances
+and per-call runtimes, everything funnels through `runtime.rs`:
+
+- **One owned multi-thread runtime** (a lazy `OnceLock<Runtime>`); the library
+  never builds a runtime per call.
+- **`block_on` — the single sync→async bridge.** Its ambient policy is explicit:
+  no runtime → the owned runtime; a multi-thread runtime → `block_in_place` +
+  the current handle (don't nest runtimes; keep other tasks progressing); a
+  **current-thread runtime → panic with direction** ("call the async API"),
+  because that case is genuinely unsupportable (no worker to hand off to; a
+  nested `block_on` would deadlock). Every sync API (`Agent::run`,
+  `Tools::dispatch`, `ensure_model_blocking`) is a one-line shim over its async
+  primitive through this bridge.
+- **`run_blocking` — the compute island.** Blocking work *whose result the async
+  fn needs inline* (model inference inside the agent/chat loop) runs here:
+  `block_in_place` on a multi-thread runtime so the executor stays live, a plain
+  call otherwise. This is what un-paints the earlier half-paint, where the
+  synchronous `complete()` sat directly in the async loop and starved tool
+  watchers during generation.
+
+`block_in_place` (not `spawn_blocking`) is correct for the inline case: the work
+borrows `&mut Engine`/`&mut Completer`, which is neither `'static` nor `Send`, so
+it can't be *moved* to a blocking pool — but it can relocate *other* tasks off
+the worker. `spawn_blocking` + a bounded channel remains the right tool for the
+*detached* streaming adapter sketched above (`generate_events`), where the work
+is owned and the consumer wants a stream rather than an awaited result.
+
+The binary edges (CLI + examples) are `#[tokio::main(flavor = "multi_thread")]`
+and call the async APIs directly, so they dogfood the runtime rather than hide a
+`block_on`; the sync shims exist for embedders that aren't async.
+
 ## Registries
 
 The **canonical** invariant & law registry lives in the crate docs — see the
