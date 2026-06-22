@@ -1409,8 +1409,8 @@ mod tests {
     // multi-token answer must reach `on_token` in more than one call (the trait's
     // default impl would deliver the whole text in a single call). Gated, skips
     // fast if the weights aren't cached.
-    #[test]
-    fn e2e_engine_streams_in_multiple_chunks() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn e2e_engine_streams_in_multiple_chunks() -> Result<()> {
         use crate::completer::Completer;
         if std::env::var_os("YATIMA_E2E").is_none() {
             eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
@@ -1431,15 +1431,17 @@ mod tests {
         };
         let mut calls = 0usize;
         let mut acc = String::new();
-        let completion = engine.complete_streaming(
-            "Rust is a systems programming language that",
-            &opts,
-            &[],
-            &mut |piece| {
-                calls += 1;
-                acc.push_str(piece);
-            },
-        )?;
+        let completion = engine
+            .complete_streaming(
+                "Rust is a systems programming language that",
+                &opts,
+                &[],
+                &mut |piece| {
+                    calls += 1;
+                    acc.push_str(piece);
+                },
+            )
+            .await?;
         assert!(calls > 1, "expected >1 streamed chunk, got {calls}");
         assert_eq!(acc, completion.text, "streamed pieces reconstruct the text");
         Ok(())

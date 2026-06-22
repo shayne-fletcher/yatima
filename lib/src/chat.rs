@@ -76,46 +76,19 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         self
     }
 
-    /// Send a user message and get the assistant's reply. Appends both to the
-    /// transcript so later turns remember them; the reply is rendered from the
-    /// *whole* history (no stop strings — chat has no tools).
-    pub fn turn(&mut self, user: &str) -> Result<&str> {
-        self.turns.push(Turn {
-            role: Role::User,
-            content: user.to_string(),
-        });
-        let prompt = self.template.render(&self.turns);
-        // Inference is the synchronous compute island; `run_blocking` runs it
-        // directly in a sync context and via `block_in_place` when called from a
-        // multi-thread async context, so it never stalls an executor (RT-1).
-        let completion =
-            crate::runtime::run_blocking(|| self.completer.complete(&prompt, &self.opts, &[]))?;
-        self.last_stop = Some(completion.stop);
-        self.turns.push(Turn {
-            role: Role::Assistant,
-            content: completion.text.trim().to_string(),
-        });
-        Ok(&self.turns.last().expect("just pushed").content)
-    }
-
-    /// Async variant of [`turn`](ChatSession::turn) for async hosts; the
-    /// inference still runs under `run_blocking` so it doesn't stall the runtime.
+    /// Send a user message and get the assistant's reply (async). Appends both
+    /// to the transcript so later turns remember them; the reply is rendered from
+    /// the *whole* history (no stop strings — chat has no tools). This is the
+    /// primitive; [`turn`](ChatSession::turn) is its sync shim.
     pub async fn turn_async(&mut self, user: &str) -> Result<&str> {
-        self.turn(user)
-    }
-
-    /// Like [`turn`](ChatSession::turn), but streams the reply to `on_token` as
-    /// it is produced (live chat UIs). Same transcript bookkeeping.
-    pub fn turn_streaming(&mut self, user: &str, on_token: &mut dyn FnMut(&str)) -> Result<&str> {
         self.turns.push(Turn {
             role: Role::User,
             content: user.to_string(),
         });
         let prompt = self.template.render(&self.turns);
-        let completion = crate::runtime::run_blocking(|| {
-            self.completer
-                .complete_streaming(&prompt, &self.opts, &[], on_token)
-        })?;
+        // Just await: the Completer impl owns whether this is sync compute (the
+        // local Engine, under run_blocking) or I/O (a remote completer). CMP-1.
+        let completion = self.completer.complete(&prompt, &self.opts, &[]).await?;
         self.last_stop = Some(completion.stop);
         self.turns.push(Turn {
             role: Role::Assistant,
@@ -124,13 +97,40 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         Ok(&self.turns.last().expect("just pushed").content)
     }
 
-    /// Async variant of [`turn_streaming`](ChatSession::turn_streaming).
+    /// Sync shim over [`turn_async`](ChatSession::turn_async) for non-async
+    /// callers, bridged through the one runtime (RT-1: panics, with direction, if
+    /// called from within a current-thread runtime).
+    pub fn turn(&mut self, user: &str) -> Result<&str> {
+        crate::runtime::block_on(self.turn_async(user))
+    }
+
+    /// Like [`turn_async`](ChatSession::turn_async), but streams the reply to
+    /// `on_token` as it is produced (live chat UIs). Same transcript bookkeeping.
     pub async fn turn_streaming_async(
         &mut self,
         user: &str,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<&str> {
-        self.turn_streaming(user, on_token)
+        self.turns.push(Turn {
+            role: Role::User,
+            content: user.to_string(),
+        });
+        let prompt = self.template.render(&self.turns);
+        let completion = self
+            .completer
+            .complete_streaming(&prompt, &self.opts, &[], on_token)
+            .await?;
+        self.last_stop = Some(completion.stop);
+        self.turns.push(Turn {
+            role: Role::Assistant,
+            content: completion.text.trim().to_string(),
+        });
+        Ok(&self.turns.last().expect("just pushed").content)
+    }
+
+    /// Sync shim over [`turn_streaming_async`](ChatSession::turn_streaming_async).
+    pub fn turn_streaming(&mut self, user: &str, on_token: &mut dyn FnMut(&str)) -> Result<&str> {
+        crate::runtime::block_on(self.turn_streaming_async(user, on_token))
     }
 
     /// Why the most recent turn stopped (EOS / max tokens / cancelled), or
@@ -177,7 +177,12 @@ mod tests {
     }
 
     impl Completer for Scripted {
-        fn complete(&mut self, prompt: &str, _: &GenOpts, _: &[String]) -> Result<Completion> {
+        async fn complete(
+            &mut self,
+            prompt: &str,
+            _: &GenOpts,
+            _: &[String],
+        ) -> Result<Completion> {
             self.last_prompt = prompt.to_string();
             let text = self.replies.get(self.i).cloned().unwrap_or_default();
             self.i += 1;

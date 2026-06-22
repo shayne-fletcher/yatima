@@ -60,6 +60,13 @@
 //!   via the single `runtime::block_on` bridge (which panics, with direction, if
 //!   misused from a current-thread runtime); blocking compute (inference) runs
 //!   only under [`run_blocking`], never directly on an async worker.
+//! - **CMP-1** [`Completer`] is a **native `async fn`** trait (not `async_trait`)
+//!   so `Send` is inferred per impl — the local [`Engine`] is `!Send` and runs
+//!   sync decode under [`run_blocking`], a remote completer is `Send` and awaits
+//!   I/O. It is generic-only (never `dyn`), awaited inline (never spawned), so no
+//!   global `Send` bound is imposed (`async_fn_in_trait` is `#[allow]`ed with
+//!   that rationale). Contrast [`Tool`], which is `dyn` + spawned, hence
+//!   `#[async_trait]` + `Send`.
 //!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.

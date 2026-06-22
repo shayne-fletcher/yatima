@@ -172,12 +172,10 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
 
         loop {
             let prompt = self.template.render(&transcript);
-            // Inference is the synchronous compute island; run it via
-            // `run_blocking` so it never stalls the executor (tool watchers,
-            // concurrent tasks keep progressing). RT-1.
-            let completion = crate::runtime::run_blocking(|| {
-                self.completer.complete(&prompt, &self.opts, &stops)
-            })?;
+            // Await the completion; the Completer impl owns its operational shape
+            // (the local Engine runs sync decode under run_blocking so it never
+            // stalls the executor; a remote completer awaits I/O). CMP-1 / RT-1.
+            let completion = self.completer.complete(&prompt, &self.opts, &stops).await?;
             let text = completion.text;
             transcript.push(Turn {
                 role: Role::Assistant,
@@ -356,7 +354,7 @@ mod tests {
     }
 
     impl Completer for Scripted {
-        fn complete(&mut self, _: &str, _: &GenOpts, _: &[String]) -> Result<Completion> {
+        async fn complete(&mut self, _: &str, _: &GenOpts, _: &[String]) -> Result<Completion> {
             let c = self
                 .script
                 .get(self.i)

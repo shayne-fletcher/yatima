@@ -381,6 +381,44 @@ The binary edges (CLI + examples) are `#[tokio::main(flavor = "multi_thread")]`
 and call the async APIs directly, so they dogfood the runtime rather than hide a
 `block_on`; the sync shims exist for embedders that aren't async.
 
+### The model seam is async, `Send` inferred per impl (CMP-1)
+
+`Completer` is the effect boundary: prompt → completion. It is an **async** trait
+so it generalizes past local blocking compute to a **remote/HTTP model** that is
+fundamentally async I/O. The non-obvious, deliberate choice is *how* it is async:
+**native `async fn` in trait** (Rust ≥ 1.75), **not** the `async_trait` crate.
+
+Why that matters: with native `async fn`, the returned future's `Send`-ness is
+**inferred per implementation** rather than fixed at the trait. The local
+`Engine` owns GPU handles (`Box<dyn CausalLm>`, no `Send` bound) so its
+completion future is naturally `!Send`; a remote completer captures only `Send`
+state so its future is naturally `Send`. We thereby avoid *both* bad global
+choices: `?Send` (strips `Send` from every completer, penalising the remote
+case) and forcing `Engine: Send` (a lie about the rented engine that buys
+nothing — it is one-generation-at-a-time and `block_in_place`-pinned anyway). The
+`Send` decision lives where the truth is: each impl.
+
+Each impl also owns the **operational shape** of the effect. Native `async`
+alone does not make candle inference non-blocking — so `Engine::complete` runs
+its sync decode under `run_blocking`; a remote completer instead `.await`s
+network I/O. Callers (`Agent`, `ChatSession`) just `.await` and assume nothing
+about whether completion is CPU- or I/O-bound; the synchronous `turn`/`run`
+shims bridge through `runtime::block_on`.
+
+This is the principled counterpart to `Tool`, and the contrast is the point:
+
+| trait | shape | stored as | concurrency | mechanism |
+|-------|-------|-----------|-------------|-----------|
+| `Tool` | `dyn`-compatible | `Arc<dyn Tool>` | `tokio::spawn`ed, watched, cancelled across tasks | `#[async_trait]` + `Send` |
+| `Completer` | generic, monomorphic | `Agent<C>` / `ChatSession<C>` | awaited inline, one at a time | native `async fn`, `Send` per impl |
+
+Tradeoff, accepted: a public native-`async fn` trait trips
+`clippy::async_fn_in_trait` (you cannot name a `Send` bound on the method). We
+`#[allow]` it *because* completions are never spawned, so imposing a global
+`Send` bound would be wrong, not merely unnecessary. The day an engine-actor
+needs to move a completion across threads, that is when to reach for
+return-type-notation or `trait_variant` — not before.
+
 ## Registries
 
 The **canonical** invariant & law registry lives in the crate docs — see the
