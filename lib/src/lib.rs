@@ -54,6 +54,13 @@
 //! - **PROFILE-2** a [`ModelProfile`] resolves to exactly one source (`repo`
 //!   xor `dir`) before load.
 //!
+//! Runtime & concurrency (async-first, one owned runtime):
+//! - **RT-1** the library owns exactly one (multi-thread) runtime and never
+//!   builds one per call; every sync API is a thin shim over its async primitive
+//!   via the single `runtime::block_on` bridge (which panics, with direction, if
+//!   misused from a current-thread runtime); blocking compute (inference) runs
+//!   only under [`run_blocking`], never directly on an async worker.
+//!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
@@ -96,6 +103,7 @@ mod chat;
 mod completer;
 mod engine;
 mod host;
+mod runtime;
 mod template;
 mod token_output_stream;
 mod tool;
@@ -113,6 +121,7 @@ pub use engine::{
 pub use host::{
     caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelProfile, ModelSource,
 };
+pub use runtime::run_blocking;
 pub use template::{
     ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
 };

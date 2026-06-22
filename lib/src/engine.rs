@@ -1020,16 +1020,15 @@ pub(crate) async fn ensure_model(
     Ok(dir)
 }
 
-/// Blocking wrapper around `ensure_model` for synchronous callers (the CLI);
-/// drives the async fetch on a private tokio runtime.
+/// Blocking wrapper around `ensure_model` for synchronous callers; drives the
+/// async fetch through the library's single runtime bridge (RT-1).
 #[cfg(feature = "fetch")]
 pub fn ensure_model_blocking(
     repo: &crate::ModelId,
     models_root: &Path,
     gguf: Option<&str>,
 ) -> Result<PathBuf> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(ensure_model(repo, models_root, gguf))
+    crate::runtime::block_on(ensure_model(repo, models_root, gguf))
 }
 
 /// Collect EOS token ids from the model config and (optional) generation

@@ -85,13 +85,23 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             content: user.to_string(),
         });
         let prompt = self.template.render(&self.turns);
-        let completion = self.completer.complete(&prompt, &self.opts, &[])?;
+        // Inference is the synchronous compute island; `run_blocking` runs it
+        // directly in a sync context and via `block_in_place` when called from a
+        // multi-thread async context, so it never stalls an executor (RT-1).
+        let completion =
+            crate::runtime::run_blocking(|| self.completer.complete(&prompt, &self.opts, &[]))?;
         self.last_stop = Some(completion.stop);
         self.turns.push(Turn {
             role: Role::Assistant,
             content: completion.text.trim().to_string(),
         });
         Ok(&self.turns.last().expect("just pushed").content)
+    }
+
+    /// Async variant of [`turn`](ChatSession::turn) for async hosts; the
+    /// inference still runs under `run_blocking` so it doesn't stall the runtime.
+    pub async fn turn_async(&mut self, user: &str) -> Result<&str> {
+        self.turn(user)
     }
 
     /// Like [`turn`](ChatSession::turn), but streams the reply to `on_token` as
@@ -102,15 +112,25 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             content: user.to_string(),
         });
         let prompt = self.template.render(&self.turns);
-        let completion = self
-            .completer
-            .complete_streaming(&prompt, &self.opts, &[], on_token)?;
+        let completion = crate::runtime::run_blocking(|| {
+            self.completer
+                .complete_streaming(&prompt, &self.opts, &[], on_token)
+        })?;
         self.last_stop = Some(completion.stop);
         self.turns.push(Turn {
             role: Role::Assistant,
             content: completion.text.trim().to_string(),
         });
         Ok(&self.turns.last().expect("just pushed").content)
+    }
+
+    /// Async variant of [`turn_streaming`](ChatSession::turn_streaming).
+    pub async fn turn_streaming_async(
+        &mut self,
+        user: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<&str> {
+        self.turn_streaming(user, on_token)
     }
 
     /// Why the most recent turn stopped (EOS / max tokens / cancelled), or

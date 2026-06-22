@@ -285,16 +285,7 @@ impl Tools {
     /// model-facing projection for compatibility; async/runtime callers should
     /// prefer [`Tools::dispatch_async`] to get the full [`ToolOutcome`] algebra.
     pub fn dispatch(&self, call: &ToolCall) -> ToolResult {
-        let outcome = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                tokio::task::block_in_place(|| handle.block_on(self.dispatch_async(call)))
-            }
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build tokio runtime for tool dispatch")
-                .block_on(self.dispatch_async(call)),
-        };
+        let outcome = crate::runtime::block_on(self.dispatch_async(call));
         outcome.render_for_model(&call.name)
     }
 

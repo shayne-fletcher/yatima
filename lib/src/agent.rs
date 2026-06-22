@@ -132,15 +132,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         init: A,
         mut step: impl FnMut(A, AgentEvent) -> Result<ControlFlow<A, A>>,
     ) -> Result<(A, Run)> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(self.run_with_async(user, init, &mut step))
-            }),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(self.run_with_async(user, init, &mut step)),
-        }
+        crate::runtime::block_on(self.run_with_async(user, init, &mut step))
     }
 
     /// Run while folding each [`AgentEvent`] into an accumulator. Returning
@@ -180,7 +172,12 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
 
         loop {
             let prompt = self.template.render(&transcript);
-            let completion = self.completer.complete(&prompt, &self.opts, &stops)?;
+            // Inference is the synchronous compute island; run it via
+            // `run_blocking` so it never stalls the executor (tool watchers,
+            // concurrent tasks keep progressing). RT-1.
+            let completion = crate::runtime::run_blocking(|| {
+                self.completer.complete(&prompt, &self.opts, &stops)
+            })?;
             let text = completion.text;
             transcript.push(Turn {
                 role: Role::Assistant,
