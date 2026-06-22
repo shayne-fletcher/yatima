@@ -61,6 +61,13 @@
 //!   base `GenOpts`, and an unset `prefill_chunk` defers to the engine default.
 //! - **PROFILE-2** a [`ModelProfile`] resolves to exactly one source (`repo`
 //!   xor `dir`) before load.
+//! - **CTX-1** the context window is discovered from model config at load
+//!   ([`Engine::context_length`], from `max_position_embeddings` /
+//!   `<arch>.context_length`) and enforced: a prompt plus `max_tokens` that
+//!   would exceed it is refused before decode, rather than silently overflowing.
+//!   An undeclared window imposes no constraint. (Hosts use the same budget to
+//!   trim/compact a transcript — the higher rungs of the ladder in
+//!   `notes/design.md`.)
 //!
 //! Runtime & concurrency (async-first, one owned runtime):
 //! - **RT-1** the library owns exactly one (multi-thread) runtime and never

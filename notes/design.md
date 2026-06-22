@@ -542,28 +542,30 @@ and deliberately shelved — the note records why so we don't repeat them.
   own and the earlier rungs sufficient for most use:
   1. **Know the budget** — `Engine::context_length()` (engine-native fact, same
      shape as `arch()` / `default_prefill_chunk()`; sourced from GGUF
-     `<arch>.context_length` / safetensors `max_position_embeddings`). Not
-     surfaced today; this is the prerequisite for everything below.
+     `<arch>.context_length` / safetensors `max_position_embeddings`). **Done**
+     (CTX-1): discovered in both load paths, exposed as an accessor.
   2. **Detect + fail clean** — before a turn, `token_count(prompt) + max_tokens`
      vs `context_length`; a typed error / `StopReason`, never silent garbage.
      This rung alone fixes the real bug — it is a *correctness signal*, not a
-     feature.
+     feature. **Done** (CTX-1): `generate_with` refuses an over-budget prompt
+     before decode via the `within_context` guard.
   3. **Trim (evict oldest)** — keep the system turn + the most-recent turns that
-     fit. Deterministic and lossy; covers most chat pain.
+     fit. Deterministic and lossy; covers most chat pain. *On trigger.*
   4. **Summarize (compaction)** — fold the evicted prefix into one synthetic turn
      *via the `Completer` itself* (the local analog of server-side compaction);
-     heaviest and lossiest, gated on real long-session use.
+     heaviest and lossiest, gated on real long-session use. *On trigger.*
   - Agent-specific rung: **elide old tool-result payloads** (keep "called
     `read_file` → ok", drop the body) — the analog of context-editing, cheaper
-    than summarizing prose, since tool output is the actual bloat.
+    than summarizing prose, since tool output is the actual bloat. *On trigger.*
 
   Layering (LAYER-1): the *budget* is an engine fact (`context_length`); the
   *policy* lives in `ChatSession`/`Agent` — the engine never decides what to
-  drop. Introduces **CTX-1** when built: a turn never sends more than
-  `context_length` tokens — over-budget is trimmed/compacted/rejected, never
-  silently truncated by the backend. Build rungs 1–2 soon (correctness); 3–4 on
-  trigger. (`generate` one-shot and short chats don't need this; the `embed`
-  classify loop `reset()`s per item, so it never grows.)
+  drop. **CTX-1** (rungs 1–2, built): the context window is discovered from
+  config and a turn never sends more than `context_length` tokens — over-budget
+  is rejected before decode, never silently truncated by the backend. Rungs 3–4
+  (trim/compact) layer the *policy* on top, on trigger. (`generate` one-shot and
+  short chats rarely hit this; the `embed` classify loop `reset()`s per item, so
+  it never grows.)
 - **Readline niceties** — line editing + history (e.g. `rustyline`); the loop is
   plain `stdin` today.
 - **Conversation persistence** — save/load a session transcript.

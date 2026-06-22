@@ -281,6 +281,37 @@ fn arch_from_gguf(s: &str) -> Result<Arch> {
     }
 }
 
+/// The model's context window from a safetensors `config.json` — the standard
+/// `max_position_embeddings` field. `None` when absent (the guard then can't
+/// enforce a budget it doesn't know — CTX-1).
+fn context_length_from_config(config: &serde_json::Value) -> Option<usize> {
+    config
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+}
+
+/// CTX-1: refuse a generation that cannot fit the model's context window —
+/// `prompt + max_tokens` must be ≤ the window, so the backend never silently
+/// truncates or corrupts past it. Pure (testable without a model); `None` window
+/// = unknown, so no constraint to enforce.
+fn within_context(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    context_length: Option<usize>,
+) -> Result<()> {
+    if let Some(window) = context_length {
+        let needed = prompt_tokens.saturating_add(max_tokens);
+        if needed > window {
+            bail!(
+                "prompt ({prompt_tokens} tokens) + max_tokens ({max_tokens}) exceeds the model's \
+                 context window ({window}); shorten the prompt/history or lower max_tokens"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Detect the architecture from `config.json`, accepting both the
 /// `architectures` class name (e.g. `Qwen2ForCausalLM`) and the `model_type`
 /// short form (e.g. `qwen2`), so the fallback is real.
@@ -348,6 +379,10 @@ pub struct Engine {
     dtype: DType,
     arch: Arch,
     prefill_chunk: Option<usize>,
+    /// The model's context window in tokens, discovered from its config/GGUF
+    /// metadata at load (`None` when the metadata doesn't declare it). Engine-
+    /// native fact (CTX-1); the budget the generation guard enforces.
+    context_length: Option<usize>,
 }
 
 impl Engine {
@@ -378,6 +413,7 @@ impl Engine {
         let config_bytes = std::fs::read(&config_path)?;
         let config_value: serde_json::Value = serde_json::from_slice(&config_bytes)?;
         let arch = detect_arch(&config_value)?;
+        let context_length = context_length_from_config(&config_value);
 
         let gen_config_path = model_dir.join("generation_config.json");
         let gen_config_value = if gen_config_path.exists() {
@@ -461,6 +497,7 @@ impl Engine {
             dtype,
             arch,
             prefill_chunk: None,
+            context_length,
         };
         tracing::info!(
             model = %model_dir.display(),
@@ -504,6 +541,13 @@ impl Engine {
             .and_then(|v| v.to_string().ok())
             .ok_or_else(|| anyhow!("GGUF metadata has no general.architecture"))?;
         let arch = arch_from_gguf(arch_str)?;
+        // The window is stored under `<arch>.context_length` (e.g.
+        // `qwen2.context_length`) — read it before `content` is consumed below.
+        let context_length = content
+            .metadata
+            .get(&format!("{arch_str}.context_length"))
+            .and_then(|v| v.to_u32().ok())
+            .map(|n| n as usize);
 
         let eos = gguf_eos_ids(&content, &tokenizer);
         // GGUF weights carry their own quantized dtype; report q-on-device.
@@ -541,6 +585,7 @@ impl Engine {
             dtype,
             arch,
             prefill_chunk,
+            context_length,
         };
         tracing::info!(
             model = %model_dir.display(),
@@ -578,8 +623,16 @@ impl Engine {
         self.prefill_chunk
     }
 
+    /// The model's context window in tokens, discovered from its config / GGUF
+    /// metadata at load (`None` when undeclared). The budget a host uses to
+    /// trim/compact a transcript (CTX-1); the generation loop also enforces it.
+    pub fn context_length(&self) -> Option<usize> {
+        self.context_length
+    }
+
     /// The number of tokens `text` encodes to under this model's tokenizer — a
-    /// small helper for run metadata (reproducible comparisons).
+    /// small helper for run metadata (reproducible comparisons) and for a host
+    /// to budget a transcript against [`context_length`](Engine::context_length).
     pub fn token_count(&self, text: &str) -> Result<usize> {
         Ok(self.encode_prompt(text)?.len())
     }
@@ -762,6 +815,8 @@ impl Engine {
         let mut stream = TokenOutputStream::new(self.tokenizer.clone());
         let mut tokens = self.encode_prompt(prompt)?;
         let prompt_tokens = tokens.len();
+        // CTX-1: refuse rather than silently overflow the context window.
+        within_context(prompt_tokens, opts.max_tokens, self.context_length)?;
 
         let mut logits_processor = opts.sampling.logits_processor();
         let mut acc = init;
@@ -1148,6 +1203,25 @@ mod tests {
         ] {
             assert_eq!(arch.metal_prefill_chunk(), None, "{arch:?}");
         }
+    }
+
+    #[test]
+    fn context_length_read_from_config() {
+        // upholds: CTX-1 — the context window is discovered from model config
+        // (`max_position_embeddings`), and is `None` when undeclared.
+        let cfg = serde_json::json!({ "max_position_embeddings": 32768 });
+        assert_eq!(context_length_from_config(&cfg), Some(32768));
+        assert_eq!(context_length_from_config(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn within_context_guards_the_window() {
+        // upholds: CTX-1 — a prompt+budget that would overflow the discovered
+        // window is refused; an undeclared window imposes no constraint.
+        assert!(within_context(1000, 256, Some(4096)).is_ok());
+        assert!(within_context(4096, 0, Some(4096)).is_ok()); // exactly fits
+        assert!(within_context(4000, 256, Some(4096)).is_err()); // 4256 > 4096
+        assert!(within_context(10_000, 10_000, None).is_ok()); // unknown = no limit
     }
 
     #[test]
