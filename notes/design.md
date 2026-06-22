@@ -534,9 +534,36 @@ Grouped by area; rough priority within each. Items marked *(lesson)* were tried
 and deliberately shelved — the note records why so we don't repeat them.
 
 ### Chat
-- **Context-window management** — the multi-turn REPL grows the transcript
-  unbounded and will degrade/err past the model's window; add trimming (drop or
-  summarize oldest turns) keyed off a token budget.
+- **Context-length handling — a staged, robust progression.** The multi-turn
+  REPL (and the agent loop sooner, via tool results) grows the transcript until
+  it exceeds the model's window; today **nothing checks**, so the failure is
+  *silent* — RoPE positions degrade, then KV/position errors. Give the local path
+  simple, robust behaviour built **down a ladder**, each rung shippable on its
+  own and the earlier rungs sufficient for most use:
+  1. **Know the budget** — `Engine::context_length()` (engine-native fact, same
+     shape as `arch()` / `default_prefill_chunk()`; sourced from GGUF
+     `<arch>.context_length` / safetensors `max_position_embeddings`). Not
+     surfaced today; this is the prerequisite for everything below.
+  2. **Detect + fail clean** — before a turn, `token_count(prompt) + max_tokens`
+     vs `context_length`; a typed error / `StopReason`, never silent garbage.
+     This rung alone fixes the real bug — it is a *correctness signal*, not a
+     feature.
+  3. **Trim (evict oldest)** — keep the system turn + the most-recent turns that
+     fit. Deterministic and lossy; covers most chat pain.
+  4. **Summarize (compaction)** — fold the evicted prefix into one synthetic turn
+     *via the `Completer` itself* (the local analog of server-side compaction);
+     heaviest and lossiest, gated on real long-session use.
+  - Agent-specific rung: **elide old tool-result payloads** (keep "called
+    `read_file` → ok", drop the body) — the analog of context-editing, cheaper
+    than summarizing prose, since tool output is the actual bloat.
+
+  Layering (LAYER-1): the *budget* is an engine fact (`context_length`); the
+  *policy* lives in `ChatSession`/`Agent` — the engine never decides what to
+  drop. Introduces **CTX-1** when built: a turn never sends more than
+  `context_length` tokens — over-budget is trimmed/compacted/rejected, never
+  silently truncated by the backend. Build rungs 1–2 soon (correctness); 3–4 on
+  trigger. (`generate` one-shot and short chats don't need this; the `embed`
+  classify loop `reset()`s per item, so it never grows.)
 - **Readline niceties** — line editing + history (e.g. `rustyline`); the loop is
   plain `stdin` today.
 - **Conversation persistence** — save/load a session transcript.
@@ -610,7 +637,16 @@ and deliberately shelved — the note records why so we don't repeat them.
   through it, and the CLI's interactive `chat` REPL now drives a `ChatSession`
   end-to-end (the hand-rolled loop is gone) — so the CLI fully dogfoods the
   library on both the one-shot and streaming paths.
-- A worked **service/TUI** embedder — the next consumer after the example.
+- **A TUI chat app (sometime soon).** A "ChatGPT-style" terminal app to prove
+  out and play with capabilities interactively — the next real consumer after
+  the examples, and the natural **forcing function**: a long interactive session
+  is exactly what exercises streaming chat end-to-end *and* surfaces the
+  context-length ladder (rungs 1–2 become load-bearing the moment you chat past
+  the window). It would also be where agent/tool capabilities get hands-on play.
+  Drives demand for: the context-length rungs above, readline niceties, and
+  eventually the engine-actor (if it grows beyond one session). Stays a pure
+  embedder over `ChatSession`/`Agent` — no library changes it needs that aren't
+  already wanted.
 
 ### Architecture / research
 - **Invariant reviewer example — done.** `lib/examples/invariant_reviewer.rs`
@@ -630,6 +666,32 @@ and deliberately shelved — the note records why so we don't repeat them.
   above — until then the flat string is fine. **Prerequisite done:** `Role`/`Turn`
   now live in a neutral `transcript` module (were in `agent`), so the seam would
   not make the model layer depend upward into the agent layer.
+- **Serving & scale (deferred — mostly a different *process/tier*, not a
+  module).** `yatima-lib` is the in-process **leaf**; serving concerns must not
+  leak into it (no auth/tenancy/routing in `Engine`/`ChatSession`/`Agent`). The
+  map, by where each concern lives:
+  - *Node concurrency* (many clients, one model) → the **engine-actor** above
+    (owns the `Engine`, serves requests over a channel; home of KV reuse). A
+    request queue gives modest concurrency cheaply; real throughput needs
+    continuous batching — a large engine build, probably **rented** (see fork).
+  - *Tenancy / auth / quotas / multi-client API* → a separate **service tier**
+    (e.g. `yatima-serve`) mapping tenant → capabilities → budget → model. Builds
+    on the capability primitive (`Dir`/`WriteDir`/`WebOrigin`/`NtfyTopic` —
+    bounded effects are exactly what isolation needs); never enters the library.
+  - *Clusters / routing / model placement* → a **control-plane** tier above the
+    service; the library is the leaf and knows nothing of it.
+  - *Model sharding* → engine-internal, **rented from candle/backend**, surfaced
+    as a load fact (like device/dtype), not a yatima subsystem.
+  LAYER-1 extends one tier up: each serving tier is a new *edge* depending
+  **down** into the library, never up. **Identity fork:** yatima as *embedded
+  library / orchestrator* (scale by composing rented backends behind remote
+  `Completer`s — vLLM / TGI / llama.cpp-server / cloud) **vs** yatima as *serving
+  engine* (continuous batching — far larger, lower-level). The remote `Completer`
+  is the escape hatch: front a real serving engine and let yatima orchestrate.
+  The async runtime (RT-1/RT-2), `Send`-per-impl `Completer` (CMP-1), the
+  engine-actor, and capability scoping are the substrate the service tier
+  consumes — the serving tier is the first consumer that would pull the
+  engine-actor off this list.
 - **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the
   `<root>/<org>/<name>` layout, extracted once there's a real trigger (possum
   validating its own ids, or a second consumer).
