@@ -91,6 +91,34 @@ mod tests {
         assert_eq!(run_blocking(|| 6 * 7), 42);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_keeps_the_executor_live() {
+        // upholds: RT-1 — blocking compute under run_blocking (block_in_place)
+        // must not freeze the executor: a concurrently spawned task still makes
+        // progress on another worker while this one blocks. This is the property
+        // that un-paints the half-paint (tool watchers stay live during decode).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let progressed = Arc::new(AtomicBool::new(false));
+        let flag = progressed.clone();
+        let handle = tokio::spawn(async move {
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        // Block this worker the way inference does. On a live multi-thread
+        // executor the spawned task runs on the other worker meanwhile.
+        run_blocking(|| std::thread::sleep(std::time::Duration::from_millis(150)));
+
+        // Checked *before* awaiting the handle: it must have run *during* the
+        // block, not after — i.e. the executor stayed live.
+        assert!(
+            progressed.load(Ordering::SeqCst),
+            "spawned task did not progress while run_blocking blocked the worker"
+        );
+        handle.await.unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[should_panic(expected = "current-thread")]
     async fn block_on_inside_current_thread_panics_with_direction() {
