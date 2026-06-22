@@ -15,26 +15,10 @@ use crate::template::PromptTemplate;
 use crate::tool::{
     ToolCall, ToolCallCodec, ToolEvent, ToolOutcome, ToolRejection, ToolResult, Tools,
 };
+use crate::transcript::{Role, Turn};
 use crate::GenOpts;
 use anyhow::Result;
 use std::ops::ControlFlow;
-
-/// A role in the transcript — mirrors the de-facto standard (system / user /
-/// assistant / tool).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-/// One transcript entry.
-#[derive(Debug, Clone)]
-pub struct Turn {
-    pub role: Role,
-    pub content: String,
-}
 
 /// An observable step of a run, delivered to [`Agent::run_with`]'s fold.
 #[derive(Debug, Clone)]

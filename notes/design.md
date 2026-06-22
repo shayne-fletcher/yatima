@@ -527,6 +527,34 @@ and deliberately shelved — the note records why so we don't repeat them.
   GGUF tokenizers are **done**. Remaining: sharded multi-file GGUF + more
   quantized arches; other backends (mistral.rs, llama.cpp) via more `Completer`
   impls.
+- **Remote `Completer` (Anthropic / OpenAI)** — the payoff of the async-`Completer`
+  generalization (CMP-1): a `RemoteCompleter` holds only `Send` state, so its
+  future is naturally `Send` (per-impl inference, no `?Send`), and it **awaits
+  HTTP directly** — no `run_blocking`, no `BlockingIsland` (RT-2 gates only the
+  local sync decode). Rust has no official Anthropic SDK, so use raw `reqwest`
+  (already a dep) against `POST /v1/messages`: headers `x-api-key` +
+  `anthropic-version: 2023-06-01`; body `{model, max_tokens, system?, messages,
+  stop_sequences?}`; model ids bare (`claude-opus-4-8`, …, no date suffix);
+  `complete_streaming` reads SSE `content_block_delta` → `text_delta` onto
+  `on_token`; budget via `POST /v1/messages/count_tokens` + response `usage`.
+  Three real impedance points to design around, not gloss:
+  1. **Stop sequences aren't echoed.** Our `Completer` contract *includes* the
+     matched stop marker (so a `ToolCallCodec` sees `</tool_call>`); the Messages
+     API omits it on `stop_reason: "stop_sequence"`. The impl must re-append it.
+  2. **`temperature`/`top_p` are 400s on current Claude models.** `Sampling`
+     doesn't forward 1:1 — drop it, or map "more/less thinking" onto `effort`.
+  3. **The seam passes a flat prompt string; the chat API wants structured
+     `messages`.** A first cut sends the rendered prompt as one `user` message
+     (works, loses role structure). Doing it well is the seam refinement below.
+  Also: handle `stop_reason: "refusal"` before reading content. A flat-prompt,
+  greedy-only remote completer is buildable today with no seam surgery.
+  **Scope decision (deliberate): a remote `Completer` is chat/generate, text
+  only — no tools.** Our tools live in the `Agent` loop via a *text* codec gated
+  to local tool-trained formats (Qwen/Plain); a hosted model's **native** tool
+  use (`tool_use`/`tool_result` blocks, `stop_reason: "tool_use"`) cannot ride
+  the flat-string `Completer` seam and would need a separate "agent backend"
+  abstraction (most likely letting the provider run its own tool loop). That is
+  explicitly **kicked down the road** — do not conflate it with the `Completer`.
 - **More chat templates** — Llama-3, Zephyr/TinyLlama (same shape as Gemma/Mistral).
 - **Sampling quality** — `top_p`/`top_k` nucleus sampling (only temperature
   today) for better free-text on smaller models; download integrity/resume.
@@ -555,6 +583,15 @@ and deliberately shelved — the note records why so we don't repeat them.
   capabilities rather than ambient shell access.
 - **Async engine-actor** owning the `Engine` and wrapping `run_with_async` — the
   home for cross-request concurrency and KV-cache reuse (see Concurrency).
+- **Structured-message `Completer` seam** — `complete` takes a *rendered prompt
+  string* today, which suits a local model fed one prompt but loses role
+  structure for a hosted chat API (Anthropic/OpenAI take `messages[]`, not a
+  flat string). A richer seam would hand the completer the structured turns
+  (`&[Turn]`) and let each impl render: local impls run their `PromptTemplate`,
+  a remote impl maps turns → API `messages`. Trigger: the remote `Completer`
+  above — until then the flat string is fine. **Prerequisite done:** `Role`/`Turn`
+  now live in a neutral `transcript` module (were in `agent`), so the seam would
+  not make the model layer depend upward into the agent layer.
 - **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the
   `<root>/<org>/<name>` layout, extracted once there's a real trigger (possum
   validating its own ids, or a second consumer).

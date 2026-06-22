@@ -23,9 +23,9 @@
 //!
 //! [`Agent`]: crate::Agent
 
-use crate::agent::{Role, Turn};
 use crate::completer::Completer;
 use crate::template::PromptTemplate;
+use crate::transcript::{Role, Turn};
 use crate::{GenOpts, StopReason};
 use anyhow::Result;
 

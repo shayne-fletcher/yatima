@@ -8,7 +8,7 @@
 //! [`PlainTemplate`] keeps the minimal layout for models with no known template
 //! and for tests.
 
-use crate::agent::{Role, Turn};
+use crate::transcript::{Role, Turn};
 
 /// Render a transcript into the prompt string fed to the model, ending with the
 /// cue that makes the model speak next.

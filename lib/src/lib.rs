@@ -122,8 +122,9 @@ mod runtime;
 mod template;
 mod token_output_stream;
 mod tool;
+mod transcript;
 
-pub use agent::{Agent, AgentEvent, AgentStop, Role, Run, Turn};
+pub use agent::{Agent, AgentEvent, AgentStop, Run};
 pub use capability::{Dir, NtfyTopic, WebOrigin, WriteDir};
 pub use chat::ChatSession;
 pub use completer::{Completer, Completion};
@@ -145,6 +146,7 @@ pub use tool::{
     ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolFailure, ToolOutcome, ToolRejection,
     ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
 };
+pub use transcript::{Role, Turn};
 
 use anyhow::{bail, Result};
 use std::ffi::OsString;
