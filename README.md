@@ -141,6 +141,44 @@ date, and XBRL tag they came from. The example-local validator warns when the
 model cites unknown tags or accessions, drifts from normalized `value_text`,
 omits citation fields, or uses trend language when only one period was supplied.
 
+The insider-watchlist example looks for a different kind of stock-selection
+signal: recent Form 4 open-market insider purchases. Rust resolves tickers,
+fetches SEC submissions and filing-directory indexes, parses ownership XML,
+keeps only non-derivative `P` purchases with acquired/disposed code `A`, scores
+the typed transactions mechanically, then optionally asks a local model to rank
+the watchlist from that evidence.
+
+For a reliable live demo, fetch one known SEC filing, save the normalized
+evidence, and run the model in the same pass:
+
+```bash
+SEC_USER_AGENT="your-name your-email@example.com" \
+cargo run -p yatima-lib --release --example insider_watchlist --features metal -- \
+  --filing ENR:1632790:0001140361-26-026118:form4.xml:2026-06-23 \
+  --sec-delay-ms 2000 \
+  --sec-max-requests 2 \
+  --save-evidence /tmp/insider-watchlist-enr.json \
+  --profile mistral \
+  --max-tokens 600
+```
+
+Replay the captured evidence to compare models without touching SEC:
+
+```bash
+cargo run -p yatima-lib --release --example insider_watchlist --features metal -- \
+  --evidence /tmp/insider-watchlist-enr.json \
+  --profile qwen32b \
+  --prefill-chunk 64 \
+  --max-tokens 600
+```
+
+The example routes SEC traffic through a metered client: `--sec-delay-ms`
+defaults to 1000, `--sec-max-requests` defaults to 25, and HTTP 429 stops the
+run immediately rather than retrying into a longer block. The model-facing prompt
+requires citations back to ticker, owner, accession, transaction date, shares,
+price, and normalized `value_text`; the validator warns on unknown cited
+accessions.
+
 ## Embedding
 
 The CLI is just one consumer. `yatima-lib` is meant to be called as a library,
