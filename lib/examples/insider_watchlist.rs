@@ -441,11 +441,20 @@ fn print_human_summary(watchlist: &InsiderWatchlist) {
 /// the model only needs what it must cite, so this drops the bulky internal
 /// fields (`archive_url`, `reasons`, both CIKs, `form`, …). It is ~10x fewer
 /// tokens, which keeps a wide screen inside a 32k context window.
+/// Buys shown to the model per ticker. The verdict already carries the cluster
+/// size and totals; the model only needs the top few rows to rank and cite, and
+/// keeping this small keeps the prompt out of Candle's Metal long-context
+/// precision danger zone.
+const MAX_PROMPT_BUYS_PER_TICKER: usize = 8;
+
 #[derive(Serialize)]
 struct PromptView<'a> {
     verdict: Vec<PromptVerdict<'a>>,
     buys: Vec<PromptBuy<'a>>,
-    excluded: Vec<PromptExcluded<'a>>,
+    /// Non-qualifying rows collapsed to per-ticker counts by transaction code
+    /// (e.g. `{"A":10,"F":5}`) instead of one verbose row each — dozens of award
+    /// and tax-withholding lines would otherwise dominate the prompt.
+    excluded_summary: Vec<PromptExcludedSummary>,
 }
 
 #[derive(Serialize)]
@@ -468,15 +477,49 @@ struct PromptBuy<'a> {
 }
 
 #[derive(Serialize)]
-struct PromptExcluded<'a> {
-    ticker: &'a str,
-    owner: &'a str,
-    transaction_code: &'a str,
-    accession: &'a str,
-    reason: &'a str,
+struct PromptExcludedSummary {
+    ticker: String,
+    excluded_by_code: BTreeMap<String, usize>,
 }
 
 fn prompt_view(watchlist: &InsiderWatchlist) -> PromptView<'_> {
+    // Signals arrive ranked (rank_signals); keep the top few per ticker.
+    let mut shown: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut buys = Vec::new();
+    for s in &watchlist.signals {
+        let n = shown.entry(s.ticker.as_str()).or_default();
+        if *n >= MAX_PROMPT_BUYS_PER_TICKER {
+            continue;
+        }
+        *n += 1;
+        buys.push(PromptBuy {
+            ticker: &s.ticker,
+            owner: &s.owner,
+            role: &s.role,
+            transaction_date: &s.transaction_date,
+            value_text: &s.value_text,
+            accession: &s.accession,
+            is_10b5_1: s.is_10b5_1,
+        });
+    }
+
+    // Collapse disqualifiers to per-ticker counts by transaction code.
+    let mut counts: BTreeMap<&str, BTreeMap<String, usize>> = BTreeMap::new();
+    for d in &watchlist.disqualifiers {
+        *counts
+            .entry(d.ticker.as_str())
+            .or_default()
+            .entry(d.transaction_code.clone())
+            .or_default() += 1;
+    }
+    let excluded_summary = counts
+        .into_iter()
+        .map(|(ticker, excluded_by_code)| PromptExcludedSummary {
+            ticker: ticker.to_string(),
+            excluded_by_code,
+        })
+        .collect();
+
     PromptView {
         verdict: watchlist
             .companies
@@ -488,35 +531,15 @@ fn prompt_view(watchlist: &InsiderWatchlist) -> PromptView<'_> {
                 why: &c.tier_rationale,
             })
             .collect(),
-        buys: watchlist
-            .signals
-            .iter()
-            .map(|s| PromptBuy {
-                ticker: &s.ticker,
-                owner: &s.owner,
-                role: &s.role,
-                transaction_date: &s.transaction_date,
-                value_text: &s.value_text,
-                accession: &s.accession,
-                is_10b5_1: s.is_10b5_1,
-            })
-            .collect(),
-        excluded: watchlist
-            .disqualifiers
-            .iter()
-            .map(|d| PromptExcluded {
-                ticker: &d.ticker,
-                owner: &d.owner,
-                transaction_code: &d.transaction_code,
-                accession: &d.accession,
-                reason: &d.reason,
-            })
-            .collect(),
+        buys,
+        excluded_summary,
     }
 }
 
 fn build_prompt(watchlist: &InsiderWatchlist) -> Result<String> {
-    let evidence_json = serde_json::to_string_pretty(&prompt_view(watchlist))?;
+    // Compact (not pretty) JSON: the model doesn't need the indentation, and the
+    // whitespace is pure prompt tokens.
+    let evidence_json = serde_json::to_string(&prompt_view(watchlist))?;
     let tiers = watchlist
         .companies
         .iter()
@@ -547,9 +570,11 @@ Required format:
   not claim a stronger tier than the one assigned above.
 - Signal strength: explain which mechanical reasons matter most.
 - False-positive risks: explain which signals could be optics, compensation
-  related, stale, or too small to matter. Rows under `excluded` and buys with
-  `is_10b5_1: true` are not discretionary purchases — treat them as risks, never
-  as conviction buys.
+  related, stale, or too small to matter. `excluded_summary` counts the
+  non-qualifying transaction codes per ticker (A = award/grant, F = tax
+  withholding, M = option exercise, S = sale); those, and any buy with
+  `is_10b5_1: true`, are not discretionary purchases — treat them as risks,
+  never as conviction buys.
 - Follow-up research: concrete public-data checks to run next.
 
 SEC Form 4 evidence JSON (compact view of the audited watchlist):
