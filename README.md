@@ -141,59 +141,19 @@ date, and XBRL tag they came from. The example-local validator warns when the
 model cites unknown tags or accessions, drifts from normalized `value_text`,
 omits citation fields, or uses trend language when only one period was supplied.
 
-The insider-watchlist example looks for a different kind of stock-selection
-signal: recent Form 4 open-market insider purchases. Rust resolves tickers,
-fetches SEC submissions, parses ownership XML, keeps only non-derivative `P`
-purchases with acquired/disposed code `A`, sets aside everything else (awards,
-exercises, sales) as disqualifiers, flags Rule 10b5-1 plan buys, and then
-**assigns each issuer a deterministic signal tier** — strong, moderate, weak, or
-noise — from the rubric (cluster of insiders, dollar size, discretionary vs.
-plan). Only after the verdict is fixed does a local model rank the watchlist; the
-prompt hands it the assigned tier as a ceiling it may not exceed.
+The same shape extends to other evidence layers. **`sieve`** is a downstream
+project that applies it to SEC Form 4 insider transactions: it resolves tickers,
+parses ownership XML, keeps only open-market `P` purchases, sets aside awards,
+exercises, sales, and Rule 10b5-1 plan buys as disqualifiers, and **assigns each
+issuer a deterministic signal tier** in Rust — strong, moderate, weak, or noise —
+before any model runs. The model receives that tier as a ceiling it may not
+exceed, and a validator audits the resulting note against the supplied evidence.
 
-For a reliable live demo, fetch one known SEC filing, save the normalized
-evidence, and run the model in the same pass:
-
-```bash
-SEC_USER_AGENT="your-name your-email@example.com" \
-cargo run -p yatima-lib --release --example insider_watchlist --features metal -- \
-  --filing ENR:1632790:0001140361-26-026118:form4.xml:2026-06-23 \
-  --sec-delay-ms 2000 \
-  --sec-max-requests 2 \
-  --save-evidence /tmp/insider-watchlist-enr.json \
-  --profile mistral \
-  --max-tokens 600
-```
-
-Replay the captured evidence to compare models without touching SEC:
-
-```bash
-cargo run -p yatima-lib --release --example insider_watchlist --features metal -- \
-  --evidence /tmp/insider-watchlist-enr.json \
-  --profile qwen32b \
-  --prefill-chunk 64 \
-  --max-tokens 600
-```
-
-SEC traffic is metered so it can be used freely for discovery without tripping
-the fair-access limiter. `--sec-delay-ms` (default 300, ~3.3 req/s) sets the
-spacing but is clamped up to a hard floor that no value can cross, so the rate
-stays under SEC's ~10 req/s ceiling no matter what you pass — lower values just
-run nearer the floor. `--sec-max-requests` (default 300) is a backstop against a
-runaway scan, not a usage cap: raise it freely for wider screens (each ticker
-costs roughly one request plus one per Form 4 fetched). Per-filing fetches go
-straight to the raw ownership XML (no extra directory round-trip), and a 429
-stops the run immediately — surfacing any `Retry-After` — rather than retrying
-into a longer block (a 403 is reported as a likely User-Agent problem). For
-repeated iteration on the same evidence, `--demo` and `--evidence` replay touch
-SEC zero times.
-
-The model-facing prompt requires citations back to ticker, owner, accession,
-transaction date, shares, price, and normalized `value_text`. The validator
-warns when the note cites an unknown accession, claims more conviction than the
-Rust-assigned tier, describes a 10b5-1 or non-purchase row as a discretionary
-open-market buy, or asserts price/drawdown context the Form 4 evidence never
-supplied.
+`sieve` builds on `yatima-lib` as a library, exactly as the section below
+describes. It is maintained in its own repository rather than this one, so the
+open-source engine stays focused on the runtime while the strategy layer evolves
+separately. `sieve` is a private project, available to invited collaborators on
+request.
 
 ## Embedding
 
