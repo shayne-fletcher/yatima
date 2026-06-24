@@ -141,19 +141,11 @@ date, and XBRL tag they came from. The example-local validator warns when the
 model cites unknown tags or accessions, drifts from normalized `value_text`,
 omits citation fields, or uses trend language when only one period was supplied.
 
-The same shape extends to other evidence layers. **`sieve`** is a downstream
-project that applies it to SEC Form 4 insider transactions: it resolves tickers,
-parses ownership XML, keeps only open-market `P` purchases, sets aside awards,
-exercises, sales, and Rule 10b5-1 plan buys as disqualifiers, and **assigns each
-issuer a deterministic signal tier** in Rust — strong, moderate, weak, or noise —
-before any model runs. The model receives that tier as a ceiling it may not
-exceed, and a validator audits the resulting note against the supplied evidence.
-
-`sieve` builds on `yatima-lib` as a library, exactly as the section below
-describes. It is maintained in its own repository rather than this one, so the
-open-source engine stays focused on the runtime while the strategy layer evolves
-separately. `sieve` is a private project, available to invited collaborators on
-request.
+The same shape powers **`sieve`**, a private project built on `yatima-lib` that
+screens SEC Form 4 filings for insider buys: it keeps only open-market `P`
+purchases and assigns each issuer a deterministic Rust signal tier — strong,
+moderate, weak, or noise — that caps what the model may claim. Available to
+invited collaborators on request.
 
 ## Embedding
 
