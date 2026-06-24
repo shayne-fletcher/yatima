@@ -32,7 +32,7 @@ use crate::token_output_stream::TokenOutputStream;
 /// calls — so it is a per-call [`GenOpts`] knob the agent turns off.
 const DEFAULT_REPEAT_PENALTY: f32 = 1.1;
 const REPEAT_LAST_N: usize = 64;
-const GLM4_METAL_PREFILL_CHUNK: usize = 64;
+const METAL_PREFILL_CHUNK: usize = 64;
 
 /// How the next token is chosen. Replaces the old `temperature <= 0` sentinel
 /// with an explicit choice — greedy carries no temperature, and seed is
@@ -255,17 +255,20 @@ pub enum Arch {
 }
 
 impl Arch {
-    /// The engine-native prefill-chunk default for this architecture **on
-    /// Metal** (`None` = one full-prompt prefill). Runtime policy only — it
-    /// names no host/format type, so the inference core never depends upward on
-    /// the hosting layer. GLM-4 GGUF degrades on a single long Metal prefill
-    /// (matrix-matrix kernel precision), so it is bounded; see
-    /// `notes/glm4-prefill-reproducer.md`. The caller gates on `device.is_metal`.
+    /// The engine-native prefill-chunk default **on Metal** (`None` = one
+    /// full-prompt prefill). Runtime policy only — it names no host/format type,
+    /// so the inference core never depends upward on the hosting layer. Candle's
+    /// Metal matmul kernels lose precision on a single long prefill: first
+    /// observed on GLM-4 GGUF (see `notes/glm4-prefill-reproducer.md`), but it
+    /// also corrupts other architectures on long prompts — e.g. Mistral BF16
+    /// safetensors degenerates into repetition past a few thousand tokens. So
+    /// every architecture is bounded to a micro-batch on Metal, mirroring
+    /// llama.cpp's `n_ubatch`. The caller gates on `device.is_metal`.
     pub fn metal_prefill_chunk(self) -> Option<usize> {
-        match self {
-            Arch::Glm4 => Some(GLM4_METAL_PREFILL_CHUNK),
-            _ => None,
-        }
+        // Uniform across architectures today; an explicit `--prefill-chunk` (or a
+        // profile) still overrides per run (PREFILL-1).
+        let _ = self;
+        Some(METAL_PREFILL_CHUNK)
     }
 }
 
@@ -489,6 +492,14 @@ impl Engine {
             }
         };
 
+        // Bound the Metal prefill the same way the GGUF path does (PREFILL-1):
+        // a single long prefill loses precision on Candle's Metal kernels, so
+        // safetensors models are micro-batched on Metal too.
+        let prefill_chunk = if device.is_metal() {
+            arch.metal_prefill_chunk()
+        } else {
+            None
+        };
         let engine = Self {
             model,
             tokenizer,
@@ -496,7 +507,7 @@ impl Engine {
             eos,
             dtype,
             arch,
-            prefill_chunk: None,
+            prefill_chunk,
             context_length,
         };
         tracing::info!(
@@ -554,9 +565,9 @@ impl Engine {
         let dtype = DType::F32;
 
         // Engine-native, device-aware prefill default. llama.cpp evaluates
-        // prompts through bounded micro-batches (`n_ubatch`); feeding GLM-4 GGUF
-        // a long prompt as one Metal prefill destabilizes generation on Candle.
-        // The per-arch policy lives on `Arch`; we gate it on the actual device.
+        // prompts through bounded micro-batches (`n_ubatch`); feeding a long
+        // prompt as one Metal prefill destabilizes generation on Candle. The
+        // policy lives on `Arch`; we gate it on the actual device.
         let prefill_chunk = if device.is_metal() {
             arch.metal_prefill_chunk()
         } else {
@@ -1187,13 +1198,12 @@ mod tests {
     }
 
     #[test]
-    fn metal_prefill_chunk_is_glm4_only() {
-        // upholds: PREFILL-1 — only GLM-4 carries a bounded Metal prefill default.
-        assert_eq!(
-            Arch::Glm4.metal_prefill_chunk(),
-            Some(GLM4_METAL_PREFILL_CHUNK)
-        );
+    fn metal_prefill_chunk_bounds_every_arch() {
+        // upholds: PREFILL-1 — every architecture carries a bounded Metal prefill
+        // default; Candle's Metal kernels corrupt a single long prefill
+        // regardless of arch, so none is left unbounded.
         for arch in [
+            Arch::Glm4,
             Arch::Qwen2,
             Arch::Llama,
             Arch::Mistral,
@@ -1201,7 +1211,11 @@ mod tests {
             Arch::Gemma2,
             Arch::Starcoder2,
         ] {
-            assert_eq!(arch.metal_prefill_chunk(), None, "{arch:?}");
+            assert_eq!(
+                arch.metal_prefill_chunk(),
+                Some(METAL_PREFILL_CHUNK),
+                "{arch:?}"
+            );
         }
     }
 
