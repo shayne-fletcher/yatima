@@ -47,9 +47,12 @@
 //! - **ARCH-2** GGUF `general.architecture` strings are normalized to [`Arch`]
 //!   at the load boundary (`glm4`/`chatglm` → `Glm4`, …); raw metadata strings
 //!   never leak into dispatch logic.
-//! - **PREFILL-1** device-sensitive prefill defaults are owned by the loaded
-//!   engine ([`Engine::default_prefill_chunk`], from [`Arch::metal_prefill_chunk`]
-//!   gated on the device); profiles and CLI flags only override deliberately.
+//! - **PREFILL-1** device- and dtype-sensitive prefill defaults are owned by the
+//!   loaded engine ([`Engine::default_prefill_chunk`], from
+//!   [`Arch::metal_prefill_chunk`] gated on Metal **and** an F32 runtime dtype);
+//!   a BF16/F16 model never chunks its prefill (chunked prefill would hit a
+//!   Candle KV-cache `cat` dtype mismatch). Profiles and CLI flags only override
+//!   deliberately.
 //! - **HOST-1** an omitted chat format resolves to the architecture default
 //!   ([`ChatFormat::default_for`] / [`resolve_format`], from [`caps_for`]).
 //! - **HOST-2** a supplied format differing from the architecture default is

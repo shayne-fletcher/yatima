@@ -245,6 +245,19 @@ single giant prompt prefill. Yatima therefore defaults GLM-4 GGUF on Metal to a
 64-token prefill chunk, while preserving the explicit override for benchmarking,
 diagnosis, and future Candle-side fixes.
 
+**Gated on F32 dtype (PREFILL-1).** The Metal chunk default applies *only* when
+the runtime dtype is F32. Chunked prefill on a **BF16/F16** model crashes:
+Candle's attention produces F32 K/V at `seqlen_offset > 0` (every chunk after the
+first), which cannot `cat` onto the BF16 KV cache the first chunk laid down —
+`dtype mismatch in cat, lhs: BF16, rhs: F32`. It surfaces mid-conversation, once
+the re-rendered transcript first exceeds one chunk (~64 tokens). So a BF16
+safetensors model prefills in one shot (numerically fine — verified), while F32
+models (GGUF dequant; F32 safetensors) keep chunking for the precision reason
+above. The decision is a pure function (`prefill_chunk_for(arch, is_metal,
+dtype)`), unit-tested model-free as the CI regression guard, with a gated e2e
+(`lib/tests/prefill_dtype_repro.rs`) driving a >1-chunk prompt through a real
+BF16 model.
+
 **North star — a hylomorphism.** Generation *unfolds* a fragment stream (a
 coalgebra deciding termination on EOS/max/break) and *folds* it with the caller's
 `step` algebra: `generate = ana ; cata = hylo`. The hot loop stays imperative;

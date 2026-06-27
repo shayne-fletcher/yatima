@@ -265,6 +265,27 @@ fn effective_prefill_chunk(configured: Option<usize>, default: Option<usize>, le
     }
 }
 
+/// The prefill-chunk default a freshly loaded engine adopts (PREFILL-1), gated on
+/// device **and runtime dtype**.
+///
+/// Metal chunking applies only to **F32** models. A BF16/F16 model cannot survive
+/// chunked prefill: Candle produces F32 K/V at `seqlen_offset > 0` (the second
+/// chunk on), which cannot `cat` onto the BF16 KV cache the first chunk laid down
+/// ("dtype mismatch in cat, lhs: BF16, rhs: F32"). Such a model must prefill in
+/// one shot — numerically fine in practice. F32 models (GGUF dequant, or an F32
+/// safetensors model) chunk safely **and** need it for the Metal long-prefill
+/// precision issue first seen on GLM-4 GGUF. Off Metal, never chunk.
+///
+/// Pure so the gate is unit-tested without a GPU (the regression guard for the
+/// BF16 chunked-prefill crash).
+fn prefill_chunk_for(arch: Arch, device_is_metal: bool, dtype: DType) -> Option<usize> {
+    if device_is_metal && dtype == DType::F32 {
+        arch.metal_prefill_chunk()
+    } else {
+        None
+    }
+}
+
 /// The model architectures the runtime can load. The single public spine both
 /// load paths normalize through (ARCH-1): safetensors via `detect_arch` and
 /// GGUF via `arch_from_gguf`.
@@ -555,14 +576,10 @@ impl Engine {
             }
         };
 
-        // Bound the Metal prefill the same way the GGUF path does (PREFILL-1):
-        // a single long prefill loses precision on Candle's Metal kernels, so
-        // safetensors models are micro-batched on Metal too.
-        let prefill_chunk = if device.is_metal() {
-            arch.metal_prefill_chunk()
-        } else {
-            None
-        };
+        // PREFILL-1, gated on dtype (see [`prefill_chunk_for`]): a BF16
+        // safetensors model must prefill in one shot, or chunked prefill hits a
+        // Candle KV-cache dtype mismatch.
+        let prefill_chunk = prefill_chunk_for(arch, device.is_metal(), dtype);
         let engine = Self {
             model,
             tokenizer,
@@ -627,15 +644,10 @@ impl Engine {
         // GGUF weights carry their own quantized dtype; report q-on-device.
         let dtype = DType::F32;
 
-        // Engine-native, device-aware prefill default. llama.cpp evaluates
-        // prompts through bounded micro-batches (`n_ubatch`); feeding a long
-        // prompt as one Metal prefill destabilizes generation on Candle. The
-        // policy lives on `Arch`; we gate it on the actual device.
-        let prefill_chunk = if device.is_metal() {
-            arch.metal_prefill_chunk()
-        } else {
-            None
-        };
+        // PREFILL-1 (see [`prefill_chunk_for`]). `dtype` is F32 here (GGUF
+        // dequant), so chunking applies on Metal — needed for the long-prefill
+        // precision issue first seen on GLM-4 GGUF.
+        let prefill_chunk = prefill_chunk_for(arch, device.is_metal(), dtype);
 
         let model: Box<dyn CausalLm> = match arch {
             Arch::Qwen2 => Box::new(quantized_qwen2::ModelWeights::from_gguf(
@@ -1406,6 +1418,35 @@ mod tests {
                 "metal prefill {arch:?}"
             );
         }
+    }
+
+    #[test]
+    fn prefill_chunking_is_gated_on_f32_dtype() {
+        // upholds: PREFILL-1 — and the regression guard for the BF16 chunked-
+        // prefill crash. Chunked prefill on Metal is enabled ONLY for F32 models;
+        // a BF16/F16 model must prefill in one shot (None), or Candle's KV-cache
+        // `cat` fails with "dtype mismatch in cat, lhs: BF16, rhs: F32". Off Metal,
+        // never chunk. Pure — no GPU/model needed, so this runs in CI.
+        let arch = Arch::Qwen2;
+        // The crash case, now prevented: BF16 on Metal does not chunk.
+        assert_eq!(
+            prefill_chunk_for(arch, true, DType::F32),
+            arch.metal_prefill_chunk(),
+            "F32 on Metal chunks (GGUF dequant / F32 safetensors; GLM-4 fix)"
+        );
+        assert_eq!(
+            prefill_chunk_for(arch, true, DType::BF16),
+            None,
+            "BF16 on Metal must NOT chunk (the cat dtype-mismatch regression)"
+        );
+        assert_eq!(
+            prefill_chunk_for(arch, true, DType::F16),
+            None,
+            "F16 on Metal must NOT chunk either"
+        );
+        // Off Metal, no chunking regardless of dtype.
+        assert_eq!(prefill_chunk_for(arch, false, DType::F32), None);
+        assert_eq!(prefill_chunk_for(arch, false, DType::BF16), None);
     }
 
     #[test]
