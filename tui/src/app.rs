@@ -130,10 +130,20 @@ impl App {
     }
 
     /// Begin a turn — unless input is empty or a turn is already in flight
-    /// (TUI-7 single-in-flight).
+    /// (TUI-7 single-in-flight). A leading-slash command (`/reset`) is handled
+    /// here instead of submitting.
     fn start_turn(&mut self) {
         let user = self.input.trim().to_string();
         if user.is_empty() || self.in_flight.is_some() {
+            return;
+        }
+        // `/reset` clears the conversation — the in-session recovery/escape hatch
+        // (clears the engine's authoritative history and the UI mirror).
+        if user == "/reset" {
+            let _ = self.req_tx.send(EngineRequest::Reset);
+            self.transcript.clear();
+            self.input.clear();
+            self.scroll_back = 0;
             return;
         }
         let turn_id = self.next_turn_id;
@@ -346,6 +356,29 @@ mod tests {
             stop: StopReason::Eos,
         });
         assert_eq!(app.transcript.len(), 2, "fragments/done must not append");
+    }
+
+    #[test]
+    fn slash_reset_clears_mirror_and_signals_engine() {
+        // /reset is the in-session recovery: it clears the UI mirror and tells
+        // the engine to reset its authoritative history — no turn is submitted.
+        let (mut app, rx) = test_app();
+        app.input = "hi".into();
+        app.apply(Intent::Submit);
+        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
+        app.on_engine_event(EngineEvent::Done {
+            turn_id: 0,
+            answer: "ok".into(),
+            stop: StopReason::Eos,
+        });
+        assert!(!app.transcript.is_empty());
+        let _ = rx.try_recv(); // drain the Submit
+
+        app.input = "/reset".into();
+        app.apply(Intent::Submit);
+        assert!(app.transcript.is_empty(), "reset clears the mirror");
+        assert!(app.in_flight.is_none(), "reset does not start a turn");
+        assert!(matches!(rx.try_recv(), Ok(EngineRequest::Reset)));
     }
 
     #[test]

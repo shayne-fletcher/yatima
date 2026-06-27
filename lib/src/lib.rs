@@ -135,6 +135,9 @@
 //!   transcript re-rendered into the next prompt, and the surfaced answer is the
 //!   post-reasoning text. The split recognizes every known marker dialect and is
 //!   the identity when none is present (safe for any model/format).
+//! - **CHAT-1** a [`ChatSession`] turn is atomic: if its completion errors, the
+//!   user turn is rolled back so the transcript is unchanged. A failed turn never
+//!   poisons the session — a later turn re-renders clean history and succeeds.
 
 mod agent;
 mod capability;

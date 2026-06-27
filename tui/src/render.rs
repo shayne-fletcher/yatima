@@ -146,7 +146,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.in_flight.is_some() {
         "^C quit (cancel: soon)"
     } else {
-        "^C quit · PgUp/PgDn scroll"
+        "^C quit · /reset · PgUp/PgDn scroll"
     };
     let parts = [
         app.status.model_label.clone(),

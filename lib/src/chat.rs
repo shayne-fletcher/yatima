@@ -93,7 +93,16 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         let prompt = self.template.render(&self.turns);
         // Just await: the Completer impl owns whether this is sync compute (the
         // local Engine, under run_blocking) or I/O (a remote completer). CMP-1.
-        let completion = self.completer.complete(&prompt, &self.opts, &[]).await?;
+        // A turn is atomic (CHAT-1): on error, roll back the user turn so a failed
+        // turn leaves the transcript exactly as before — never a dangling
+        // unanswered user turn that poisons every later prompt.
+        let completion = match self.completer.complete(&prompt, &self.opts, &[]).await {
+            Ok(completion) => completion,
+            Err(e) => {
+                self.turns.pop();
+                return Err(e);
+            }
+        };
         self.last_stop = Some(completion.stop);
         // Keep only the answer in history; the reasoning span is surfaced via
         // `last_reasoning`, never re-fed into the next prompt (REASON-1).
@@ -125,10 +134,20 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             content: user.to_string(),
         });
         let prompt = self.template.render(&self.turns);
-        let completion = self
+        // Atomic on error (CHAT-1): roll back the user turn. Any fragments already
+        // streamed to `on_token` cannot be un-emitted, but the *stored* history
+        // stays clean, so the next turn re-renders consistent prompt history.
+        let completion = match self
             .completer
             .complete_streaming(&prompt, &self.opts, &[], on_token)
-            .await?;
+            .await
+        {
+            Ok(completion) => completion,
+            Err(e) => {
+                self.turns.pop();
+                return Err(e);
+            }
+        };
         self.last_stop = Some(completion.stop);
         // The live `on_token` stream is raw (reasoning tokens included; a
         // channel-tagged stream is a follow-up), but the stored turn is
@@ -213,6 +232,62 @@ mod tests {
                 stop: StopReason::Eos,
             })
         }
+    }
+
+    /// A [`Completer`] that errors on its first call, then succeeds — so we can
+    /// assert a failed turn does not poison the session (CHAT-1).
+    struct FailsThenWorks {
+        calls: usize,
+        last_prompt: String,
+    }
+
+    impl Completer for FailsThenWorks {
+        async fn complete(
+            &mut self,
+            prompt: &str,
+            _: &GenOpts,
+            _: &[String],
+        ) -> Result<Completion> {
+            self.last_prompt = prompt.to_string();
+            self.calls += 1;
+            if self.calls == 1 {
+                anyhow::bail!("simulated engine error");
+            }
+            Ok(Completion {
+                text: "recovered".to_string(),
+                stop: StopReason::Eos,
+            })
+        }
+    }
+
+    #[test]
+    fn a_failed_turn_is_atomic_and_recovers() {
+        // upholds: CHAT-1 — a turn whose completion errors rolls back its user
+        // turn, leaving the transcript unchanged, so the session is not poisoned:
+        // a later turn re-renders clean history and succeeds, and the failed
+        // message never enters the prompt.
+        let mut model = FailsThenWorks {
+            calls: 0,
+            last_prompt: String::new(),
+        };
+        let mut chat = ChatSession::new(&mut model, PlainTemplate).with_system("sys");
+        assert_eq!(chat.history().len(), 1); // system only
+
+        assert!(chat.turn("poison me").is_err(), "first turn errors");
+        assert_eq!(
+            chat.history().len(),
+            1,
+            "a failed turn must leave no dangling user turn"
+        );
+
+        let reply = chat.turn("hello again").unwrap().to_string();
+        assert_eq!(reply, "recovered");
+        // history: system, user(hello again), assistant(recovered).
+        assert_eq!(chat.history().len(), 3);
+        assert!(
+            !chat.completer.last_prompt.contains("poison me"),
+            "the failed message must not reach the model's prompt"
+        );
     }
 
     #[test]
