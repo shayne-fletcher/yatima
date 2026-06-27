@@ -24,6 +24,7 @@
 //! [`Agent`]: crate::Agent
 
 use crate::completer::Completer;
+use crate::reasoning::{split_reasoning, Reasoned};
 use crate::template::PromptTemplate;
 use crate::transcript::{Role, Turn};
 use crate::{GenOpts, StopReason};
@@ -41,6 +42,9 @@ pub struct ChatSession<'a, C: Completer, T: PromptTemplate> {
     system_len: usize,
     /// Why the most recent turn stopped (for run metadata); `None` before any.
     last_stop: Option<StopReason>,
+    /// The most recent reply's reasoning span, if it was a reasoning model;
+    /// `None` otherwise. Kept out of the transcript (REASON-1) but surfaced here.
+    last_reasoning: Option<String>,
 }
 
 impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
@@ -54,6 +58,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             turns: Vec::new(),
             system_len: 0,
             last_stop: None,
+            last_reasoning: None,
         }
     }
 
@@ -90,9 +95,13 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         // local Engine, under run_blocking) or I/O (a remote completer). CMP-1.
         let completion = self.completer.complete(&prompt, &self.opts, &[]).await?;
         self.last_stop = Some(completion.stop);
+        // Keep only the answer in history; the reasoning span is surfaced via
+        // `last_reasoning`, never re-fed into the next prompt (REASON-1).
+        let Reasoned { reasoning, answer } = split_reasoning(&completion.text);
+        self.last_reasoning = reasoning;
         self.turns.push(Turn {
             role: Role::Assistant,
-            content: completion.text.trim().to_string(),
+            content: answer,
         });
         Ok(&self.turns.last().expect("just pushed").content)
     }
@@ -121,9 +130,14 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             .complete_streaming(&prompt, &self.opts, &[], on_token)
             .await?;
         self.last_stop = Some(completion.stop);
+        // The live `on_token` stream is raw (reasoning tokens included; a
+        // channel-tagged stream is a follow-up), but the stored turn is
+        // answer-only so history stays clean (REASON-1).
+        let Reasoned { reasoning, answer } = split_reasoning(&completion.text);
+        self.last_reasoning = reasoning;
         self.turns.push(Turn {
             role: Role::Assistant,
-            content: completion.text.trim().to_string(),
+            content: answer,
         });
         Ok(&self.turns.last().expect("just pushed").content)
     }
@@ -137,6 +151,14 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
     /// `None` before the first turn — for run metadata (META-1).
     pub fn last_stop(&self) -> Option<StopReason> {
         self.last_stop
+    }
+
+    /// The reasoning span of the most recent reply (a reasoning model's
+    /// chain-of-thought), or `None` for a non-reasoning model or before any
+    /// turn. The span is never part of [`history`](ChatSession::history)
+    /// (REASON-1); this is the only place it is surfaced.
+    pub fn last_reasoning(&self) -> Option<&str> {
+        self.last_reasoning.as_deref()
     }
 
     /// Clear the conversation back to the seeded system prompt.
@@ -226,6 +248,23 @@ mod tests {
         assert_eq!(answer, "streamed reply");
         assert_eq!(got, "streamed reply"); // delivered via the callback
         assert_eq!(chat.history().len(), 2); // user + assistant
+    }
+
+    #[test]
+    fn reasoning_is_split_from_the_reply_and_history() {
+        // upholds: REASON-1 — a reasoning model's think span is surfaced via
+        // last_reasoning, but the stored/returned reply is answer-only, so it is
+        // not re-fed into the next prompt.
+        let mut model = Scripted::new(&["<think>recall the name</think>Your name is Ada."]);
+        let mut chat = ChatSession::new(&mut model, PlainTemplate);
+        let reply = chat.turn("What is my name?").unwrap().to_string();
+        assert_eq!(reply, "Your name is Ada.");
+        assert_eq!(chat.last_reasoning(), Some("recall the name"));
+        // History (re-rendered into the next prompt) holds the answer only.
+        let assistant = &chat.history()[1];
+        assert_eq!(assistant.role, Role::Assistant);
+        assert_eq!(assistant.content, "Your name is Ada.");
+        assert!(!assistant.content.contains("<think>"));
     }
 
     #[test]

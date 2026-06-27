@@ -127,6 +127,11 @@
 //!   tokenizer adds one (Gemma `<bos>`, Mistral `<s>`) — never double-BOS.
 //! - **TMPL-2** for a model with no system role (Gemma, Mistral), system text is
 //!   folded into the first user turn rather than emitted as a system turn.
+//! - **REASON-1** a reasoning model's chain-of-thought is split off at the
+//!   completion→turn boundary ([`split_reasoning`]): it never enters the
+//!   transcript re-rendered into the next prompt, and the surfaced answer is the
+//!   post-reasoning text. The split recognizes every known marker dialect and is
+//!   the identity when none is present (safe for any model/format).
 
 mod agent;
 mod capability;
@@ -134,6 +139,7 @@ mod chat;
 mod completer;
 mod engine;
 mod host;
+mod reasoning;
 mod runtime;
 mod template;
 mod token_output_stream;
@@ -153,6 +159,7 @@ pub use engine::{
 pub use host::{
     caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelProfile, ModelSource,
 };
+pub use reasoning::{split_reasoning, strip_reasoning, Reasoned};
 pub use runtime::run_blocking;
 pub use template::{
     ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,

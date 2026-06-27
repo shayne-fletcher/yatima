@@ -11,6 +11,7 @@
 //! turn.
 
 use crate::completer::Completer;
+use crate::reasoning::{split_reasoning, Reasoned};
 use crate::template::PromptTemplate;
 use crate::tool::{
     ToolCall, ToolCallCodec, ToolEvent, ToolOutcome, ToolRejection, ToolResult, Tools,
@@ -27,6 +28,10 @@ pub enum AgentEvent {
     ToolStarted(ToolCall),
     ToolProgress(String),
     ToolOutcome(ToolOutcome),
+    /// A reasoning model's chain-of-thought for the step just completed. Emitted
+    /// before the resulting `ToolCall`/`Final`; observational (for UIs/logging).
+    /// The trace is *not* re-fed into the transcript (REASON-1).
+    Reasoning(String),
     Final(String),
 }
 
@@ -160,21 +165,37 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             // (the local Engine runs sync decode under run_blocking so it never
             // stalls the executor; a remote completer awaits I/O). CMP-1 / RT-1.
             let completion = self.completer.complete(&prompt, &self.opts, &stops).await?;
-            let text = completion.text;
+            // Split off the reasoning span at the completion→turn boundary: the
+            // transcript (re-rendered into the next prompt) carries only the
+            // answer, never the chain-of-thought (REASON-1). The reply still
+            // holds any trailing tool call, so the codec parses it below.
+            let Reasoned {
+                reasoning,
+                answer: reply,
+            } = split_reasoning(&completion.text);
             transcript.push(Turn {
                 role: Role::Assistant,
-                content: text.clone(),
+                content: reply.clone(),
             });
+            if let Some(reasoning) = reasoning {
+                match step(acc, AgentEvent::Reasoning(reasoning))? {
+                    ControlFlow::Continue(a) => acc = a,
+                    ControlFlow::Break(a) => {
+                        acc = a;
+                        stop = AgentStop::Stopped;
+                        break;
+                    }
+                }
+            }
 
-            match self.codec.parse(&text) {
-                // A plain answer: the run is done (a model's reasoning block, if
-                // any, is stripped from the surfaced answer).
+            match self.codec.parse(&reply) {
+                // A plain answer: the run is done (the reasoning span, if any, has
+                // already been stripped from `reply`).
                 None => {
-                    let final_answer = strip_think(&text);
-                    match step(acc, AgentEvent::Final(final_answer.clone()))? {
+                    match step(acc, AgentEvent::Final(reply.clone()))? {
                         ControlFlow::Continue(a) | ControlFlow::Break(a) => acc = a,
                     }
-                    answer = final_answer;
+                    answer = reply;
                     stop = AgentStop::Final;
                     break;
                 }
@@ -289,16 +310,6 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 stop,
             },
         ))
-    }
-}
-
-/// Strip a leading reasoning block from a model's answer: keep only what follows
-/// the last `</think>`. A no-op for output with no think block (so it is safe
-/// for any template/codec).
-fn strip_think(text: &str) -> String {
-    match text.rfind("</think>") {
-        Some(i) => text[i + "</think>".len()..].trim().to_string(),
-        None => text.trim().to_string(),
     }
 }
 
@@ -584,20 +595,31 @@ mod tests {
     }
 
     #[test]
-    fn strip_think_keeps_only_the_answer() {
-        assert_eq!(strip_think("no think here"), "no think here");
-        assert_eq!(
-            strip_think("<think>weighing it</think>\nthe answer"),
-            "the answer"
+    fn reasoning_is_stripped_from_the_surfaced_answer() {
+        // The agent surfaces (and re-feeds) only the answer; the reasoning span
+        // is dropped from the transcript (REASON-1). Marker coverage and edge
+        // cases are tested in `crate::reasoning`.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&["<think>2+2 is 4</think>The answer is 4."]);
+        let mut agent = Agent::new(
+            &mut model,
+            &tools,
+            JsonToolCall,
+            PlainTemplate,
+            "be brief",
+            4,
         );
-        // multiple closers: keep what follows the last one.
-        assert_eq!(strip_think("a</think>b</think>final"), "final");
-        assert_eq!(strip_think("  padded  "), "padded");
-        // an unterminated think block is left intact (trimmed).
-        assert_eq!(
-            strip_think("<think>still thinking"),
-            "<think>still thinking"
-        );
+        let run = agent.run("what is 2+2?").unwrap();
+        assert_eq!(run.answer, "The answer is 4.");
+        assert_eq!(run.stop, AgentStop::Final);
+        // The reasoning span is absent from the re-rendered transcript.
+        let assistant = run
+            .transcript
+            .iter()
+            .find(|t| t.role == Role::Assistant)
+            .unwrap();
+        assert_eq!(assistant.content, "The answer is 4.");
+        assert!(!assistant.content.contains("<think>"));
     }
 
     // End-to-end agent runs over a real, tool-trained model (Qwen2.5-Instruct,
