@@ -24,11 +24,16 @@ pub fn activity_line(answering: bool, elapsed: Duration, frags: usize) -> String
     let frame = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
     let secs = elapsed.as_secs();
     let phase = if answering { "answering" } else { "thinking" };
+    // Show the rate: it distinguishes "slow" (low but non-zero, e.g. a large
+    // model under memory pressure) from "stalled" (decaying toward 0), so a slow
+    // turn is never mistaken for a hang.
+    let rate = frags as f64 / elapsed.as_secs_f64().max(0.1);
     format!(
-        "{frame} {phase}… · {}:{:02} · {} tok",
+        "{frame} {phase}… · {}:{:02} · {} tok · {:.1} tok/s",
         secs / 60,
         secs % 60,
-        frags
+        frags,
+        rate
     )
 }
 
@@ -202,6 +207,8 @@ mod tests {
         let line = activity_line(true, Duration::from_secs(3), 40);
         assert!(line.contains("answering…"));
         assert!(line.contains("0:03"));
+        // The rate is shown — the slow-vs-stalled signal.
+        assert!(line.contains("tok/s"));
     }
 
     #[test]
