@@ -4,12 +4,13 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 
-# candle is pinned to the exact git rev validated during bring-up (≈0.10.2);
-# the upstream `qwen` example ran our local DeepSeek weights against this rev.
+# candle pinned to the 0.11.0 release tag — i-quant GGUF support (modern quants
+# load) and newer architectures. Staying on the frontier; re-validate the Metal
+# prefill behavior on each bump (notes/glm4-prefill-reproducer.md).
 [dependencies]
-candle-core = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
-candle-nn = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
-candle-transformers = { git = "https://github.com/huggingface/candle", rev = "0190c65" }
+candle-core = { git = "https://github.com/huggingface/candle", tag = "0.11.0" }
+candle-nn = { git = "https://github.com/huggingface/candle", tag = "0.11.0" }
+candle-transformers = { git = "https://github.com/huggingface/candle", tag = "0.11.0" }
 tokenizers = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
