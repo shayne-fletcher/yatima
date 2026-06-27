@@ -17,8 +17,9 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::{
-    gemma2, glm4_new, llama, mistral, phi3, quantized_glm4, quantized_llama, quantized_qwen2,
-    qwen2, starcoder2,
+    deepseek2, gemma2, gemma3, glm4_new, llama, mistral, phi3, quantized_gemma3, quantized_glm4,
+    quantized_llama, quantized_qwen2, quantized_qwen3, quantized_qwen3_moe, qwen2, qwen3,
+    qwen3_moe, starcoder2,
 };
 use candle_transformers::utils::apply_repeat_penalty;
 use tokenizers::Tokenizer;
@@ -181,16 +182,40 @@ macro_rules! self_cache_causal_lm {
 }
 
 self_cache_causal_lm!(qwen2::ModelForCausalLM);
+self_cache_causal_lm!(qwen3::ModelForCausalLM);
+self_cache_causal_lm!(qwen3_moe::ModelForCausalLM);
 self_cache_causal_lm!(mistral::Model);
 self_cache_causal_lm!(phi3::Model);
 self_cache_causal_lm!(gemma2::Model);
+self_cache_causal_lm!(gemma3::Model);
 self_cache_causal_lm!(starcoder2::Model);
 self_cache_causal_lm!(glm4_new::ModelForCausalLM);
+self_cache_causal_lm!(deepseek2::DeepSeekV2);
 
 // Quantized (GGUF) models fit the same self-cache shape: `forward(&mut self, x,
 // index_pos)` + `clear_kv_cache()`.
 self_cache_causal_lm!(quantized_qwen2::ModelWeights);
+self_cache_causal_lm!(quantized_qwen3::ModelWeights);
 self_cache_causal_lm!(quantized_llama::ModelWeights);
+
+// Quantized Qwen3-MoE and Gemma-3 have the same `forward(input, offset)` but no
+// public `clear_kv_cache` — like quantized GLM-4 they reset their KV cache when
+// `offset == 0` (the prefill our loop always hits first), so `reset` is a safe
+// no-op.
+macro_rules! noreset_causal_lm {
+    ($ty:ty) => {
+        impl CausalLm for $ty {
+            fn forward(&mut self, input: &Tensor, pos: usize) -> Result<Tensor> {
+                Ok(<$ty>::forward(self, input, pos)?)
+            }
+            fn reset(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+    };
+}
+noreset_causal_lm!(quantized_qwen3_moe::GGUFQWenMoE);
+noreset_causal_lm!(quantized_gemma3::ModelWeights);
 
 // Quantized GLM-4 has the same `forward(input, offset)` but no public
 // `clear_kv_cache`: it auto-resets its KV cache when `offset == 0` (the prefill
@@ -246,12 +271,18 @@ fn effective_prefill_chunk(configured: Option<usize>, default: Option<usize>, le
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     Qwen2,
+    Qwen3,
+    Qwen3Moe,
     Llama,
     Mistral,
     Phi3,
     Gemma2,
+    Gemma3,
     Starcoder2,
     Glm4,
+    /// DeepSeek-V2/V3 family (MoE + MLA). Safetensors only — candle has no
+    /// quantized DeepSeek loader, so there is no GGUF path for it.
+    DeepSeek2,
 }
 
 impl Arch {
@@ -278,9 +309,15 @@ impl Arch {
 fn arch_from_gguf(s: &str) -> Result<Arch> {
     match s {
         "qwen2" => Ok(Arch::Qwen2),
+        "qwen3" => Ok(Arch::Qwen3),
+        "qwen3moe" => Ok(Arch::Qwen3Moe),
         "llama" => Ok(Arch::Llama),
+        "gemma3" => Ok(Arch::Gemma3),
         "glm4" | "chatglm" => Ok(Arch::Glm4),
-        other => bail!("unsupported GGUF architecture: {other} (supported: qwen2, llama, glm4)"),
+        other => bail!(
+            "unsupported GGUF architecture: {other} \
+             (supported: qwen2, qwen3, qwen3moe, llama, gemma3, glm4)"
+        ),
     }
 }
 
@@ -327,15 +364,21 @@ fn detect_arch(config: &serde_json::Value) -> Result<Arch> {
     match class.or(model_type) {
         Some(name) => match name {
             "Qwen2ForCausalLM" | "qwen2" => Ok(Arch::Qwen2),
+            "Qwen3ForCausalLM" | "qwen3" => Ok(Arch::Qwen3),
+            "Qwen3MoeForCausalLM" | "qwen3_moe" => Ok(Arch::Qwen3Moe),
             "LlamaForCausalLM" | "llama" => Ok(Arch::Llama),
             "MistralForCausalLM" | "mistral" => Ok(Arch::Mistral),
             "Phi3ForCausalLM" | "phi3" => Ok(Arch::Phi3),
             "Gemma2ForCausalLM" | "gemma2" => Ok(Arch::Gemma2),
+            "Gemma3ForCausalLM" | "gemma3" => Ok(Arch::Gemma3),
             "Starcoder2ForCausalLM" | "starcoder2" => Ok(Arch::Starcoder2),
             "Glm4ForCausalLM" | "glm4" => Ok(Arch::Glm4),
+            "DeepseekV2ForCausalLM" | "deepseek_v2" | "DeepseekV3ForCausalLM" | "deepseek_v3" => {
+                Ok(Arch::DeepSeek2)
+            }
             other => bail!(
-                "unsupported architecture: {other} (supported: Qwen2, Llama, \
-                 Mistral, Phi3, Gemma2, Starcoder2, Glm4)"
+                "unsupported architecture: {other} (supported: Qwen2, Qwen3, Qwen3Moe, Llama, \
+                 Mistral, Phi3, Gemma2, Gemma3, Starcoder2, Glm4, DeepSeek2)"
             ),
         },
         None => bail!("config.json has no `architectures` or `model_type`"),
@@ -451,6 +494,16 @@ impl Engine {
                     serde_json::from_slice(&config_bytes).map_err(|_| parse("Qwen2"))?;
                 Box::new(qwen2::ModelForCausalLM::new(&cfg, vb)?)
             }
+            Arch::Qwen3 => {
+                let cfg: qwen3::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Qwen3"))?;
+                Box::new(qwen3::ModelForCausalLM::new(&cfg, vb)?)
+            }
+            Arch::Qwen3Moe => {
+                let cfg: qwen3_moe::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Qwen3Moe"))?;
+                Box::new(qwen3_moe::ModelForCausalLM::new(&cfg, vb)?)
+            }
             Arch::Mistral => {
                 let cfg: mistral::Config =
                     serde_json::from_slice(&config_bytes).map_err(|_| parse("Mistral"))?;
@@ -466,6 +519,11 @@ impl Engine {
                     serde_json::from_slice(&config_bytes).map_err(|_| parse("Gemma2"))?;
                 Box::new(gemma2::Model::new(false, &cfg, vb)?)
             }
+            Arch::Gemma3 => {
+                let cfg: gemma3::Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("Gemma3"))?;
+                Box::new(gemma3::Model::new(false, &cfg, vb)?)
+            }
             Arch::Starcoder2 => {
                 let cfg: starcoder2::Config =
                     serde_json::from_slice(&config_bytes).map_err(|_| parse("Starcoder2"))?;
@@ -475,6 +533,11 @@ impl Engine {
                 let cfg: glm4_new::Config =
                     serde_json::from_slice(&config_bytes).map_err(|_| parse("Glm4"))?;
                 Box::new(glm4_new::ModelForCausalLM::new(&cfg, vb)?)
+            }
+            Arch::DeepSeek2 => {
+                let cfg: deepseek2::DeepSeekV2Config =
+                    serde_json::from_slice(&config_bytes).map_err(|_| parse("DeepSeek2"))?;
+                Box::new(deepseek2::DeepSeekV2::new(&cfg, vb)?)
             }
             Arch::Llama => {
                 let cfg: llama::LlamaConfig =
@@ -578,13 +641,22 @@ impl Engine {
             Arch::Qwen2 => Box::new(quantized_qwen2::ModelWeights::from_gguf(
                 content, &mut file, &device,
             )?),
+            Arch::Qwen3 => Box::new(quantized_qwen3::ModelWeights::from_gguf(
+                content, &mut file, &device,
+            )?),
+            Arch::Qwen3Moe => Box::new(quantized_qwen3_moe::GGUFQWenMoE::from_gguf(
+                content, &mut file, &device, dtype,
+            )?),
             Arch::Llama => Box::new(quantized_llama::ModelWeights::from_gguf(
+                content, &mut file, &device,
+            )?),
+            Arch::Gemma3 => Box::new(quantized_gemma3::ModelWeights::from_gguf(
                 content, &mut file, &device,
             )?),
             Arch::Glm4 => Box::new(quantized_glm4::ModelWeights::from_gguf(
                 content, &mut file, &device, dtype,
             )?),
-            // `arch_from_gguf` only yields the three above.
+            // `arch_from_gguf` yields only the quantized-capable archs above.
             other => unreachable!("GGUF arch {other:?} has no quantized loader"),
         };
 
@@ -1197,24 +1269,141 @@ mod tests {
         assert!(arch_from_gguf("nope").is_err());
     }
 
+    /// Declared wiring for one architecture — the single source of truth the
+    /// consistency harness checks against.
+    struct ArchSpec {
+        /// safetensors `architectures[0]` class names that map to this arch.
+        class_names: &'static [&'static str],
+        /// the `model_type` short form.
+        model_type: &'static str,
+        /// the GGUF `general.architecture` string, when a quantized loader exists.
+        gguf: Option<&'static str>,
+        /// the native chat format.
+        format: crate::ChatFormat,
+    }
+
+    /// One row per arch. **Exhaustive** — a newly added [`Arch`] does not compile
+    /// until its detection + GGUF + format wiring is declared here.
+    fn arch_spec(arch: Arch) -> ArchSpec {
+        use crate::ChatFormat::{Gemma, Glm, Mistral, Plain, Qwen};
+        match arch {
+            Arch::Qwen2 => ArchSpec {
+                class_names: &["Qwen2ForCausalLM"],
+                model_type: "qwen2",
+                gguf: Some("qwen2"),
+                format: Qwen,
+            },
+            Arch::Qwen3 => ArchSpec {
+                class_names: &["Qwen3ForCausalLM"],
+                model_type: "qwen3",
+                gguf: Some("qwen3"),
+                format: Qwen,
+            },
+            Arch::Qwen3Moe => ArchSpec {
+                class_names: &["Qwen3MoeForCausalLM"],
+                model_type: "qwen3_moe",
+                gguf: Some("qwen3moe"),
+                format: Qwen,
+            },
+            Arch::Llama => ArchSpec {
+                class_names: &["LlamaForCausalLM"],
+                model_type: "llama",
+                gguf: Some("llama"),
+                format: Plain,
+            },
+            Arch::Mistral => ArchSpec {
+                class_names: &["MistralForCausalLM"],
+                model_type: "mistral",
+                gguf: None,
+                format: Mistral,
+            },
+            Arch::Phi3 => ArchSpec {
+                class_names: &["Phi3ForCausalLM"],
+                model_type: "phi3",
+                gguf: None,
+                format: Plain,
+            },
+            Arch::Gemma2 => ArchSpec {
+                class_names: &["Gemma2ForCausalLM"],
+                model_type: "gemma2",
+                gguf: None,
+                format: Gemma,
+            },
+            Arch::Gemma3 => ArchSpec {
+                class_names: &["Gemma3ForCausalLM"],
+                model_type: "gemma3",
+                gguf: Some("gemma3"),
+                format: Gemma,
+            },
+            Arch::Starcoder2 => ArchSpec {
+                class_names: &["Starcoder2ForCausalLM"],
+                model_type: "starcoder2",
+                gguf: None,
+                format: Plain,
+            },
+            Arch::Glm4 => ArchSpec {
+                class_names: &["Glm4ForCausalLM"],
+                model_type: "glm4",
+                gguf: Some("glm4"),
+                format: Glm,
+            },
+            Arch::DeepSeek2 => ArchSpec {
+                class_names: &["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"],
+                model_type: "deepseek_v2",
+                gguf: None,
+                format: Plain,
+            },
+        }
+    }
+
+    /// Every enabled architecture, in one place. The harness iterates this.
+    const ALL_ARCHS: &[Arch] = &[
+        Arch::Qwen2,
+        Arch::Qwen3,
+        Arch::Qwen3Moe,
+        Arch::Llama,
+        Arch::Mistral,
+        Arch::Phi3,
+        Arch::Gemma2,
+        Arch::Gemma3,
+        Arch::Starcoder2,
+        Arch::Glm4,
+        Arch::DeepSeek2,
+    ];
+
     #[test]
-    fn metal_prefill_chunk_bounds_every_arch() {
-        // upholds: PREFILL-1 — every architecture carries a bounded Metal prefill
-        // default; Candle's Metal kernels corrupt a single long prefill
-        // regardless of arch, so none is left unbounded.
-        for arch in [
-            Arch::Glm4,
-            Arch::Qwen2,
-            Arch::Llama,
-            Arch::Mistral,
-            Arch::Phi3,
-            Arch::Gemma2,
-            Arch::Starcoder2,
-        ] {
+    fn arch_wiring_is_consistent_and_complete() {
+        // The consistency harness for enabled architectures (ARCH-1/ARCH-2,
+        // PREFILL-1): for every arch, detection from its safetensors class names
+        // and model_type, GGUF normalization when a quantized loader exists, the
+        // chat-format mapping, and the bounded Metal prefill all agree with the
+        // declared `arch_spec`. `arch_spec` is exhaustive, so a new arch cannot be
+        // added without wiring all of these.
+        for &arch in ALL_ARCHS {
+            let spec = arch_spec(arch);
+            for class in spec.class_names {
+                let cfg = serde_json::json!({ "architectures": [class] });
+                assert_eq!(detect_arch(&cfg).unwrap(), arch, "class {class}");
+            }
+            let cfg = serde_json::json!({ "model_type": spec.model_type });
+            assert_eq!(
+                detect_arch(&cfg).unwrap(),
+                arch,
+                "model_type {}",
+                spec.model_type
+            );
+            if let Some(g) = spec.gguf {
+                assert_eq!(arch_from_gguf(g).unwrap(), arch, "gguf {g}");
+            }
+            assert_eq!(
+                crate::ChatFormat::default_for(arch),
+                spec.format,
+                "format {arch:?}"
+            );
             assert_eq!(
                 arch.metal_prefill_chunk(),
                 Some(METAL_PREFILL_CHUNK),
-                "{arch:?}"
+                "metal prefill {arch:?}"
             );
         }
     }

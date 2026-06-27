@@ -111,7 +111,8 @@ pub struct Caps {
 /// The [`Caps`] for an architecture.
 pub fn caps_for(arch: Arch) -> Caps {
     match arch {
-        Arch::Qwen2 => Caps {
+        // Qwen2.5 and Qwen3 share the ChatML format.
+        Arch::Qwen2 | Arch::Qwen3 | Arch::Qwen3Moe => Caps {
             default_format: ChatFormat::Qwen,
             supports_system_role: true,
         },
@@ -119,7 +120,8 @@ pub fn caps_for(arch: Arch) -> Caps {
             default_format: ChatFormat::Glm,
             supports_system_role: true,
         },
-        Arch::Gemma2 => Caps {
+        // Gemma-2 and Gemma-3 share the `<start_of_turn>` format (no system role).
+        Arch::Gemma2 | Arch::Gemma3 => Caps {
             default_format: ChatFormat::Gemma,
             supports_system_role: false,
         },
@@ -128,7 +130,9 @@ pub fn caps_for(arch: Arch) -> Caps {
             supports_system_role: false,
         },
         // No native instruct chat template wired up — fall back to Plain.
-        Arch::Llama | Arch::Phi3 | Arch::Starcoder2 => Caps {
+        // (DeepSeek has its own template; a proper ChatFormat::DeepSeek is a
+        // follow-up, so DeepSeek-V2/V3 uses Plain for now.)
+        Arch::Llama | Arch::Phi3 | Arch::Starcoder2 | Arch::DeepSeek2 => Caps {
             default_format: ChatFormat::Plain,
             supports_system_role: true,
         },
