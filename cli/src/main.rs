@@ -7,7 +7,7 @@
 //! - **CLI-3** the CLI owns tracing subscriber setup and initializes it
 //!   idempotently; `yatima-lib` only emits events.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -15,10 +15,10 @@ use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use yatima_lib::{
-    device, model_dir, models_root, resolve_format, run_blocking, Agent, ChatFormat,
+    device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
-    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage, Sampling,
-    ToolCallCodec, Tools, WebOrigin,
+    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage,
+    ReasoningSplitter, Sampling, ToolCallCodec, Tools, WebOrigin,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -267,19 +267,24 @@ async fn chat(args: ChatArgs) -> Result<()> {
         }
         // Interactive: stream each turn through the same `ChatSession`, fully
         // dogfooding the library's streaming API (`turn_streaming_async`).
-        None => chat_repl(session).await?,
+        None => chat_repl(session, format.pre_seeds_reasoning()).await?,
     }
     Ok(())
 }
 
 /// Interactive multi-turn loop over a library [`ChatSession`]: `you> ` prompt,
 /// stdin line by line, the answer streamed to stdout token-by-token via
-/// [`ChatSession::turn_streaming`]. EOF (Ctrl-D) or `/exit` ends the session;
-/// `/reset` clears the conversation (keeping the system turn).
+/// [`ChatSession::turn_streaming`]. A reasoning model's chain-of-thought is
+/// routed through a [`ReasoningSplitter`] and dimmed (on a terminal), so the
+/// answer stands out and the markers never print (REASON-1). `pre_seeds` selects
+/// the splitter mode for a format whose cue opens the think block (DeepSeek).
+/// EOF (Ctrl-D) or `/exit` ends the session; `/reset` clears history.
 async fn chat_repl<C: Completer, T: PromptTemplate>(
     mut session: ChatSession<'_, C, T>,
+    pre_seeds: bool,
 ) -> Result<()> {
     let stdin = std::io::stdin();
+    let color = std::io::stdout().is_terminal();
     eprintln!("entering chat — /exit to quit, /reset to clear history");
     loop {
         eprint!("\nyou> ");
@@ -304,16 +309,48 @@ async fn chat_repl<C: Completer, T: PromptTemplate>(
             _ => {}
         }
         let mut stdout = std::io::stdout();
+        let mut splitter = if pre_seeds {
+            ReasoningSplitter::seeded()
+        } else {
+            ReasoningSplitter::new()
+        };
+        let mut current: Option<Channel> = None;
         session
             .turn_streaming_async(line, &mut |piece| {
-                // best-effort live echo; a write failure just drops the fragment.
-                let _ = stdout.write_all(piece.as_bytes());
-                let _ = stdout.flush();
+                splitter.push(piece, |ch, text| {
+                    write_channel(&mut stdout, ch, text, &mut current, color)
+                });
             })
             .await?;
+        splitter.finish(|ch, text| write_channel(&mut stdout, ch, text, &mut current, color));
+        if color {
+            let _ = stdout.write_all(b"\x1b[0m"); // ensure dim is cleared
+        }
         println!();
     }
     Ok(())
+}
+
+/// Echo a classified streaming span: dim the reasoning channel (on a terminal),
+/// normal for the answer, emitting the SGR escape only when the channel changes.
+/// Best-effort — a write failure just drops the fragment.
+fn write_channel(
+    out: &mut impl Write,
+    channel: Channel,
+    text: &str,
+    current: &mut Option<Channel>,
+    color: bool,
+) {
+    if color && *current != Some(channel) {
+        let code: &[u8] = match channel {
+            Channel::Reasoning => b"\x1b[2m", // dim
+            Channel::Answer => b"\x1b[0m",    // reset
+        };
+        let _ = out.write_all(code);
+    }
+    *current = Some(channel);
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
 }
 
 /// Compose the agent's toolset: file tools under `root`, plus a `read_page` tool

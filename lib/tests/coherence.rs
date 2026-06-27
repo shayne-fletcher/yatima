@@ -56,9 +56,12 @@ const CASES: &[Case] = &[
     },
     // Reasoning, `<think>` dialect (cheap): a DeepSeek-R1 distill thinks, then
     // answers — exercises the channel split end-to-end without a 45 GB load.
+    // Uses the native DeepSeek format (the distill is Qwen2 arch but trained on
+    // DeepSeek's template; the cue pre-seeds <think> so output carries the close
+    // marker only).
     Case {
         repo: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-        format: ChatFormat::Qwen,
+        format: ChatFormat::DeepSeek,
         prompt: "What is 2 + 2? Reply with only the number.",
         expect: "4",
         expects_reasoning: true,

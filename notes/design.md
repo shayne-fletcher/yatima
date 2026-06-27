@@ -96,6 +96,41 @@ Chat templates omit a literal BOS when the model's tokenizer adds one
 (TMPL-1); models without a system role fold system text into the first user turn
 (TMPL-2).
 
+### The reasoning channel (REASON-1)
+
+Reasoning models (Kimi-Dev, Qwen3, the DeepSeek-R1 family) emit an inline
+chain-of-thought before their answer, wrapped in model-specific markers
+(`<think>…</think>`; Kimi's special-token `◁think▷…◁/think▷`). That span is
+**ephemeral**: it must not be surfaced as the answer, and — crucially — must not
+re-enter the transcript that is re-rendered into the next prompt, or the model
+re-reads its own stale reasoning off-distribution. (DeepSeek's *own* chat
+template enforces exactly this, dropping history reasoning via
+`content.split('</think>')[-1]` — so REASON-1 is the model authors' contract, not
+ours alone.)
+
+`split_reasoning` (`reasoning.rs`) is the pure split at the completion→turn
+boundary: `{ reasoning, answer }` over a `DIALECTS` table, the identity when no
+marker is present (safe for any model). `Agent` and `ChatSession` store only the
+answer in history and surface the trace out-of-band (`AgentEvent::Reasoning`,
+`ChatSession::last_reasoning`). `Turn::content` therefore never holds a reasoning
+span.
+
+For *streaming*, `ReasoningSplitter` is the incremental dual: it classifies each
+fragment as `Channel::Reasoning` or `Channel::Answer` as it arrives (handling a
+marker split across fragment boundaries), so a UI can fold/dim the trace — the
+CLI chat REPL dims it. The channel enum is intentionally binary: reasoning vs.
+answer is the complete partition for what streams today (chat has no tools); a
+`ToolCall` arm is a non-breaking addition for if the agent ever streams or a
+harmony-style multi-channel model is enabled.
+
+A model whose cue **pre-seeds** the opener (DeepSeek renders
+`<｜Assistant｜><think>`) emits only the *close* marker; both the pure split
+(close-without-open) and the streaming splitter (`ReasoningSplitter::seeded`,
+selected via `ChatFormat::pre_seeds_reasoning`) handle that. Reasoning models
+also need a larger token budget — they spend the default 256 mid-thought — so a
+profile marked `reasoning: true` floors `max_tokens` at `REASONING_MIN_TOKENS`
+(raising only, never reducing a larger caller budget).
+
 ## Generation: an effectful fold (the contract)
 
 `generate_with` is the primitive; `generate` is the `acc = ()` specialization
@@ -326,15 +361,24 @@ Gemma-3, StarCoder2, GLM-4, DeepSeek-V2/V3** (safetensors) plus
 **GGUF/quantized** Qwen2, Qwen3, Qwen3-MoE, Llama, Gemma-3, and GLM-4 (DeepSeek
 is safetensors-only — candle has no quantized DeepSeek loader). This covers
 *loading + `generate`* for all, and `chat` for those with a chat template
-(Qwen/Gemma/GLM/Mistral; the rest fall back to Plain); the **agent** path still
-assumes the Qwen/ChatML tool format.
+(Qwen/Gemma/GLM/Mistral/DeepSeek; the rest fall back to Plain); the **agent**
+path still assumes the Qwen/ChatML tool format.
+
+The R1 *distills* (DeepSeek-R1-Distill-Qwen/-Llama) are a subtlety: they are
+Qwen2/Llama **arch** but trained on DeepSeek's **format**, so the arch default
+(ChatML) mis-renders them. A host selects `deepseek` explicitly — the
+`deepseek-r1` builtin profile does this — and the `DeepSeekTemplate` then renders
+them natively (verified live: the distill answers cleanly with no `<|im_end|>`
+leak that the ChatML mis-render produced).
 
 A CI **consistency harness** (`arch_wiring_is_consistent_and_complete`) drives a
 single `ALL_ARCHS` + exhaustive `arch_spec` table, asserting every arch's
 detection / GGUF normalization / chat-format / Metal-prefill wiring agrees — so a
 newly added `Arch` cannot compile until it is fully wired. The newest families
-(Qwen3, Qwen3-MoE, Gemma-3, DeepSeek) are **wired + harness-tested but not yet
-runtime-validated with weights**.
+(Qwen3, Qwen3-MoE, Gemma-3) are **wired + harness-tested but not yet
+runtime-validated with weights**; the DeepSeek format is runtime-validated via
+the R1 distill (`lib/tests/coherence.rs`), though the genuine DeepSeek-V2/V3
+*arch* (safetensors-only) is not.
 
 GGUF caveat: candle reads standard quant types only (`Q4_0/1`, `Q5_0/1`, `Q8_0`,
 `Q2_K`–`Q6_K`) — **no i-quants** (`IQ*`). A GGUF containing `IQ4_NL` etc. fails to
@@ -512,7 +556,7 @@ In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
 **GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1/2**, **CAP-1/2**,
 **PROTO-1**); observability (**OBS-1/2/3/4**); chat templates
-(**TMPL-1/2**); CLI (**CLI-1/2/3**).
+(**TMPL-1/2**, **REASON-1**); CLI (**CLI-1/2/3**).
 
 ## State machines
 
@@ -597,8 +641,11 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **Readline niceties** — line editing + history (e.g. `rustyline`); the loop is
   plain `stdin` today.
 - **Conversation persistence** — save/load a session transcript.
-- **Reasoning-model think-stripping in chat** — instruct defaults don't emit a
-  `<think>` block; add stripping if a reasoning model is used via `chat`.
+- **Reasoning-model think handling** — **Done** (REASON-1): `split_reasoning`
+  separates the chain-of-thought at the completion→turn boundary across every
+  marker dialect; chat/agent store answer-only history and surface the trace
+  out-of-band; the REPL dims the streamed reasoning via `ReasoningSplitter`. See
+  "The reasoning channel" above.
 
 ### Tools / agent
 - **Constrained decoding** *(lesson)* — a top-K JSON-prefix masking prototype was

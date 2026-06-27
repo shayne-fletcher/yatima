@@ -9,6 +9,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The minimum token budget a reasoning profile guarantees: enough headroom for
+/// a think block *and* an answer. Reasoning models spend the default 256-token
+/// budget mid-thought, never reaching the answer; a reasoning profile floors the
+/// budget here (raising it only — never reducing a larger caller budget).
+pub const REASONING_MIN_TOKENS: usize = 2048;
+
 /// A model and its run configuration. Every field beyond `name` is optional:
 /// an unset field falls back to the loaded engine's default (e.g.
 /// `prefill_chunk` → [`crate::Engine::default_prefill_chunk`]) or a caller base
@@ -26,6 +32,12 @@ pub struct ModelProfile {
     pub gguf: Option<String>,
     /// The chat format; `None` infers it from the model's architecture.
     pub format: Option<ChatFormat>,
+    /// Whether this is a reasoning model (emits a chain-of-thought before its
+    /// answer). When set, [`apply_gen_overrides`](ModelProfile::apply_gen_overrides)
+    /// raises `max_tokens` to at least [`REASONING_MIN_TOKENS`] so the think
+    /// block is not truncated, and a host knows to surface the reasoning channel.
+    #[serde(default)]
+    pub reasoning: bool,
     /// Prompt prefill chunk override; `None` keeps the engine's device default.
     pub prefill_chunk: Option<usize>,
     pub max_tokens: Option<usize>,
@@ -60,11 +72,25 @@ impl ModelProfile {
             // running on Metal). On a 48 GB Mac, load it with
             // `sudo sysctl iogpu.wired_limit_mb=46080` (default budget is too low
             // for 41 GB of weights).
-            "kimi-dev" => p(
-                "unsloth/Kimi-Dev-72B-GGUF",
-                Some("Kimi-Dev-72B-Q4_0.gguf"),
-                ChatFormat::Qwen,
-            ),
+            "kimi-dev" => ModelProfile {
+                reasoning: true,
+                ..p(
+                    "unsloth/Kimi-Dev-72B-GGUF",
+                    Some("Kimi-Dev-72B-Q4_0.gguf"),
+                    ChatFormat::Qwen,
+                )
+            },
+            // DeepSeek-R1-Distill-Qwen-7B: a Qwen2-arch distill trained on
+            // DeepSeek's format, so it pins `deepseek` explicitly (the arch alone
+            // would say Qwen/ChatML). A reasoning model (`<think>` dialect).
+            "deepseek-r1" => ModelProfile {
+                reasoning: true,
+                ..p(
+                    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+                    None,
+                    ChatFormat::DeepSeek,
+                )
+            },
             "glm4-32b" => p(
                 "bartowski/THUDM_GLM-4-32B-0414-GGUF",
                 Some("THUDM_GLM-4-32B-0414-Q6_K_L.gguf"),
@@ -82,8 +108,14 @@ impl ModelProfile {
     }
 
     /// The names of every built-in profile (for `--help` / listing).
-    pub const BUILTIN_NAMES: [&'static str; 5] =
-        ["qwen32b", "glm4-32b", "gemma2", "mistral", "kimi-dev"];
+    pub const BUILTIN_NAMES: [&'static str; 6] = [
+        "qwen32b",
+        "glm4-32b",
+        "gemma2",
+        "mistral",
+        "kimi-dev",
+        "deepseek-r1",
+    ];
 
     /// The model source this profile names — a directory **xor** a repository
     /// (PROFILE-2, via [`ModelSource::from_args`]).
@@ -115,6 +147,12 @@ impl ModelProfile {
         }
         if let Some(prefill_chunk) = self.prefill_chunk {
             opts.prefill_chunk = Some(prefill_chunk);
+        }
+        // A reasoning model needs room to think *and* answer: floor the budget so
+        // the think block is never truncated, raising it only (a deliberately
+        // larger caller/profile budget is kept).
+        if self.reasoning {
+            opts.max_tokens = opts.max_tokens.max(REASONING_MIN_TOKENS);
         }
         opts
     }
@@ -152,6 +190,35 @@ mod tests {
         assert!(
             gguf.ends_with(".gguf") && !gguf.contains("-of-"),
             "expected a single-file gguf, got {gguf}"
+        );
+        assert!(p.reasoning, "kimi-dev is a reasoning model");
+    }
+
+    #[test]
+    fn reasoning_profile_floors_the_token_budget() {
+        // A reasoning profile raises a too-small budget to the floor (so the
+        // think block is not truncated), but never reduces a larger one.
+        let p = ModelProfile::builtin("deepseek-r1").expect("deepseek-r1 is built in");
+        assert!(p.reasoning);
+        assert_eq!(p.format, Some(ChatFormat::DeepSeek));
+        // default base (256) → floored up.
+        let opts = p.apply_gen_overrides(GenOpts::default());
+        assert_eq!(opts.max_tokens, REASONING_MIN_TOKENS);
+        // a larger caller budget is kept (floor only raises).
+        let big = GenOpts {
+            max_tokens: REASONING_MIN_TOKENS * 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            p.apply_gen_overrides(big).max_tokens,
+            REASONING_MIN_TOKENS * 4
+        );
+        // a non-reasoning profile leaves the budget alone.
+        let plain = ModelProfile::builtin("gemma2").unwrap();
+        assert!(!plain.reasoning);
+        assert_eq!(
+            plain.apply_gen_overrides(GenOpts::default()).max_tokens,
+            GenOpts::default().max_tokens
         );
     }
 

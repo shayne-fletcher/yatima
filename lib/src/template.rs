@@ -185,6 +185,68 @@ impl PromptTemplate for GlmTemplate {
     }
 }
 
+/// DeepSeek's chat format (DeepSeek-V2/V3 and the R1 distills): a literal
+/// `<｜begin▁of▁sentence｜>` prefix, the system text raw (no wrapper, hoisted to
+/// the front — DeepSeek has a system role), then `<｜User｜>{content}` and
+/// `<｜Assistant｜>{content}<｜end▁of▁sentence｜>` turns, ending in a
+/// `<｜Assistant｜><think>\n` cue. Two deliberate choices:
+///
+/// - **The BOS is emitted literally.** DeepSeek tokenizers carry no
+///   `TemplateProcessing` post-processor (verified: plain ByteLevel), so nothing
+///   adds it otherwise — the emit-side of the no-double-BOS rule (TMPL-1), like
+///   [`GlmTemplate`].
+/// - **The cue pre-seeds `<think>\n`.** R1 reasons reliably only when the
+///   assistant turn opens inside the think block, so the model's output carries
+///   the *closing* `</think>` but not the opening one — the close-without-open
+///   case [`crate::split_reasoning`] handles (REASON-1). Prior assistant turns
+///   are answer-only already (REASON-1), matching DeepSeek's own template, which
+///   drops history reasoning via `content.split('</think>')[-1]`.
+///
+/// Chat-only (no DeepSeek tool-call markers); a `Tool` turn is rendered as a
+/// single tool-output block for completeness.
+pub struct DeepSeekTemplate;
+
+const DS_BOS: &str = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
+const DS_USER: &str = "<\u{ff5c}User\u{ff5c}>";
+const DS_ASSISTANT: &str = "<\u{ff5c}Assistant\u{ff5c}>";
+const DS_EOS: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+const DS_TOOL_OUT_BEGIN: &str = "<\u{ff5c}tool\u{2581}output\u{2581}begin\u{ff5c}>";
+const DS_TOOL_OUT_END: &str = "<\u{ff5c}tool\u{2581}output\u{2581}end\u{ff5c}>";
+
+impl PromptTemplate for DeepSeekTemplate {
+    fn render(&self, turns: &[Turn]) -> String {
+        let mut s = String::from(DS_BOS);
+        // System text is hoisted to the front, raw (no wrapper).
+        for turn in turns {
+            if turn.role == Role::System {
+                s.push_str(&turn.content);
+            }
+        }
+        for turn in turns {
+            match turn.role {
+                Role::System => {}
+                Role::User => {
+                    s.push_str(DS_USER);
+                    s.push_str(&turn.content);
+                }
+                Role::Assistant => {
+                    s.push_str(DS_ASSISTANT);
+                    s.push_str(&turn.content);
+                    s.push_str(DS_EOS);
+                }
+                Role::Tool => {
+                    s.push_str(DS_TOOL_OUT_BEGIN);
+                    s.push_str(&turn.content);
+                    s.push_str(DS_TOOL_OUT_END);
+                }
+            }
+        }
+        s.push_str(DS_ASSISTANT);
+        s.push_str("<think>\n");
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +326,42 @@ mod tests {
             "[gMASK]<sop><|system|>\nBe brief.<|user|>\nhi<|assistant|>\n"
         );
         assert_eq!(s.matches("[gMASK]").count(), 1, "exactly one gMASK prefix");
+    }
+
+    #[test]
+    fn deepseek_emits_bos_keeps_system_and_seeds_think() {
+        // upholds: TMPL-1 — the BOS is emitted exactly once (DeepSeek tokenizers
+        // don't add it). System has a real role (hoisted, not folded). The cue
+        // pre-seeds <think> so the model's output carries only the close marker.
+        let s = DeepSeekTemplate.render(&[turn(Role::System, "Be brief."), turn(Role::User, "hi")]);
+        assert_eq!(
+            s,
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>Be brief.\
+             <\u{ff5c}User\u{ff5c}>hi<\u{ff5c}Assistant\u{ff5c}><think>\n"
+        );
+        assert_eq!(
+            s.matches("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>")
+                .count(),
+            1,
+            "exactly one BOS"
+        );
+        assert!(s.ends_with("<think>\n"), "cue pre-seeds the think block");
+    }
+
+    #[test]
+    fn deepseek_history_uses_answer_only_assistant_turns() {
+        // upholds: REASON-1 — a prior assistant turn (already answer-only) renders
+        // wrapped in the EOS; combined with the seeded <think> cue, a reasoning
+        // model's output is a clean reasoning…</think>answer the split recovers.
+        let s = DeepSeekTemplate.render(&[
+            turn(Role::User, "2+2?"),
+            turn(Role::Assistant, "4"),
+            turn(Role::User, "x3?"),
+        ]);
+        assert!(s.contains(
+            "<\u{ff5c}Assistant\u{ff5c}>4<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>"
+        ));
+        assert!(s.ends_with("<\u{ff5c}Assistant\u{ff5c}><think>\n"));
     }
 
     #[test]

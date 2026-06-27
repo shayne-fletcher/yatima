@@ -92,6 +92,150 @@ pub fn strip_reasoning(text: &str) -> String {
     split_reasoning(text).answer
 }
 
+/// Which channel a streamed span belongs to.
+///
+/// Intentionally binary: it is the *complete* partition for what streams today
+/// (the chat path, which has no tools — reasoning vs. answer is everything). A
+/// tool call is not a stream channel here because the only tool consumer, the
+/// [`Agent`](crate::Agent), runs non-streaming and extracts calls downstream via
+/// its [`ToolCallCodec`](crate::ToolCallCodec) (PROTO-1). If the agent ever
+/// streams, or a harmony/gpt-oss-style multi-channel model is enabled, this enum
+/// grows a `ToolCall` (and perhaps `Commentary`) arm — a non-breaking addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// The model's chain-of-thought (between reasoning markers).
+    Reasoning,
+    /// The surfaced answer.
+    Answer,
+}
+
+/// The streaming dual of [`split_reasoning`] (REASON-1): an incremental
+/// classifier that routes each fragment of a *streamed* completion to
+/// [`Channel::Reasoning`] or [`Channel::Answer`] as it arrives, so a live UI can
+/// fold or dim the chain-of-thought. It recognizes the same dialects and handles
+/// a marker that straddles fragment boundaries (split across two `push` calls).
+/// Marker text itself is control, never emitted.
+pub struct ReasoningSplitter {
+    in_reasoning: bool,
+    buf: String,
+}
+
+impl Default for ReasoningSplitter {
+    fn default() -> ReasoningSplitter {
+        ReasoningSplitter::new()
+    }
+}
+
+impl ReasoningSplitter {
+    /// A splitter for output that *begins in the answer* and enters reasoning on
+    /// an open marker — the usual case (Kimi/Qwen3 emit `◁think▷`/`<think>`
+    /// first).
+    pub fn new() -> ReasoningSplitter {
+        ReasoningSplitter {
+            in_reasoning: false,
+            buf: String::new(),
+        }
+    }
+
+    /// A splitter for output that *begins inside the reasoning block* — used when
+    /// the prompt pre-seeds the opener (DeepSeek's `<｜Assistant｜><think>` cue),
+    /// so the stream's first marker is the close. See
+    /// [`ChatFormat::pre_seeds_reasoning`](crate::ChatFormat::pre_seeds_reasoning).
+    pub fn seeded() -> ReasoningSplitter {
+        ReasoningSplitter {
+            in_reasoning: true,
+            buf: String::new(),
+        }
+    }
+
+    /// Feed the next raw fragment; `emit(channel, text)` is called for each
+    /// classified piece (zero or more times).
+    pub fn push(&mut self, fragment: &str, mut emit: impl FnMut(Channel, &str)) {
+        self.buf.push_str(fragment);
+        self.drain(&mut emit);
+    }
+
+    /// Flush any buffered tail at end of stream. A partial marker that never
+    /// completed is treated as content on the current channel.
+    pub fn finish(mut self, mut emit: impl FnMut(Channel, &str)) {
+        self.drain(&mut emit);
+        if !self.buf.is_empty() {
+            emit(self.channel(), &self.buf);
+            self.buf.clear();
+        }
+    }
+
+    fn channel(&self) -> Channel {
+        if self.in_reasoning {
+            Channel::Reasoning
+        } else {
+            Channel::Answer
+        }
+    }
+
+    /// The markers to watch in the current state: closers when in reasoning,
+    /// openers otherwise.
+    fn markers(&self) -> impl Iterator<Item = &'static str> + '_ {
+        DIALECTS
+            .iter()
+            .map(move |d| if self.in_reasoning { d.close } else { d.open })
+    }
+
+    fn drain(&mut self, emit: &mut impl FnMut(Channel, &str)) {
+        loop {
+            // The earliest complete marker for the current state flips the channel.
+            let hit = self
+                .markers()
+                .filter_map(|m| self.buf.find(m).map(|i| (i, m)))
+                .min_by_key(|(i, _)| *i);
+            match hit {
+                Some((i, marker)) => {
+                    if i > 0 {
+                        let ch = self.channel();
+                        emit(ch, &self.buf[..i]);
+                    }
+                    self.buf = self.buf.split_off(i + marker.len());
+                    self.in_reasoning = !self.in_reasoning;
+                }
+                None => {
+                    // No complete marker: emit all but a tail that could be the
+                    // start of one, so a boundary-straddling marker is caught on
+                    // the next push.
+                    let keep = self.held_back_len();
+                    let upto = self.buf.len() - keep;
+                    if upto > 0 {
+                        let ch = self.channel();
+                        emit(ch, &self.buf[..upto]);
+                        self.buf.drain(..upto);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Bytes to hold back: the longest suffix of `buf` that is a proper prefix of
+    /// any watched marker (at a marker char boundary, so the kept split is always
+    /// a valid `str` boundary). No complete marker is present here (the caller
+    /// already searched), so the overlap is always shorter than the marker.
+    fn held_back_len(&self) -> usize {
+        let mut best = 0;
+        for marker in self.markers() {
+            let mut k = marker.len().min(self.buf.len());
+            while k > best {
+                if marker.is_char_boundary(k)
+                    && self.buf.as_bytes().ends_with(&marker.as_bytes()[..k])
+                {
+                    best = k;
+                    break;
+                }
+                k -= 1;
+            }
+        }
+        best
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +300,72 @@ mod tests {
         let r = split_reasoning("<think></think>answer");
         assert_eq!(r.reasoning, None);
         assert_eq!(r.answer, "answer");
+    }
+
+    /// Run a splitter over `fragments`, collecting per-channel output.
+    fn stream(mut s: ReasoningSplitter, fragments: &[&str]) -> (String, String) {
+        let mut reasoning = String::new();
+        let mut answer = String::new();
+        let mut sink = |ch: Channel, t: &str| match ch {
+            Channel::Reasoning => reasoning.push_str(t),
+            Channel::Answer => answer.push_str(t),
+        };
+        for f in fragments {
+            s.push(f, &mut sink);
+        }
+        s.finish(&mut sink);
+        (reasoning, answer)
+    }
+
+    #[test]
+    fn splitter_classifies_a_single_fragment() {
+        let (r, a) = stream(ReasoningSplitter::new(), &["<think>reason</think>answer"]);
+        assert_eq!(r, "reason");
+        assert_eq!(a, "answer");
+    }
+
+    #[test]
+    fn splitter_handles_markers_across_boundaries() {
+        // The open and close markers are each split across pushes.
+        let (r, a) = stream(
+            ReasoningSplitter::new(),
+            &["<th", "ink>hi the", "re</thi", "nk>by", "e"],
+        );
+        assert_eq!(r, "hi there");
+        assert_eq!(a, "bye");
+    }
+
+    #[test]
+    fn splitter_seeded_starts_in_reasoning() {
+        // DeepSeek pre-seeds `<think>`, so the stream opens mid-thought and the
+        // first marker is the close.
+        let (r, a) = stream(
+            ReasoningSplitter::seeded(),
+            &["thinking…", "</think>", "the answer"],
+        );
+        assert_eq!(r, "thinking…");
+        assert_eq!(a, "the answer");
+    }
+
+    #[test]
+    fn splitter_handles_the_kimi_dialect() {
+        let (r, a) = stream(ReasoningSplitter::new(), &["◁think▷w◁/think▷4"]);
+        assert_eq!(r, "w");
+        assert_eq!(a, "4");
+    }
+
+    #[test]
+    fn splitter_with_no_markers_is_all_answer() {
+        let (r, a) = stream(ReasoningSplitter::new(), &["just ", "an ", "answer"]);
+        assert_eq!(r, "");
+        assert_eq!(a, "just an answer");
+    }
+
+    #[test]
+    fn splitter_flushes_an_unterminated_partial_marker() {
+        // A dangling `<thi` at end of stream is content, not a swallowed marker.
+        let (r, a) = stream(ReasoningSplitter::new(), &["answer <thi"]);
+        assert_eq!(r, "");
+        assert_eq!(a, "answer <thi");
     }
 }

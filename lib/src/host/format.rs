@@ -5,8 +5,8 @@
 //! taking a CLI dependency.
 
 use crate::{
-    Arch, ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate,
-    PromptTemplate,
+    Arch, ChatMlTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate, MistralTemplate,
+    PlainTemplate, PromptTemplate,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -25,6 +25,9 @@ pub enum ChatFormat {
     Mistral,
     /// GLM-4: `[gMASK]<sop><|role|>` (chat only).
     Glm,
+    /// DeepSeek-V2/V3 and R1 distills: `<｜begin▁of▁sentence｜>…<｜User｜>…
+    /// <｜Assistant｜><think>` (chat only; reasoning model).
+    DeepSeek,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
     Plain,
 }
@@ -32,7 +35,7 @@ pub enum ChatFormat {
 impl ChatFormat {
     /// Every format's name, in declaration order — the accepted spellings for
     /// [`FromStr`] and a ready-made list for a CLI `PossibleValuesParser`.
-    pub const NAMES: [&'static str; 5] = ["qwen", "gemma", "mistral", "glm", "plain"];
+    pub const NAMES: [&'static str; 6] = ["qwen", "gemma", "mistral", "glm", "deepseek", "plain"];
 
     /// The lowercase name (the inverse of [`FromStr`]).
     pub fn name(self) -> &'static str {
@@ -41,6 +44,7 @@ impl ChatFormat {
             ChatFormat::Gemma => "gemma",
             ChatFormat::Mistral => "mistral",
             ChatFormat::Glm => "glm",
+            ChatFormat::DeepSeek => "deepseek",
             ChatFormat::Plain => "plain",
         }
     }
@@ -52,6 +56,7 @@ impl ChatFormat {
             ChatFormat::Gemma => Box::new(GemmaTemplate),
             ChatFormat::Mistral => Box::new(MistralTemplate),
             ChatFormat::Glm => Box::new(GlmTemplate),
+            ChatFormat::DeepSeek => Box::new(DeepSeekTemplate),
             ChatFormat::Plain => Box::new(PlainTemplate),
         }
     }
@@ -61,6 +66,15 @@ impl ChatFormat {
     /// gates on this (CAPS-1).
     pub fn supports_tools(self) -> bool {
         matches!(self, ChatFormat::Qwen | ChatFormat::Plain)
+    }
+
+    /// Whether this format's generation cue pre-seeds the reasoning opener (so a
+    /// model's output begins *inside* the think block and carries only the close
+    /// marker). `DeepSeek` does (`<｜Assistant｜><think>`). A streaming host uses
+    /// this to pick [`ReasoningSplitter::seeded`](crate::ReasoningSplitter::seeded)
+    /// over [`new`](crate::ReasoningSplitter::new).
+    pub fn pre_seeds_reasoning(self) -> bool {
+        matches!(self, ChatFormat::DeepSeek)
     }
 
     /// The format a model of this architecture speaks natively — the default a
@@ -79,6 +93,7 @@ impl FromStr for ChatFormat {
             "gemma" => Ok(ChatFormat::Gemma),
             "mistral" => Ok(ChatFormat::Mistral),
             "glm" => Ok(ChatFormat::Glm),
+            "deepseek" => Ok(ChatFormat::DeepSeek),
             "plain" => Ok(ChatFormat::Plain),
             other => anyhow::bail!(
                 "unknown chat format {other:?}; expected one of {:?}",
@@ -129,10 +144,16 @@ pub fn caps_for(arch: Arch) -> Caps {
             default_format: ChatFormat::Mistral,
             supports_system_role: false,
         },
+        // DeepSeek-V2/V3 (and R1) speak DeepSeek's native format. Note the R1
+        // *distills* are Qwen2/Llama arch, so a host selects `deepseek` for them
+        // explicitly (via profile or --format); the arch default below covers
+        // the genuine DeepSeek-arch models.
+        Arch::DeepSeek2 => Caps {
+            default_format: ChatFormat::DeepSeek,
+            supports_system_role: true,
+        },
         // No native instruct chat template wired up — fall back to Plain.
-        // (DeepSeek has its own template; a proper ChatFormat::DeepSeek is a
-        // follow-up, so DeepSeek-V2/V3 uses Plain for now.)
-        Arch::Llama | Arch::Phi3 | Arch::Starcoder2 | Arch::DeepSeek2 => Caps {
+        Arch::Llama | Arch::Phi3 | Arch::Starcoder2 => Caps {
             default_format: ChatFormat::Plain,
             supports_system_role: true,
         },
@@ -227,7 +248,12 @@ mod tests {
         // upholds: CAPS-1 — chat-only formats carry no tool codec.
         assert!(ChatFormat::Qwen.supports_tools());
         assert!(ChatFormat::Plain.supports_tools());
-        for fmt in [ChatFormat::Gemma, ChatFormat::Mistral, ChatFormat::Glm] {
+        for fmt in [
+            ChatFormat::Gemma,
+            ChatFormat::Mistral,
+            ChatFormat::Glm,
+            ChatFormat::DeepSeek,
+        ] {
             assert!(!fmt.supports_tools());
         }
     }

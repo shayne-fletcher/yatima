@@ -1285,7 +1285,7 @@ mod tests {
     /// One row per arch. **Exhaustive** — a newly added [`Arch`] does not compile
     /// until its detection + GGUF + format wiring is declared here.
     fn arch_spec(arch: Arch) -> ArchSpec {
-        use crate::ChatFormat::{Gemma, Glm, Mistral, Plain, Qwen};
+        use crate::ChatFormat::{DeepSeek, Gemma, Glm, Mistral, Plain, Qwen};
         match arch {
             Arch::Qwen2 => ArchSpec {
                 class_names: &["Qwen2ForCausalLM"],
@@ -1351,7 +1351,7 @@ mod tests {
                 class_names: &["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"],
                 model_type: "deepseek_v2",
                 gguf: None,
-                format: Plain,
+                format: DeepSeek,
             },
         }
     }

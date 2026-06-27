@@ -63,7 +63,16 @@ real model of that family.
 | Mistral-v0.3        | yes      | yes   | later       |
 | TinyLlama-chat      | yes      | yes   | no          |
 | StarCoder2          | yes      | maybe | no          |
-| DeepSeek-V2/V3 ‡    | yes      | plain | no          |
+| DeepSeek-V2/V3 ‡    | yes      | yes   | no          |
+
+**Reasoning models** (Kimi-Dev, the DeepSeek-R1 distills, Qwen3) emit an inline
+chain-of-thought before their answer. yatima separates it: the trace is stripped
+from the answer and kept out of conversation history, and `yatima chat` dims it
+live (it never pollutes the reply or the next prompt). Run one with a profile —
+e.g. `--profile kimi-dev` or `--profile deepseek-r1` — which also raises the
+token budget so the think block isn't truncated. The R1 *distills* are Qwen2/Llama
+architecture trained on DeepSeek's format, so select it with `--format deepseek`
+(the `deepseek-r1` profile does this for you).
 
 > **GGUF quant note:** candle reads standard quant types (`Q4_0/1`, `Q5_0/1`,
 > `Q8_0`, `Q2_K`–`Q6_K`) but **no i-quants** (`IQ*`). Many modern community GGUFs

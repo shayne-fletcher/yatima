@@ -158,11 +158,13 @@ pub use engine::{
 };
 pub use host::{
     caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelProfile, ModelSource,
+    REASONING_MIN_TOKENS,
 };
-pub use reasoning::{split_reasoning, strip_reasoning, Reasoned};
+pub use reasoning::{split_reasoning, strip_reasoning, Channel, Reasoned, ReasoningSplitter};
 pub use runtime::run_blocking;
 pub use template::{
-    ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
+    ChatMlTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate,
+    PromptTemplate,
 };
 pub use tool::{
     JsonToolCall, ListDir, QwenToolCall, ReadFile, ReadPage, ReadUrl, SendNotification, Tool,
