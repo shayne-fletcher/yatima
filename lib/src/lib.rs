@@ -32,6 +32,10 @@
 //!   as a *set* — never hard-coded token strings.
 //! - **FETCH-1** `ensure_model` re-checks `presence` after download; a
 //!   partial directory never reaches [`Engine::load`] (gated e2e / fetch path).
+//! - **MEM-1** [`Engine::load`] refuses weights that exceed a safe fraction of
+//!   physical RAM *before* allocating — an oversized model can exhaust memory and
+//!   hang the machine (a raised Metal `iogpu.wired_limit_mb` makes it worse).
+//!   Overridable with `YATIMA_ALLOW_OVERSIZED_MODEL`; skipped when RAM is unknown.
 //!
 //! Generation:
 //! - **SAM-1** every [`Sampling`] maps to exactly one candle `LogitsProcessor`

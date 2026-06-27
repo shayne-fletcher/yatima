@@ -292,6 +292,93 @@ fn effective_prefill_chunk(configured: Option<usize>, default: Option<usize>, le
     }
 }
 
+/// Fraction of physical RAM a model's *weights* may occupy before [`Engine::load`]
+/// refuses — leaving headroom for the KV cache, activations, and the OS. On Metal
+/// a raised `iogpu.wired_limit_mb` lets the GPU grab nearly all RAM, so an
+/// oversized model can exhaust memory and hang the machine; this guard prevents
+/// that before any allocation happens.
+const MEMORY_SAFE_FRACTION: f64 = 0.7;
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Whether weights of `weight_bytes` exceed the safe budget for `total_ram`.
+/// Pure, so the policy is unit-tested without touching the machine.
+fn exceeds_safe_memory(weight_bytes: u64, total_ram: u64) -> bool {
+    weight_bytes > (total_ram as f64 * MEMORY_SAFE_FRACTION) as u64
+}
+
+/// Total physical memory in bytes — best effort. `None` if it can't be
+/// determined, in which case the budget guard is skipped rather than guessing.
+fn total_physical_memory() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kb.saturating_mul(1024))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// The total size of a model's weight files, in bytes (best effort).
+fn weight_files_bytes(paths: &[PathBuf]) -> u64 {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Refuse to load weights that would crowd out the KV cache and the OS — the
+/// failure mode that can hang the machine (a too-high Metal wired limit lets the
+/// GPU take nearly all RAM). Skipped when RAM is unknown or the override
+/// `YATIMA_ALLOW_OVERSIZED_MODEL` is set. Checked *before* any allocation.
+fn check_weight_budget(weight_bytes: u64) -> Result<()> {
+    if std::env::var_os("YATIMA_ALLOW_OVERSIZED_MODEL").is_some() {
+        return Ok(());
+    }
+    let Some(total) = total_physical_memory() else {
+        return Ok(());
+    };
+    if exceeds_safe_memory(weight_bytes, total) {
+        let safe = (total as f64 * MEMORY_SAFE_FRACTION) as u64;
+        bail!(
+            "model weights are ~{:.0} GiB, but only ~{:.0} GiB of {:.0} GiB RAM \
+             is safe to use for weights (the rest must stay free for the KV \
+             cache, activations, and the OS). Loading it risks exhausting memory \
+             and hanging the machine. Use a smaller model or quant, or set \
+             YATIMA_ALLOW_OVERSIZED_MODEL=1 to force it (at your own risk; a \
+             raised iogpu.wired_limit_mb makes this especially dangerous).",
+            gib(weight_bytes),
+            gib(safe),
+            gib(total)
+        );
+    }
+    Ok(())
+}
+
 /// How many trailing generated tokens to inspect for the degeneration guard, and
 /// the largest cycle period it looks for.
 const REPETITION_GUARD_WINDOW: usize = 50;
@@ -543,6 +630,9 @@ impl Engine {
             Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("loading tokenizer: {e}"))?;
 
         let shards = model_shards(model_dir)?;
+        // Refuse an oversized model before allocating (don't risk hanging the
+        // machine).
+        check_weight_budget(weight_files_bytes(&shards))?;
         // dtype is an implementation detail, not a gate: bf16 on the GPU, f32
         // on CPU. The actual choice is recorded and exposed via `backend`.
         let dtype = if device.is_metal() || device.is_cuda() {
@@ -659,6 +749,10 @@ impl Engine {
             gguf = %gguf_path.display()
         );
         let _enter = span.enter();
+        // Refuse an oversized model before reading/allocating its weights.
+        check_weight_budget(weight_files_bytes(std::slice::from_ref(
+            &gguf_path.to_path_buf(),
+        )))?;
         let mut file = std::fs::File::open(gguf_path)?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow!("reading GGUF {}: {e}", gguf_path.display()))?;
@@ -1501,6 +1595,31 @@ mod tests {
         // Off Metal, no chunking regardless of dtype.
         assert_eq!(prefill_chunk_for(arch, false, DType::F32), None);
         assert_eq!(prefill_chunk_for(arch, false, DType::BF16), None);
+    }
+
+    #[test]
+    fn memory_budget_refuses_oversized_weights() {
+        // The guard that would have prevented the hard reboot: weights over ~70%
+        // of RAM are refused. On a 48 GiB machine ~33.6 GiB is the ceiling.
+        let g = |gigs: u64| gigs * 1024 * 1024 * 1024;
+        assert!(
+            exceeds_safe_memory(g(41), g(48)),
+            "Kimi-72B Q4_0 (~41 GiB) must be refused on a 48 GiB machine"
+        );
+        assert!(
+            exceeds_safe_memory(g(64), g(48)),
+            "a 32B BF16 (~64 GiB) cannot fit and is refused"
+        );
+        assert!(
+            !exceeds_safe_memory(g(20), g(48)),
+            "Qwen32B Q4_K_M (~20 GiB) fits with headroom"
+        );
+        assert!(
+            !exceeds_safe_memory(g(14), g(48)),
+            "a 7B BF16 (~14 GiB) fits easily"
+        );
+        // Scales with the machine: 41 GiB is fine on a 256 GiB server.
+        assert!(!exceeds_safe_memory(g(41), g(256)));
     }
 
     #[test]
