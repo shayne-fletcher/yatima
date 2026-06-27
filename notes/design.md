@@ -321,11 +321,25 @@ returns last-token logits as `[1, vocab]` vs the others' `[1, 1, vocab]` — bot
 normalized by the single `last_token_logits` helper. Unsupported models fail with
 a clear "unsupported architecture" error, not a serde mismatch.
 
-Loadable today: **Qwen2, Llama, Mistral, Phi-3, Gemma-2, StarCoder2, GLM-4**
-(safetensors) plus **GGUF/quantized** Qwen2, Llama, and GLM-4. Note this covers
-*loading + `generate`* (raw completion) for all of them, and `chat` for those with
-a chat template (Qwen/Gemma/Mistral/GLM); the **agent** path still assumes the
-Qwen/ChatML tool format.
+Loadable today: **Qwen2, Qwen3, Qwen3-MoE, Llama, Mistral, Phi-3, Gemma-2,
+Gemma-3, StarCoder2, GLM-4, DeepSeek-V2/V3** (safetensors) plus
+**GGUF/quantized** Qwen2, Qwen3, Qwen3-MoE, Llama, Gemma-3, and GLM-4 (DeepSeek
+is safetensors-only — candle has no quantized DeepSeek loader). This covers
+*loading + `generate`* for all, and `chat` for those with a chat template
+(Qwen/Gemma/GLM/Mistral; the rest fall back to Plain); the **agent** path still
+assumes the Qwen/ChatML tool format.
+
+A CI **consistency harness** (`arch_wiring_is_consistent_and_complete`) drives a
+single `ALL_ARCHS` + exhaustive `arch_spec` table, asserting every arch's
+detection / GGUF normalization / chat-format / Metal-prefill wiring agrees — so a
+newly added `Arch` cannot compile until it is fully wired. The newest families
+(Qwen3, Qwen3-MoE, Gemma-3, DeepSeek) are **wired + harness-tested but not yet
+runtime-validated with weights**.
+
+GGUF caveat: candle reads standard quant types only (`Q4_0/1`, `Q5_0/1`, `Q8_0`,
+`Q2_K`–`Q6_K`) — **no i-quants** (`IQ*`). A GGUF containing `IQ4_NL` etc. fails to
+load (`unknown dtype 20`); use a standard-type or llama.cpp `--pure` quant. This
+is why Kimi-Dev-72B runs only from its legacy `Q4_0` GGUF.
 
 **GGUF / quantized.** A model dir with a single `*.gguf` takes the quantized
 path: `Engine::load_gguf` reads the file's metadata for the architecture
