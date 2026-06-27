@@ -9,6 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use yatima_lib::StopReason;
+
 use crate::app::{scroll_y, App, Entry};
 
 /// Braille spinner frames for the live activity indicator.
@@ -63,7 +65,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             Entry::Assistant {
                 reasoning,
                 answer,
-                stop: _,
+                stop,
             } => {
                 lines.push(Line::from(Span::styled(
                     "assistant",
@@ -80,6 +82,16 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     );
                 }
                 push_wrapped(&mut lines, answer, Style::default());
+                // Surface a non-EOS stop so a truncated / collapsed turn is not
+                // mistaken for a complete answer.
+                if let Some(note) = stop_note(*stop) {
+                    lines.push(Line::from(Span::styled(
+                        note,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::DIM),
+                    )));
+                }
                 lines.push(Line::from(""));
             }
             Entry::Error(text) => {
@@ -93,15 +105,31 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
+    let inner_width = area.width.saturating_sub(2); // borders
     let viewport = area.height.saturating_sub(2) as usize; // borders
-    let top = scroll_y(lines.len(), viewport, app.scroll_back);
 
     let block = Block::default().borders(Borders::ALL).title("yatima");
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((top as u16, 0));
+        .wrap(Wrap { trim: false });
+    // Auto-follow uses the *wrapped* row count, not the logical line count: each
+    // logical line can wrap to several rows, so scrolling by logical lines would
+    // leave streaming output below the fold (looks frozen while it's still
+    // streaming). `line_count` reports the rows Paragraph will actually render.
+    let total_rows = paragraph.line_count(inner_width);
+    let top = scroll_y(total_rows, viewport, app.scroll_back);
+    let paragraph = paragraph.scroll((top as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// A short note for a non-`Eos` stop reason, or `None` for a clean finish.
+fn stop_note(stop: Option<StopReason>) -> Option<&'static str> {
+    match stop {
+        Some(StopReason::MaxTokens) => Some("[stopped: hit max tokens]"),
+        Some(StopReason::Repetition) => Some("[stopped: repetition detected]"),
+        Some(StopReason::Stopped) => Some("[stopped: cancelled]"),
+        Some(StopReason::Eos) | None => None,
+    }
 }
 
 /// Wrap a (possibly multi-line) string into styled `Line`s.

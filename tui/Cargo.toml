@@ -20,7 +20,10 @@ fetch = ["yatima-lib/fetch"]
 yatima-lib = { path = "../lib" }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
-ratatui = "0.29"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, needed to
+# auto-follow streaming text: the scroll offset must be in *wrapped* rows, not
+# logical lines, or new output streams off-screen below the fold.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

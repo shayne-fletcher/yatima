@@ -133,6 +133,9 @@ pub enum StopReason {
     MaxTokens,
     /// The fold step returned `ControlFlow::Break` (voluntary cancellation).
     Stopped,
+    /// Generation collapsed into a short repeating cycle and was stopped by the
+    /// degeneration guard (rather than running on to `max_tokens`).
+    Repetition,
 }
 
 /// The outcome of a generation: how many tokens were produced and why it ended.
@@ -287,6 +290,26 @@ fn effective_prefill_chunk(configured: Option<usize>, default: Option<usize>, le
         Some(0) | None => len,
         Some(n) => n,
     }
+}
+
+/// How many trailing generated tokens to inspect for the degeneration guard, and
+/// the largest cycle period it looks for.
+const REPETITION_GUARD_WINDOW: usize = 50;
+const REPETITION_GUARD_MAX_PERIOD: usize = 10;
+
+/// True when the tail of *generated* tokens has collapsed into a short repeating
+/// cycle — degenerate output ("the the the…", a `####…` flood). Perfect
+/// periodicity with a small period over a long window essentially never occurs
+/// in real text, so this is high-precision: it ends a runaway early (a clean
+/// [`StopReason::Repetition`]) without clipping legitimate output. Pure, so it is
+/// unit-tested without a model.
+fn is_degenerate_tail(generated: &[u32]) -> bool {
+    if generated.len() < REPETITION_GUARD_WINDOW {
+        return false;
+    }
+    let tail = &generated[generated.len() - REPETITION_GUARD_WINDOW..];
+    // Perfectly periodic with period p ⇔ tail[i] == tail[i - p] for all i ≥ p.
+    (1..=REPETITION_GUARD_MAX_PERIOD).any(|p| tail[p..].iter().zip(tail).all(|(a, b)| a == b))
 }
 
 /// The prefill-chunk default a freshly loaded engine adopts (PREFILL-1), gated on
@@ -972,6 +995,13 @@ impl Engine {
                 stop = StopReason::Eos;
                 break;
             }
+            // Degeneration guard: a model can collapse into a repeating cycle
+            // ("the the the…") and otherwise run to `max_tokens`. Stop early,
+            // cleanly, before emitting more of the garbage tail.
+            if is_degenerate_tail(&tokens[prompt_tokens..]) {
+                stop = StopReason::Repetition;
+                break;
+            }
             if let Some(piece) = stream.next_token(next)? {
                 match step(acc, &piece)? {
                     ControlFlow::Continue(a) => acc = a,
@@ -1471,6 +1501,30 @@ mod tests {
         // Off Metal, no chunking regardless of dtype.
         assert_eq!(prefill_chunk_for(arch, false, DType::F32), None);
         assert_eq!(prefill_chunk_for(arch, false, DType::BF16), None);
+    }
+
+    #[test]
+    fn degeneration_guard_catches_short_cycles_only() {
+        // Stops "the the the…" (period 1) and short cycles, but not legitimate
+        // varied text — high precision, no false positives on real output.
+        assert!(is_degenerate_tail(&vec![7u32; 60]), "period-1 collapse");
+        let ab: Vec<u32> = (0..60).map(|i| (i % 2) as u32).collect();
+        assert!(is_degenerate_tail(&ab), "period-2 cycle");
+        let p5: Vec<u32> = (0..60).map(|i| (i % 5) as u32).collect();
+        assert!(is_degenerate_tail(&p5), "period-5 cycle");
+        // A coprime stride has period 50 (> max), so it is not flagged.
+        let varied: Vec<u32> = (0..60).map(|i| (i * 7 % 50) as u32).collect();
+        assert!(
+            !is_degenerate_tail(&varied),
+            "varied text is not degenerate"
+        );
+        // A frequently-but-not-periodically repeated token (normal "the" usage).
+        let natural: Vec<u32> = (0..60)
+            .map(|i| if i % 5 == 0 { 9 } else { i as u32 })
+            .collect();
+        assert!(!is_degenerate_tail(&natural), "interspersed repeat is fine");
+        // Too short to judge.
+        assert!(!is_degenerate_tail(&[1, 1, 1, 1]));
     }
 
     #[test]
