@@ -24,6 +24,18 @@ swappable dependency.
 - **`yatima-cli`** — a thin wrapper: `yatima generate`, `yatima chat`, `yatima
   agent`, and `yatima models-dir`, with model selection parsed into a
   `ModelSource` ADT at the edge.
+- **`yatima-tui`** — an interactive terminal UI (`ratatui`/`crossterm`), kept a
+  separate crate so its UI deps never touch the lean CLI. Its keystone: a
+  dedicated **engine thread** owns the `Engine` *and* `ChatSession` (the one
+  authoritative history) and calls the sync `turn_streaming` — because local
+  decode is `!Send` on the blocking island (CMP-1/RT-2) it cannot run in a
+  `tokio::spawn`. Three planes connect it to the async UI: a `std::sync::mpsc`
+  **request** plane, a `tokio::sync::mpsc` **event** plane (the UI's only
+  transcript truth; rendered as a *mirror*), and an out-of-band **control** plane
+  (a shared `Arc<AtomicBool>` per turn) so a cancel is reachable while the actor
+  is mid-decode. Its own `TUI-N` invariant registry (cursor-bounds, pure-render,
+  single-append, ui-liveness, single-in-flight) is in the crate doc. Built in
+  slices; Slice 1 is chat + streaming + the reasoning split.
 
 ## Module layering (LAYER-1)
 
