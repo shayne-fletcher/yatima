@@ -157,9 +157,9 @@ pub use template::{
     ChatMlTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate, PromptTemplate,
 };
 pub use tool::{
-    JsonToolCall, ListDir, QwenToolCall, ReadFile, ReadUrl, SendNotification, Tool, ToolCall,
-    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolFailure, ToolOutcome, ToolRejection,
-    ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
+    JsonToolCall, ListDir, QwenToolCall, ReadFile, ReadPage, ReadUrl, SendNotification, Tool,
+    ToolCall, ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolFailure, ToolOutcome,
+    ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
 };
 pub use transcript::{Role, Turn};
 

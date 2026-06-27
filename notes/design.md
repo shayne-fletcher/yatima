@@ -214,7 +214,21 @@ The design is **small composable seams**, simplest concrete impl behind each:
   only the model-facing projection the transcript receives (PROTO-1).
   `Tools::spawn` returns a `ToolTask` with `ToolEvent`s, `join`, and cooperative
   cancellation. Current tools: `ReadFile`, `ListDir`, `WriteFile`, `ReadUrl`,
-  and `SendNotification`, each holding its own capability.
+  `ReadPage`, and `SendNotification`, each holding its own capability.
+  `ReadUrl` returns a body **verbatim** (JSON/plaintext/APIs); `ReadPage` fetches
+  an HTML page under the same `WebOrigin` capability and returns the **readable
+  main article** (title + text) via a readability pass (`dom_smoothie`),
+  async-first: the body is streamed under a hard size cap (never buffered then
+  measured), the CPU extraction runs on `spawn_blocking`, output is truncated to
+  a char budget rather than failing, and obvious non-HTML is rejected with a
+  "use read_url" message. Server-rendered HTML only — no JS, paywalls, or
+  cross-origin links.
+- **`Tool` is a downstream extension point.** `Tool` is `pub` and `Tools::with`
+  takes any `impl Tool`, so a consumer crate (e.g. `sieve`) can define and
+  register its own domain tools — they implement `Tool` (needs the `async-trait`
+  dep) and live in the crate that already depends on `yatima-lib` (e.g.
+  `sieve-cli`), keeping the engine-free core engine-free. The toolset is composed
+  by the host; the engine bundles none by default (sandbox-by-omission, AGENT-2).
 - **`PromptTemplate`** (the chat format) — renders the transcript into the
   model's *native* prompt string. `ChatMlTemplate` (Qwen2.5), `PlainTemplate`
   (fallback/tests). A model is acutely sensitive to its trained format; the wrong

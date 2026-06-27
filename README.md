@@ -225,9 +225,11 @@ for a human to judge.
 ## Tools And Capabilities
 
 Tools hold their authority. A `ReadFile` tool constructed with a `Dir` can only
-read under that root; `WriteFile` uses a separate `WriteDir`; `ReadUrl` is scoped
-to a `WebOrigin`; `SendNotification` is scoped to a pre-shared `NtfyTopic`.
-The model supplies arguments, not authority.
+read under that root; `WriteFile` uses a separate `WriteDir`; `ReadUrl` (raw
+body) and `ReadPage` (readable main article from HTML) are both scoped to a
+`WebOrigin`; `SendNotification` is scoped to a pre-shared `NtfyTopic`.
+The model supplies arguments, not authority. `Tool` is public and `Tools::with`
+takes any `impl Tool`, so a consumer crate can register its own domain tools.
 
 Tool execution is async and observable. Runtime code sees a typed `ToolOutcome`
 algebra; the model sees only the projected `ToolResult` turn. A caller can use

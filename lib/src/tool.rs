@@ -30,6 +30,18 @@ use tracing::Instrument;
 
 const DEFAULT_READ_URL_MAX_BYTES: usize = 1_000_000;
 
+/// `read_page` input cap: the streamed body is rejected once it exceeds this, so
+/// a pathological page cannot be buffered into memory.
+const DEFAULT_READ_PAGE_MAX_BYTES: usize = 4_000_000;
+/// `read_page` output budget, in characters of the *readable article text* (the
+/// returned string may exceed this by the title, URL, and truncation marker).
+const DEFAULT_READ_PAGE_MAX_CHARS: usize = 40_000;
+/// Structural guard handed to the readability extractor, independent of bytes.
+const READ_PAGE_MAX_ELEMENTS: usize = 100_000;
+/// Below this many non-whitespace chars, an extraction is treated as "no
+/// readable content" (extractors return title-only/boilerplate on non-articles).
+const READ_PAGE_MIN_TEXT_CHARS: usize = 20;
+
 /// What a tool advertises to the model: its name, a description, and a JSON
 /// Schema for its arguments.
 #[derive(Debug, Clone)]
@@ -753,6 +765,184 @@ impl Tool for ReadUrl {
     }
 }
 
+/// Truncate `text` to at most `max_chars` characters on a char boundary.
+/// Returns the (possibly shortened) text and `Some((kept, total))` if truncated.
+fn truncate_chars(text: &str, max_chars: usize) -> (String, Option<(usize, usize)>) {
+    let total = text.chars().count();
+    if total <= max_chars {
+        (text.to_string(), None)
+    } else {
+        (
+            text.chars().take(max_chars).collect(),
+            Some((max_chars, total)),
+        )
+    }
+}
+
+/// Read the **readable main content** of an HTML page under a [`WebOrigin`]
+/// capability: fetch, extract the article (title + text) with a readability pass,
+/// and return it as plain text truncated to a budget.
+///
+/// Distinct from [`ReadUrl`], which returns the raw body verbatim — use that for
+/// JSON/plaintext/APIs. `read_page` is for **server-rendered HTML only**: it does
+/// not execute JavaScript, bypass paywalls, or follow links to other origins
+/// (CAP-2: authority is exactly the held origin). v1 decodes the body as UTF-8
+/// and emits plain text (link `href`s are dropped; a markdown-with-links variant
+/// is a possible v2).
+pub struct ReadPage {
+    origin: WebOrigin,
+    client: Client,
+    max_input_bytes: usize,
+    max_output_chars: usize,
+}
+
+impl ReadPage {
+    /// A capability-scoped page reader with default budgets.
+    pub fn new(origin: WebOrigin) -> Result<ReadPage> {
+        Self::with_limits(
+            origin,
+            DEFAULT_READ_PAGE_MAX_BYTES,
+            DEFAULT_READ_PAGE_MAX_CHARS,
+        )
+    }
+
+    /// A capability-scoped page reader with explicit input/output budgets.
+    pub fn with_limits(
+        origin: WebOrigin,
+        max_input_bytes: usize,
+        max_output_chars: usize,
+    ) -> Result<ReadPage> {
+        let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
+        Ok(ReadPage {
+            origin,
+            client,
+            max_input_bytes,
+            max_output_chars,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ReadPage {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_page".to_string(),
+            description: "Read the readable main content (title + article text) of an HTML page \
+                          under the configured origin. For raw or non-HTML responses (JSON, \
+                          plaintext, APIs) use read_url instead. Server-rendered HTML only — no \
+                          JavaScript, paywalls, or cross-origin links."
+                .to_string(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "absolute same-origin URL or path relative to the configured origin"
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+        let target = required_string(&args, "read_page", "url")?;
+        let url = self.origin.resolve(target)?;
+
+        let mut response = self.client.get(url.clone()).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("read_page failed with HTTP {status} for {url}");
+        }
+
+        // Content-type gate (case-insensitive): reject obvious non-HTML before
+        // reading or extracting. A missing/blank type is allowed (servers are
+        // sloppy); the meaningful-content check below catches true non-HTML.
+        if let Some(ct) = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !ct.to_ascii_lowercase().contains("html") {
+                bail!(
+                    "read_page: non-HTML response ({ct}) for {url}; use read_url for raw content"
+                );
+            }
+        }
+
+        // Content-Length preflight, then a streamed hard cap: never buffer a
+        // pathological body via `bytes().await`.
+        if let Some(len) = response.content_length() {
+            if len as usize > self.max_input_bytes {
+                bail!(
+                    "read_page: response too large ({len} bytes > {} limit) for {url}; use read_url",
+                    self.max_input_bytes
+                );
+            }
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if buf.len() + chunk.len() > self.max_input_bytes {
+                bail!(
+                    "read_page: response exceeded the {} byte limit for {url}; use read_url",
+                    self.max_input_bytes
+                );
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let html = String::from_utf8(buf).map_err(|_| {
+            anyhow!("read_page: response was not valid UTF-8 HTML for {url}; use read_url")
+        })?;
+
+        // Extract off the async worker — also required because the extractor's
+        // types are `!Send`, so they are created and consumed entirely here and
+        // only owned `String`s escape.
+        let url_string = url.to_string();
+        let (title, text) = tokio::task::spawn_blocking(move || -> Result<(String, String)> {
+            let cfg = dom_smoothie::Config {
+                max_elements_to_parse: READ_PAGE_MAX_ELEMENTS,
+                ..Default::default()
+            };
+            let mut readability =
+                dom_smoothie::Readability::new(html, Some(url_string.as_str()), Some(cfg)).map_err(
+                    |e| {
+                        anyhow!("read_page: could not initialize the extractor for {url_string}: {e}; use read_url for raw content")
+                    },
+                )?;
+            let article = readability.parse().map_err(|e| {
+                anyhow!("read_page: no readable article at {url_string}: {e}; use read_url for raw content")
+            })?;
+            Ok((article.title.to_string(), article.text_content.to_string()))
+        })
+        .await??;
+
+        // Meaningful-content check (extractors return title-only/boilerplate on
+        // non-articles); errors carry the resolved URL for debuggability.
+        let text = text.trim();
+        if text.chars().filter(|c| !c.is_whitespace()).count() < READ_PAGE_MIN_TEXT_CHARS {
+            bail!("read_page: no readable article content at {url}; use read_url for raw content");
+        }
+
+        // Truncate the *text portion* to the char budget (the header/marker may
+        // push the full string past it — that is intended).
+        let (body, truncated) = truncate_chars(text, self.max_output_chars);
+        let mut out = String::new();
+        let title = title.trim();
+        if !title.is_empty() {
+            out.push_str("# ");
+            out.push_str(title);
+            out.push('\n');
+        }
+        out.push_str(url.as_str());
+        out.push_str("\n\n");
+        out.push_str(&body);
+        if let Some((kept, total)) = truncated {
+            out.push_str(&format!("\n\n[truncated: kept {kept} of {total} chars]"));
+        }
+        Ok(out)
+    }
+}
+
 /// Send a notification to a fixed ntfy topic held as a capability.
 pub struct SendNotification {
     publisher: NtfyPublisher,
@@ -1345,6 +1535,243 @@ mod tests {
         });
         assert!(result.is_error);
         assert!(result.content.contains("escapes web origin"));
+    }
+
+    // A realistic article with nav/script/footer noise around the body.
+    const ARTICLE_HTML: &str = r#"<!DOCTYPE html><html><head><title>The Quarterly Report</title></head>
+<body>
+<nav>HOME ABOUT CONTACT SUBSCRIBE_NAV_LINK</nav>
+<script>var tracking = "BEACON_PIXEL_12345";</script>
+<article>
+<h1>The Quarterly Report</h1>
+<p>Acme Corporation announced today that quarterly revenue rose sharply across all
+divisions, driven by strong demand in the industrial segment and disciplined cost
+control throughout the period under review by the board.</p>
+<p>Management reaffirmed full-year guidance and highlighted continued investment in
+research and development as a core priority for sustaining the company competitive
+position over the coming years.</p>
+</article>
+<footer>Copyright 2026 Acme Corporation</footer>
+</body></html>"#;
+
+    #[tokio::test]
+    async fn read_page_extracts_readable_article() {
+        // upholds: the new behaviour vs read_url — main article, not page chrome.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/post"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/post"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("Quarterly Report")); // title
+        assert!(result.content.contains("quarterly revenue rose sharply")); // article prose
+        assert!(!result.content.contains("BEACON_PIXEL_12345")); // script dropped
+        assert!(!result.content.contains("SUBSCRIBE_NAV_LINK")); // nav dropped
+    }
+
+    #[test]
+    fn read_page_rejects_escaping_origins_before_network() {
+        // upholds: CAP-2 — same origin discipline as read_url.
+        let origin = WebOrigin::new("https://example.com").unwrap();
+        let tools = Tools::new().with(ReadPage::new(origin).unwrap());
+        let result = tools.dispatch(&ToolCall {
+            name: "read_page".to_string(),
+            args: json(r#"{"url": "https://evil.example/doc"}"#),
+        });
+        assert!(result.is_error);
+        assert!(result.content.contains("escapes web origin"));
+    }
+
+    #[tokio::test]
+    async fn read_page_truncates_article_text_not_failing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        // Tiny output budget; generous input budget.
+        let reader =
+            ReadPage::with_limits(WebOrigin::new(&server.uri()).unwrap(), 1_000_000, 50).unwrap();
+        let result = Tools::new()
+            .with(reader)
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/x"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("[truncated: kept 50 of"));
+        assert!(result.content.contains("Acme Corporation")); // start of the text kept
+    }
+
+    #[tokio::test]
+    async fn read_page_rejects_non_html_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(br#"{"ok":true}"#.to_vec(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/api"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(result.is_error);
+        assert!(result.content.contains("read_url"));
+    }
+
+    #[tokio::test]
+    async fn read_page_accepts_parameterized_and_mixed_case_html() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "Text/HTML; charset=UTF-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/x"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("quarterly revenue rose sharply"));
+    }
+
+    #[tokio::test]
+    async fn read_page_enforces_input_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        // Input cap far below the body size → guarded before extraction.
+        let reader =
+            ReadPage::with_limits(WebOrigin::new(&server.uri()).unwrap(), 100, 40_000).unwrap();
+        let result = Tools::new()
+            .with(reader)
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/x"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(result.is_error);
+        assert!(result.content.contains("read_url"));
+    }
+
+    #[tokio::test]
+    async fn read_page_reports_non_2xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/missing"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(result.is_error);
+        assert!(result.content.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn read_page_rejects_non_utf8_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(vec![0xff, 0xff, 0xff, 0xfe], "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/x"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(result.is_error);
+        assert!(result.content.contains("UTF-8"));
+        assert!(result.content.contains("read_url"));
+    }
+
+    #[tokio::test]
+    async fn read_page_empty_extraction_points_at_read_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                b"<html><head><title>Empty</title></head><body></body></html>".to_vec(),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(r#"{"url": "/empty"}"#),
+            })
+            .await
+            .render_for_model("read_page");
+
+        assert!(result.is_error);
+        assert!(result.content.contains("read_url"));
     }
 
     #[test]
