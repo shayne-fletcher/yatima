@@ -78,10 +78,17 @@ pub fn split_reasoning(text: &str) -> Reasoned {
                 None => before,
             }
             .trim();
-            Reasoned {
+            let reasoned = Reasoned {
                 reasoning: (!reasoning.is_empty()).then(|| reasoning.to_string()),
                 answer,
-            }
+            };
+            tracing::trace!(
+                dialect = dialect.close,
+                reasoning_chars = reasoned.reasoning.as_deref().map_or(0, str::len),
+                answer_chars = reasoned.answer.len(),
+                "reasoning split"
+            );
+            reasoned
         }
     }
 }
@@ -173,35 +180,38 @@ impl ReasoningSplitter {
         }
     }
 
-    /// The markers to watch in the current state: closers when in reasoning,
-    /// openers otherwise.
-    fn markers(&self) -> impl Iterator<Item = &'static str> + '_ {
-        DIALECTS
-            .iter()
-            .map(move |d| if self.in_reasoning { d.close } else { d.open })
-    }
-
     fn drain(&mut self, emit: &mut impl FnMut(Channel, &str)) {
         loop {
-            // The earliest complete marker for the current state flips the channel.
-            let hit = self
-                .markers()
-                .filter_map(|m| self.buf.find(m).map(|i| (i, m)))
-                .min_by_key(|(i, _)| *i);
+            // The earliest complete marker — open *or* close — controls the
+            // channel. A marker *sets* state (open→reasoning, close→answer)
+            // rather than toggling, so a stray or duplicated marker (e.g. a model
+            // that emits `</think>` twice while degenerating) is always consumed,
+            // never leaked into a channel.
+            let hit = all_markers()
+                .filter_map(|(text, opens)| self.buf.find(text).map(|i| (i, text, opens)))
+                .min_by_key(|(i, ..)| *i);
             match hit {
-                Some((i, marker)) => {
+                Some((i, text, opens)) => {
                     if i > 0 {
                         let ch = self.channel();
                         emit(ch, &self.buf[..i]);
                     }
-                    self.buf = self.buf.split_off(i + marker.len());
-                    self.in_reasoning = !self.in_reasoning;
+                    self.buf = self.buf.split_off(i + text.len());
+                    let was = self.in_reasoning;
+                    self.in_reasoning = opens;
+                    tracing::trace!(
+                        marker = text,
+                        opens,
+                        was_reasoning = was,
+                        now_reasoning = self.in_reasoning,
+                        "reasoning channel marker"
+                    );
                 }
                 None => {
                     // No complete marker: emit all but a tail that could be the
                     // start of one, so a boundary-straddling marker is caught on
                     // the next push.
-                    let keep = self.held_back_len();
+                    let keep = held_back_len(&self.buf);
                     let upto = self.buf.len() - keep;
                     if upto > 0 {
                         let ch = self.channel();
@@ -213,27 +223,35 @@ impl ReasoningSplitter {
             }
         }
     }
+}
 
-    /// Bytes to hold back: the longest suffix of `buf` that is a proper prefix of
-    /// any watched marker (at a marker char boundary, so the kept split is always
-    /// a valid `str` boundary). No complete marker is present here (the caller
-    /// already searched), so the overlap is always shorter than the marker.
-    fn held_back_len(&self) -> usize {
-        let mut best = 0;
-        for marker in self.markers() {
-            let mut k = marker.len().min(self.buf.len());
-            while k > best {
-                if marker.is_char_boundary(k)
-                    && self.buf.as_bytes().ends_with(&marker.as_bytes()[..k])
-                {
-                    best = k;
-                    break;
-                }
-                k -= 1;
+/// Every marker the stream watches — both ends of every dialect, paired with
+/// whether it *opens* a reasoning span — derived from the single [`DIALECTS`]
+/// source so the batch and streaming splitters never drift.
+fn all_markers() -> impl Iterator<Item = (&'static str, bool)> {
+    DIALECTS
+        .iter()
+        .flat_map(|d| [(d.open, true), (d.close, false)])
+}
+
+/// Bytes to hold back at the tail of `buf`: the longest suffix that is a proper
+/// prefix of any marker (at a marker char boundary, so the kept split is always
+/// a valid `str` boundary), in case the marker completes in the next fragment.
+/// No complete marker is present here (the caller already searched), so the
+/// overlap is always shorter than the marker.
+fn held_back_len(buf: &str) -> usize {
+    let mut best = 0;
+    for (m, _opens) in all_markers() {
+        let mut k = m.len().min(buf.len());
+        while k > best {
+            if m.is_char_boundary(k) && buf.as_bytes().ends_with(&m.as_bytes()[..k]) {
+                best = k;
+                break;
             }
+            k -= 1;
         }
-        best
     }
+    best
 }
 
 #[cfg(test)]
@@ -367,5 +385,59 @@ mod tests {
         let (r, a) = stream(ReasoningSplitter::new(), &["answer <thi"]);
         assert_eq!(r, "");
         assert_eq!(a, "answer <thi");
+    }
+
+    /// Drive the splitter one *character* at a time — the most adversarial
+    /// fragmentation (every marker is split maximally) — and never leak a marker.
+    fn stream_char_by_char(s: ReasoningSplitter, text: &str) -> (String, String) {
+        let frags: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = frags.iter().map(String::as_str).collect();
+        stream(s, &refs)
+    }
+
+    #[test]
+    fn splitter_seeded_consumes_close_amid_real_text() {
+        // Regression: a DeepSeek-style stream (seeded, close marker after real
+        // punctuation `]\n`) fed char-by-char must consume `</think>`, not leak
+        // it into the answer.
+        let raw = "reasoning\n\\boxed{3}\n]\n</think>\n\nThe answer is 3.";
+        let (r, a) = stream_char_by_char(ReasoningSplitter::seeded(), raw);
+        assert!(!a.contains("think"), "marker leaked into answer: {a:?}");
+        assert!(!r.contains("think"), "marker leaked into reasoning: {r:?}");
+        // The stream preserves whitespace (live display); trim for the compare.
+        assert_eq!(a.trim(), "The answer is 3.");
+        assert!(r.contains("\\boxed{3}"));
+    }
+
+    #[test]
+    fn splitter_consumes_a_stray_or_duplicate_close() {
+        // Regression for the live bug: a degenerating model emitted `</think>`
+        // twice. With a toggle, the second close (seen while already in the
+        // answer) leaked; set-semantics consume every marker. Reproduced
+        // synthetically, no model needed.
+        let raw = "think one</think>answer one</think>answer two";
+        let (r, a) = stream_char_by_char(ReasoningSplitter::seeded(), raw);
+        assert!(!a.contains("think"), "stray close leaked: {a:?}");
+        assert_eq!(r, "think one");
+        assert_eq!(a, "answer oneanswer two");
+    }
+
+    #[test]
+    fn splitter_ignores_a_stray_open_while_reasoning() {
+        // The dual: a second open while already reasoning is consumed, not leaked.
+        let raw = "<think>a<think>b</think>done";
+        let (r, a) = stream_char_by_char(ReasoningSplitter::new(), raw);
+        assert!(!r.contains("think") && !a.contains("think"));
+        assert_eq!(r, "ab");
+        assert_eq!(a, "done");
+    }
+
+    #[test]
+    fn splitter_open_then_close_char_by_char() {
+        // The new() path under the same adversarial fragmentation.
+        let raw = "<think>weigh it</think>final";
+        let (r, a) = stream_char_by_char(ReasoningSplitter::new(), raw);
+        assert_eq!(r, "weigh it");
+        assert_eq!(a, "final");
     }
 }

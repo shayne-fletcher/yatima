@@ -131,6 +131,24 @@ also need a larger token budget — they spend the default 256 mid-thought — s
 profile marked `reasoning: true` floors `max_tokens` at `REASONING_MIN_TOKENS`
 (raising only, never reducing a larger caller budget).
 
+**Marker semantics are set, not toggle.** A real model can emit a marker more
+than once (a degenerating model re-emitting `</think>`), so the streaming
+splitter treats every recognized marker as *setting* the channel
+(open→reasoning, close→answer) and always consumes it — a stray or duplicate
+marker is never leaked into a channel. (A *toggle* would let the second close,
+seen while already in the answer, slip through — the bug a synthetic
+double-close unit test now pins, plus a gated e2e that streams a real distill.)
+Both splitters draw their dialects from one `DIALECTS` table, so batch and
+streaming never drift.
+
+**Observability (taps).** The split is instrumented so its state is never opaque:
+`tracing::trace!` fires on every streaming channel transition (`marker`, `opens`,
+`was/now_reasoning`) and on each batch split (dialect + per-channel char counts) —
+OBS-compliant (trace level, counts not content). Programmatic taps: the agent
+emits `AgentEvent::Reasoning`, `ChatSession::last_reasoning()` exposes the last
+trace, and the `ReasoningSplitter` callback (`Channel`, `&str`) is itself the
+streaming tap a host renders.
+
 ## Generation: an effectful fold (the contract)
 
 `generate_with` is the primitive; `generate` is the `acc = ()` specialization

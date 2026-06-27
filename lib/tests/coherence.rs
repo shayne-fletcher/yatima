@@ -11,8 +11,8 @@
 //! `cargo test -p yatima-lib --features metal --test coherence -- --nocapture`.
 
 use yatima_lib::{
-    device, is_model_present, model_dir, models_root, split_reasoning, ChatFormat, ChatMlTemplate,
-    ChatSession, Engine, GenOpts, ModelId, Role, Turn,
+    device, is_model_present, model_dir, models_root, split_reasoning, Channel, ChatFormat,
+    ChatMlTemplate, ChatSession, Engine, GenOpts, ModelId, ReasoningSplitter, Role, Turn,
 };
 
 /// One coherence row: a cached model, the format to speak, a prompt, and what a
@@ -155,6 +155,58 @@ fn coherence_across_cached_models() -> anyhow::Result<()> {
     for case in CASES {
         run_case(case)?;
     }
+    Ok(())
+}
+
+/// The streaming reasoning channel is clean on a real reasoning model: routing
+/// the live token stream through a [`ReasoningSplitter`] (exactly as the chat
+/// REPL does) must never leak a marker into the answer channel (REASON-1). Dumps
+/// the raw fragments for diagnosis.
+#[test]
+fn streaming_reasoning_channel_is_clean() -> anyhow::Result<()> {
+    if !gated() {
+        eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+        return Ok(());
+    }
+    let dir = model_dir(
+        &models_root(),
+        &ModelId::parse("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")?,
+    );
+    if !is_model_present(&dir) {
+        eprintln!("skip streaming-channel: DeepSeek-R1-Distill-Qwen-1.5B not cached");
+        return Ok(());
+    }
+    let mut engine = Engine::load(&dir, device(false)?)?;
+    let format = ChatFormat::DeepSeek;
+    let mut chat = ChatSession::new(&mut engine, format.template()).with_opts(GenOpts {
+        max_tokens: 700,
+        ..Default::default()
+    });
+
+    let mut splitter = if format.pre_seeds_reasoning() {
+        ReasoningSplitter::seeded()
+    } else {
+        ReasoningSplitter::new()
+    };
+    let mut reasoning = String::new();
+    let mut answer = String::new();
+    chat.turn_streaming("how many 'e's are there in 'greece'?", &mut |piece| {
+        eprintln!("RAW FRAG: {piece:?}");
+        splitter.push(piece, |ch, text| match ch {
+            Channel::Reasoning => reasoning.push_str(text),
+            Channel::Answer => answer.push_str(text),
+        });
+    })?;
+    splitter.finish(|ch, text| match ch {
+        Channel::Reasoning => reasoning.push_str(text),
+        Channel::Answer => answer.push_str(text),
+    });
+    eprintln!("--- reasoning: {reasoning:?}");
+    eprintln!("--- answer:    {answer:?}");
+    assert!(
+        !answer.contains("think"),
+        "reasoning marker leaked into the answer channel: {answer:?}"
+    );
     Ok(())
 }
 
