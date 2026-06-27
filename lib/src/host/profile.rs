@@ -54,12 +54,15 @@ impl ModelProfile {
                 ChatFormat::Qwen,
             ),
             // Kimi-Dev-72B is a Qwen2.5-72B finetune (GGUF arch `qwen2`,
-            // ChatML/Qwen template). The K-quants (Q4_K_M/Q5_K_M/Q6_K) ship as
-            // 2-part split GGUFs that the single-file loader can't take, so this
-            // pins the largest single-file 4-bit (Q4_1, ~45.7 GB).
+            // ChatML/Qwen template). candle reads no i-quants and the community
+            // K-quants embed IQ4_NL, so this pins the legacy Q4_0 (~41.4 GB;
+            // dtypes F32/Q4_0/Q4_1/Q6_K — verified candle-loadable and confirmed
+            // running on Metal). On a 48 GB Mac, load it with
+            // `sudo sysctl iogpu.wired_limit_mb=46080` (default budget is too low
+            // for 41 GB of weights).
             "kimi-dev" => p(
                 "unsloth/Kimi-Dev-72B-GGUF",
-                Some("Kimi-Dev-72B-Q4_1.gguf"),
+                Some("Kimi-Dev-72B-Q4_0.gguf"),
                 ChatFormat::Qwen,
             ),
             "glm4-32b" => p(
