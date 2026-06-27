@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
-    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage,
+    ModelProfile, ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage,
     ReasoningSplitter, Sampling, ToolCallCodec, Tools, WebOrigin,
 };
 
@@ -147,6 +147,12 @@ struct AgentArgs {
 
 #[derive(clap::Args)]
 struct ChatArgs {
+    /// A built-in model profile (e.g. `kimi-dev`, `deepseek-r1`): sets the model,
+    /// chat format, and generation defaults. A reasoning profile raises the token
+    /// budget and enables sampling. Replaces `--model`/`--repo`; an explicit
+    /// `--format` still wins, and `--max-tokens` raises (never lowers) the budget.
+    #[arg(long)]
+    profile: Option<String>,
     /// Explicit model directory.
     #[arg(long)]
     model: Option<PathBuf>,
@@ -227,31 +233,55 @@ fn init_tracing() {
 /// `generate` and the `agent` tool loop. `--prompt` gives one shot; omitting it
 /// opens an interactive multi-turn session that remembers the conversation.
 async fn chat(args: ChatArgs) -> Result<()> {
-    let dir = ModelSource::from_args(
-        args.model,
-        args.repo,
-        args.models_dir,
-        args.offline,
-        args.gguf,
-    )?
-    .resolve()?;
+    // A `--profile` names the model + format + generation defaults; explicit
+    // flags below still layer on top (the profile is a set of overrides over a
+    // CLI-built base — PROFILE-1).
+    let profile = match &args.profile {
+        Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown profile {name:?}; built-ins: {:?}",
+                ModelProfile::BUILTIN_NAMES
+            )
+        })?),
+        None => None,
+    };
+
+    let dir = match &profile {
+        Some(p) => p.to_source(args.offline)?.resolve()?,
+        None => ModelSource::from_args(
+            args.model,
+            args.repo,
+            args.models_dir,
+            args.offline,
+            args.gguf,
+        )?
+        .resolve()?,
+    };
 
     let dev = device(args.cpu)?;
     let mut engine = run_blocking(|| Engine::load(&dir, dev))?;
     eprintln!("loaded {} [{}]", dir.display(), engine.backend());
 
     // Infer the chat format from the model's architecture unless overridden
-    // (HOST-1); warn on a contradicting override rather than mis-render (HOST-2).
-    let (format, mismatch) = resolve_format(engine.arch(), args.format);
+    // (HOST-1) — an explicit `--format` wins, else the profile's, else inference;
+    // warn on a contradicting override rather than mis-render (HOST-2).
+    let explicit_format = args
+        .format
+        .or_else(|| profile.as_ref().and_then(ModelProfile::format));
+    let (format, mismatch) = resolve_format(engine.arch(), explicit_format);
     if let Some(m) = mismatch {
         eprintln!("warning: {m}");
     }
     let template = format.template();
-    let opts = GenOpts {
+    let base = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::from_temperature(args.temperature, args.seed),
         prefill_chunk: args.prefill_chunk,
         ..Default::default()
+    };
+    let opts = match &profile {
+        Some(p) => p.apply_gen_overrides(base),
+        None => base,
     };
 
     let system = args.system;
@@ -565,6 +595,19 @@ mod tests {
         };
         assert_eq!(args.prompt.as_deref(), Some("explain rust"));
         assert_eq!(args.format, Some(ChatFormat::Gemma));
+    }
+
+    #[test]
+    fn chat_accepts_a_profile() {
+        let cli = Cli::try_parse_from(["yatima", "chat", "--profile", "kimi-dev"]).unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected the chat subcommand");
+        };
+        assert_eq!(args.profile.as_deref(), Some("kimi-dev"));
+        // The named profile resolves to a reasoning model with its format pinned.
+        let p = ModelProfile::builtin(args.profile.as_deref().unwrap()).unwrap();
+        assert!(p.reasoning);
+        assert_eq!(p.format(), Some(ChatFormat::Qwen));
     }
 
     #[test]

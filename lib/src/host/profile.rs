@@ -74,6 +74,9 @@ impl ModelProfile {
             // for 41 GB of weights).
             "kimi-dev" => ModelProfile {
                 reasoning: true,
+                // Reasoning models want sampling, not greedy (greedy collapses
+                // into repetition); ~0.6 is the family's recommended setting.
+                temperature: Some(0.6),
                 ..p(
                     "unsloth/Kimi-Dev-72B-GGUF",
                     Some("Kimi-Dev-72B-Q4_0.gguf"),
@@ -85,6 +88,7 @@ impl ModelProfile {
             // would say Qwen/ChatML). A reasoning model (`<think>` dialect).
             "deepseek-r1" => ModelProfile {
                 reasoning: true,
+                temperature: Some(0.6),
                 ..p(
                     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                     None,
