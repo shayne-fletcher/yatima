@@ -53,6 +53,15 @@ impl ModelProfile {
                 Some("Qwen2.5-32B-Instruct-Q4_K_M.gguf"),
                 ChatFormat::Qwen,
             ),
+            // Kimi-Dev-72B is a Qwen2.5-72B finetune (GGUF arch `qwen2`,
+            // ChatML/Qwen template). The K-quants (Q4_K_M/Q5_K_M/Q6_K) ship as
+            // 2-part split GGUFs that the single-file loader can't take, so this
+            // pins the largest single-file 4-bit (Q4_1, ~45.7 GB).
+            "kimi-dev" => p(
+                "unsloth/Kimi-Dev-72B-GGUF",
+                Some("Kimi-Dev-72B-Q4_1.gguf"),
+                ChatFormat::Qwen,
+            ),
             "glm4-32b" => p(
                 "bartowski/THUDM_GLM-4-32B-0414-GGUF",
                 Some("THUDM_GLM-4-32B-0414-Q6_K_L.gguf"),
@@ -70,7 +79,8 @@ impl ModelProfile {
     }
 
     /// The names of every built-in profile (for `--help` / listing).
-    pub const BUILTIN_NAMES: [&'static str; 4] = ["qwen32b", "glm4-32b", "gemma2", "mistral"];
+    pub const BUILTIN_NAMES: [&'static str; 5] =
+        ["qwen32b", "glm4-32b", "gemma2", "mistral", "kimi-dev"];
 
     /// The model source this profile names — a directory **xor** a repository
     /// (PROFILE-2, via [`ModelSource::from_args`]).

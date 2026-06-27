@@ -17,8 +17,8 @@ use tracing_subscriber::EnvFilter;
 use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, Agent, ChatFormat,
     ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
-    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, Sampling, ToolCallCodec,
-    Tools,
+    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage, Sampling,
+    ToolCallCodec, Tools, WebOrigin,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -105,6 +105,11 @@ struct AgentArgs {
     /// Capability root the file tools may read under (default: cwd).
     #[arg(long)]
     root: Option<PathBuf>,
+    /// Grant the agent a `read_page` tool scoped to this HTTP(S) origin (e.g.
+    /// `https://example.com`). Omit for no web access. One origin per run; the
+    /// tool may only read same-origin URLs (CAP-2).
+    #[arg(long = "web-origin")]
+    web_origin: Option<String>,
     /// System prompt; a sensible default is used when omitted.
     #[arg(long)]
     system: Option<String>,
@@ -326,9 +331,12 @@ async fn agent(args: AgentArgs) -> Result<()> {
         None => std::env::current_dir()?,
     };
     let cap = Dir::new(&root);
-    let tools = Tools::new()
+    let mut tools = Tools::new()
         .with(ReadFile::new(cap.clone()))
         .with(ListDir::new(cap));
+    if let Some(origin) = &args.web_origin {
+        tools = tools.with(ReadPage::new(WebOrigin::new(origin)?)?);
+    }
 
     let opts = GenOpts {
         max_tokens: args.max_tokens,
