@@ -1,7 +1,7 @@
 //! The transcript vocabulary: [`Role`] and [`Turn`].
 //!
 //! These are the conversation primitives shared by the chat, template, and agent
-//! layers — and by any future structured `Completer` seam that takes turns
+//! layers — and by a future structured `Completer` boundary that takes turns
 //! rather than a rendered string. They live here, *below* all of those, so
 //! nothing depends upward into the agent layer for them (they previously lived
 //! in `agent`, which made `template` and `chat` depend on the agent module for a

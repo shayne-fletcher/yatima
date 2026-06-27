@@ -266,7 +266,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
             println!("{}", session.turn_async(&prompt).await?);
         }
         // Interactive: stream each turn through the same `ChatSession`, fully
-        // dogfooding the library's streaming seam (`turn_streaming_async`).
+        // dogfooding the library's streaming API (`turn_streaming_async`).
         None => chat_repl(session).await?,
     }
     Ok(())

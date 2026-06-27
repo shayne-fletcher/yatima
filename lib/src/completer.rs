@@ -1,15 +1,15 @@
-//! The model seam.
+//! The model boundary.
 //!
 //! [`Completer`] is the one thing the agent loop needs from a model: turn a
 //! prompt into text, stopping at EOS / `max_tokens` / a caller-supplied stop
 //! string. The real [`crate::Engine`] implements it over `generate_with`; tests
 //! implement it with canned outputs (a *scripted* completer), so the agent's
-//! laws are provable with no GPU. It is also the engine-swap seam — mistral.rs,
-//! llama.cpp, or a **remote/HTTP model** would be another `Completer`.
+//! laws are provable with no GPU. It is also the engine-swap boundary —
+//! mistral.rs, llama.cpp, or a remote/HTTP model would be another `Completer`.
 //!
-//! # The seam is async, and `Send` is inferred per impl (CMP-1)
+//! # The boundary is async, and `Send` is inferred per impl (CMP-1)
 //!
-//! `Completer` is an **async** trait so the seam generalizes beyond local
+//! `Completer` is an **async** trait so the boundary generalizes beyond local
 //! blocking compute to a remote model that is fundamentally async I/O. Crucially
 //! it uses **native `async fn` in trait** (stable since Rust 1.75), *not* the
 //! `async_trait` crate. That choice is the whole point, and it is non-obvious —
@@ -189,8 +189,8 @@ impl Engine {
 /// before decoding" — is discharged here, once, and is **type-enforced**: the
 /// decode methods require the `BlockingIsland` that only `run_blocking_island`
 /// mints, so this impl cannot be written to stall the executor (RT-2). This is
-/// the seam an alternate backend (a remote/HTTP model) would also fill — by
-/// awaiting I/O instead, with no island.
+/// the boundary an alternate backend (a remote/HTTP model) would also fill —
+/// by awaiting I/O instead, with no island.
 impl Completer for Engine {
     async fn complete(
         &mut self,

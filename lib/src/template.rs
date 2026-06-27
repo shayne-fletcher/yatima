@@ -3,8 +3,8 @@
 //!
 //! A model is acutely sensitive to its trained chat format: feed it a generic
 //! `<|role|>` layout and it can destabilise (degenerate repetition, no
-//! instruction-following). [`PromptTemplate`] is the seam that makes the format
-//! per-model; [`ChatMlTemplate`] matches Qwen2.5's trained format, and
+//! instruction-following). [`PromptTemplate`] is the boundary that makes the
+//! format per-model; [`ChatMlTemplate`] matches Qwen2.5's trained format, and
 //! [`PlainTemplate`] keeps the minimal layout for models with no known template
 //! and for tests.
 

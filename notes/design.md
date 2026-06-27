@@ -19,7 +19,7 @@ swappable dependency.
   generate_with}`, `Sampling`/`GenOpts`/`Generation`/`StopReason`, the
   `ModelId`/`models_root`/`model_dir` resolver, the `presence`/`model_shards`
   discovery, and (behind the `fetch` feature) `ensure_model`. Plus the acting
-  layer: the `Completer` model seam, `Dir` capabilities, `Tool`/`Tools` with the
+  layer: the `Completer` model boundary, `Dir` capabilities, `Tool`/`Tools` with the
   `ToolCallCodec` protocol, and the `Agent` loop.
 - **`yatima-cli`** — a thin wrapper: `yatima generate`, `yatima chat`, `yatima
   agent`, and `yatima models-dir`, with model selection parsed into a
@@ -39,21 +39,21 @@ flowchart TD
     edges["edges — cli / examples (#[tokio::main])"]
     host["config — host (ChatFormat, ModelSource, ModelProfile, Caps)"]
     action["action — capability · tool · agent · chat"]
-    seam["model seam — engine · completer · template"]
+    boundary["model boundary — engine · completer · template"]
     prim["primitives — transcript · runtime · token_output_stream · root ids/paths"]
     edges --> host
     edges --> action
-    host --> seam
-    action --> seam
-    seam --> prim
+    host --> boundary
+    action --> boundary
+    boundary --> prim
 ```
 
 An arrow is "may depend on". Reading it: **primitives** (`transcript` = `Role`/
 `Turn`, `runtime` = the one bridge + island, `token_output_stream`, the
-`ModelId`/`model_dir` resolver) depend on nothing in-crate. The **model seam**
+`ModelId`/`model_dir` resolver) depend on nothing in-crate. The **model boundary**
 (`engine`, `completer`, `template`) sits on primitives (`completer` over
 `engine`). **config** (`host`) and **action** (`capability` → `tool` →
-`agent`/`chat`) are *siblings* — both consume the seam, neither depends on the
+`agent`/`chat`) are *siblings* — both consume the boundary, neither depends on the
 other (the agent never imports `host`; `host` never imports the agent). The
 **edges** (CLI, examples) sit on top and may use everything.
 
@@ -196,13 +196,13 @@ is async: a caller can await the result, watch lifecycle/progress events, join
 the task, or request cooperative cancellation. The loop is still provable against
 a *scripted* `Completer` with no GPU.
 
-The design is **small composable seams**, simplest concrete impl behind each:
+The design is **small composable boundaries**, simplest concrete impl behind each:
 
-- **`Completer`** (the model seam) — `complete(prompt, opts, stops) ->
+- **`Completer`** (the model boundary) — `complete(prompt, opts, stops) ->
   Completion { text, stop }`, stopping at EOS / `max_tokens` / a stop string,
   with the stop marker **included** so the codec sees the whole block. `Engine`
   implements it over `generate_with`; tests use a canned `Completer`. This is
-  also the engine-swap seam (mistral.rs / llama.cpp would be another impl).
+  also the engine-swap boundary (mistral.rs / llama.cpp would be another impl).
 - **`Dir`** (authority as a value) — a rooted filesystem capability;
   `resolve(rel)` rejects escapes via the same `is_safe_relative` check as
   `ModelId` (MS-3 / CAP-1). A tool *holds* its capabilities; we never hand it
@@ -280,7 +280,7 @@ capability notion) — is the part worth owning; its lineage is ocap *systems*
 **Interop.** Schemas and roles follow the de-facto standard (JSON-Schema params;
 system/user/assistant/**tool** turns) rather than reinvent. MCP is a different
 problem — a transport for *out-of-process* tool servers; later it can ride the
-same seams at the edge (consume an MCP server *as* a `Tool`, or expose our tools
+same boundaries at the edge (consume an MCP server *as* a `Tool`, or expose our tools
 *as* an MCP server), without changing the in-process core.
 
 ## Model storage & loading
@@ -463,7 +463,7 @@ pinned by a liveness test (a ticker task progresses while a completion is in
 flight). This is `Send`-gates-`spawn` for blocking: a witness that you are inside
 the island gates the call, exactly as `Send` gates a cross-thread move.
 
-### The model seam is async, `Send` inferred per impl (CMP-1)
+### The model boundary is async, `Send` inferred per impl (CMP-1)
 
 `Completer` is the effect boundary: prompt → completion. It is an **async** trait
 so it generalizes past local blocking compute to a **remote/HTTP model** that is
@@ -615,7 +615,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   turn / planning. `WriteDir`, `WebOrigin`, and `NtfyTopic` are now present as
   first slices of the broader capability model.
 - **MCP edge adapter** — consume an MCP server *as* a `Tool`, or expose our tools
-  *as* an MCP server (out-of-process; rides the same seams at the edge).
+  *as* an MCP server (out-of-process; rides the same boundaries at the edge).
 
 ### Models / engine
 - **Engine swappability** — cross-arch dispatch + GGUF/quantized + self-contained
@@ -638,16 +638,16 @@ and deliberately shelved — the note records why so we don't repeat them.
      API omits it on `stop_reason: "stop_sequence"`. The impl must re-append it.
   2. **`temperature`/`top_p` are 400s on current Claude models.** `Sampling`
      doesn't forward 1:1 — drop it, or map "more/less thinking" onto `effort`.
-  3. **The seam passes a flat prompt string; the chat API wants structured
+  3. **The boundary passes a flat prompt string; the chat API wants structured
      `messages`.** A first cut sends the rendered prompt as one `user` message
-     (works, loses role structure). Doing it well is the seam refinement below.
+     (works, loses role structure). Doing it well is the boundary refinement below.
   Also: handle `stop_reason: "refusal"` before reading content. A flat-prompt,
-  greedy-only remote completer is buildable today with no seam surgery.
+  greedy-only remote completer is buildable today with no boundary surgery.
   **Scope decision (deliberate): a remote `Completer` is chat/generate, text
   only — no tools.** Our tools live in the `Agent` loop via a *text* codec gated
   to local tool-trained formats (Qwen/Plain); a hosted model's **native** tool
   use (`tool_use`/`tool_result` blocks, `stop_reason: "tool_use"`) cannot ride
-  the flat-string `Completer` seam and would need a separate "agent backend"
+  the flat-string `Completer` boundary and would need a separate "agent backend"
   abstraction (most likely letting the provider run its own tool loop). That is
   explicitly **kicked down the road** — do not conflate it with the `Completer`.
 - **More chat templates** — Llama-3, Zephyr/TinyLlama (same shape as Gemma/Mistral).
@@ -671,7 +671,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   out and play with capabilities interactively — the next real consumer after
   the examples, and the natural **forcing function**: a long interactive session
   is exactly what exercises streaming chat end-to-end *and* surfaces the
-  context-length ladder (rungs 1–2 become load-bearing the moment you chat past
+  context-length ladder (rungs 1–2 become essential the moment you chat past
   the window). It would also be where agent/tool capabilities get hands-on play.
   Drives demand for: the context-length rungs above, readline niceties, and
   eventually the engine-actor (if it grows beyond one session). Stays a pure
@@ -687,14 +687,14 @@ and deliberately shelved — the note records why so we don't repeat them.
   capabilities rather than ambient shell access.
 - **Async engine-actor** owning the `Engine` and wrapping `run_with_async` — the
   home for cross-request concurrency and KV-cache reuse (see Concurrency).
-- **Structured-message `Completer` seam** — `complete` takes a *rendered prompt
+- **Structured-message `Completer` boundary** — `complete` takes a *rendered prompt
   string* today, which suits a local model fed one prompt but loses role
   structure for a hosted chat API (Anthropic/OpenAI take `messages[]`, not a
-  flat string). A richer seam would hand the completer the structured turns
+  flat string). A richer boundary would hand the completer the structured turns
   (`&[Turn]`) and let each impl render: local impls run their `PromptTemplate`,
   a remote impl maps turns → API `messages`. Trigger: the remote `Completer`
   above — until then the flat string is fine. **Prerequisite done:** `Role`/`Turn`
-  now live in a neutral `transcript` module (were in `agent`), so the seam would
+  now live in a neutral `transcript` module (were in `agent`), so the boundary would
   not make the model layer depend upward into the agent layer.
 - **Serving & scale (deferred — mostly a different *process/tier*, not a
   module).** `yatima-lib` is the in-process **leaf**; serving concerns must not
