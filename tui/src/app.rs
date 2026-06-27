@@ -37,6 +37,9 @@ pub struct InFlight {
     pub turn_id: TurnId,
     pub started: Instant,
     pub frags: usize,
+    /// Whether the answer channel has begun (vs still reasoning) — drives the
+    /// "thinking" → "answering" phase in the activity indicator.
+    pub answering: bool,
     /// Control-plane handle (Slice 1: plumbed, inert).
     pub control: TurnControl,
 }
@@ -141,6 +144,7 @@ impl App {
             turn_id,
             started: Instant::now(),
             frags: 0,
+            answering: false,
             control: control.clone(),
         });
         let _ = self.req_tx.send(EngineRequest::Submit {
@@ -180,6 +184,9 @@ impl App {
             } if self.is_current(turn_id) => {
                 if let Some(f) = self.in_flight.as_mut() {
                     f.frags += 1;
+                    if channel == Channel::Answer {
+                        f.answering = true;
+                    }
                 }
                 self.append_fragment(channel, &text);
             }
@@ -244,9 +251,16 @@ where
     B: Backend,
     S: Stream<Item = io::Result<Event>> + Unpin,
 {
+    // A periodic tick redraws on a timer so the live activity indicator (spinner
+    // + elapsed) animates even when the model stalls between tokens — without it,
+    // a slow reasoning stretch looks hung (TUI: thinking ≠ frozen).
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         terminal.draw(|frame| render::ui(frame, &app))?;
         tokio::select! {
+            _ = tick.tick() => {} // wake to re-draw the animated indicator
             maybe_key = key_events.next() => {
                 match maybe_key {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => app.on_key(key),
@@ -361,6 +375,7 @@ mod tests {
             turn_id: 0,
             started: Instant::now(),
             frags: 0,
+            answering: false,
             control: TurnControl::new(),
         });
 
