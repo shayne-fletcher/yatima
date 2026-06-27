@@ -42,6 +42,10 @@ pub struct ModelProfile {
     pub prefill_chunk: Option<usize>,
     pub max_tokens: Option<usize>,
     pub temperature: Option<f64>,
+    /// Nucleus (top-p) sampling cutoff; `None` samples the full distribution.
+    /// Reasoning models want this (e.g. 0.95) to curb repetition degeneration.
+    #[serde(default)]
+    pub top_p: Option<f64>,
     pub seed: Option<u64>,
     pub repeat_penalty: Option<f32>,
 }
@@ -74,9 +78,11 @@ impl ModelProfile {
             // for 41 GB of weights).
             "kimi-dev" => ModelProfile {
                 reasoning: true,
-                // Reasoning models want sampling, not greedy (greedy collapses
-                // into repetition); ~0.6 is the family's recommended setting.
+                // Reasoning models want temperature + nucleus sampling, not greedy
+                // (greedy/full-dist collapses into repetition); ~0.6 + top-p 0.95
+                // is the family's recommended setting.
                 temperature: Some(0.6),
+                top_p: Some(0.95),
                 ..p(
                     "unsloth/Kimi-Dev-72B-GGUF",
                     Some("Kimi-Dev-72B-Q4_0.gguf"),
@@ -88,7 +94,9 @@ impl ModelProfile {
             // would say Qwen/ChatML). A reasoning model (`<think>` dialect).
             "deepseek-r1" => ModelProfile {
                 reasoning: true,
+                // DeepSeek-R1's own recommendation: temperature 0.6 + top-p 0.95.
                 temperature: Some(0.6),
+                top_p: Some(0.95),
                 ..p(
                     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                     None,
@@ -146,8 +154,24 @@ impl ModelProfile {
         if let Some(repeat_penalty) = self.repeat_penalty {
             opts.repeat_penalty = repeat_penalty;
         }
-        if let Some(temperature) = self.temperature {
-            opts.sampling = Sampling::from_temperature(temperature, self.seed.unwrap_or(0));
+        // Sampling overrides compose *per component* over the base, so a profile
+        // that sets only `temperature` keeps the caller's `--seed`/`--top-p`
+        // rather than silently resetting them (the seed-drop bug). Rebuild from
+        // the resolved (temperature, top_p, seed).
+        let (base_temp, base_top_p, base_seed) = match opts.sampling {
+            Sampling::Greedy => (0.0, None, 0),
+            Sampling::Sample {
+                temperature,
+                top_p,
+                seed,
+            } => (temperature, top_p, seed),
+        };
+        if self.temperature.is_some() || self.top_p.is_some() || self.seed.is_some() {
+            opts.sampling = Sampling::nucleus(
+                self.temperature.unwrap_or(base_temp),
+                self.top_p.or(base_top_p),
+                self.seed.unwrap_or(base_seed),
+            );
         }
         if let Some(prefill_chunk) = self.prefill_chunk {
             opts.prefill_chunk = Some(prefill_chunk);
@@ -273,10 +297,54 @@ mod tests {
             opts.sampling,
             Sampling::Sample {
                 temperature: 0.7,
+                top_p: None,
                 seed: 9
             }
         );
         assert_eq!(opts.prefill_chunk, Some(32));
+    }
+
+    #[test]
+    fn profile_temperature_keeps_the_caller_seed_and_top_p() {
+        // Regression: a profile that overrides only `temperature` must NOT reset
+        // the caller's seed/top_p (the seed-drop bug). Components compose.
+        let profile = ModelProfile {
+            name: "x".into(),
+            temperature: Some(0.6),
+            ..Default::default()
+        };
+        let base = GenOpts {
+            sampling: Sampling::nucleus(0.9, Some(0.8), 42),
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.apply_gen_overrides(base).sampling,
+            Sampling::Sample {
+                temperature: 0.6, // profile overrides temperature
+                top_p: Some(0.8), // base top_p preserved
+                seed: 42,         // base seed preserved (the bug)
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_profiles_pin_temperature_and_top_p() {
+        // The shipped reasoning profiles request nucleus sampling (the repetition
+        // mitigation): temperature 0.6 + top-p 0.95.
+        for name in ["deepseek-r1", "kimi-dev"] {
+            let p = ModelProfile::builtin(name).unwrap();
+            assert_eq!(p.temperature, Some(0.6), "{name} temperature");
+            assert_eq!(p.top_p, Some(0.95), "{name} top_p");
+            assert_eq!(
+                p.apply_gen_overrides(GenOpts::default()).sampling,
+                Sampling::Sample {
+                    temperature: 0.6,
+                    top_p: Some(0.95),
+                    seed: 0,
+                },
+                "{name} resolves to nucleus sampling"
+            );
+        }
     }
 
     #[test]

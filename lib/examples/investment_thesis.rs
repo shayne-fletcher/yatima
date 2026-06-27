@@ -275,7 +275,11 @@ fn print_run_metadata(
     };
     let sampling = match opts.sampling {
         Sampling::Greedy => "greedy".to_string(),
-        Sampling::Sample { temperature, seed } => format!("sample t={temperature} seed={seed}"),
+        Sampling::Sample {
+            temperature,
+            top_p,
+            seed,
+        } => format!("sample t={temperature} top_p={top_p:?} seed={seed}"),
     };
     eprintln!(
         "run: profile={} source={} arch={:?} format={} backend={} prefill={} max_tokens={} \

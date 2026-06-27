@@ -46,6 +46,10 @@ struct Args {
     max_tokens: usize,
     #[arg(long, default_value_t = 0.0)]
     temperature: f64,
+    /// Nucleus (top-p) sampling cutoff; omit for the full distribution. A profile
+    /// may set its own (e.g. reasoning profiles use 0.95).
+    #[arg(long)]
+    top_p: Option<f64>,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     /// Force CPU instead of the GPU.
@@ -89,7 +93,7 @@ async fn main() -> Result<()> {
 
     let base = GenOpts {
         max_tokens: args.max_tokens,
-        sampling: Sampling::from_temperature(args.temperature, args.seed),
+        sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
         ..Default::default()
     };
     let opts = match &profile {

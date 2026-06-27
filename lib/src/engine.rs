@@ -42,8 +42,16 @@ const METAL_PREFILL_CHUNK: usize = 64;
 pub enum Sampling {
     /// Greedy / argmax — deterministic and seed-free.
     Greedy,
-    /// Seeded sampling at the given temperature (expected `> 0`).
-    Sample { temperature: f64, seed: u64 },
+    /// Seeded sampling at the given temperature (expected `> 0`). `top_p`
+    /// (nucleus) restricts sampling to the smallest set of tokens whose
+    /// cumulative probability reaches `p` — the standard repetition mitigation,
+    /// and what reasoning models want (DeepSeek-R1: temperature 0.6 + top-p
+    /// 0.95). `None` samples the full (temperature-scaled) distribution.
+    Sample {
+        temperature: f64,
+        top_p: Option<f64>,
+        seed: u64,
+    },
 }
 
 impl Sampling {
@@ -54,20 +62,36 @@ impl Sampling {
     fn logits_processor(self) -> LogitsProcessor {
         match self {
             Sampling::Greedy => LogitsProcessor::new(0, None, None),
-            Sampling::Sample { temperature, seed } => {
-                LogitsProcessor::new(seed, Some(temperature), None)
-            }
+            // candle maps `(Some(temperature), top_p)` to `All` when top_p is
+            // `None` and to `TopP` (nucleus) when it is `Some`.
+            Sampling::Sample {
+                temperature,
+                top_p,
+                seed,
+            } => LogitsProcessor::new(seed, Some(temperature), top_p),
         }
     }
 
     /// Map a `(temperature, seed)` pair to a policy: a non-positive temperature
     /// is deterministic [`Greedy`](Sampling::Greedy) (the seed is ignored, per
-    /// SAM-2); a positive temperature is seeded [`Sample`](Sampling::Sample).
+    /// SAM-2); a positive temperature is seeded [`Sample`](Sampling::Sample) over
+    /// the full distribution (no nucleus).
     pub fn from_temperature(temperature: f64, seed: u64) -> Sampling {
+        Sampling::nucleus(temperature, None, seed)
+    }
+
+    /// Like [`from_temperature`](Sampling::from_temperature) but with optional
+    /// `top_p` nucleus sampling. A non-positive temperature is still
+    /// [`Greedy`](Sampling::Greedy).
+    pub fn nucleus(temperature: f64, top_p: Option<f64>, seed: u64) -> Sampling {
         if temperature <= 0.0 {
             Sampling::Greedy
         } else {
-            Sampling::Sample { temperature, seed }
+            Sampling::Sample {
+                temperature,
+                top_p,
+                seed,
+            }
         }
     }
 }
@@ -1479,9 +1503,20 @@ mod tests {
             Sampling::from_temperature(0.8, 7),
             Sampling::Sample {
                 temperature: 0.8,
+                top_p: None,
                 seed: 7
             }
         );
+        // nucleus carries top_p; non-positive temperature is still greedy.
+        assert_eq!(
+            Sampling::nucleus(0.6, Some(0.95), 7),
+            Sampling::Sample {
+                temperature: 0.6,
+                top_p: Some(0.95),
+                seed: 7
+            }
+        );
+        assert_eq!(Sampling::nucleus(0.0, Some(0.95), 7), Sampling::Greedy);
     }
 
     #[test]

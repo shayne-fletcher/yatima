@@ -34,8 +34,10 @@
 //!   partial directory never reaches [`Engine::load`] (gated e2e / fetch path).
 //!
 //! Generation:
-//! - **SAM-1** every [`Sampling`] maps to exactly one candle `LogitsProcessor`;
-//!   **SAM-2** `Greedy` ignores any seed.
+//! - **SAM-1** every [`Sampling`] maps to exactly one candle `LogitsProcessor`
+//!   (temperature, with optional `top_p` nucleus truncation); **SAM-2** `Greedy`
+//!   ignores any seed, while a seeded `Sample` is reproducible — the seed is
+//!   threaded through to the sampler (gated e2e `seeded_sampling_is_reproducible`).
 //! - **STOP-1** every successful generation returns exactly one [`StopReason`].
 //! - **GEN-3** a generation emits at most `max_tokens` tokens.
 //! - **GE-1** stateless: repeated `Greedy` runs on the same engine + prompt are
