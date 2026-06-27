@@ -316,6 +316,20 @@ async fn chat_repl<C: Completer, T: PromptTemplate>(
     Ok(())
 }
 
+/// Compose the agent's toolset: file tools under `root`, plus a `read_page` tool
+/// when a web origin is granted. Factored out so the capability wiring is
+/// unit-testable without loading a model.
+fn agent_tools(root: &std::path::Path, web_origin: Option<&str>) -> Result<Tools> {
+    let cap = Dir::new(root);
+    let mut tools = Tools::new()
+        .with(ReadFile::new(cap.clone()))
+        .with(ListDir::new(cap));
+    if let Some(origin) = web_origin {
+        tools = tools.with(ReadPage::new(WebOrigin::new(origin)?)?);
+    }
+    Ok(tools)
+}
+
 async fn agent(args: AgentArgs) -> Result<()> {
     let dir = ModelSource::from_args(
         args.model,
@@ -330,13 +344,7 @@ async fn agent(args: AgentArgs) -> Result<()> {
         Some(r) => r,
         None => std::env::current_dir()?,
     };
-    let cap = Dir::new(&root);
-    let mut tools = Tools::new()
-        .with(ReadFile::new(cap.clone()))
-        .with(ListDir::new(cap));
-    if let Some(origin) = &args.web_origin {
-        tools = tools.with(ReadPage::new(WebOrigin::new(origin)?)?);
-    }
+    let tools = agent_tools(&root, args.web_origin.as_deref())?;
 
     let opts = GenOpts {
         max_tokens: args.max_tokens,
@@ -478,6 +486,29 @@ async fn generate(args: GenerateArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_names(tools: &Tools) -> Vec<String> {
+        tools.specs().into_iter().map(|s| s.name).collect()
+    }
+
+    #[test]
+    fn agent_tools_have_no_web_access_without_origin() {
+        let names = tool_names(&agent_tools(std::path::Path::new("."), None).unwrap());
+        assert!(!names.iter().any(|n| n == "read_page"));
+    }
+
+    #[test]
+    fn agent_tools_grant_read_page_for_a_web_origin() {
+        let names = tool_names(
+            &agent_tools(std::path::Path::new("."), Some("https://example.com")).unwrap(),
+        );
+        assert!(names.iter().any(|n| n == "read_page"));
+    }
+
+    #[test]
+    fn agent_tools_reject_a_bad_web_origin() {
+        assert!(agent_tools(std::path::Path::new("."), Some("not a url")).is_err());
+    }
 
     #[test]
     fn chat_command_parses_optional_format() {

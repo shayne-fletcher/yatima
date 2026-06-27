@@ -139,6 +139,20 @@ mod tests {
     }
 
     #[test]
+    fn kimi_dev_is_a_single_file_qwen_gguf() {
+        // Kimi-Dev-72B is a Qwen2.5 finetune → ChatML/Qwen; the loader needs a
+        // single-file GGUF (the K-quants ship split, so we pin Q4_1).
+        let p = ModelProfile::builtin("kimi-dev").expect("kimi-dev is built in");
+        assert_eq!(p.format, Some(ChatFormat::Qwen));
+        assert!(p.repo.as_deref().unwrap().contains("Kimi-Dev-72B"));
+        let gguf = p.gguf.as_deref().expect("kimi-dev pins a gguf quant");
+        assert!(
+            gguf.ends_with(".gguf") && !gguf.contains("-of-"),
+            "expected a single-file gguf, got {gguf}"
+        );
+    }
+
+    #[test]
     fn to_source_is_repo_xor_dir() {
         // upholds: PROFILE-2 — a profile resolves to exactly one source.
         let repo = ModelProfile::builtin("gemma2").unwrap();

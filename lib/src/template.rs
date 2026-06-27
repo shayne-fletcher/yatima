@@ -337,6 +337,56 @@ mod tests {
         Ok(())
     }
 
+    // Coherence e2e: Kimi-Dev-72B (Qwen2.5 finetune, ChatML) follows a simple
+    // instruction and answers correctly — a guard against quantized/loader
+    // gibberish (cf. the GLM-4 prefill bug). Gated on `YATIMA_E2E=1` + the cached
+    // `kimi-dev` GGUF; skips otherwise. Heavy (~45 GB); run with
+    // `--features metal --nocapture`.
+    #[test]
+    fn e2e_kimi_dev_is_coherent() -> anyhow::Result<()> {
+        if std::env::var_os("YATIMA_E2E").is_none() {
+            eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+            return Ok(());
+        }
+        let dir = crate::model_dir(
+            &crate::models_root(),
+            &crate::ModelId::parse("unsloth/Kimi-Dev-72B-GGUF").unwrap(),
+        );
+        if !crate::is_model_present(&dir) {
+            eprintln!(
+                "skipping e2e: kimi-dev GGUF not cached at {}",
+                dir.display()
+            );
+            return Ok(());
+        }
+        let mut engine = crate::Engine::load(&dir, crate::device(false)?)?;
+        let prompt = ChatMlTemplate.render(&[turn(
+            Role::User,
+            "What is 2 + 2? Reply with only the number.",
+        )]);
+        let opts = crate::GenOpts {
+            max_tokens: 32,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        engine.generate(&prompt, &opts, |s| {
+            out.push_str(s);
+            Ok(())
+        })?;
+        eprintln!("kimi-dev → {out:?}");
+        // Coherence: a real, instruction-following answer — not gibberish or a
+        // runaway repetition loop.
+        assert!(
+            out.contains('4'),
+            "expected a coherent answer containing 4, got {out:?}"
+        );
+        assert!(
+            out.trim().len() < 200,
+            "expected a terse answer, got runaway output: {out:?}"
+        );
+        Ok(())
+    }
+
     // Multi-turn memory e2e: exercises exactly what the chat REPL does — push a
     // user turn, generate, append the answer, push a second user turn that refers
     // back, and re-render the *whole* transcript. Asserts the second answer
