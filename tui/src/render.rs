@@ -13,28 +13,82 @@ use yatima_lib::StopReason;
 
 use crate::app::{scroll_y, App, Entry};
 
-/// Braille spinner frames for the live activity indicator.
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// The animated glyph for an activity phase. Reasoning gets a HAL-ish red
+/// breathing **eye**; answering gets a green **pulse**. The frame advances on the
+/// redraw tick (from elapsed time), so it animates even when the model stalls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivitySkin {
+    Eye,
+    Pulse,
+}
 
-/// The live "the model is working, not hung" indicator (pure, so it is testable):
-/// an animated spinner, the phase (thinking vs answering), elapsed `m:ss`, and a
-/// token count. The spinner frame is derived from elapsed time so it animates on
-/// the periodic redraw tick even when the model stalls between tokens.
-pub fn activity_line(answering: bool, elapsed: Duration, frags: usize) -> String {
-    let frame = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
+const EYE: [&str; 6] = ["◌", "◎", "◉", "●", "◉", "◎"];
+const PULSE: [&str; 4] = ["·", "•", "●", "•"];
+
+impl ActivitySkin {
+    fn frames(self) -> &'static [&'static str] {
+        match self {
+            ActivitySkin::Eye => &EYE,
+            ActivitySkin::Pulse => &PULSE,
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            ActivitySkin::Eye => Color::Red,
+            ActivitySkin::Pulse => Color::Green,
+        }
+    }
+
+    /// The glyph for this moment, plus a style that *breathes*: bright + bold at
+    /// the open frames (`●`/`◉`/`•`), dim at the closed ones — so the eye pulses
+    /// in brightness, not just shape.
+    fn glyph(self, elapsed: Duration) -> (&'static str, Style) {
+        let frames = self.frames();
+        let glyph = frames[(elapsed.as_millis() / 180) as usize % frames.len()];
+        let open = matches!(glyph, "●" | "◉" | "•");
+        let style = Style::default().fg(self.color()).add_modifier(if open {
+            Modifier::BOLD
+        } else {
+            Modifier::DIM
+        });
+        (glyph, style)
+    }
+}
+
+/// The text trailing the activity glyph (pure; testable): phase, elapsed `m:ss`,
+/// token count, and the rate. The rate distinguishes "slow" (low but non-zero,
+/// e.g. a large model under memory pressure) from "stalled" (decaying toward 0).
+fn activity_text(answering: bool, elapsed: Duration, frags: usize) -> String {
     let secs = elapsed.as_secs();
     let phase = if answering { "answering" } else { "thinking" };
-    // Show the rate: it distinguishes "slow" (low but non-zero, e.g. a large
-    // model under memory pressure) from "stalled" (decaying toward 0), so a slow
-    // turn is never mistaken for a hang.
     let rate = frags as f64 / elapsed.as_secs_f64().max(0.1);
     format!(
-        "{frame} {phase}… · {}:{:02} · {} tok · {:.1} tok/s",
+        " {phase}… · {}:{:02} · {} tok · {:.1} tok/s",
         secs / 60,
         secs % 60,
         frags,
         rate
     )
+}
+
+/// The live "the model is working, not hung" indicator as styled spans: a
+/// breathing colored glyph (red eye = reasoning, green pulse = answering) and the
+/// phase/elapsed/tokens/rate, the whole line tinted by phase.
+fn activity_spans(answering: bool, elapsed: Duration, frags: usize) -> Vec<Span<'static>> {
+    let skin = if answering {
+        ActivitySkin::Pulse
+    } else {
+        ActivitySkin::Eye
+    };
+    let (glyph, glyph_style) = skin.glyph(elapsed);
+    vec![
+        Span::styled(glyph, glyph_style),
+        Span::styled(
+            activity_text(answering, elapsed, frags),
+            Style::default().fg(skin.color()),
+        ),
+    ]
 }
 
 /// Draw the whole UI for one frame.
@@ -168,10 +222,11 @@ fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     // While a turn is in flight, the input box title carries the live activity
-    // indicator (so it is unmistakably working, never apparently hung).
-    let title: String = match &app.in_flight {
-        Some(f) => activity_line(f.answering, f.started.elapsed(), f.frags),
-        None => "message".to_string(),
+    // indicator (a breathing colored glyph + stats) — unmistakably working,
+    // never apparently hung.
+    let title: Line = match &app.in_flight {
+        Some(f) => Line::from(activity_spans(f.answering, f.started.elapsed(), f.frags)),
+        None => Line::from("message"),
     };
     let busy = app.in_flight.is_some();
     let prompt = if busy {
@@ -180,19 +235,8 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         Style::default()
     };
     let body = format!("{}{}", app.input, if busy { "" } else { "▏" });
-    let title_style = if busy {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
     let paragraph = Paragraph::new(Span::styled(body, prompt))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(title, title_style)),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -243,16 +287,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activity_line_shows_phase_elapsed_and_tokens() {
-        let line = activity_line(false, Duration::from_secs(75), 812);
-        assert!(line.contains("thinking…"));
-        assert!(line.contains("1:15")); // 75s = 1:15
-        assert!(line.contains("812 tok"));
-        let line = activity_line(true, Duration::from_secs(3), 40);
-        assert!(line.contains("answering…"));
-        assert!(line.contains("0:03"));
-        // The rate is shown — the slow-vs-stalled signal.
-        assert!(line.contains("tok/s"));
+    fn activity_text_shows_phase_elapsed_tokens_and_rate() {
+        let t = activity_text(false, Duration::from_secs(75), 812);
+        assert!(t.contains("thinking…"));
+        assert!(t.contains("1:15")); // 75s = 1:15
+        assert!(t.contains("812 tok"));
+        assert!(t.contains("tok/s")); // the slow-vs-stalled signal
+        let t = activity_text(true, Duration::from_secs(3), 40);
+        assert!(t.contains("answering…"));
+        assert!(t.contains("0:03"));
+    }
+
+    #[test]
+    fn skin_is_phase_colored_and_breathes() {
+        // Reasoning = red eye, answering = green pulse.
+        assert_eq!(ActivitySkin::Eye.color(), Color::Red);
+        assert_eq!(ActivitySkin::Pulse.color(), Color::Green);
+        // The glyph advances with time (animates on the redraw tick), and the
+        // open frames are bold while the closed ones are dim (it breathes).
+        let (g0, _) = ActivitySkin::Eye.glyph(Duration::from_millis(0)); // ◌ (closed)
+        let (g3, s3) = ActivitySkin::Eye.glyph(Duration::from_millis(3 * 180)); // ● (open)
+        assert_ne!(g0, g3, "the eye glyph should change over time");
+        assert!(
+            s3.add_modifier.contains(Modifier::BOLD),
+            "open frame is bold"
+        );
     }
 
     #[test]
@@ -263,18 +322,5 @@ mod tests {
             "ctx 2.1k/32.8k"
         );
         assert_eq!(context_label(Some(512), None).unwrap(), "ctx 512");
-    }
-
-    #[test]
-    fn spinner_animates_with_elapsed_time() {
-        // Different elapsed → (generally) different spinner frame, so the
-        // indicator visibly moves on the redraw tick even between tokens.
-        let a = activity_line(false, Duration::from_millis(0), 0);
-        let b = activity_line(false, Duration::from_millis(500), 0);
-        assert_ne!(
-            a.chars().next(),
-            b.chars().next(),
-            "spinner frame should advance with time"
-        );
     }
 }
