@@ -342,6 +342,69 @@ fn total_physical_memory() -> Option<u64> {
     }
 }
 
+/// This process's resident memory, in bytes — best effort. `None` if it can't be
+/// determined, in which case the runtime guard is skipped rather than guessing.
+/// On unified-memory Macs this includes wired GPU (Metal) allocations, which is
+/// exactly the footprint that can drive the machine into swap during decode.
+fn process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // `ps -o rss=` reports resident set in KiB for this pid.
+        let pid = std::process::id().to_string();
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .ok()?;
+        let kib: u64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
+        Some(kib.saturating_mul(1024))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // statm field 2 (resident) is in pages; multiply by the page size.
+        let text = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages: u64 = text.split_whitespace().nth(1)?.parse().ok()?;
+        let page = 4096u64; // the near-universal Linux page size
+        Some(resident_pages.saturating_mul(page))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Refuse to *start a turn* when this process's live footprint already exceeds
+/// the safe fraction of RAM (MEM-2). MEM-1 guards the static weight size at load,
+/// but the working set grows during decode (KV cache, activations, and — on
+/// unified-memory Macs — Metal allocations that aren't fully reclaimed between
+/// turns). Without this, a second turn can tip an already-large model into swap
+/// and hang the machine (the UI loop stops being scheduled; even Ctrl+C can't get
+/// through). The predicate is the same as MEM-1's ([`exceeds_safe_memory`]),
+/// applied to the live RSS instead of the file size. Skipped when RAM or RSS is
+/// unknown, or when `YATIMA_ALLOW_OVERSIZED_MODEL` is set; checked *before* any
+/// allocation for the turn.
+fn check_runtime_memory_budget() -> Result<()> {
+    if std::env::var_os("YATIMA_ALLOW_OVERSIZED_MODEL").is_some() {
+        return Ok(());
+    }
+    let (Some(total), Some(rss)) = (total_physical_memory(), process_rss_bytes()) else {
+        return Ok(());
+    };
+    if exceeds_safe_memory(rss, total) {
+        let safe = (total as f64 * MEMORY_SAFE_FRACTION) as u64;
+        bail!(
+            "this process is using ~{:.0} GiB of {:.0} GiB RAM — past the ~{:.0} \
+             GiB safe limit. Starting another turn risks exhausting memory and \
+             hanging the machine, so it is refused. Use /reset to shrink history, \
+             restart with a smaller model/quant, or lower --max-tokens. Override \
+             with YATIMA_ALLOW_OVERSIZED_MODEL=1 (at your own risk).",
+            gib(rss),
+            gib(total),
+            gib(safe)
+        );
+    }
+    Ok(())
+}
+
 /// The total size of a model's weight files, in bytes (best effort).
 fn weight_files_bytes(paths: &[PathBuf]) -> u64 {
     paths
@@ -1046,6 +1109,10 @@ impl Engine {
             default_prefill_chunk = ?self.default_prefill_chunk()
         );
         let _enter = span.enter();
+        // MEM-2: refuse a turn whose start already sits past the safe memory
+        // budget, before touching the model — a second large turn can otherwise
+        // tip a unified-memory machine into swap and hang it.
+        check_runtime_memory_budget()?;
         self.model.reset()?;
 
         let mut stream = TokenOutputStream::new(self.tokenizer.clone());
@@ -1620,6 +1687,18 @@ mod tests {
         );
         // Scales with the machine: 41 GiB is fine on a 256 GiB server.
         assert!(!exceeds_safe_memory(g(41), g(256)));
+        // MEM-2 reuses the same predicate against live RSS: a process resident at
+        // ~40 GiB on a 48 GiB machine is past the cliff and the next turn refused.
+        assert!(exceeds_safe_memory(g(40), g(48)), "runaway RSS is refused");
+    }
+
+    #[test]
+    fn process_rss_probe_is_plausible() {
+        // MEM-2's runtime guard needs a live footprint. On this platform the probe
+        // must return some non-zero resident size (this test process itself).
+        if let Some(rss) = process_rss_bytes() {
+            assert!(rss > 0, "resident set must be positive");
+        }
     }
 
     #[test]

@@ -36,6 +36,12 @@
 //!   physical RAM *before* allocating — an oversized model can exhaust memory and
 //!   hang the machine (a raised Metal `iogpu.wired_limit_mb` makes it worse).
 //!   Overridable with `YATIMA_ALLOW_OVERSIZED_MODEL`; skipped when RAM is unknown.
+//! - **MEM-2** [`Engine::generate_with`] refuses to *start a turn* when this
+//!   process's live resident footprint already exceeds the same safe fraction of
+//!   RAM — the working set grows during decode (KV cache, activations, and Metal
+//!   allocations not reclaimed between turns), so a later turn can tip the machine
+//!   into swap and hang it even when the static weights fit. Same predicate as
+//!   MEM-1 applied to live RSS; same override; skipped when RAM/RSS is unknown.
 //!
 //! Generation:
 //! - **SAM-1** every [`Sampling`] maps to exactly one candle `LogitsProcessor`
