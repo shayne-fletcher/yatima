@@ -27,7 +27,7 @@ use crate::completer::Completer;
 use crate::reasoning::{split_reasoning, Reasoned};
 use crate::template::PromptTemplate;
 use crate::transcript::{Role, Turn};
-use crate::{GenOpts, StopReason};
+use crate::{Cancel, GenOpts, StopReason};
 use anyhow::Result;
 
 /// A stateful, tool-free conversation over a [`Completer`] and a
@@ -134,6 +134,20 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         user: &str,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<&str> {
+        self.turn_streaming_cancellable_async(user, &Cancel::new(), on_token)
+            .await
+    }
+
+    /// [`turn_streaming_async`](ChatSession::turn_streaming_async) with a
+    /// [`Cancel`] handle the caller can flip to stop the turn in flight (TUI-6).
+    /// On cancel the turn ends with [`StopReason::Stopped`] and the partial reply
+    /// is stored like any other completed turn (history stays clean per REASON-1).
+    pub async fn turn_streaming_cancellable_async(
+        &mut self,
+        user: &str,
+        cancel: &Cancel,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<&str> {
         self.turns.push(Turn {
             role: Role::User,
             content: user.to_string(),
@@ -145,7 +159,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         // stays clean, so the next turn re-renders consistent prompt history.
         let completion = match self
             .completer
-            .complete_streaming(&prompt, &self.opts, &[], on_token)
+            .complete_streaming(&prompt, &self.opts, &[], cancel, on_token)
             .await
         {
             Ok(completion) => completion,
@@ -170,6 +184,17 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
     /// Sync shim over [`turn_streaming_async`](ChatSession::turn_streaming_async).
     pub fn turn_streaming(&mut self, user: &str, on_token: &mut dyn FnMut(&str)) -> Result<&str> {
         crate::runtime::block_on(self.turn_streaming_async(user, on_token))
+    }
+
+    /// Sync shim over
+    /// [`turn_streaming_cancellable_async`](ChatSession::turn_streaming_cancellable_async).
+    pub fn turn_streaming_cancellable(
+        &mut self,
+        user: &str,
+        cancel: &Cancel,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<&str> {
+        crate::runtime::block_on(self.turn_streaming_cancellable_async(user, cancel, on_token))
     }
 
     /// Why the most recent turn stopped (EOS / max tokens / cancelled), or

@@ -62,7 +62,7 @@
 //! reach for return-type-notation or `trait_variant`, not now.
 
 use crate::runtime::{run_blocking_island, BlockingIsland};
-use crate::{Engine, GenOpts, StopReason};
+use crate::{Cancel, Engine, GenOpts, StopReason};
 use anyhow::Result;
 use std::ops::ControlFlow;
 
@@ -108,14 +108,17 @@ pub trait Completer {
     }
 
     /// Like [`complete`](Completer::complete), but delivers text to `on_token` as
-    /// it is produced (for live UIs / streaming chat). The default emits the whole
-    /// completion once — so every `Completer` works unchanged; backends that can
-    /// stream (e.g. [`Engine`]) override this to forward fragments incrementally.
+    /// it is produced (for live UIs / streaming chat) and polls `cancel` so a
+    /// caller can stop the turn in flight (a clean [`StopReason::Stopped`]). The
+    /// default emits the whole completion once — so every `Completer` works
+    /// unchanged; backends that can stream (e.g. [`Engine`]) override this to
+    /// forward fragments incrementally and honor `cancel` per token.
     async fn complete_streaming(
         &mut self,
         prompt: &str,
         opts: &GenOpts,
         stops: &[String],
+        _cancel: &Cancel,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion> {
         let completion = self.complete(prompt, opts, stops).await?;
@@ -138,8 +141,12 @@ impl Engine {
         opts: &GenOpts,
         stops: &[String],
     ) -> Result<Completion> {
-        let (text, generation) =
-            self.generate_with(prompt, opts, String::new(), |mut acc, fragment| {
+        let (text, generation) = self.generate_with(
+            prompt,
+            opts,
+            &Cancel::new(),
+            String::new(),
+            |mut acc, fragment| {
                 acc.push_str(fragment);
                 match first_stop_end(&acc, stops) {
                     Some(end) => {
@@ -148,7 +155,8 @@ impl Engine {
                     }
                     None => Ok(ControlFlow::Continue(acc)),
                 }
-            })?;
+            },
+        )?;
         Ok(Completion {
             text,
             stop: generation.stop,
@@ -161,13 +169,14 @@ impl Engine {
         prompt: &str,
         opts: &GenOpts,
         stops: &[String],
+        cancel: &Cancel,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion> {
         // Stream each newly-committed slice as it is decoded; never emit past a
         // stop marker (truncate to it, like `complete_on`).
         let mut emitted = 0usize;
         let (text, generation) =
-            self.generate_with(prompt, opts, String::new(), |mut acc, fragment| {
+            self.generate_with(prompt, opts, cancel, String::new(), |mut acc, fragment| {
                 acc.push_str(fragment);
                 let flow = match first_stop_end(&acc, stops) {
                     Some(end) => {
@@ -218,10 +227,11 @@ impl Completer for Engine {
         prompt: &str,
         opts: &GenOpts,
         stops: &[String],
+        cancel: &Cancel,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion> {
         run_blocking_island(|island| {
-            self.complete_streaming_on(island, prompt, opts, stops, on_token)
+            self.complete_streaming_on(island, prompt, opts, stops, cancel, on_token)
         })
     }
 }

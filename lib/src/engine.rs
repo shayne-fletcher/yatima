@@ -25,6 +25,7 @@ use candle_transformers::utils::apply_repeat_penalty;
 use tokenizers::Tokenizer;
 
 use crate::token_output_stream::TokenOutputStream;
+use crate::Cancel;
 
 /// The upstream qwen example's anti-repetition default; without it a
 /// temperature-0 raw *prose* completion of an instruction-tuned distill
@@ -1095,6 +1096,7 @@ impl Engine {
         &mut self,
         prompt: &str,
         opts: &GenOpts,
+        cancel: &Cancel,
         init: A,
         mut step: impl FnMut(A, &str) -> Result<ControlFlow<A, A>>,
     ) -> Result<(A, Generation)> {
@@ -1127,6 +1129,15 @@ impl Engine {
         let mut stop = StopReason::MaxTokens;
 
         for index in 0..opts.max_tokens {
+            // Cooperative cancellation (TUI-6): polled once per token, so a
+            // requested stop takes effect at the next token boundary — a clean
+            // StopReason::Stopped, with the partial output so far preserved. (A
+            // single in-flight `forward` is not interruptible, but decode emits
+            // tokens steadily, so this is prompt in practice.)
+            if cancel.is_cancelled() {
+                stop = StopReason::Stopped;
+                break;
+            }
             // Prefill the prompt on the first step, then feed one token at a
             // time; the model advances its own KV cache via `start_pos`.
             //
@@ -1208,10 +1219,11 @@ impl Engine {
         opts: &GenOpts,
         mut on_token: impl FnMut(&str) -> Result<()>,
     ) -> Result<Generation> {
-        let ((), generation) = self.generate_with(prompt, opts, (), |(), piece| {
-            on_token(piece)?;
-            Ok(ControlFlow::Continue(()))
-        })?;
+        let ((), generation) =
+            self.generate_with(prompt, opts, &Cancel::new(), (), |(), piece| {
+                on_token(piece)?;
+                Ok(ControlFlow::Continue(()))
+            })?;
         Ok(generation)
     }
 }
@@ -2041,6 +2053,7 @@ mod tests {
                 "Rust is a systems programming language that",
                 &opts,
                 &[],
+                &Cancel::new(),
                 &mut |piece| {
                     calls += 1;
                     acc.push_str(piece);

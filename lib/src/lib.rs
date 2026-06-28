@@ -152,6 +152,7 @@
 //!   poisons the session — a later turn re-renders clean history and succeeds.
 
 mod agent;
+mod cancel;
 mod capability;
 mod chat;
 mod completer;
@@ -165,6 +166,7 @@ mod tool;
 mod transcript;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
+pub use cancel::Cancel;
 pub use capability::{Dir, NtfyTopic, WebOrigin, WriteDir};
 pub use chat::ChatSession;
 pub use completer::{Completer, Completion};
