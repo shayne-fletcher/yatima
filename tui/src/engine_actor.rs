@@ -18,64 +18,28 @@
 //!   the actor is busy decoding (Slice 3 acts on it; Slice 1 plumbs it inert).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use yatima_lib::{
-    device, resolve_format, Arch, Channel, ChatFormat, ChatSession, Engine, GenOpts,
+    device, resolve_format, Arch, Cancel, Channel, ChatFormat, ChatSession, Engine, GenOpts,
     ReasoningSplitter, StopReason,
 };
 
 /// A turn identifier, monotonic per session. Lets the UI ignore stale events.
 pub type TurnId = u64;
 
-/// The per-turn **control plane** (shared memory, out-of-band). The UI flips
-/// `cancel`; the decode callback polls it mid-decode. `Arc<AtomicBool>` is the
-/// simplest correct first version for a flag crossing a plain OS thread and a
-/// sync callback; a `CancellationToken` is the drop-in upgrade later.
-#[derive(Clone)]
-pub struct TurnControl {
-    pub cancel: Arc<AtomicBool>,
-}
-
-impl TurnControl {
-    pub fn new() -> TurnControl {
-        TurnControl {
-            cancel: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Signal cancellation (Slice 3 — the decode callback cannot yet act on it).
-    #[allow(dead_code)]
-    pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
-    }
-
-    /// Whether cancellation has been requested.
-    #[allow(dead_code)]
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for TurnControl {
-    fn default() -> TurnControl {
-        TurnControl::new()
-    }
-}
-
 /// Request plane: UI → actor (queued; the actor blocks on it between turns).
 pub enum EngineRequest {
-    /// Run one turn. `control` is the per-turn control-plane handle (inert in
-    /// Slice 1).
+    /// Run one turn. `control` is the per-turn **control-plane** handle (shared
+    /// memory, out-of-band): the UI flips it and the decode loop polls it per
+    /// token, so a cancel is reachable while the actor is busy decoding (TUI-6).
     Submit {
         turn_id: TurnId,
         user: String,
-        control: TurnControl,
+        control: Cancel,
     },
     /// Clear the conversation back to the system prompt.
     Reset,
@@ -207,8 +171,8 @@ fn actor_main(
             EngineRequest::Submit {
                 turn_id,
                 user,
-                control: _control, // Slice 1: plumbed, inert (turn_streaming can't break yet).
-            } => run_turn(&mut session, &event_tx, format, turn_id, &user),
+                control,
+            } => run_turn(&mut session, &event_tx, format, turn_id, &user, &control),
             EngineRequest::Reset => session.reset(),
             EngineRequest::Shutdown => break,
         }
@@ -230,6 +194,7 @@ fn run_turn(
     format: ChatFormat,
     turn_id: TurnId,
     user: &str,
+    cancel: &Cancel,
 ) {
     let _ = event_tx.send(EngineEvent::Started { turn_id });
 
@@ -250,7 +215,7 @@ fn run_turn(
             });
         };
         session
-            .turn_streaming(user, &mut on_token)
+            .turn_streaming_cancellable(user, cancel, &mut on_token)
             .map(|answer| answer.to_string())
     };
     // `on_token` is dropped at the block end, releasing `splitter` so the tail

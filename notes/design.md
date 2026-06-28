@@ -32,10 +32,13 @@ swappable dependency.
   `tokio::spawn`. Three planes connect it to the async UI: a `std::sync::mpsc`
   **request** plane, a `tokio::sync::mpsc` **event** plane (the UI's only
   transcript truth; rendered as a *mirror*), and an out-of-band **control** plane
-  (a shared `Arc<AtomicBool>` per turn) so a cancel is reachable while the actor
-  is mid-decode. Its own `TUI-N` invariant registry (cursor-bounds, pure-render,
-  single-append, ui-liveness, single-in-flight) is in the crate doc. Built in
-  slices; Slice 1 is chat + streaming + the reasoning split.
+  (a shared `Cancel` per turn — the lib's cooperative cancellation flag) so a
+  cancel is reachable while the actor is mid-decode: the decode loop polls it per
+  token and stops at the next boundary (`StopReason::Stopped`, partial output
+  kept). Its own `TUI-N` invariant registry (cursor-bounds, pure-render,
+  single-append, ui-liveness, reasoning-foldable, prompt-cancel, single-in-flight)
+  is in the crate doc. Built in slices: Slice 1 chat + streaming + reasoning
+  split, Slice 2 foldable reasoning + context meter, Slice 3 Esc cancellation.
 
 ## Module layering (LAYER-1)
 

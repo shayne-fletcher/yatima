@@ -16,9 +16,9 @@ use futures::{Stream, StreamExt};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 use tokio::sync::mpsc::UnboundedReceiver;
-use yatima_lib::{Channel, StopReason};
+use yatima_lib::{Cancel, Channel, StopReason};
 
-use crate::engine_actor::{EngineEvent, EngineRequest, Ready, TurnControl, TurnId};
+use crate::engine_actor::{EngineEvent, EngineRequest, Ready, TurnId};
 use crate::render;
 
 /// One rendered transcript entry (the mirror; the actor's session is truth).
@@ -40,8 +40,11 @@ pub struct InFlight {
     /// Whether the answer channel has begun (vs still reasoning) — drives the
     /// "thinking" → "answering" phase in the activity indicator.
     pub answering: bool,
-    /// Control-plane handle (Slice 1: plumbed, inert).
-    pub control: TurnControl,
+    /// Whether a cancel has been requested for this turn (the decode stops at the
+    /// next token boundary; the indicator shows "cancelling…" until `Done`).
+    pub cancelling: bool,
+    /// Control-plane handle: flip it to cancel this turn in flight (TUI-6).
+    pub control: Cancel,
 }
 
 /// Status-bar facts.
@@ -61,6 +64,8 @@ pub enum Intent {
     None,
     Quit,
     Submit,
+    /// Request cancellation of the in-flight turn (TUI-6).
+    Cancel,
     Backspace,
     Insert(char),
     ScrollUp,
@@ -114,6 +119,7 @@ impl App {
             KeyCode::Char('c') if ctrl => Intent::Quit,
             KeyCode::Char('d') if ctrl => Intent::Quit,
             KeyCode::Char('r') if ctrl => Intent::ToggleReasoning,
+            KeyCode::Esc => Intent::Cancel,
             KeyCode::PageUp => Intent::ScrollUp,
             KeyCode::PageDown => Intent::ScrollDown,
             KeyCode::Enter => Intent::Submit,
@@ -133,6 +139,7 @@ impl App {
             Intent::None => {}
             Intent::Quit => self.should_quit = true,
             Intent::Submit => self.start_turn(),
+            Intent::Cancel => self.cancel_in_flight(),
             Intent::Backspace => {
                 self.input.pop();
             }
@@ -162,13 +169,14 @@ impl App {
         }
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
-        let control = TurnControl::new();
+        let control = Cancel::new();
         self.push_entry(Entry::User(user.clone()));
         self.in_flight = Some(InFlight {
             turn_id,
             started: Instant::now(),
             frags: 0,
             answering: false,
+            cancelling: false,
             control: control.clone(),
         });
         let _ = self.req_tx.send(EngineRequest::Submit {
@@ -178,6 +186,17 @@ impl App {
         });
         self.input.clear();
         self.scroll_back = 0; // jump to the latest
+    }
+
+    /// Request cancellation of the in-flight turn (TUI-6): flip the shared
+    /// control flag the decode loop polls. The turn stops at the next token
+    /// boundary and arrives as a normal `Done` with `StopReason::Stopped`; until
+    /// then the indicator shows "cancelling…". A no-op when nothing is in flight.
+    fn cancel_in_flight(&mut self) {
+        if let Some(f) = self.in_flight.as_mut() {
+            f.control.cancel();
+            f.cancelling = true;
+        }
     }
 
     /// The single transcript-append path (TUI-3).
@@ -363,6 +382,27 @@ mod tests {
     }
 
     #[test]
+    fn esc_cancels_the_in_flight_turn() {
+        // upholds: TUI-6 — Esc flips the shared control flag the decode loop polls
+        // and marks the turn "cancelling"; a no-op when nothing is in flight.
+        assert_eq!(App::classify(key(KeyCode::Esc)), Intent::Cancel);
+        let (mut app, _rx) = test_app();
+        app.apply(Intent::Cancel); // nothing in flight: harmless
+        assert!(app.in_flight.is_none());
+
+        app.input = "hi".into();
+        app.apply(Intent::Submit);
+        let control = app.in_flight.as_ref().unwrap().control.clone();
+        assert!(!control.is_cancelled());
+        app.apply(Intent::Cancel);
+        assert!(control.is_cancelled(), "Esc must flip the control flag");
+        assert!(
+            app.in_flight.as_ref().unwrap().cancelling,
+            "the turn is marked cancelling for the indicator"
+        );
+    }
+
+    #[test]
     fn scroll_y_is_always_in_bounds() {
         // upholds: TUI-1 — the displayed top row never exceeds the max scroll.
         for &(total, viewport, back) in &[
@@ -490,7 +530,8 @@ mod tests {
             started: Instant::now(),
             frags: 0,
             answering: false,
-            control: TurnControl::new(),
+            cancelling: false,
+            control: Cancel::new(),
         });
 
         let (event_tx, event_rx) = unbounded_channel();

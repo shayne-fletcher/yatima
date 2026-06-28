@@ -59,9 +59,17 @@ impl ActivitySkin {
 /// The text trailing the activity glyph (pure; testable): phase, elapsed `m:ss`,
 /// token count, and the rate. The rate distinguishes "slow" (low but non-zero,
 /// e.g. a large model under memory pressure) from "stalled" (decaying toward 0).
-fn activity_text(answering: bool, elapsed: Duration, frags: usize) -> String {
+/// A requested-but-not-yet-effected cancel shows "cancelling…" (the decode stops
+/// at the next token boundary), so the key press is never apparently ignored.
+fn activity_text(answering: bool, cancelling: bool, elapsed: Duration, frags: usize) -> String {
     let secs = elapsed.as_secs();
-    let phase = if answering { "answering" } else { "thinking" };
+    let phase = if cancelling {
+        "cancelling"
+    } else if answering {
+        "answering"
+    } else {
+        "thinking"
+    };
     let rate = frags as f64 / elapsed.as_secs_f64().max(0.1);
     format!(
         " {phase}… · {}:{:02} · {} tok · {:.1} tok/s",
@@ -75,7 +83,12 @@ fn activity_text(answering: bool, elapsed: Duration, frags: usize) -> String {
 /// The live "the model is working, not hung" indicator as styled spans: a
 /// breathing colored glyph (red eye = reasoning, green pulse = answering) and the
 /// phase/elapsed/tokens/rate, the whole line tinted by phase.
-fn activity_spans(answering: bool, elapsed: Duration, frags: usize) -> Vec<Span<'static>> {
+fn activity_spans(
+    answering: bool,
+    cancelling: bool,
+    elapsed: Duration,
+    frags: usize,
+) -> Vec<Span<'static>> {
     let skin = if answering {
         ActivitySkin::Pulse
     } else {
@@ -85,7 +98,7 @@ fn activity_spans(answering: bool, elapsed: Duration, frags: usize) -> Vec<Span<
     vec![
         Span::styled(glyph, glyph_style),
         Span::styled(
-            activity_text(answering, elapsed, frags),
+            activity_text(answering, cancelling, elapsed, frags),
             Style::default().fg(skin.color()),
         ),
     ]
@@ -225,7 +238,12 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     // indicator (a breathing colored glyph + stats) — unmistakably working,
     // never apparently hung.
     let title: Line = match &app.in_flight {
-        Some(f) => Line::from(activity_spans(f.answering, f.started.elapsed(), f.frags)),
+        Some(f) => Line::from(activity_spans(
+            f.answering,
+            f.cancelling,
+            f.started.elapsed(),
+            f.frags,
+        )),
         None => Line::from("message"),
     };
     let busy = app.in_flight.is_some();
@@ -243,7 +261,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.in_flight.is_some() {
-        "^C quit (cancel: soon)"
+        "Esc cancel · ^C quit"
     } else {
         "^C quit · /reset · ^R reasoning · PgUp/PgDn"
     };
@@ -288,14 +306,18 @@ mod tests {
 
     #[test]
     fn activity_text_shows_phase_elapsed_tokens_and_rate() {
-        let t = activity_text(false, Duration::from_secs(75), 812);
+        let t = activity_text(false, false, Duration::from_secs(75), 812);
         assert!(t.contains("thinking…"));
         assert!(t.contains("1:15")); // 75s = 1:15
         assert!(t.contains("812 tok"));
         assert!(t.contains("tok/s")); // the slow-vs-stalled signal
-        let t = activity_text(true, Duration::from_secs(3), 40);
+        let t = activity_text(true, false, Duration::from_secs(3), 40);
         assert!(t.contains("answering…"));
         assert!(t.contains("0:03"));
+        // A requested cancel overrides the phase word so the key isn't apparently
+        // ignored while the decode winds down to the next token boundary.
+        let t = activity_text(true, true, Duration::from_secs(3), 40);
+        assert!(t.contains("cancelling…"), "cancel shows in the indicator");
     }
 
     #[test]

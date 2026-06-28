@@ -28,11 +28,12 @@
 //! - **TUI-5 reasoning-foldable** — a completed turn's reasoning collapses to a
 //!   one-line summary (Ctrl+R toggles); the in-flight turn always streams it
 //!   live. The reasoning is never lost (REASON-1 carried into the UI).
+//! - **TUI-6 prompt-cancel** — Esc flips a shared [`Cancel`](yatima_lib::Cancel)
+//!   the decode loop polls per token; the turn stops at the next token boundary
+//!   as a clean `StopReason::Stopped`, partial output preserved, and the
+//!   indicator shows "cancelling…" until `Done`.
 //! - **TUI-7 single-in-flight** — at most one turn at a time; a submit while one
 //!   is active is a no-op.
-//!
-//! Deferred: TUI-6 prompt-cancel (Slice 3 — needs a stoppable streaming callback
-//! in the lib; the control plane is plumbed but inert here).
 
 pub mod app;
 pub mod engine_actor;
