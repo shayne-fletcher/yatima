@@ -20,6 +20,9 @@ use std::thread;
 use anyhow::Result;
 use clap::Parser;
 use eframe::egui;
+
+/// The yatima logo, embedded so the binary is self-contained.
+const LOGO_PNG: &[u8] = include_bytes!("../../images/logo.png");
 use yatima_lib::{
     device, resolve_format, Cancel, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile,
     ModelSource, Sampling,
@@ -271,11 +274,15 @@ struct GuiApp {
     /// A handle to the egui context, for uploading image artifacts as textures
     /// off the render path (in `drain_events`).
     ctx: egui::Context,
+    /// The yatima logo texture, shown as a splash while the transcript is empty.
+    logo: Option<egui::TextureHandle>,
     input: String,
     transcript: Vec<Msg>,
     /// The reply currently streaming in, if a turn is in flight.
     streaming: Option<String>,
     status: Status,
+    /// Opacity applied to image artifacts and the logo splash (live slider).
+    opacity: f32,
 }
 
 impl GuiApp {
@@ -285,15 +292,23 @@ impl GuiApp {
         let ctx = cc.egui_ctx.clone();
         let runner_ctx = ctx.clone();
         thread::spawn(move || runner(cfg, req_rx, ev_tx, runner_ctx));
+        let logo = decode_texture(&ctx, LOGO_PNG).ok();
         GuiApp {
             req_tx,
             ev_rx,
             ctx,
+            logo,
             input: String::new(),
             transcript: Vec::new(),
             streaming: None,
             status: Status::Loading,
+            opacity: 0.85,
         }
+    }
+
+    /// The tint applied to images at the current opacity.
+    fn image_tint(&self) -> egui::Color32 {
+        egui::Color32::from_white_alpha((self.opacity.clamp(0.0, 1.0) * 255.0).round() as u8)
     }
 
     fn in_flight(&self) -> bool {
@@ -369,6 +384,13 @@ impl eframe::App for GuiApp {
                     ui.spinner();
                     ui.label("answering…");
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.opacity, 0.0..=1.0)
+                            .text("opacity")
+                            .fixed_decimals(2),
+                    );
+                });
             });
         });
 
@@ -393,11 +415,28 @@ impl eframe::App for GuiApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // Empty transcript (loading / pre-first-message): the logo as a
+            // centered splash. It fades once the conversation starts.
+            if self.transcript.is_empty() && self.streaming.is_none() {
+                if let Some(logo) = &self.logo {
+                    let tint = self.image_tint();
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.16);
+                        ui.add(
+                            egui::Image::new(egui::load::SizedTexture::from_handle(logo))
+                                .max_width(360.0)
+                                .tint(tint),
+                        );
+                    });
+                }
+                return;
+            }
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
+                    let tint = self.image_tint();
                     for msg in &self.transcript {
-                        render_msg(ui, msg);
+                        render_msg(ui, msg, tint);
                     }
                     if let Some(buf) = &self.streaming {
                         speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
@@ -419,7 +458,7 @@ fn speaker(ui: &mut egui::Ui, who: &str, color: egui::Color32) {
     ui.label(egui::RichText::new(who).strong().color(color));
 }
 
-fn render_msg(ui: &mut egui::Ui, msg: &Msg) {
+fn render_msg(ui: &mut egui::Ui, msg: &Msg, image_tint: egui::Color32) {
     match msg {
         Msg::User(text) => {
             speaker(ui, "you", egui::Color32::LIGHT_BLUE);
@@ -437,7 +476,7 @@ fn render_msg(ui: &mut egui::Ui, msg: &Msg) {
                 ui.add(
                     egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                         .max_width(640.0)
-                        .tint(egui::Color32::from_white_alpha(217)),
+                        .tint(image_tint),
                 );
             });
         }
