@@ -189,11 +189,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                             },
                             Style::default().fg(Color::DarkGray),
                         )));
-                        push_wrapped(
-                            &mut lines,
-                            &prettify_math(reasoning),
-                            Style::default().add_modifier(Modifier::DIM),
-                        );
+                        lines.extend(render_reasoning(reasoning, inner_width));
                     } else {
                         lines.push(Line::from(Span::styled(
                             format!("▸ reasoning ({} lines · Ctrl+R)", reasoning.lines().count()),
@@ -656,7 +652,7 @@ fn render_answer(answer: &str, width: u16) -> Vec<Line<'static>> {
             while j < lines.len() && !is_code_fence(lines[j]) {
                 j += 1;
             }
-            out.extend(render_code_block(&lang, &lines[i + 1..j], width));
+            out.extend(render_code_block(&lang, &lines[i + 1..j], width, false));
             i = if j < lines.len() { j + 1 } else { j }; // skip the closing fence
             continue;
         }
@@ -680,6 +676,32 @@ fn render_answer(answer: &str, width: u16) -> Vec<Line<'static>> {
     }
     if !buf.is_empty() {
         out.extend(render_markdown_block(&buf.join("\n"), width));
+    }
+    out
+}
+
+/// Render the reasoning scratchpad: dim plain text (LaTeX prettified), but with
+/// fenced code blocks syntax-highlighted in muted form — code stays legible
+/// without competing with the answer.
+fn render_reasoning(reasoning: &str, width: u16) -> Vec<Line<'static>> {
+    let text = prettify_math(reasoning);
+    let lines: Vec<&str> = text.lines().collect();
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if is_code_fence(lines[i]) {
+            let lang = fence_lang(lines[i]);
+            let mut j = i + 1;
+            while j < lines.len() && !is_code_fence(lines[j]) {
+                j += 1;
+            }
+            out.extend(render_code_block(&lang, &lines[i + 1..j], width, true));
+            i = if j < lines.len() { j + 1 } else { j };
+        } else {
+            out.push(Line::from(Span::styled(lines[i].to_string(), dim)));
+            i += 1;
+        }
     }
     out
 }
@@ -784,8 +806,11 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
 
 /// Render a fenced code block: each line verbatim (indentation preserved), syntax
 /// highlighted via `syntect` with colors mapped to the 256-cube, and framed by a
-/// dim left gutter so the block reads as code distinct from prose.
-fn render_code_block(lang: &str, code: &[&str], width: u16) -> Vec<Line<'static>> {
+/// dim left gutter. In the answer pane (`muted == false`) the theme background
+/// tints the whole block so it reads as a panel; in the reasoning scratchpad
+/// (`muted == true`) the highlight is kept but dimmed and the panel tint dropped,
+/// so code stays subordinate to the answer.
+fn render_code_block(lang: &str, code: &[&str], width: u16, muted: bool) -> Vec<Line<'static>> {
     let ss = syntax_set();
     let syntax = (!lang.is_empty())
         .then(|| ss.find_syntax_by_token(lang))
@@ -794,11 +819,15 @@ fn render_code_block(lang: &str, code: &[&str], width: u16) -> Vec<Line<'static>
     let theme = code_theme();
     let mut hl = HighlightLines::new(syntax, theme);
 
-    // The theme's own background, mapped to the 256-cube, tints the whole block
-    // so it reads as a panel; every span carries it (incl. the padding).
-    let base = match theme.settings.background {
-        Some(c) => Style::default().bg(Color::Indexed(rgb_to_256(c.r, c.g, c.b))),
-        None => Style::default(),
+    // Answer: tint the whole block with the theme background (a panel). Reasoning:
+    // no tint, everything dimmed.
+    let base = if muted {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        match theme.settings.background {
+            Some(c) => Style::default().bg(Color::Indexed(rgb_to_256(c.r, c.g, c.b))),
+            None => Style::default(),
+        }
     };
 
     const GUTTER: &str = "▏ ";
@@ -815,9 +844,9 @@ fn render_code_block(lang: &str, code: &[&str], width: u16) -> Vec<Line<'static>
                     base.fg(Color::Indexed(rgb_to_256(fg.r, fg.g, fg.b))),
                 ));
             }
-            // Pad the rest of the row so the block's tint reads as a panel.
+            // Pad the row so the panel tint fills the width (only when tinted).
             let used = GUTTER.chars().count() + line.chars().count();
-            if used < body {
+            if !muted && used < body {
                 spans.push(Span::styled(" ".repeat(body - used), base));
             }
             Line::from(spans)
@@ -1265,6 +1294,43 @@ mod tests {
                 .flat_map(|l| &l.spans)
                 .any(|s| s.style.fg.is_some()),
             "syntax highlighting applied a color"
+        );
+    }
+
+    #[test]
+    fn reasoning_highlights_code_muted() {
+        let r = "let me try:\n\n```rust\nfn f() {}\n```\n\nthat works";
+        let lines = render_reasoning(r, 40);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("```")),
+            "fences consumed in reasoning: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("fn f()")), "code survives");
+        // The code line is highlighted (a colored span) AND muted (DIM).
+        let code_line = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("fn f()")
+            })
+            .expect("code line present");
+        assert!(
+            code_line.spans.iter().any(|s| s.style.fg.is_some()),
+            "reasoning code is highlighted"
+        );
+        assert!(
+            code_line
+                .spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            "reasoning code is muted (DIM)"
         );
     }
 
