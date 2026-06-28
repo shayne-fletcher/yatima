@@ -12,7 +12,8 @@
 
 use yatima_lib::{
     device, is_model_present, model_dir, models_root, split_reasoning, Channel, ChatFormat,
-    ChatMlTemplate, ChatSession, Engine, GenOpts, ModelId, ReasoningSplitter, Role, Turn,
+    ChatMlTemplate, ChatSession, Engine, GenOpts, ModelId, ModelProfile, ReasoningSplitter, Role,
+    Turn,
 };
 
 /// One coherence row: a cached model, the format to speak, a prompt, and what a
@@ -154,6 +155,77 @@ fn coherence_across_cached_models() -> anyhow::Result<()> {
     }
     for case in CASES {
         run_case(case)?;
+    }
+    Ok(())
+}
+
+/// Every built-in **reasoning profile** actually surfaces a reasoning channel
+/// when driven through the path the TUI uses: render with the profile's format,
+/// pick the splitter by [`ChatFormat::pre_seeds_reasoning`], and classify the
+/// output. This is the guard that catches a profile↔model format mismatch — the
+/// QwQ bug, where a pre-seeding model on a plain-`Qwen` (non-seeding) format ran
+/// the `new()` splitter and showed its reasoning as the answer (reasoning span
+/// empty). Pre-seed-vs-emit is a model behavior, so this needs the real model;
+/// gated, skips uncached profiles. (Kimi is skipped — MEM-1 would refuse it.)
+#[test]
+fn reasoning_profiles_surface_a_reasoning_channel() -> anyhow::Result<()> {
+    if !gated() {
+        eprintln!("skipping e2e: set YATIMA_E2E=1 to run");
+        return Ok(());
+    }
+    for name in ["deepseek-r1", "qwq"] {
+        let profile = ModelProfile::builtin(name).unwrap();
+        assert!(profile.reasoning, "{name} should be a reasoning profile");
+        // Resolve offline; skip if not cached.
+        let dir = match profile.to_source(true).and_then(|s| s.resolve()) {
+            Ok(dir) => dir,
+            Err(_) => {
+                eprintln!("skip {name}: not cached");
+                continue;
+            }
+        };
+        let format = profile.format().expect("a reasoning profile pins a format");
+        let mut engine = Engine::load(&dir, device(false)?)?;
+        let prompt = format.template().render(&[Turn {
+            role: Role::User,
+            content: "What is 2 + 2?".to_string(),
+        }]);
+        // A small budget suffices: with the right (seeded) splitter, the output so
+        // far is reasoning even before `</think>`; with the wrong (new) splitter
+        // it would all be answer.
+        let opts = GenOpts {
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        engine.generate(&prompt, &opts, |s| {
+            out.push_str(s);
+            Ok(())
+        })?;
+        // Classify exactly as the TUI does: splitter chosen by the format.
+        let mut splitter = if format.pre_seeds_reasoning() {
+            ReasoningSplitter::seeded()
+        } else {
+            ReasoningSplitter::new()
+        };
+        let mut reasoning = String::new();
+        splitter.push(&out, |ch, t| {
+            if ch == Channel::Reasoning {
+                reasoning.push_str(t);
+            }
+        });
+        splitter.finish(|ch, t| {
+            if ch == Channel::Reasoning {
+                reasoning.push_str(t);
+            }
+        });
+        eprintln!("{name} ({format:?}): reasoning_chars={}", reasoning.len());
+        assert!(
+            !reasoning.trim().is_empty(),
+            "{name} ({format:?}) surfaced NO reasoning — profile/format mismatch \
+             (e.g. a pre-seeding model on a non-seeding format). raw: {:?}",
+            out.chars().take(80).collect::<String>()
+        );
     }
     Ok(())
 }

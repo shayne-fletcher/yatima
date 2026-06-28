@@ -404,8 +404,20 @@ Gemma-3, StarCoder2, GLM-4, DeepSeek-V2/V3** (safetensors) plus
 **GGUF/quantized** Qwen2, Qwen3, Qwen3-MoE, Llama, Gemma-3, and GLM-4 (DeepSeek
 is safetensors-only — candle has no quantized DeepSeek loader). This covers
 *loading + `generate`* for all, and `chat` for those with a chat template
-(Qwen/Gemma/GLM/Mistral/DeepSeek; the rest fall back to Plain); the **agent**
-path still assumes the Qwen/ChatML tool format.
+(Qwen/Gemma/GLM/Mistral/DeepSeek/QwenThink; the rest fall back to Plain); the
+**agent** path still assumes the Qwen/ChatML tool format.
+
+**Reasoning formats — pre-seed vs emit.** A reasoning model either *emits* the
+`<think>` opener itself (Kimi's `◁think▷`; classified by the `new()` splitter) or
+*pre-seeds* it in the prompt and emits only the closing `</think>` (DeepSeek,
+QwQ-32B; classified by the `seeded()` splitter). A format declares which via
+`ChatFormat::pre_seeds_reasoning`, and this MUST agree with whether its template
+seeds `<think>` — a pure test (`pre_seeds_matches_template`) enforces it. QwQ-32B
+is ChatML **+** a pre-seeded `<think>` (`ChatFormat::QwenThink` /
+`ChatMlThinkTemplate`), distinct from plain `Qwen`; using plain `Qwen` for it
+showed the reasoning *as the answer* (the bug this guard now prevents). A gated
+e2e (`reasoning_profiles_surface_a_reasoning_channel`) runs each reasoning
+profile and asserts its reasoning channel actually fires.
 
 The R1 *distills* (DeepSeek-R1-Distill-Qwen/-Llama) are a subtlety: they are
 Qwen2/Llama **arch** but trained on DeepSeek's **format**, so the arch default

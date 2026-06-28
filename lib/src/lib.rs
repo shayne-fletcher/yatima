@@ -175,8 +175,8 @@ pub use host::{
 pub use reasoning::{split_reasoning, strip_reasoning, Channel, Reasoned, ReasoningSplitter};
 pub use runtime::run_blocking;
 pub use template::{
-    ChatMlTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate, MistralTemplate, PlainTemplate,
-    PromptTemplate,
+    ChatMlTemplate, ChatMlThinkTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate,
+    MistralTemplate, PlainTemplate, PromptTemplate,
 };
 pub use tool::{
     JsonToolCall, ListDir, QwenToolCall, ReadFile, ReadPage, ReadUrl, SendNotification, Tool,

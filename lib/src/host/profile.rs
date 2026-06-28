@@ -102,7 +102,11 @@ impl ModelProfile {
                 ..p(
                     "bartowski/Qwen_QwQ-32B-GGUF",
                     Some("Qwen_QwQ-32B-Q4_K_M.gguf"),
-                    ChatFormat::Qwen,
+                    // QwenThink, not Qwen: QwQ's template pre-seeds `<think>`, so
+                    // its output carries only the close marker — the seeded
+                    // splitter classifies it (a plain-Qwen format would mis-show
+                    // the reasoning as the answer).
+                    ChatFormat::QwenThink,
                 )
             },
             "deepseek-r1" => ModelProfile {

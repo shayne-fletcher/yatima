@@ -5,8 +5,8 @@
 //! taking a CLI dependency.
 
 use crate::{
-    Arch, ChatMlTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate, MistralTemplate,
-    PlainTemplate, PromptTemplate,
+    Arch, ChatMlTemplate, ChatMlThinkTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate,
+    MistralTemplate, PlainTemplate, PromptTemplate,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -28,6 +28,11 @@ pub enum ChatFormat {
     /// DeepSeek-V2/V3 and R1 distills: `<｜begin▁of▁sentence｜>…<｜User｜>…
     /// <｜Assistant｜><think>` (chat only; reasoning model).
     DeepSeek,
+    /// ChatML with a pre-seeded `<think>` cue — reasoning Qwen models (QwQ-32B,
+    /// Qwen3 thinking). Same turns as `Qwen`, but the assistant cue is
+    /// `<|im_start|>assistant\n<think>\n`, so the model emits only the closing
+    /// `</think>` (chat only; reasoning model).
+    QwenThink,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
     Plain,
 }
@@ -35,7 +40,15 @@ pub enum ChatFormat {
 impl ChatFormat {
     /// Every format's name, in declaration order — the accepted spellings for
     /// [`FromStr`] and a ready-made list for a CLI `PossibleValuesParser`.
-    pub const NAMES: [&'static str; 6] = ["qwen", "gemma", "mistral", "glm", "deepseek", "plain"];
+    pub const NAMES: [&'static str; 7] = [
+        "qwen",
+        "gemma",
+        "mistral",
+        "glm",
+        "deepseek",
+        "qwen-think",
+        "plain",
+    ];
 
     /// The lowercase name (the inverse of [`FromStr`]).
     pub fn name(self) -> &'static str {
@@ -45,6 +58,7 @@ impl ChatFormat {
             ChatFormat::Mistral => "mistral",
             ChatFormat::Glm => "glm",
             ChatFormat::DeepSeek => "deepseek",
+            ChatFormat::QwenThink => "qwen-think",
             ChatFormat::Plain => "plain",
         }
     }
@@ -57,6 +71,7 @@ impl ChatFormat {
             ChatFormat::Mistral => Box::new(MistralTemplate),
             ChatFormat::Glm => Box::new(GlmTemplate),
             ChatFormat::DeepSeek => Box::new(DeepSeekTemplate),
+            ChatFormat::QwenThink => Box::new(ChatMlThinkTemplate),
             ChatFormat::Plain => Box::new(PlainTemplate),
         }
     }
@@ -70,11 +85,13 @@ impl ChatFormat {
 
     /// Whether this format's generation cue pre-seeds the reasoning opener (so a
     /// model's output begins *inside* the think block and carries only the close
-    /// marker). `DeepSeek` does (`<｜Assistant｜><think>`). A streaming host uses
-    /// this to pick [`ReasoningSplitter::seeded`](crate::ReasoningSplitter::seeded)
-    /// over [`new`](crate::ReasoningSplitter::new).
+    /// marker). `DeepSeek` and `QwenThink` do. A streaming host uses this to pick
+    /// [`ReasoningSplitter::seeded`](crate::ReasoningSplitter::seeded) over
+    /// [`new`](crate::ReasoningSplitter::new). It MUST agree with whether the
+    /// format's template seeds `<think>` — see the `pre_seeds_matches_template`
+    /// test (the consistency that prevents the QwQ-style mis-classification).
     pub fn pre_seeds_reasoning(self) -> bool {
-        matches!(self, ChatFormat::DeepSeek)
+        matches!(self, ChatFormat::DeepSeek | ChatFormat::QwenThink)
     }
 
     /// The format a model of this architecture speaks natively — the default a
@@ -94,6 +111,7 @@ impl FromStr for ChatFormat {
             "mistral" => Ok(ChatFormat::Mistral),
             "glm" => Ok(ChatFormat::Glm),
             "deepseek" => Ok(ChatFormat::DeepSeek),
+            "qwen-think" => Ok(ChatFormat::QwenThink),
             "plain" => Ok(ChatFormat::Plain),
             other => anyhow::bail!(
                 "unknown chat format {other:?}; expected one of {:?}",
@@ -253,8 +271,33 @@ mod tests {
             ChatFormat::Mistral,
             ChatFormat::Glm,
             ChatFormat::DeepSeek,
+            ChatFormat::QwenThink,
         ] {
             assert!(!fmt.supports_tools());
+        }
+    }
+
+    #[test]
+    fn pre_seeds_matches_template() {
+        // The guard that prevents the QwQ-style mis-classification: a format's
+        // `pre_seeds_reasoning()` must agree with whether its template actually
+        // seeds `<think>` in the cue. If they disagree, the streaming splitter is
+        // selected wrong (seeded vs new) and reasoning is mis-classified. Pure —
+        // no model needed; runs every commit, for every format.
+        for name in ChatFormat::NAMES {
+            let fmt: ChatFormat = name.parse().unwrap();
+            let rendered = fmt.template().render(&[Turn {
+                role: Role::User,
+                content: "hi".into(),
+            }]);
+            let template_seeds_think = rendered.trim_end().ends_with("<think>");
+            assert_eq!(
+                template_seeds_think,
+                fmt.pre_seeds_reasoning(),
+                "format {name}: template-seeds-<think> ({template_seeds_think}) must \
+                 equal pre_seeds_reasoning() ({})",
+                fmt.pre_seeds_reasoning()
+            );
         }
     }
 

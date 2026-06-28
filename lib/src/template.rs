@@ -58,23 +58,46 @@ pub struct ChatMlTemplate;
 
 impl PromptTemplate for ChatMlTemplate {
     fn render(&self, turns: &[Turn]) -> String {
-        let mut s = String::new();
-        for turn in turns {
-            match turn.role {
-                Role::System => block(&mut s, "system", &turn.content),
-                Role::User => block(&mut s, "user", &turn.content),
-                Role::Assistant => block(&mut s, "assistant", &turn.content),
-                Role::Tool => block(
-                    &mut s,
-                    "user",
-                    &format!("<tool_response>\n{}\n</tool_response>", turn.content),
-                ),
-            }
-        }
-        s.push_str(IM_START);
-        s.push_str("assistant\n");
-        s
+        render_chatml(turns, false)
     }
+}
+
+/// ChatML that **pre-seeds `<think>\n`** in the assistant cue — the format of
+/// reasoning Qwen models (QwQ-32B, Qwen3 in thinking mode), whose chat template
+/// ends `<|im_start|>assistant\n<think>\n`. Because the opener is in the prompt,
+/// the model emits only the *closing* `</think>`, so a host pairs this with
+/// [`crate::ReasoningSplitter::seeded`] (see
+/// [`ChatFormat::pre_seeds_reasoning`](crate::ChatFormat::pre_seeds_reasoning))
+/// to classify the stream (REASON-1).
+pub struct ChatMlThinkTemplate;
+
+impl PromptTemplate for ChatMlThinkTemplate {
+    fn render(&self, turns: &[Turn]) -> String {
+        render_chatml(turns, true)
+    }
+}
+
+/// Render ChatML turns; `seed_think` appends `<think>\n` to the assistant cue.
+fn render_chatml(turns: &[Turn], seed_think: bool) -> String {
+    let mut s = String::new();
+    for turn in turns {
+        match turn.role {
+            Role::System => block(&mut s, "system", &turn.content),
+            Role::User => block(&mut s, "user", &turn.content),
+            Role::Assistant => block(&mut s, "assistant", &turn.content),
+            Role::Tool => block(
+                &mut s,
+                "user",
+                &format!("<tool_response>\n{}\n</tool_response>", turn.content),
+            ),
+        }
+    }
+    s.push_str(IM_START);
+    s.push_str("assistant\n");
+    if seed_think {
+        s.push_str("<think>\n");
+    }
+    s
 }
 
 /// Append one `<|im_start|>{role}\n{content}<|im_end|>\n` block.

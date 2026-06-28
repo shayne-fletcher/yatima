@@ -65,14 +65,17 @@ real model of that family.
 | StarCoder2          | yes      | maybe | no          |
 | DeepSeek-V2/V3 ‡    | yes      | yes   | no          |
 
-**Reasoning models** (Kimi-Dev, the DeepSeek-R1 distills, Qwen3) emit an inline
+**Reasoning models** (QwQ-32B, Kimi-Dev, the DeepSeek-R1 distills) emit an inline
 chain-of-thought before their answer. yatima separates it: the trace is stripped
-from the answer and kept out of conversation history, and `yatima chat` dims it
-live (it never pollutes the reply or the next prompt). Run one with a profile —
-e.g. `--profile kimi-dev` or `--profile deepseek-r1` — which also raises the
-token budget so the think block isn't truncated. The R1 *distills* are Qwen2/Llama
-architecture trained on DeepSeek's format, so select it with `--format deepseek`
-(the `deepseek-r1` profile does this for you).
+from the answer and kept out of conversation history, and the chat UIs dim/fold
+it (it never pollutes the reply or the next prompt). Run one with a profile —
+**`--profile qwq`** (QwQ-32B, ~20 GB GGUF — the recommended reasoning model: a
+strong reasoner that fits comfortably) or `--profile deepseek-r1` — which also
+raises the token budget so the think block isn't truncated. Some reasoning models
+*pre-seed* the `<think>` opener in their prompt (QwQ → `qwen-think` format,
+DeepSeek → `deepseek`), emitting only the closing marker; others *emit* the
+opener themselves. The profiles pin the right format so the reasoning is
+classified either way.
 
 > **GGUF quant note:** candle reads standard quant types (`Q4_0/1`, `Q5_0/1`,
 > `Q8_0`, `Q2_K`–`Q6_K`) but **no i-quants** (`IQ*`). Many modern community GGUFs
