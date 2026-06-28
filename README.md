@@ -23,8 +23,6 @@ Rust control flow: fetch evidence, normalize it into typed values, ask a local
 model, then validate what it said against the data your program supplied. The
 inference engine is rented from [candle](https://github.com/huggingface/candle);
 weights are acquired by [`possum`](https://github.com/shayne-fletcher/possum).
-Kindred in spirit to Anil Madhavapeddy's
-[*Language Integrated LLMs as an OCaml Function*](https://anil.recoil.org/notes/language-integrated-llms).
 
 <p align="center">
   <img src="./images/yatima-tui.png" width="820" alt="yatima-tui: a QwQ-32B turn mid-answer, with the green answering indicator and Esc-to-cancel">
@@ -74,6 +72,8 @@ narrower by design (Qwen/ChatML today).
   observable async tools.
 - [Architecture](articles/architecture.md) — the generate/chat/agent layering,
   the runtime, and diagnostics.
+- [Relevant research](articles/relevant-research.md) — prior work that informs
+  yatima's shape.
 
 For the full invariant registry, state machines, and design rationale, see
 [notes/design.md](notes/design.md).
