@@ -77,6 +77,21 @@ DeepSeek → `deepseek`), emitting only the closing marker; others *emit* the
 opener themselves. The profiles pin the right format so the reasoning is
 classified either way.
 
+## Interactive TUI
+
+`yatima-tui` is an interactive terminal chat over a local model: streaming
+output, a live activity indicator (red eye while reasoning, green pulse while
+answering, with elapsed/tokens/rate so a slow model never looks hung), foldable
+reasoning (Ctrl+R), a context meter, and Esc-to-cancel an in-flight turn.
+
+<p align="center">
+  <img src="./images/yatima-tui.png" width="820" alt="yatima-tui: a QwQ-32B turn mid-answer, with the green answering indicator and Esc-to-cancel">
+</p>
+
+```bash
+cargo run -p yatima-tui --release --features metal -- --profile qwq
+```
+
 > **GGUF quant note:** candle reads standard quant types (`Q4_0/1`, `Q5_0/1`,
 > `Q8_0`, `Q2_K`–`Q6_K`) but **no i-quants** (`IQ*`). Many modern community GGUFs
 > embed `IQ4_NL` tensors and will fail to load (`unknown dtype 20`); pick a
