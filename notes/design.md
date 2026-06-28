@@ -850,3 +850,23 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **The Haskell study** — formalize the `generate` and agent contracts
   (GE/STOP/AGENT/CAP/PROTO/TMPL as propositions); the planned home for the
   recursion-scheme reading and `axiom`.
+- **A GPU frontend (the "render anything" direction).** The terminal frontend
+  has hard ceilings — no glyph shaping, RTL, proportional layout, typeset math,
+  or inline media; the emulator owns all of that. (Felt sharply when the model
+  wrote yatima's own name in Arabic, يَتِيمَة, which a TTY cannot shape — the
+  idle TUI title now carries it as a standing reminder.) The answer is a
+  **separate** frontend, not a TTY upgrade: a sibling edge (`yatima-gui`) over
+  `yatima-lib`, reusing the engine-actor's three planes unchanged (the actor is
+  already frontend-agnostic — preserve that as an invariant). Rust build path,
+  not a Haskell port: `wgpu` + `cosmic-text`/`glyphon` for shaped/bidi text,
+  `egui`/`makepad` for imgui-style controls, MSDF for crisp scaling. Beyond
+  rendering, the deeper bet is **live-tweak / incremental recomputation** — a
+  CBPV base where bindings are FRP cells and a salsa-style engine recomputes only
+  consequences (an always-consistent notebook; incremental LLM pipelines where a
+  changed prompt/param reruns one model call, not ten), with bounded memoization
+  (Kirisame-style cost eviction, matching MEM-1/2) and identity-tracked
+  interpolative animation for provenance ("see what came from what"). Prior art:
+  Ed Kmett's `codex`/Cadenza (commercialized as Enso) and acko.net/MathBox.
+  Large, separable, gated on a real trigger (typeset math, non-Latin scripts,
+  inline plots); the TUI stays the default. Detailed working notes live in the
+  (ephemeral, untracked) `plans/text-rendering.plan.md`.
