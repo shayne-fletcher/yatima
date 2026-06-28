@@ -1,6 +1,7 @@
 //! Pure rendering: `ui(frame, &App)` mutates nothing (TUI-2). The transcript,
 //! input box, and status bar are drawn as a projection of [`App`] state.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -8,6 +9,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 use yatima_lib::StopReason;
 
@@ -639,6 +643,23 @@ fn render_answer(answer: &str, width: u16) -> Vec<Line<'static>> {
     let mut buf: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
+        // A fenced code block: ``` (or ~~~) opens it, the same fence closes it.
+        // We render it ourselves (verbatim lines + syntax highlight) — leaving it
+        // to the Markdown pass collapses the newlines and leaks the fences.
+        if is_code_fence(lines[i]) {
+            if !buf.is_empty() {
+                out.extend(render_markdown_block(&buf.join("\n"), width));
+                buf.clear();
+            }
+            let lang = fence_lang(lines[i]);
+            let mut j = i + 1;
+            while j < lines.len() && !is_code_fence(lines[j]) {
+                j += 1;
+            }
+            out.extend(render_code_block(&lang, &lines[i + 1..j], width));
+            i = if j < lines.len() { j + 1 } else { j }; // skip the closing fence
+            continue;
+        }
         // A GFM table starts with a `|`-bearing header row immediately followed
         // by a separator row (dashes/colons), and runs while rows carry `|`.
         if i + 1 < lines.len() && lines[i].contains('|') && is_table_separator(lines[i + 1]) {
@@ -694,6 +715,114 @@ fn render_markdown_block(text: &str, width: u16) -> Vec<Line<'static>> {
         ));
     }
     out
+}
+
+/// Whether `line` opens or closes a fenced code block (``` or ~~~).
+fn is_code_fence(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("```") || t.starts_with("~~~")
+}
+
+/// The language token on a fence line (` ```rust ` → `rust`), lowercased.
+fn fence_lang(line: &str) -> String {
+    line.trim()
+        .trim_start_matches(['`', '~'])
+        .trim()
+        .to_lowercase()
+}
+
+/// The default syntax/theme sets, loaded once. `nonewlines` matches our
+/// line-at-a-time highlighting (we split the block and strip the `\n`).
+fn syntax_set() -> &'static SyntaxSet {
+    static SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SET.get_or_init(SyntaxSet::load_defaults_nonewlines)
+}
+
+fn code_theme() -> &'static Theme {
+    static THEME: OnceLock<Theme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        let mut themes = ThemeSet::load_defaults().themes;
+        themes
+            .remove("base16-ocean.dark")
+            .or_else(|| themes.into_values().next())
+            .expect("syntect ships default themes")
+    })
+}
+
+/// Map a 24-bit color to the nearest xterm-256 index (the 6×6×6 cube or the
+/// grayscale ramp, whichever is closer). Terminals without truecolor — Apple
+/// Terminal among them — render indexed colors faithfully where they mangle RGB.
+fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let nearest = |v: u8| -> usize {
+        STEPS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &s)| (s as i32 - v as i32).abs())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    let (ri, gi, bi) = (nearest(r), nearest(g), nearest(b));
+    let cube_rgb = (STEPS[ri], STEPS[gi], STEPS[bi]);
+    let cube = 16 + 36 * ri + 6 * gi + bi;
+
+    let avg = (r as u32 + g as u32 + b as u32) / 3;
+    let gray_level = (avg.saturating_sub(8) / 10).min(23) as u8;
+    let gray_v = 8 + gray_level * 10;
+    let gray_idx = 232 + gray_level as usize;
+
+    let dist = |(ar, ag, ab): (u8, u8, u8)| {
+        let d = |x: u8, y: u8| (x as i32 - y as i32).pow(2);
+        d(ar, r) + d(ag, g) + d(ab, b)
+    };
+    if dist(cube_rgb) <= dist((gray_v, gray_v, gray_v)) {
+        cube as u8
+    } else {
+        gray_idx as u8
+    }
+}
+
+/// Render a fenced code block: each line verbatim (indentation preserved), syntax
+/// highlighted via `syntect` with colors mapped to the 256-cube, and framed by a
+/// dim left gutter so the block reads as code distinct from prose.
+fn render_code_block(lang: &str, code: &[&str], width: u16) -> Vec<Line<'static>> {
+    let ss = syntax_set();
+    let syntax = (!lang.is_empty())
+        .then(|| ss.find_syntax_by_token(lang))
+        .flatten()
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let theme = code_theme();
+    let mut hl = HighlightLines::new(syntax, theme);
+
+    // The theme's own background, mapped to the 256-cube, tints the whole block
+    // so it reads as a panel; every span carries it (incl. the padding).
+    let base = match theme.settings.background {
+        Some(c) => Style::default().bg(Color::Indexed(rgb_to_256(c.r, c.g, c.b))),
+        None => Style::default(),
+    };
+
+    const GUTTER: &str = "▏ ";
+    let body = width as usize;
+
+    code.iter()
+        .map(|line| {
+            let ranges = hl.highlight_line(line, ss).unwrap_or_default();
+            let mut spans = vec![Span::styled(GUTTER, base.fg(Color::Indexed(238)))];
+            for (style, text) in ranges {
+                let fg = style.foreground;
+                spans.push(Span::styled(
+                    text.to_string(),
+                    base.fg(Color::Indexed(rgb_to_256(fg.r, fg.g, fg.b))),
+                ));
+            }
+            // Pad the rest of the row so the block's tint reads as a panel.
+            let used = GUTTER.chars().count() + line.chars().count();
+            if used < body {
+                spans.push(Span::styled(" ".repeat(body - used), base));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Whether `line` is a GFM table separator row: dashes/colons and pipes only,
@@ -1102,6 +1231,59 @@ mod tests {
             texts.iter().any(|t| t.contains("┼")),
             "a header rule is drawn: {texts:?}"
         );
+    }
+
+    #[test]
+    fn answer_renders_fenced_code_verbatim_and_highlighted() {
+        let md = "intro\n\n```rust\nfn main() {\n    let x = 1;\n}\n```\n\nafter";
+        let lines = render_answer(md, 40);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("```")),
+            "fences are consumed: {texts:?}"
+        );
+        // Each code line survives on its own row (newlines preserved, not mashed).
+        assert!(texts.iter().any(|t| t.contains("fn main()")));
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("let x = 1;") && !t.contains("fn main")),
+            "code lines are not collapsed together: {texts:?}"
+        );
+        // Indentation is preserved.
+        assert!(
+            texts.iter().any(|t| t.contains("    let x = 1;")),
+            "leading indentation kept: {texts:?}"
+        );
+        // Highlighting produced styled (non-default) spans.
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg.is_some()),
+            "syntax highlighting applied a color"
+        );
+    }
+
+    #[test]
+    fn code_fence_helpers_parse() {
+        assert!(is_code_fence("```rust"));
+        assert!(is_code_fence("  ~~~"));
+        assert!(!is_code_fence("not code"));
+        assert_eq!(fence_lang("```rust"), "rust");
+        assert_eq!(fence_lang("```  Python "), "python");
+        assert_eq!(fence_lang("```"), "");
+    }
+
+    #[test]
+    fn rgb_to_256_maps_into_indexed_range() {
+        assert_eq!(rgb_to_256(0, 0, 0), 16); // cube origin
+        assert_eq!(rgb_to_256(255, 255, 255), 231); // cube apex
+        let mid = rgb_to_256(128, 128, 128);
+        assert!((16..=255).contains(&mid)); // some grayscale/cube index
     }
 
     #[test]

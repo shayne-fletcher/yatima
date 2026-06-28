@@ -35,3 +35,7 @@ tui-markdown = { version = "0.3.8", default-features = false }
 # ratatui 0.30 / crossterm 0.29; default features give the crossterm `Input`
 # conversion we feed key events through.
 tui-textarea = { package = "tui-textarea-2", version = "0.11" }
+# Syntax highlighting for fenced code blocks. `default-fancy` selects the
+# pure-Rust regex engine (no C oniguruma). We map its colors onto the 256-color
+# cube ourselves, so highlighting renders even on terminals without truecolor.
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
