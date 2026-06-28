@@ -198,34 +198,51 @@ fn fatal(ev_tx: &Sender<Ev>, ctx: &egui::Context, e: impl std::fmt::Display) {
     ctx.request_repaint();
 }
 
-/// Spike: produce a matplotlib chart as PNG bytes by shelling out to `python3`.
+/// The Python interpreter to use — the seam that, in a real `RunPython` tool,
+/// *is* the capability. Prefers `$YATIMA_PYTHON`, then a project `.venv` (the
+/// pinned environment the plan calls for), then system `python3`.
+fn python_interpreter() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("YATIMA_PYTHON") {
+        return p.into();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let venv = cwd.join(".venv/bin/python3");
+        if venv.exists() {
+            return venv;
+        }
+    }
+    "python3".into()
+}
+
+/// Spike: produce a matplotlib chart as PNG bytes by shelling out to Python.
 /// A stand-in for a real capability-scoped `RunPython` tool — enough to prove the
-/// artifact → egui-image path. Requires `python3` with `matplotlib`/`numpy`.
+/// artifact → egui-image path. Needs `numpy` + `matplotlib` (see the `.venv`).
 fn render_demo_chart() -> Result<Vec<u8>> {
     let out = std::env::temp_dir().join("yatima-gui-plot.png");
-    // Pure-`math` (no numpy) so it runs with just matplotlib installed.
-    let code = r#"import sys, math
+    let code = r#"import sys, numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-xs = [i * 2 * math.pi / 399 for i in range(400)]
+x = np.linspace(0, 2 * np.pi, 400)
 fig, ax = plt.subplots(figsize=(6, 4))
-ax.plot(xs, [math.sin(x) for x in xs], label="sin")
-ax.plot(xs, [math.cos(x) for x in xs], label="cos")
+ax.plot(x, np.sin(x), label="sin")
+ax.plot(x, np.cos(x), label="cos")
 ax.set_title("yatima-gui artifact spike")
 ax.legend()
 ax.grid(True, alpha=0.3)
 fig.savefig(sys.argv[1], dpi=120, bbox_inches="tight")
 "#;
-    let output = std::process::Command::new("python3")
+    let python = python_interpreter();
+    let output = std::process::Command::new(&python)
         .arg("-c")
         .arg(code)
         .arg(&out)
         .output()
-        .map_err(|e| anyhow::anyhow!("could not run python3: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not run {}: {e}", python.display()))?;
     if !output.status.success() {
         anyhow::bail!(
-            "python3/matplotlib failed: {}",
+            "{} (numpy/matplotlib) failed: {}",
+            python.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }

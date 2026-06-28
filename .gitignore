@@ -5,3 +5,4 @@ Cargo.lock
 *.pdb
 .DS_Store
 plans/
+.venv/
