@@ -23,7 +23,10 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # `unstable-rendered-line-info` exposes `Paragraph::line_count`, needed to
 # auto-follow streaming text: the scroll offset must be in *wrapped* rows, not
 # logical lines, or new output streams off-screen below the fold.
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Markdown → ratatui Text. default-features off drops the syntect code-highlight
+# stack (heavy); we render structure (headings, bold, lists, rules), not syntax.
+tui-markdown = { version = "0.3.8", default-features = false }

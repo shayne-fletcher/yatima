@@ -295,6 +295,9 @@ pub async fn run_loop<B, S>(
 ) -> Result<()>
 where
     B: Backend,
+    // ratatui 0.30 made `Backend::Error` an associated type; `?` into `anyhow`
+    // needs it to be a `Send + Sync + 'static` std error.
+    B::Error: std::error::Error + Send + Sync + 'static,
     S: Stream<Item = io::Result<Event>> + Unpin,
 {
     // A periodic tick redraws on a timer so the live activity indicator (spinner

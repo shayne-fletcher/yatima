@@ -193,7 +193,11 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                         )));
                     }
                 }
-                push_wrapped(&mut lines, answer, Style::default());
+                // Render the answer as Markdown (headings, bold, lists, rules)
+                // rather than raw text. Partial Markdown mid-stream renders fine,
+                // so this works while the answer is still arriving. The reasoning
+                // scratchpad stays plain.
+                lines.extend(tui_markdown::from_str(answer).lines);
                 // Surface a non-EOS stop so a truncated / collapsed turn is not
                 // mistaken for a complete answer.
                 if let Some(note) = stop_note(*stop) {
@@ -250,8 +254,10 @@ fn stop_note(stop: Option<StopReason>) -> Option<&'static str> {
     }
 }
 
-/// Wrap a (possibly multi-line) string into styled `Line`s.
-fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
+/// Wrap a (possibly multi-line) string into styled `Line`s. Generic over the
+/// buffer lifetime so it composes with borrowed lines (the Markdown answer
+/// borrows the transcript); the owned lines it pushes coerce in.
+fn push_wrapped<'a>(lines: &mut Vec<Line<'a>>, text: &str, style: Style) {
     for line in text.split('\n') {
         lines.push(Line::from(Span::styled(line.to_string(), style)));
     }
@@ -393,6 +399,33 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn answer_markdown_is_rendered_not_raw() {
+        // The answer pane parses Markdown: emphasis is rendered (the `**` markup
+        // is consumed, the text styled) and the content survives. (tui-markdown
+        // keeps the `#` heading marker, styled, as a visual cue — that's fine.)
+        let text = tui_markdown::from_str("# Heading\n\nsome **bold** words");
+        let rendered: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(rendered.contains("Heading"), "heading text is kept");
+        assert!(rendered.contains("bold"), "emphasis text is kept");
+        assert!(
+            !rendered.contains("**"),
+            "the '**' emphasis markup is consumed, not shown raw"
+        );
+        // Some span carries a non-default style (the parse produced styling).
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style != Style::default()),
+            "markdown applied styling"
+        );
     }
 
     #[test]
