@@ -139,6 +139,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
+    let inner_width = area.width.saturating_sub(2); // borders
     let mut lines: Vec<Line> = Vec::new();
     let last = app.transcript.len().saturating_sub(1);
     for (idx, entry) in app.transcript.iter().enumerate() {
@@ -197,7 +198,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 // rather than raw text. Partial Markdown mid-stream renders fine,
                 // so this works while the answer is still arriving. The reasoning
                 // scratchpad stays plain.
-                lines.extend(tui_markdown::from_str(answer).lines);
+                lines.extend(render_answer(answer, inner_width));
                 // Surface a non-EOS stop so a truncated / collapsed turn is not
                 // mistaken for a complete answer.
                 if let Some(note) = stop_note(*stop) {
@@ -221,7 +222,6 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let inner_width = area.width.saturating_sub(2); // borders
     let viewport = area.height.saturating_sub(2) as usize; // borders
 
     // The "yatima" label carries the live UI state (a cute aurora runner).
@@ -242,6 +242,52 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let top = scroll_y(total_rows, viewport, app.scroll_back);
     let paragraph = paragraph.scroll((top as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// Render the assistant's answer as Markdown lines. `tui-markdown` handles
+/// emphasis, lists and inline styling; we post-process the two things it leaves
+/// raw: strip the leading `#` from ATX headings (keeping the color it applied)
+/// and turn a thematic break (`---`/`***`/`___`) into a rule drawn across `width`.
+fn render_answer(answer: &str, width: u16) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in tui_markdown::from_str(answer).lines {
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let trimmed = plain.trim();
+        // Thematic break: a line of only -, * or _ (three or more).
+        if trimmed.len() >= 3 && trimmed.chars().all(|c| matches!(c, '-' | '*' | '_')) {
+            out.push(Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+        // Heading: strip the `#` markers, keep tui-markdown's heading style.
+        if let Some(text) = heading_text(&plain) {
+            let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+            out.push(Line::from(Span::styled(text, style)));
+            continue;
+        }
+        // Otherwise keep tui-markdown's rendering (owned so the line is 'static).
+        out.push(Line::from(
+            line.spans
+                .into_iter()
+                .map(|s| Span::styled(s.content.into_owned(), s.style))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    out
+}
+
+/// The text of a Markdown ATX heading (`## Title` → `Title`), or `None` if the
+/// line is not a heading.
+fn heading_text(line: &str) -> Option<String> {
+    let s = line.trim_start();
+    let hashes = s.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && s[hashes..].starts_with(' ') {
+        Some(s[hashes..].trim().to_string())
+    } else {
+        None
+    }
 }
 
 /// A short note for a non-`Eos` stop reason, or `None` for a clean finish.
@@ -425,6 +471,38 @@ mod tests {
                 .flat_map(|l| &l.spans)
                 .any(|s| s.style != Style::default()),
             "markdown applied styling"
+        );
+    }
+
+    #[test]
+    fn heading_text_parses_atx() {
+        assert_eq!(heading_text("### 1. Carbon").as_deref(), Some("1. Carbon"));
+        assert_eq!(heading_text("# Title").as_deref(), Some("Title"));
+        assert_eq!(heading_text("no heading"), None);
+        assert_eq!(heading_text("####### too many"), None); // 7 hashes isn't a heading
+        assert_eq!(heading_text("#nospace"), None);
+    }
+
+    #[test]
+    fn answer_strips_heading_hashes_and_draws_rules() {
+        let lines = render_answer("### Heading\n\n---\n\nbody **x**", 12);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            texts.iter().all(|t| !t.contains('#')),
+            "no '#' markup leaks through: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Heading")),
+            "heading text survives"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.chars().filter(|&c| c == '─').count() >= 3),
+            "a thematic break becomes a drawn rule: {texts:?}"
         );
     }
 
