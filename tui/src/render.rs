@@ -13,47 +13,64 @@ use yatima_lib::StopReason;
 
 use crate::app::{scroll_y, App, Entry};
 
-/// The animated glyph for an activity phase. Reasoning gets a HAL-ish red
-/// breathing **eye**; answering gets a green **pulse**. The frame advances on the
-/// redraw tick (from elapsed time), so it animates even when the model stalls.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ActivitySkin {
-    Eye,
-    Pulse,
+// Aurora — northern-lights greens, teals, blues and violets shimmering to pink,
+// over the 256-color cube (not 24-bit RGB, so it renders in Apple Terminal,
+// which has no truecolor). The one palette the live UI animates with. The ramp
+// is *ping-ponged*, so the open ends shimmer back and forth instead of jumping.
+const AURORA: [u8; 12] = [48, 43, 50, 51, 45, 39, 33, 63, 99, 141, 177, 213];
+const COLOR_STEP_MS: u128 = 140;
+
+// A single quadrant orbiting the cell corners — the activity glyph, a smooth
+// spin in the logo's block idiom.
+const ORBIT: [&str; 4] = ["▘", "▝", "▗", "▖"];
+
+/// The orbit glyph for this moment.
+fn orbit_glyph(elapsed: Duration) -> &'static str {
+    ORBIT[(elapsed.as_millis() / 180) as usize % ORBIT.len()]
 }
 
-const EYE: [&str; 6] = ["◌", "◎", "◉", "●", "◉", "◎"];
-const PULSE: [&str; 4] = ["·", "•", "●", "•"];
+/// An aurora color sampled at position `pos` along the (ping-ponged) ramp.
+fn aurora_at(pos: usize) -> Color {
+    let n = AURORA.len();
+    let period = 2 * (n - 1);
+    let t = pos % period;
+    let i = if t < n { t } else { period - t };
+    Color::Indexed(AURORA[i])
+}
 
-impl ActivitySkin {
-    fn frames(self) -> &'static [&'static str] {
-        match self {
-            ActivitySkin::Eye => &EYE,
-            ActivitySkin::Pulse => &PULSE,
-        }
-    }
+/// The activity glyph's shimmering color this moment.
+fn aurora_now(elapsed: Duration) -> Color {
+    aurora_at((elapsed.as_millis() / COLOR_STEP_MS) as usize)
+}
 
-    fn color(self) -> Color {
-        match self {
-            ActivitySkin::Eye => Color::Red,
-            ActivitySkin::Pulse => Color::Green,
-        }
-    }
-
-    /// The glyph for this moment, plus a style that *breathes*: bright + bold at
-    /// the open frames (`●`/`◉`/`•`), dim at the closed ones — so the eye pulses
-    /// in brightness, not just shape.
-    fn glyph(self, elapsed: Duration) -> (&'static str, Style) {
-        let frames = self.frames();
-        let glyph = frames[(elapsed.as_millis() / 180) as usize % frames.len()];
-        let open = matches!(glyph, "●" | "◉" | "•");
-        let style = Style::default().fg(self.color()).add_modifier(if open {
-            Modifier::BOLD
-        } else {
-            Modifier::DIM
-        });
-        (glyph, style)
-    }
+/// The transcript pane's "yatima" label, colored by UI state. Idle: dim and
+/// still. In flight: a single lit letter skips left-to-right along the word
+/// (the rest dim), shimmering through the aurora ramp as it travels — a cute
+/// little runner. It quickens while answering (excited, busting to share).
+fn yatima_title(state: Option<(Duration, bool)>) -> Line<'static> {
+    const WORD: &str = "yatima";
+    let Some((elapsed, answering)) = state else {
+        return Line::from(Span::styled(WORD, Style::default().fg(Color::DarkGray)));
+    };
+    let step_ms = if answering { 90 } else { 200 }; // answering = a quicker, excited skip
+    let tick = (elapsed.as_millis() / step_ms) as usize;
+    let len = WORD.chars().count();
+    let lit = tick % len; // the one lit letter, advancing left → right
+    let spans: Vec<Span<'static>> = WORD
+        .chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let style = if i == lit {
+                Style::default()
+                    .fg(aurora_at(tick)) // the runner shimmers as it moves
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect();
+    Line::from(spans)
 }
 
 /// The text trailing the activity glyph (pure; testable): phase, elapsed `m:ss`,
@@ -80,26 +97,27 @@ fn activity_text(answering: bool, cancelling: bool, elapsed: Duration, frags: us
     )
 }
 
-/// The live "the model is working, not hung" indicator as styled spans: a
-/// breathing colored glyph (red eye = reasoning, green pulse = answering) and the
-/// phase/elapsed/tokens/rate, the whole line tinted by phase.
+/// The live "the model is working, not hung" indicator as styled spans: an
+/// orbiting glyph shimmering through the aurora palette, trailed by the
+/// phase/elapsed/tokens/rate in a steady, legible tint.
 fn activity_spans(
     answering: bool,
     cancelling: bool,
     elapsed: Duration,
     frags: usize,
 ) -> Vec<Span<'static>> {
-    let skin = if answering {
-        ActivitySkin::Pulse
-    } else {
-        ActivitySkin::Eye
-    };
-    let (glyph, glyph_style) = skin.glyph(elapsed);
+    // The glyph orbits and shimmers through aurora; the stats keep a steady,
+    // legible tint so the numbers never strobe.
     vec![
-        Span::styled(glyph, glyph_style),
+        Span::styled(
+            orbit_glyph(elapsed),
+            Style::default()
+                .fg(aurora_now(elapsed))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             activity_text(answering, cancelling, elapsed, frags),
-            Style::default().fg(skin.color()),
+            Style::default().fg(Color::Indexed(51)), // steady aurora cyan
         ),
     ]
 }
@@ -202,7 +220,13 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let inner_width = area.width.saturating_sub(2); // borders
     let viewport = area.height.saturating_sub(2) as usize; // borders
 
-    let block = Block::default().borders(Borders::ALL).title("yatima");
+    // The "yatima" label carries the live UI state (a cute aurora runner).
+    let title = yatima_title(
+        app.in_flight
+            .as_ref()
+            .map(|f| (f.started.elapsed(), f.answering)),
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
@@ -321,19 +345,54 @@ mod tests {
     }
 
     #[test]
-    fn skin_is_phase_colored_and_breathes() {
-        // Reasoning = red eye, answering = green pulse.
-        assert_eq!(ActivitySkin::Eye.color(), Color::Red);
-        assert_eq!(ActivitySkin::Pulse.color(), Color::Green);
-        // The glyph advances with time (animates on the redraw tick), and the
-        // open frames are bold while the closed ones are dim (it breathes).
-        let (g0, _) = ActivitySkin::Eye.glyph(Duration::from_millis(0)); // ◌ (closed)
-        let (g3, s3) = ActivitySkin::Eye.glyph(Duration::from_millis(3 * 180)); // ● (open)
-        assert_ne!(g0, g3, "the eye glyph should change over time");
-        assert!(
-            s3.add_modifier.contains(Modifier::BOLD),
-            "open frame is bold"
+    fn glyph_orbits_and_shimmers_through_aurora() {
+        // The aurora shimmer moves over time and is 256-indexed (Apple Terminal
+        // has no truecolor); the orbit visits all four quadrants over its cycle.
+        let c0 = aurora_now(Duration::from_millis(0));
+        let c5 = aurora_now(Duration::from_millis(5 * COLOR_STEP_MS as u64));
+        assert_ne!(c0, c5, "the aurora shimmer flows over time");
+        assert!(matches!(c0, Color::Indexed(_)), "256-color, not truecolor");
+        let quadrants: std::collections::HashSet<_> = (0..4)
+            .map(|k| orbit_glyph(Duration::from_millis(k * 180)))
+            .collect();
+        assert_eq!(quadrants.len(), 4, "the orbit visits every corner");
+    }
+
+    #[test]
+    fn yatima_title_runs_one_lit_letter_left_to_right() {
+        // Idle: a single dim, unanimated span.
+        let idle = yatima_title(None);
+        assert_eq!(idle.spans.len(), 1);
+
+        // In flight: exactly one letter is lit (not DarkGray); it advances over
+        // time and is bold/quicker while answering.
+        let lit_index = |line: &Line| {
+            line.spans
+                .iter()
+                .position(|s| s.style.fg != Some(Color::DarkGray))
+        };
+        let a = yatima_title(Some((Duration::from_millis(0), false)));
+        let b = yatima_title(Some((Duration::from_millis(200), false)));
+        assert_eq!(a.spans.len(), 6, "each of yatima's letters is its own span");
+        assert_eq!(
+            a.spans
+                .iter()
+                .filter(|s| s.style.fg != Some(Color::DarkGray))
+                .count(),
+            1
         );
+        assert_ne!(
+            lit_index(&a),
+            lit_index(&b),
+            "the lit letter moves over time"
+        );
+
+        // Answering is the excited mode: the lit letter is bold.
+        let ans = yatima_title(Some((Duration::from_millis(0), true)));
+        assert!(ans
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]
