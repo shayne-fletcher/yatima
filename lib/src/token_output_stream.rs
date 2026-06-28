@@ -29,8 +29,16 @@ impl TokenOutputStream {
         }
     }
 
+    // Decode with `skip_special_tokens = false` (REASON-1). Reasoning models mark
+    // their chain-of-thought boundary with a *special* token — QwQ's `</think>`
+    // (id 151668) is flagged exactly like `<|im_end|>` — and
+    // `skip_special_tokens = true` silently drops it, so the `ReasoningSplitter`
+    // never sees the boundary and the answer is mislabeled as reasoning forever.
+    // Keeping specials is safe here because end-of-turn / EOS ids are filtered by
+    // id in the generation loop *before* a token reaches this stream, and the
+    // splitter consumes the reasoning markers (they never leak to the UI).
     fn decode(&self, tokens: &[u32]) -> Result<String> {
-        match self.tokenizer.decode(tokens, true) {
+        match self.tokenizer.decode(tokens, false) {
             Ok(str) => Ok(str),
             Err(err) => candle_core::bail!("cannot decode: {err}"),
         }
@@ -169,5 +177,52 @@ mod tests {
         }
         eprintln!("out: {out:?}");
         assert_eq!(out, input, "prose must round-trip with no duplicated words");
+    }
+
+    // Regression for the "never green" bug (REASON-1): a reasoning model's close
+    // marker is a *special* token (QwQ's `</think>` is flagged like `<|im_end|>`).
+    // The stream must NOT skip it — if it does, the splitter never sees the
+    // reasoning→answer boundary and the answer is mislabeled as reasoning forever.
+    // Gated on the QwQ GGUF tokenizer being present.
+    #[test]
+    fn stream_preserves_special_reasoning_marker() {
+        use candle_core::quantized::gguf_file;
+        use candle_core::quantized::tokenizer::TokenizerFromGguf;
+
+        let path =
+            crate::models_root().join("bartowski/Qwen_QwQ-32B-GGUF/Qwen_QwQ-32B-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: QwQ GGUF absent at {}", path.display());
+            return;
+        }
+        let mut f = std::fs::File::open(&path).unwrap();
+        let content = gguf_file::Content::read(&mut f).unwrap();
+        let tk = Tokenizer::from_gguf(&content).unwrap();
+        assert_eq!(
+            tk.encode("</think>", false).unwrap().get_ids(),
+            &[151668],
+            "QwQ encodes </think> as the special id this guards"
+        );
+
+        // reasoning tokens, then the special close marker, then answer tokens.
+        let mut ids = tk.encode("weighing it", false).unwrap().get_ids().to_vec();
+        ids.push(151668); // </think>
+        ids.extend(tk.encode("the answer", false).unwrap().get_ids());
+
+        let mut stream = TokenOutputStream::new(tk);
+        let mut out = String::new();
+        for id in ids {
+            if let Some(frag) = stream.next_token(id).unwrap() {
+                out.push_str(&frag);
+            }
+        }
+        if let Some(frag) = stream.decode_rest().unwrap() {
+            out.push_str(&frag);
+        }
+        eprintln!("streamed: {out:?}");
+        assert!(
+            out.contains("</think>"),
+            "the reasoning close marker must survive the stream, got {out:?}"
+        );
     }
 }
