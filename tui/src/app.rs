@@ -216,11 +216,11 @@ impl App {
             }
             EngineEvent::Done {
                 turn_id,
-                answer,
+                answer: _, // the streamed Fragment channels are authoritative
                 stop,
                 prompt_tokens,
             } if self.is_current(turn_id) => {
-                self.finish_assistant(answer, stop);
+                self.finish_assistant(stop);
                 self.status.prompt_tokens = prompt_tokens;
                 self.in_flight = None;
             }
@@ -245,13 +245,14 @@ impl App {
         }
     }
 
-    /// Finalize the assistant entry with the authoritative answer + stop reason.
-    fn finish_assistant(&mut self, answer: String, stop: StopReason) {
-        if let Some(Entry::Assistant {
-            answer: a, stop: s, ..
-        }) = self.transcript.last_mut()
-        {
-            *a = answer;
+    /// Record the stop reason. The answer is NOT overwritten here: the streamed
+    /// Fragment channels (classified by the actor's splitter, seeded per format)
+    /// are the single source of truth. `Done.answer` comes from the lib's
+    /// *non-seeded* batch split, which disagrees for a pre-seeded model that
+    /// emitted no `</think>` (it would mislabel the whole reasoning as the
+    /// answer, duplicating it — the "no boundary" bug).
+    fn finish_assistant(&mut self, stop: StopReason) {
+        if let Some(Entry::Assistant { stop: s, .. }) = self.transcript.last_mut() {
             *s = Some(stop);
         }
     }
@@ -401,6 +402,40 @@ mod tests {
             prompt_tokens: Some(123),
         });
         assert_eq!(app.transcript.len(), 2, "fragments/done must not append");
+    }
+
+    #[test]
+    fn done_does_not_overwrite_the_streamed_answer() {
+        // Regression for the "no boundary" bug: a pre-seeded reasoning model that
+        // emits no </think> streams all Reasoning (answer stays empty); Done's
+        // non-seeded batch answer must NOT clobber the empty streamed answer
+        // (else reasoning and answer show the same text).
+        let (mut app, _rx) = test_app();
+        app.input = "hi".into();
+        app.apply(Intent::Submit);
+        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
+        app.on_engine_event(EngineEvent::Fragment {
+            turn_id: 0,
+            channel: Channel::Reasoning,
+            text: "deep thoughts".into(),
+        });
+        app.on_engine_event(EngineEvent::Done {
+            turn_id: 0,
+            answer: "deep thoughts".into(), // the batch-split (mis)answer
+            stop: StopReason::MaxTokens,
+            prompt_tokens: Some(10),
+        });
+        let Entry::Assistant {
+            reasoning, answer, ..
+        } = &app.transcript[1]
+        else {
+            panic!("expected an assistant entry");
+        };
+        assert_eq!(reasoning, "deep thoughts");
+        assert_eq!(
+            answer, "",
+            "Done.answer must not overwrite the streamed answer"
+        );
     }
 
     #[test]

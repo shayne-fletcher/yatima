@@ -82,9 +82,12 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 if !reasoning.is_empty() {
                     // The in-flight turn streams its reasoning live; completed
                     // turns collapse to a one-line summary unless expanded (TUI-5,
-                    // Ctrl+R). Collapsing keeps the answer from being buried.
+                    // Ctrl+R). Collapsing keeps the answer from being buried — but
+                    // only collapse when there's an answer to show instead; if the
+                    // turn produced no answer (e.g. ran out of budget mid-think),
+                    // keep the reasoning visible since it's all there is.
                     let streaming = app.in_flight.is_some() && idx == last;
-                    if app.reasoning_expanded || streaming {
+                    if app.reasoning_expanded || streaming || answer.trim().is_empty() {
                         lines.push(Line::from(Span::styled(
                             if streaming {
                                 "▾ reasoning (live)".to_string()

@@ -99,6 +99,10 @@ impl ModelProfile {
                 reasoning: true,
                 temperature: Some(0.6),
                 top_p: Some(0.95),
+                // QwQ is exceptionally verbose: it routinely thinks for >2k tokens
+                // before answering, so the 2048 reasoning floor would truncate it
+                // mid-thought (no answer). Give it room to actually finish.
+                max_tokens: Some(4096),
                 ..p(
                     "bartowski/Qwen_QwQ-32B-GGUF",
                     Some("Qwen_QwQ-32B-Q4_K_M.gguf"),
