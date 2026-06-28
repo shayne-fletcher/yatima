@@ -1,0 +1,27 @@
+[package]
+name = "yatima-gui"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[[bin]]
+name = "yatima-gui"
+path = "src/main.rs"
+
+[features]
+metal = ["yatima-lib/metal"]
+fetch = ["yatima-lib/fetch"]
+
+[dependencies]
+yatima-lib = { path = "../lib" }
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+# Immediate-mode GUI on wgpu (Metal on macOS). egui 0.35 shapes text via
+# harfrust + skrifa (kerning, ligatures, combining marks); bidi/RTL is the one
+# known gap. Slice 0 is a "hello, engine" window — the GPU frontend's first
+# pixels, reusing yatima-lib only (the engine-actor lives in yatima-tui for now;
+# this spike runs its own small background runner thread).
+eframe = { version = "0.35", default-features = false, features = [
+  "wgpu",
+  "default_fonts",
+] }
