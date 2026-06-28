@@ -203,14 +203,18 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 // scratchpad stays plain.
                 lines.extend(render_answer(answer, inner_width));
                 // Surface a non-EOS stop so a truncated / collapsed turn is not
-                // mistaken for a complete answer.
+                // mistaken for a complete answer. A user cancel is called out
+                // boldly (it's a deliberate act and should read as one); the
+                // automatic stops stay quiet and dim.
                 if let Some(note) = stop_note(*stop) {
-                    lines.push(Line::from(Span::styled(
-                        note,
+                    let style = if matches!(stop, Some(StopReason::Stopped)) {
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    } else {
                         Style::default()
                             .fg(Color::Yellow)
-                            .add_modifier(Modifier::DIM),
-                    )));
+                            .add_modifier(Modifier::DIM)
+                    };
+                    lines.push(Line::from(Span::styled(note, style)));
                 }
                 lines.push(Line::from(""));
             }
@@ -804,7 +808,7 @@ fn stop_note(stop: Option<StopReason>) -> Option<&'static str> {
     match stop {
         Some(StopReason::MaxTokens) => Some("[stopped: hit max tokens]"),
         Some(StopReason::Repetition) => Some("[stopped: repetition detected]"),
-        Some(StopReason::Stopped) => Some("[stopped: cancelled]"),
+        Some(StopReason::Stopped) => Some("⊘ interrupted"),
         Some(StopReason::Eos) | None => None,
     }
 }

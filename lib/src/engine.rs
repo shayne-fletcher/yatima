@@ -954,20 +954,30 @@ impl Engine {
         &mut self,
         tokens: &[u32],
         configured: Option<usize>,
-    ) -> Result<Tensor> {
-        self.prefill_last_logits_for_tokens_with_progress(tokens, configured, &mut |_| {})
+        cancel: &Cancel,
+    ) -> Result<Option<Tensor>> {
+        self.prefill_last_logits_for_tokens_with_progress(tokens, configured, cancel, &mut |_| {})
     }
 
+    /// Prefill the prompt and return the final chunk's logits, or `Ok(None)` if
+    /// `cancel` is raised between chunks. Polling here (not only in the decode
+    /// loop) is what makes a cancel during a long prompt's prefill — the
+    /// "thinking 0 tok" window — take effect promptly instead of after the whole
+    /// prefill completes (TUI-6).
     fn prefill_last_logits_for_tokens_with_progress(
         &mut self,
         tokens: &[u32],
         configured: Option<usize>,
+        cancel: &Cancel,
         on_progress: &mut impl FnMut(PrefillProgress),
-    ) -> Result<Tensor> {
+    ) -> Result<Option<Tensor>> {
         let chunk = effective_prefill_chunk(configured, self.prefill_chunk, tokens.len());
         let chunk_count = tokens.len().div_ceil(chunk);
         let mut logits = None;
         for (chunk_index, start_pos) in (0..tokens.len()).step_by(chunk).enumerate() {
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
             let end = (start_pos + chunk).min(tokens.len());
             tracing::debug!(
                 chunk_index,
@@ -1004,7 +1014,9 @@ impl Engine {
                 finished: true,
             });
         }
-        logits.ok_or_else(|| anyhow!("tokenized prompt is empty"))
+        logits
+            .map(Some)
+            .ok_or_else(|| anyhow!("tokenized prompt is empty"))
     }
 
     /// Return the next-token logits after prompt prefill without sampling or
@@ -1033,11 +1045,14 @@ impl Engine {
     ) -> Result<PrefillLogits> {
         self.model.reset()?;
         let tokens = self.encode_prompt(prompt)?;
-        let logits = self.prefill_last_logits_for_tokens_with_progress(
-            &tokens,
-            prefill_chunk,
-            &mut on_progress,
-        )?;
+        let logits = self
+            .prefill_last_logits_for_tokens_with_progress(
+                &tokens,
+                prefill_chunk,
+                &Cancel::new(), // diagnostics are not cancellable
+                &mut on_progress,
+            )?
+            .ok_or_else(|| anyhow!("prefill cancelled"))?;
         let logits = last_token_logits(&logits)?.to_vec1::<f32>()?;
         Ok(PrefillLogits {
             token_count: tokens.len(),
@@ -1146,7 +1161,14 @@ impl Engine {
             // path. `prefill_chunk` lets those models use smaller prefill
             // chunks without changing the public API.
             let logits = if index == 0 {
-                self.prefill_last_logits_for_tokens(&tokens, opts.prefill_chunk)?
+                match self.prefill_last_logits_for_tokens(&tokens, opts.prefill_chunk, cancel)? {
+                    Some(logits) => logits,
+                    None => {
+                        // Cancelled during prefill (before any token): stop cleanly.
+                        stop = StopReason::Stopped;
+                        break;
+                    }
+                }
             } else {
                 let start_pos = tokens.len().saturating_sub(1);
                 let input = Tensor::new(&tokens[start_pos..], &self.device)?.unsqueeze(0)?;

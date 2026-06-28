@@ -80,6 +80,10 @@ pub enum Intent {
     /// Insert a literal newline in the prompt (Alt+Enter) — Enter submits, so a
     /// multi-line prompt is composed with this.
     Newline,
+    /// ↑: recall the previous prompt, or move up a line in a multi-line draft.
+    Up,
+    /// ↓: recall the next prompt (or the live draft), or move down a line.
+    Down,
     ScrollUp,
     ScrollDown,
     /// Expand/collapse the reasoning regions of completed turns (TUI-5).
@@ -95,6 +99,14 @@ pub struct App {
     /// reads its text on submit; rendering draws it at the cursor (TUI-2 stays
     /// pure — render only borrows it).
     pub input: TextArea<'static>,
+    /// Submitted prompts, oldest first — recalled with ↑/↓ (shell-style).
+    pub history: Vec<String>,
+    /// Position while browsing [`history`] with ↑/↓: `None` when editing the
+    /// live draft, `Some(i)` when showing `history[i]`.
+    history_browse: Option<usize>,
+    /// The live input stashed when history browsing began, restored on ↓ past
+    /// the newest entry.
+    draft: Option<String>,
     /// Lines scrolled up from the bottom (0 = follow latest). Display is always
     /// clamped by [`scroll_y`] (TUI-1).
     pub scroll_back: usize,
@@ -113,6 +125,9 @@ impl App {
             req_tx,
             transcript: Vec::new(),
             input: fresh_input(),
+            history: Vec::new(),
+            history_browse: None,
+            draft: None,
             scroll_back: 0,
             in_flight: None,
             status: Status {
@@ -147,6 +162,10 @@ impl App {
             // work; these add the arrow combo regardless of Option-as-Meta).
             KeyCode::Left if alt => Intent::WordBack,
             KeyCode::Right if alt => Intent::WordForward,
+            // ↑/↓ recall prior prompts (shell-style); inside a multi-line draft
+            // they move between lines first (handled in `apply`).
+            KeyCode::Up => Intent::Up,
+            KeyCode::Down => Intent::Down,
             _ => Intent::Edit(key.into()),
         }
     }
@@ -168,6 +187,21 @@ impl App {
             Intent::WordBack => self.input.move_cursor(CursorMove::WordBack),
             Intent::WordForward => self.input.move_cursor(CursorMove::WordForward),
             Intent::Newline => self.input.insert_newline(),
+            Intent::Up => {
+                if self.input.cursor().0 == 0 {
+                    self.history_prev();
+                } else {
+                    self.input.move_cursor(CursorMove::Up);
+                }
+            }
+            Intent::Down => {
+                let last_row = self.input.lines().len().saturating_sub(1);
+                if self.input.cursor().0 >= last_row {
+                    self.history_next();
+                } else {
+                    self.input.move_cursor(CursorMove::Down);
+                }
+            }
             Intent::ScrollUp => self.scroll_back = self.scroll_back.saturating_add(3),
             Intent::ScrollDown => self.scroll_back = self.scroll_back.saturating_sub(3),
             Intent::ToggleReasoning => self.reasoning_expanded = !self.reasoning_expanded,
@@ -182,6 +216,7 @@ impl App {
         if user.is_empty() || self.in_flight.is_some() {
             return;
         }
+        self.remember(&user);
         // `/reset` clears the conversation — the in-session recovery/escape hatch
         // (clears the engine's authoritative history and the UI mirror).
         if user == "/reset" {
@@ -218,12 +253,58 @@ impl App {
         self.input.lines().join("\n")
     }
 
-    /// Replace the prompt text — used by tests and any programmatic edit.
-    #[cfg(test)]
+    /// Replace the prompt text (cursor lands at the end).
     pub fn set_input(&mut self, text: &str) {
         let mut ta = fresh_input();
         ta.insert_str(text);
         self.input = ta;
+    }
+
+    /// Record a submitted prompt for ↑/↓ recall and reset the browse cursor.
+    /// Consecutive duplicates are coalesced (a re-sent prompt isn't stored twice).
+    fn remember(&mut self, prompt: &str) {
+        if self.history.last().map(String::as_str) != Some(prompt) {
+            self.history.push(prompt.to_string());
+        }
+        self.history_browse = None;
+        self.draft = None;
+    }
+
+    /// Recall the previous (older) prompt into the editor. On first step the live
+    /// draft is stashed so ↓ can restore it.
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let target = match self.history_browse {
+            None => {
+                self.draft = Some(self.input_text());
+                self.history.len() - 1
+            }
+            Some(0) => 0, // already at the oldest
+            Some(i) => i - 1,
+        };
+        self.history_browse = Some(target);
+        let text = self.history[target].clone();
+        self.set_input(&text);
+    }
+
+    /// Recall the next (newer) prompt; stepping past the newest restores the
+    /// stashed draft and leaves browsing.
+    fn history_next(&mut self) {
+        match self.history_browse {
+            None => {}
+            Some(i) if i + 1 < self.history.len() => {
+                self.history_browse = Some(i + 1);
+                let text = self.history[i + 1].clone();
+                self.set_input(&text);
+            }
+            Some(_) => {
+                self.history_browse = None;
+                let draft = self.draft.take().unwrap_or_default();
+                self.set_input(&draft);
+            }
+        }
     }
 
     /// Request cancellation of the in-flight turn (TUI-6): flip the shared
@@ -663,6 +744,38 @@ mod tests {
         assert_eq!(app.input_text(), "line one\nline two");
         assert!(app.in_flight.is_none(), "Alt+Enter must not submit");
         assert!(rx.try_recv().is_err(), "no turn submitted");
+    }
+
+    #[test]
+    fn up_down_recall_prior_prompts() {
+        // ↑/↓ browse submitted prompts; ↓ past the newest restores the draft.
+        assert_eq!(App::classify(key(KeyCode::Up)), Intent::Up);
+        assert_eq!(App::classify(key(KeyCode::Down)), Intent::Down);
+        let (mut app, _rx) = test_app();
+        let done = |id| EngineEvent::Done {
+            turn_id: id,
+            answer: "ok".into(),
+            stop: StopReason::Eos,
+            prompt_tokens: None,
+        };
+        app.set_input("first");
+        app.apply(Intent::Submit);
+        app.on_engine_event(done(0)); // clear in-flight (TUI-7)
+        app.set_input("second");
+        app.apply(Intent::Submit);
+        app.on_engine_event(done(1));
+        // A half-typed draft, then browse back through history.
+        app.set_input("draf");
+        app.apply(Intent::Up);
+        assert_eq!(app.input_text(), "second");
+        app.apply(Intent::Up);
+        assert_eq!(app.input_text(), "first");
+        app.apply(Intent::Up); // already oldest — stays
+        assert_eq!(app.input_text(), "first");
+        app.apply(Intent::Down);
+        assert_eq!(app.input_text(), "second");
+        app.apply(Intent::Down); // past the newest — restore the draft
+        assert_eq!(app.input_text(), "draf");
     }
 
     #[test]
