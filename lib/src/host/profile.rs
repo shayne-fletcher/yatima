@@ -92,6 +92,19 @@ impl ModelProfile {
             // DeepSeek-R1-Distill-Qwen-7B: a Qwen2-arch distill trained on
             // DeepSeek's format, so it pins `deepseek` explicitly (the arch alone
             // would say Qwen/ChatML). A reasoning model (`<think>` dialect).
+            // QwQ-32B: Qwen's reasoning model (ChatML + `<think>`). Q4_K_M GGUF
+            // (~20 GB, F32/Q4_K/Q6_K — candle-loadable) fits a 48 GB machine with
+            // headroom, unlike Kimi. A strong reasoning model that actually runs.
+            "qwq" => ModelProfile {
+                reasoning: true,
+                temperature: Some(0.6),
+                top_p: Some(0.95),
+                ..p(
+                    "bartowski/Qwen_QwQ-32B-GGUF",
+                    Some("Qwen_QwQ-32B-Q4_K_M.gguf"),
+                    ChatFormat::Qwen,
+                )
+            },
             "deepseek-r1" => ModelProfile {
                 reasoning: true,
                 // DeepSeek-R1's own recommendation: temperature 0.6 + top-p 0.95.
@@ -120,13 +133,14 @@ impl ModelProfile {
     }
 
     /// The names of every built-in profile (for `--help` / listing).
-    pub const BUILTIN_NAMES: [&'static str; 6] = [
+    pub const BUILTIN_NAMES: [&'static str; 7] = [
         "qwen32b",
         "glm4-32b",
         "gemma2",
         "mistral",
         "kimi-dev",
         "deepseek-r1",
+        "qwq",
     ];
 
     /// The model source this profile names — a directory **xor** a repository
@@ -331,7 +345,7 @@ mod tests {
     fn reasoning_profiles_pin_temperature_and_top_p() {
         // The shipped reasoning profiles request nucleus sampling (the repetition
         // mitigation): temperature 0.6 + top-p 0.95.
-        for name in ["deepseek-r1", "kimi-dev"] {
+        for name in ["deepseek-r1", "kimi-dev", "qwq"] {
             let p = ModelProfile::builtin(name).unwrap();
             assert_eq!(p.temperature, Some(0.6), "{name} temperature");
             assert_eq!(p.top_p, Some(0.95), "{name} top_p");
