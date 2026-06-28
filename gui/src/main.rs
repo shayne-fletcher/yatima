@@ -128,6 +128,9 @@ enum Ev {
     Ready(String),
     /// A streamed slice of the current reply (raw — reasoning not yet split).
     Fragment(String),
+    /// An image artifact (PNG bytes) produced by the turn — the artifact plane,
+    /// spiked here with a matplotlib chart from `/plot`.
+    Image(Vec<u8>),
     /// The current turn finished.
     Done,
     /// The current turn failed.
@@ -158,6 +161,18 @@ fn runner(cfg: RunConfig, req_rx: Receiver<String>, ev_tx: Sender<Ev>, ctx: egui
     ctx.request_repaint();
 
     while let Ok(prompt) = req_rx.recv() {
+        // Spike: `/plot` exercises the artifact plane without the model — shell
+        // out to matplotlib, send the PNG back as an Image artifact.
+        if prompt.trim() == "/plot" {
+            let _ = ev_tx.send(match render_demo_chart() {
+                Ok(bytes) => Ev::Image(bytes),
+                Err(e) => Ev::Error(e.to_string()),
+            });
+            let _ = ev_tx.send(Ev::Done);
+            ctx.request_repaint();
+            continue;
+        }
+
         let cancel = Cancel::new();
         let result = {
             let tx = ev_tx.clone();
@@ -183,10 +198,46 @@ fn fatal(ev_tx: &Sender<Ev>, ctx: &egui::Context, e: impl std::fmt::Display) {
     ctx.request_repaint();
 }
 
+/// Spike: produce a matplotlib chart as PNG bytes by shelling out to `python3`.
+/// A stand-in for a real capability-scoped `RunPython` tool — enough to prove the
+/// artifact → egui-image path. Requires `python3` with `matplotlib`/`numpy`.
+fn render_demo_chart() -> Result<Vec<u8>> {
+    let out = std::env::temp_dir().join("yatima-gui-plot.png");
+    // Pure-`math` (no numpy) so it runs with just matplotlib installed.
+    let code = r#"import sys, math
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+xs = [i * 2 * math.pi / 399 for i in range(400)]
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.plot(xs, [math.sin(x) for x in xs], label="sin")
+ax.plot(xs, [math.cos(x) for x in xs], label="cos")
+ax.set_title("yatima-gui artifact spike")
+ax.legend()
+ax.grid(True, alpha=0.3)
+fig.savefig(sys.argv[1], dpi=120, bbox_inches="tight")
+"#;
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(code)
+        .arg(&out)
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run python3: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "python3/matplotlib failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(std::fs::read(&out)?)
+}
+
 /// A rendered transcript entry (the UI mirror; the runner's session is truth).
 enum Msg {
     User(String),
     Assistant(String),
+    /// A decoded image artifact, uploaded as a GPU texture.
+    Image(egui::TextureHandle),
     Error(String),
 }
 
@@ -200,6 +251,9 @@ enum Status {
 struct GuiApp {
     req_tx: Sender<String>,
     ev_rx: Receiver<Ev>,
+    /// A handle to the egui context, for uploading image artifacts as textures
+    /// off the render path (in `drain_events`).
+    ctx: egui::Context,
     input: String,
     transcript: Vec<Msg>,
     /// The reply currently streaming in, if a turn is in flight.
@@ -212,10 +266,12 @@ impl GuiApp {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Ev>();
         let ctx = cc.egui_ctx.clone();
-        thread::spawn(move || runner(cfg, req_rx, ev_tx, ctx));
+        let runner_ctx = ctx.clone();
+        thread::spawn(move || runner(cfg, req_rx, ev_tx, runner_ctx));
         GuiApp {
             req_tx,
             ev_rx,
+            ctx,
             input: String::new(),
             transcript: Vec::new(),
             streaming: None,
@@ -237,9 +293,19 @@ impl GuiApp {
                         buf.push_str(&text);
                     }
                 }
+                Ev::Image(bytes) => match decode_texture(&self.ctx, &bytes) {
+                    Ok(tex) => self.transcript.push(Msg::Image(tex)),
+                    Err(e) => self
+                        .transcript
+                        .push(Msg::Error(format!("image decode: {e}"))),
+                },
                 Ev::Done => {
+                    // Drop the streaming buffer; only commit it as a reply if it
+                    // actually carried text (a `/plot` turn streams no text).
                     if let Some(buf) = self.streaming.take() {
-                        self.transcript.push(Msg::Assistant(buf));
+                        if !buf.trim().is_empty() {
+                            self.transcript.push(Msg::Assistant(buf));
+                        }
                     }
                 }
                 Ev::Error(message) => {
@@ -297,7 +363,7 @@ impl eframe::App for GuiApp {
                 let edit = ui.add_enabled(
                     ready,
                     egui::TextEdit::singleline(&mut self.input)
-                        .hint_text("message")
+                        .hint_text("message — try /plot")
                         .desired_width(f32::INFINITY),
                 );
                 let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -346,11 +412,23 @@ fn render_msg(ui: &mut egui::Ui, msg: &Msg) {
             speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
             ui.label(text);
         }
+        Msg::Image(tex) => {
+            speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
+            ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(tex)).max_width(640.0));
+        }
         Msg::Error(text) => {
             ui.colored_label(egui::Color32::LIGHT_RED, format!("error: {text}"));
         }
     }
     ui.add_space(8.0);
+}
+
+/// Decode PNG bytes and upload them as an egui texture.
+fn decode_texture(ctx: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHandle> {
+    let rgba = image::load_from_memory(bytes)?.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+    Ok(ctx.load_texture("artifact", color, egui::TextureOptions::default()))
 }
 
 fn main() -> Result<()> {
