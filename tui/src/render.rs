@@ -47,14 +47,26 @@ fn aurora_now(elapsed: Duration) -> Color {
     aurora_at((elapsed.as_millis() / COLOR_STEP_MS) as usize)
 }
 
-/// The transcript pane's "yatima" label, colored by UI state. Idle: dim and
-/// still. In flight: a single lit letter skips left-to-right along the word
-/// (the rest dim), shimmering through the aurora ramp as it travels — a cute
-/// little runner. It quickens while answering (excited, busting to share).
+/// The transcript pane's "yatima" label, colored by UI state. Idle: dim, still,
+/// and signed with the name as the model itself writes it — يَتِيمَة (Arabic,
+/// "orphan / unique one"). The RTL run is wrapped in a bidi isolate (FSI…PDI) so
+/// it cannot reorder the title or disturb the border; terminals that shape
+/// Arabic render it properly, the rest show the bare codepoints. In flight: a
+/// single lit letter skips left-to-right along "yatima" (the rest dim),
+/// shimmering through the aurora ramp as it travels — a cute little runner. It
+/// quickens while answering (excited, busting to share).
 fn yatima_title(state: Option<(Duration, bool)>) -> Line<'static> {
     const WORD: &str = "yatima";
+    // FSI (U+2068) … PDI (U+2069) isolate the right-to-left Arabic run.
+    const NAME_AR: &str = "\u{2068}يَتِيمَة\u{2069}";
     let Some((elapsed, answering)) = state else {
-        return Line::from(Span::styled(WORD, Style::default().fg(Color::DarkGray)));
+        return Line::from(vec![
+            Span::styled(WORD, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {NAME_AR}"),
+                Style::default().fg(Color::Indexed(140)), // a quiet violet — the pearl
+            ),
+        ]);
     };
     let step_ms = if answering { 90 } else { 200 }; // answering = a quicker, excited skip
     let tick = (elapsed.as_millis() / step_ms) as usize;
@@ -1079,9 +1091,15 @@ mod tests {
 
     #[test]
     fn yatima_title_runs_one_lit_letter_left_to_right() {
-        // Idle: a single dim, unanimated span.
+        // Idle: the dim "yatima" label, signed with the Arabic name.
         let idle = yatima_title(None);
-        assert_eq!(idle.spans.len(), 1);
+        let idle_text: String = idle.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(idle_text.starts_with("yatima"), "the Latin name leads");
+        assert!(
+            idle_text.contains('\u{2068}') && idle_text.contains('\u{2069}'),
+            "the RTL Arabic run is bidi-isolated (FSI…PDI)"
+        );
+        assert!(idle_text.contains('ي'), "يَتِيمَة is present");
 
         // In flight: exactly one letter is lit (not DarkGray); it advances over
         // time and is bold/quicker while answering.
