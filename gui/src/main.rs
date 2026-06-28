@@ -431,7 +431,15 @@ fn render_msg(ui: &mut egui::Ui, msg: &Msg) {
         }
         Msg::Image(tex) => {
             speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
-            ui.add(egui::Image::new(egui::load::SizedTexture::from_handle(tex)).max_width(640.0));
+            // Centered, and tinted to ~85% opacity so the chart's white panel
+            // settles into the dark UI rather than glaring against it.
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                        .max_width(640.0)
+                        .tint(egui::Color32::from_white_alpha(217)),
+                );
+            });
         }
         Msg::Error(text) => {
             ui.colored_label(egui::Color32::LIGHT_RED, format!("error: {text}"));
