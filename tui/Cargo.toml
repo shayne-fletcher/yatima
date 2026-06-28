@@ -30,3 +30,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # Markdown → ratatui Text. default-features off drops the syntect code-highlight
 # stack (heavy); we render structure (headings, bold, lists, rules), not syntax.
 tui-markdown = { version = "0.3.8", default-features = false }
+# The input box: a readline/emacs-keymapped text editor widget (Ctrl+A/E/K/U/W,
+# Alt+B/F/D word motion, insert-at-point, undo). `-2` is the maintained fork on
+# ratatui 0.30 / crossterm 0.29; default features give the crossterm `Input`
+# conversion we feed key events through.
+tui-textarea = { package = "tui-textarea-2", version = "0.11" }

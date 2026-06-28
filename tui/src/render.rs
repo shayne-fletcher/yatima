@@ -124,12 +124,15 @@ fn activity_spans(
 
 /// Draw the whole UI for one frame.
 pub fn ui(frame: &mut Frame, app: &App) {
+    // The input box grows with the prompt (Alt+Enter adds lines), capped so it
+    // never crowds out the transcript; +2 for the borders.
+    let input_rows = (app.input.lines().len().clamp(1, 8) + 2) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),    // transcript
-            Constraint::Length(3), // input
-            Constraint::Length(1), // status
+            Constraint::Min(3),             // transcript
+            Constraint::Length(input_rows), // input
+            Constraint::Length(1),          // status
         ])
         .split(frame.area());
 
@@ -184,7 +187,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                         )));
                         push_wrapped(
                             &mut lines,
-                            reasoning,
+                            &prettify_math(reasoning),
                             Style::default().add_modifier(Modifier::DIM),
                         );
                     } else {
@@ -244,13 +247,424 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render the assistant's answer as Markdown lines. `tui-markdown` handles
-/// emphasis, lists and inline styling; we post-process the two things it leaves
-/// raw: strip the leading `#` from ATX headings (keeping the color it applied)
-/// and turn a thematic break (`---`/`***`/`___`) into a rule drawn across `width`.
+// LaTeX command → symbol table for [`prettify_math`]. Longer names first so a
+// prefix (e.g. `\le`) never shadows a longer one (`\leq`, `\leftarrow`).
+const LATEX_SYMBOLS: &[(&str, &str)] = &[
+    ("\\leftarrow", "←"),
+    ("\\rightarrow", "→"),
+    ("\\Rightarrow", "⇒"),
+    ("\\Leftarrow", "⇐"),
+    ("\\times", "×"),
+    ("\\cdot", "·"),
+    ("\\div", "÷"),
+    ("\\pm", "±"),
+    ("\\mp", "∓"),
+    ("\\leq", "≤"),
+    ("\\le", "≤"),
+    ("\\geq", "≥"),
+    ("\\ge", "≥"),
+    ("\\neq", "≠"),
+    ("\\ne", "≠"),
+    ("\\approx", "≈"),
+    ("\\equiv", "≡"),
+    ("\\propto", "∝"),
+    ("\\infty", "∞"),
+    ("\\to", "→"),
+    ("\\sum", "∑"),
+    ("\\prod", "∏"),
+    ("\\int", "∫"),
+    ("\\partial", "∂"),
+    ("\\nabla", "∇"),
+    ("\\cdots", "⋯"),
+    ("\\ldots", "…"),
+    ("\\dots", "…"),
+    ("\\angle", "∠"),
+    ("\\circ", "°"),
+    ("\\lfloor", "⌊"),
+    ("\\rfloor", "⌋"),
+    ("\\lceil", "⌈"),
+    ("\\rceil", "⌉"),
+    ("\\langle", "⟨"),
+    ("\\rangle", "⟩"),
+    ("\\bmod", "mod"),
+    ("\\pmod", "mod"),
+    ("\\mod", "mod"),
+    ("\\in", "∈"),
+    ("\\notin", "∉"),
+    ("\\subseteq", "⊆"),
+    ("\\subset", "⊂"),
+    ("\\cup", "∪"),
+    ("\\cap", "∩"),
+    ("\\emptyset", "∅"),
+    ("\\forall", "∀"),
+    ("\\exists", "∃"),
+    ("\\wedge", "∧"),
+    ("\\vee", "∨"),
+    ("\\oplus", "⊕"),
+    ("\\otimes", "⊗"),
+    ("\\mapsto", "↦"),
+    ("\\%", "%"),
+    ("\\Delta", "Δ"),
+    ("\\Sigma", "Σ"),
+    ("\\Omega", "Ω"),
+    ("\\Theta", "Θ"),
+    ("\\Lambda", "Λ"),
+    ("\\Phi", "Φ"),
+    ("\\Pi", "Π"),
+    ("\\alpha", "α"),
+    ("\\beta", "β"),
+    ("\\gamma", "γ"),
+    ("\\delta", "δ"),
+    ("\\epsilon", "ε"),
+    ("\\theta", "θ"),
+    ("\\lambda", "λ"),
+    ("\\mu", "μ"),
+    ("\\pi", "π"),
+    ("\\rho", "ρ"),
+    ("\\sigma", "σ"),
+    ("\\tau", "τ"),
+    ("\\varphi", "φ"),
+    ("\\phi", "φ"),
+    ("\\psi", "ψ"),
+    ("\\chi", "χ"),
+    ("\\xi", "ξ"),
+    ("\\eta", "η"),
+    ("\\zeta", "ζ"),
+    ("\\nu", "ν"),
+    ("\\kappa", "κ"),
+    ("\\omega", "ω"),
+    // Function/operator names render as their plain word (no 2D layout needed).
+    ("\\log", "log"),
+    ("\\ln", "ln"),
+    ("\\exp", "exp"),
+    ("\\sin", "sin"),
+    ("\\cos", "cos"),
+    ("\\tan", "tan"),
+    ("\\cot", "cot"),
+    ("\\sec", "sec"),
+    ("\\csc", "csc"),
+    ("\\sinh", "sinh"),
+    ("\\cosh", "cosh"),
+    ("\\tanh", "tanh"),
+    ("\\arg", "arg"),
+    ("\\deg", "deg"),
+    ("\\det", "det"),
+    ("\\dim", "dim"),
+    ("\\gcd", "gcd"),
+    ("\\lim", "lim"),
+    ("\\max", "max"),
+    ("\\min", "min"),
+    ("\\quad", "  "),
+    ("\\,", " "),
+    ("\\;", " "),
+    ("\\!", ""),
+];
+
+/// The balanced `{...}` group at byte index `open` (which must be `{`): its inner
+/// text and the index just past the closing `}`. `None` if unbalanced.
+fn brace_group(s: &str, open: usize) -> Option<(String, usize)> {
+    if s.as_bytes().get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (j, c) in s[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[open + 1..open + j].to_string(), open + j + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Expand the brace commands LLMs lean on: `\frac{a}{b}` → `a/b`, `\sqrt{x}` →
+/// `√x`, and the wrappers (`\text`, `\boxed`, `\mathrm`, …) → their content.
+/// Other `\name` sequences are left intact for the symbol table.
+fn expand_latex_braces(s: &str) -> String {
+    const WRAPPERS: &[&str] = &[
+        "\\text",
+        "\\boxed",
+        "\\mathrm",
+        "\\mathbf",
+        "\\mathit",
+        "\\operatorname",
+    ];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let Some(pos) = rest.find('\\') else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if after.starts_with("\\frac") {
+            if let Some((num, e1)) = brace_group(rest, pos + 5) {
+                if let Some((den, e2)) = brace_group(rest, e1) {
+                    out.push_str(&format!(
+                        "{}/{}",
+                        expand_latex_braces(&num),
+                        expand_latex_braces(&den)
+                    ));
+                    rest = &rest[e2..];
+                    continue;
+                }
+            }
+        } else if after.starts_with("\\sqrt") {
+            if let Some((inner, e)) = brace_group(rest, pos + 5) {
+                out.push_str(&format!("√{}", expand_latex_braces(&inner)));
+                rest = &rest[e..];
+                continue;
+            }
+        } else if let Some(cmd) = WRAPPERS.iter().find(|c| after.starts_with(**c)) {
+            if let Some((inner, e)) = brace_group(rest, pos + cmd.len()) {
+                out.push_str(&expand_latex_braces(&inner));
+                rest = &rest[e..];
+                continue;
+            }
+        }
+        // Not a brace command we expand: emit the backslash and move on (the
+        // symbol table handles `\pi`, `\times`, … on the result).
+        out.push('\\');
+        rest = &rest[pos + 1..];
+    }
+}
+
+/// Turn LLM LaTeX into readable Unicode (it cannot be *typeset* in a line-based
+/// terminal, so this is best-effort prettifying, not layout): drop the math
+/// delimiters, expand brace commands, map symbols/Greek, and split `\\` math
+/// line-breaks. Fenced code blocks are passed through untouched so code is never
+/// mangled.
+fn prettify_math(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut in_fence = false;
+    for line in src.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+        } else if in_fence {
+            out.push_str(line);
+        } else {
+            out.push_str(&prettify_math_line(line));
+        }
+    }
+    out
+}
+
+/// Remove `\begin{env}` / `\end{env}` markers (tolerating a space before the
+/// brace, as some models emit `\end {pmatrix}`). A line-based terminal can't lay
+/// out the 2D environment they delimit (a matrix, an `aligned` block), but
+/// dropping the wrappers and the `&` column separators leaves the cell contents
+/// readable inline rather than as raw `\begin{…}` noise.
+fn strip_environments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let begin = rest.find("\\begin");
+        let end = rest.find("\\end");
+        let (pos, cmd_len) = match (begin, end) {
+            (Some(b), Some(e)) if b <= e => (b, 6),
+            (Some(_), Some(e)) => (e, 4),
+            (Some(b), None) => (b, 6),
+            (None, Some(e)) => (e, 4),
+            (None, None) => {
+                out.push_str(rest);
+                return out;
+            }
+        };
+        out.push_str(&rest[..pos]);
+        let mut j = pos + cmd_len;
+        while rest[j..].starts_with(' ') {
+            j += 1;
+        }
+        // Drop the `{env}` argument if present, else just the command token.
+        rest = match brace_group(rest, j) {
+            Some((_, after)) => &rest[after..],
+            None => &rest[pos + cmd_len..],
+        };
+    }
+}
+
+fn prettify_math_line(line: &str) -> String {
+    let mut s = strip_environments(line);
+    for d in ["\\[", "\\]", "\\(", "\\)", "\\left", "\\right", "$$"] {
+        s = s.replace(d, "");
+    }
+    s = s.replace("\\\\", "; "); // a row/line break becomes an inline separator
+    s = s.replace(" & ", "  "); // matrix/align column separator → spacing
+    s = expand_latex_braces(&s);
+    for (from, to) in LATEX_SYMBOLS {
+        s = s.replace(from, to);
+    }
+    sub_superscripts(&s)
+}
+
+/// The Unicode super/subscript for `c`, if one exists. Digits, signs and the
+/// letters with established sub/superscript forms are covered; anything else
+/// returns `None` so the caller can fall back to literal `^…`/`_…`.
+fn script_char(c: char, sup: bool) -> Option<char> {
+    // Capital letters have superscript forms (most of them) but no subscript
+    // forms in Unicode, so they're only mapped when `sup`.
+    const SUPER_CAPS: &[(char, char)] = &[
+        ('A', 'ᴬ'),
+        ('B', 'ᴮ'),
+        ('D', 'ᴰ'),
+        ('E', 'ᴱ'),
+        ('G', 'ᴳ'),
+        ('H', 'ᴴ'),
+        ('I', 'ᴵ'),
+        ('J', 'ᴶ'),
+        ('K', 'ᴷ'),
+        ('L', 'ᴸ'),
+        ('M', 'ᴹ'),
+        ('N', 'ᴺ'),
+        ('O', 'ᴼ'),
+        ('P', 'ᴾ'),
+        ('R', 'ᴿ'),
+        ('T', 'ᵀ'),
+        ('U', 'ᵁ'),
+        ('V', 'ⱽ'),
+        ('W', 'ᵂ'),
+    ];
+    if sup {
+        if let Some((_, hi)) = SUPER_CAPS.iter().find(|(base, _)| *base == c) {
+            return Some(*hi);
+        }
+    }
+    let table: &[(char, char, char)] = &[
+        // (base, superscript, subscript)
+        ('0', '⁰', '₀'),
+        ('1', '¹', '₁'),
+        ('2', '²', '₂'),
+        ('3', '³', '₃'),
+        ('4', '⁴', '₄'),
+        ('5', '⁵', '₅'),
+        ('6', '⁶', '₆'),
+        ('7', '⁷', '₇'),
+        ('8', '⁸', '₈'),
+        ('9', '⁹', '₉'),
+        ('+', '⁺', '₊'),
+        ('-', '⁻', '₋'),
+        ('=', '⁼', '₌'),
+        ('(', '⁽', '₍'),
+        (')', '⁾', '₎'),
+        ('a', 'ᵃ', 'ₐ'),
+        ('e', 'ᵉ', 'ₑ'),
+        ('h', 'ʰ', 'ₕ'),
+        ('i', 'ⁱ', 'ᵢ'),
+        ('j', 'ʲ', 'ⱼ'),
+        ('k', 'ᵏ', 'ₖ'),
+        ('l', 'ˡ', 'ₗ'),
+        ('m', 'ᵐ', 'ₘ'),
+        ('n', 'ⁿ', 'ₙ'),
+        ('o', 'ᵒ', 'ₒ'),
+        ('p', 'ᵖ', 'ₚ'),
+        ('r', 'ʳ', 'ᵣ'),
+        ('s', 'ˢ', 'ₛ'),
+        ('t', 'ᵗ', 'ₜ'),
+        ('u', 'ᵘ', 'ᵤ'),
+        ('v', 'ᵛ', 'ᵥ'),
+        ('x', 'ˣ', 'ₓ'),
+    ];
+    table
+        .iter()
+        .find(|(base, _, _)| *base == c)
+        .map(|(_, hi, lo)| if sup { *hi } else { *lo })
+}
+
+/// Render every char of `s` in super/subscript form, or `None` if any char has
+/// no such form (so a mixed group stays legible rather than half-converted).
+fn script_run(s: &str, sup: bool) -> Option<String> {
+    s.chars().map(|c| script_char(c, sup)).collect()
+}
+
+/// Convert `x^2`, `s_j`, `^{N}`, `_{j=k+1}` to Unicode super/subscripts. A group
+/// that can't be fully mapped is left as `^(…)` / `_(…)` so it stays readable.
+fn sub_superscripts(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap();
+        if c == '^' || c == '_' {
+            let sup = c == '^';
+            let rest = &s[i + 1..];
+            if rest.starts_with('{') {
+                if let Some((inner, end)) = brace_group(s, i + 1) {
+                    match script_run(&inner, sup) {
+                        Some(mapped) => out.push_str(&mapped),
+                        None => {
+                            out.push(c);
+                            out.push('(');
+                            out.push_str(&inner);
+                            out.push(')');
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+            } else if let Some(first) = rest.chars().next() {
+                if let Some(m) = script_char(first, sup) {
+                    out.push(m);
+                    i += 1 + first.len_utf8();
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        } else {
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// Render the assistant's answer as Markdown lines. The raw text is first run
+/// through [`prettify_math`] (LaTeX → Unicode). GFM pipe tables — which
+/// `tui-markdown` does not render — are pulled out and drawn as aligned columns
+/// by [`render_table`]; everything else goes through [`render_markdown_block`].
 fn render_answer(answer: &str, width: u16) -> Vec<Line<'static>> {
+    let answer = prettify_math(answer);
+    let lines: Vec<&str> = answer.lines().collect();
     let mut out: Vec<Line<'static>> = Vec::new();
-    for line in tui_markdown::from_str(answer).lines {
+    let mut buf: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        // A GFM table starts with a `|`-bearing header row immediately followed
+        // by a separator row (dashes/colons), and runs while rows carry `|`.
+        if i + 1 < lines.len() && lines[i].contains('|') && is_table_separator(lines[i + 1]) {
+            if !buf.is_empty() {
+                out.extend(render_markdown_block(&buf.join("\n"), width));
+                buf.clear();
+            }
+            let mut j = i + 2;
+            while j < lines.len() && lines[j].contains('|') && !lines[j].trim().is_empty() {
+                j += 1;
+            }
+            out.extend(render_table(lines[i], &lines[i + 2..j], width));
+            i = j;
+        } else {
+            buf.push(lines[i]);
+            i += 1;
+        }
+    }
+    if !buf.is_empty() {
+        out.extend(render_markdown_block(&buf.join("\n"), width));
+    }
+    out
+}
+
+/// Render a Markdown fragment via `tui-markdown`, post-processing the two things
+/// it leaves raw: strip the leading `#` from ATX headings (keeping the color it
+/// applied) and turn a thematic break (`---`/`***`/`___`) into a drawn rule.
+fn render_markdown_block(text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in tui_markdown::from_str(text).lines {
         let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         let trimmed = plain.trim();
         // Thematic break: a line of only -, * or _ (three or more).
@@ -274,6 +688,101 @@ fn render_answer(answer: &str, width: u16) -> Vec<Line<'static>> {
                 .map(|s| Span::styled(s.content.into_owned(), s.style))
                 .collect::<Vec<_>>(),
         ));
+    }
+    out
+}
+
+/// Whether `line` is a GFM table separator row: dashes/colons and pipes only,
+/// with at least one dash (e.g. `| --- | :--: |` or `---|---`).
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    t.contains('-') && t.contains('|') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Split a table row into trimmed cell strings (dropping the outer pipes).
+fn table_cells(row: &str) -> Vec<String> {
+    let t = row.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Pad or truncate `s` to exactly `w` display columns (char-count approximation;
+/// truncation appends `…`).
+fn fit_cell(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n > w {
+        let keep = w.saturating_sub(1);
+        let mut t: String = s.chars().take(keep).collect();
+        t.push('…');
+        t
+    } else {
+        format!("{s:<w$}")
+    }
+}
+
+/// Draw a GFM table as aligned columns: a bold header, a rule, then the body.
+/// Column widths fit content, scaled down evenly if the natural table exceeds
+/// `width` (cells then truncate with `…`).
+fn render_table(header: &str, body: &[&str], width: u16) -> Vec<Line<'static>> {
+    let head = table_cells(header);
+    let rows: Vec<Vec<String>> = body.iter().map(|r| table_cells(r)).collect();
+    let ncols = head.len().max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let cell = |row: &[String], c: usize| row.get(c).cloned().unwrap_or_default();
+
+    // Natural width per column, then scale to fit (3 cols of " │ " overhead).
+    let mut widths: Vec<usize> = (0..ncols)
+        .map(|c| {
+            let h = head.get(c).map(|s| s.chars().count()).unwrap_or(0);
+            let b = rows
+                .iter()
+                .map(|r| cell(r, c).chars().count())
+                .max()
+                .unwrap_or(0);
+            h.max(b).max(1)
+        })
+        .collect();
+    let sep = " │ ";
+    let overhead = ncols.saturating_sub(1) * sep.chars().count();
+    let budget = (width as usize).saturating_sub(overhead).max(ncols);
+    if widths.iter().sum::<usize>() > budget {
+        let each = (budget / ncols).max(1);
+        for w in &mut widths {
+            *w = (*w).min(each);
+        }
+    }
+
+    let row_line = |cells: &[String], style: Style| -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (c, w) in widths.iter().enumerate() {
+            if c > 0 {
+                spans.push(Span::styled(sep, Style::default().fg(Color::DarkGray)));
+            }
+            spans.push(Span::styled(fit_cell(&cell(cells, c), *w), style));
+        }
+        Line::from(spans)
+    };
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let header_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    out.push(row_line(&head, header_style));
+    // Rule under the header: per-column dashes joined by `─┼─`.
+    let rule = widths
+        .iter()
+        .map(|w| "─".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("─┼─");
+    out.push(Line::from(Span::styled(
+        rule,
+        Style::default().fg(Color::DarkGray),
+    )));
+    for r in &rows {
+        out.push(row_line(r, Style::default()));
     }
     out
 }
@@ -322,17 +831,13 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         )),
         None => Line::from("message"),
     };
-    let busy = app.in_flight.is_some();
-    let prompt = if busy {
-        Style::default().add_modifier(Modifier::DIM)
-    } else {
-        Style::default()
-    };
-    let body = format!("{}{}", app.input, if busy { "" } else { "▏" });
-    let paragraph = Paragraph::new(Span::styled(body, prompt))
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    // The input editor (`tui-textarea`) renders itself — cursor at the point,
+    // horizontal scroll, placeholder. We draw the bordered block (its title is
+    // the live activity indicator) and hand the editor the inner rect.
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(&app.input, inner);
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -504,6 +1009,111 @@ mod tests {
                 .any(|t| t.chars().filter(|&c| c == '─').count() >= 3),
             "a thematic break becomes a drawn rule: {texts:?}"
         );
+    }
+
+    #[test]
+    fn prettify_math_renders_llm_latex_readably() {
+        // The constructs from a real QwQ answer: display delimiters, `\\` math
+        // line-breaks, \text, \frac, \boxed, and an operator.
+        let raw = "\\[ 60t + 60 = 80t \\\\ 60 = 20t \\\\ t = 3 \\]";
+        let got = prettify_math(raw);
+        assert!(
+            !got.contains("\\["),
+            "display delimiters are dropped: {got}"
+        );
+        assert!(!got.contains("\\\\"), "math line-breaks are gone: {got}");
+        assert!(got.contains("60 = 20t"), "the math survives: {got}");
+
+        assert_eq!(
+            prettify_math("\\frac{60 \\text{ miles}}{20 \\text{ mph}}"),
+            "60  miles/20  mph"
+        );
+        assert_eq!(prettify_math("\\boxed{7} PM"), "7 PM");
+        assert_eq!(prettify_math("a \\times b \\leq c"), "a × b ≤ c");
+        assert_eq!(prettify_math("\\sqrt{2} \\approx 1.41"), "√2 ≈ 1.41");
+        assert_eq!(prettify_math("\\pi r^2 \\theta"), "π r² θ");
+    }
+
+    #[test]
+    fn prettify_math_handles_scripts_floors_and_mod() {
+        // The constructs from a reasoning trace: subscripts, superscripts, the
+        // floor brackets, and \mod (with \left/\right dropped).
+        assert_eq!(prettify_math("s_j and c_k"), "sⱼ and cₖ");
+        assert_eq!(prettify_math("\\prod_{j=k+1}^N s_j"), "∏ⱼ₌ₖ₊₁ᴺ sⱼ");
+        assert_eq!(
+            prettify_math("\\left\\lfloor \\frac{r}{s_k} \\right\\rfloor"),
+            "⌊ r/sₖ ⌋"
+        );
+        assert_eq!(prettify_math("r \\mod s_k"), "r mod sₖ");
+        // A subscript with an unmappable char stays legible, not half-converted.
+        assert_eq!(prettify_math("x_{QQ}"), "x_(QQ)");
+    }
+
+    #[test]
+    fn prettify_math_strips_environments_and_functions() {
+        // \begin/\end wrappers (even with a stray space) and `&` separators go;
+        // the cell contents survive inline. Function names render as words.
+        assert_eq!(
+            prettify_math("\\begin{pmatrix} 1 & 1 ; 1 & 0 \\end {pmatrix}"),
+            " 1  1 ; 1  0 "
+        );
+        assert_eq!(prettify_math("O(\\log n)"), "O(log n)");
+        assert_eq!(prettify_math("\\psi^n / \\sqrt{5}"), "ψⁿ / √5");
+    }
+
+    #[test]
+    fn prettify_math_leaves_fenced_code_untouched() {
+        let raw = "before\n```\nlet x = a \\\\ b; // \\frac stays\n```\nafter";
+        let got = prettify_math(raw);
+        assert!(
+            got.contains("a \\\\ b") && got.contains("\\frac stays"),
+            "code fence is passed through verbatim: {got}"
+        );
+    }
+
+    #[test]
+    fn answer_renders_gfm_tables_as_aligned_columns() {
+        let md = "| Type | Formula |\n|------|---------|\n| Recurrence | F_n = F_{n-1} + F_{n-2} |\n| Closed | Binet |";
+        let lines = render_answer(md, 80);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // No raw pipe-table markup leaks through.
+        assert!(
+            !texts.iter().any(|t| t.contains("|---")),
+            "separator row is drawn, not raw: {texts:?}"
+        );
+        // Header and a body cell survive, drawn with the column separator.
+        assert!(
+            texts.iter().any(|t| t.contains("Type") && t.contains('│')),
+            "header row with column separator: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Recurrence")),
+            "body cell survives: {texts:?}"
+        );
+        // The header rule uses the ─┼─ junction.
+        assert!(
+            texts.iter().any(|t| t.contains("┼")),
+            "a header rule is drawn: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn is_table_separator_recognizes_gfm_rules() {
+        assert!(is_table_separator("|------|---------|"));
+        assert!(is_table_separator("| :--- | ---: |"));
+        assert!(is_table_separator("---|---"));
+        assert!(!is_table_separator("| a | b |")); // a data row, not a rule
+        assert!(!is_table_separator("just prose"));
+    }
+
+    #[test]
+    fn fit_cell_pads_and_truncates() {
+        assert_eq!(fit_cell("hi", 5), "hi   ");
+        assert_eq!(fit_cell("hello", 5), "hello");
+        assert_eq!(fit_cell("toolong", 5), "tool…");
     }
 
     #[test]

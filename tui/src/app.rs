@@ -14,8 +14,10 @@ use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::{Stream, StreamExt};
 use ratatui::backend::Backend;
+use ratatui::style::Style;
 use ratatui::Terminal;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tui_textarea::{CursorMove, Input, TextArea};
 use yatima_lib::{Cancel, Channel, StopReason};
 
 use crate::engine_actor::{EngineEvent, EngineRequest, Ready, TurnId};
@@ -58,7 +60,11 @@ pub struct Status {
     pub prompt_tokens: Option<usize>,
 }
 
-/// What a key press means (classified pure of effects).
+/// What a key press means (classified pure of effects). The keys the app owns
+/// (submit, cancel, scroll, quit, reasoning-fold) are named variants; every
+/// other key is an [`Intent::Edit`] routed to the input editor, which carries
+/// the full readline/emacs keymap (Ctrl+A/E/K/U/W, Alt+B/F/D, word/char motion,
+/// insert-at-point, undo).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Intent {
     None,
@@ -66,8 +72,14 @@ pub enum Intent {
     Submit,
     /// Request cancellation of the in-flight turn (TUI-6).
     Cancel,
-    Backspace,
-    Insert(char),
+    /// A key for the input editor (anything the app does not own itself).
+    Edit(Input),
+    /// Move the editor cursor back/forward one word (Alt+←/→).
+    WordBack,
+    WordForward,
+    /// Insert a literal newline in the prompt (Alt+Enter) — Enter submits, so a
+    /// multi-line prompt is composed with this.
+    Newline,
     ScrollUp,
     ScrollDown,
     /// Expand/collapse the reasoning regions of completed turns (TUI-5).
@@ -78,7 +90,11 @@ pub enum Intent {
 pub struct App {
     pub req_tx: Sender<EngineRequest>,
     pub transcript: Vec<Entry>,
-    pub input: String,
+    /// The input editor — a `tui-textarea` widget owning the prompt buffer,
+    /// cursor, and edit history. The app feeds it [`Intent::Edit`] keys and
+    /// reads its text on submit; rendering draws it at the cursor (TUI-2 stays
+    /// pure — render only borrows it).
+    pub input: TextArea<'static>,
     /// Lines scrolled up from the bottom (0 = follow latest). Display is always
     /// clamped by [`scroll_y`] (TUI-1).
     pub scroll_back: usize,
@@ -96,7 +112,7 @@ impl App {
         App {
             req_tx,
             transcript: Vec::new(),
-            input: String::new(),
+            input: fresh_input(),
             scroll_back: 0,
             in_flight: None,
             status: Status {
@@ -112,9 +128,12 @@ impl App {
         }
     }
 
-    /// Classify a key press into an [`Intent`] (no effects — testable).
+    /// Classify a key press into an [`Intent`] (no effects — testable). The app
+    /// owns a small set of keys; everything else becomes an [`Intent::Edit`] for
+    /// the input editor, whose own keymap supplies emacs/readline editing.
     pub fn classify(key: KeyEvent) -> Intent {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('c') if ctrl => Intent::Quit,
             KeyCode::Char('d') if ctrl => Intent::Quit,
@@ -122,10 +141,13 @@ impl App {
             KeyCode::Esc => Intent::Cancel,
             KeyCode::PageUp => Intent::ScrollUp,
             KeyCode::PageDown => Intent::ScrollDown,
+            KeyCode::Enter if alt => Intent::Newline,
             KeyCode::Enter => Intent::Submit,
-            KeyCode::Backspace => Intent::Backspace,
-            KeyCode::Char(c) => Intent::Insert(c),
-            _ => Intent::None,
+            // Alt+←/→ jump by word (the editor's own Ctrl+←/→ and Alt+B/F still
+            // work; these add the arrow combo regardless of Option-as-Meta).
+            KeyCode::Left if alt => Intent::WordBack,
+            KeyCode::Right if alt => Intent::WordForward,
+            _ => Intent::Edit(key.into()),
         }
     }
 
@@ -140,10 +162,12 @@ impl App {
             Intent::Quit => self.should_quit = true,
             Intent::Submit => self.start_turn(),
             Intent::Cancel => self.cancel_in_flight(),
-            Intent::Backspace => {
-                self.input.pop();
+            Intent::Edit(input) => {
+                self.input.input(input);
             }
-            Intent::Insert(c) => self.input.push(c),
+            Intent::WordBack => self.input.move_cursor(CursorMove::WordBack),
+            Intent::WordForward => self.input.move_cursor(CursorMove::WordForward),
+            Intent::Newline => self.input.insert_newline(),
             Intent::ScrollUp => self.scroll_back = self.scroll_back.saturating_add(3),
             Intent::ScrollDown => self.scroll_back = self.scroll_back.saturating_sub(3),
             Intent::ToggleReasoning => self.reasoning_expanded = !self.reasoning_expanded,
@@ -154,7 +178,7 @@ impl App {
     /// (TUI-7 single-in-flight). A leading-slash command (`/reset`) is handled
     /// here instead of submitting.
     fn start_turn(&mut self) {
-        let user = self.input.trim().to_string();
+        let user = self.input_text().trim().to_string();
         if user.is_empty() || self.in_flight.is_some() {
             return;
         }
@@ -163,7 +187,7 @@ impl App {
         if user == "/reset" {
             let _ = self.req_tx.send(EngineRequest::Reset);
             self.transcript.clear();
-            self.input.clear();
+            self.input = fresh_input();
             self.scroll_back = 0;
             return;
         }
@@ -184,8 +208,22 @@ impl App {
             user,
             control,
         });
-        self.input.clear();
+        self.input = fresh_input();
         self.scroll_back = 0; // jump to the latest
+    }
+
+    /// The current prompt text (the editor's lines joined). Enter submits before
+    /// reaching the editor, so this is normally a single line.
+    pub fn input_text(&self) -> String {
+        self.input.lines().join("\n")
+    }
+
+    /// Replace the prompt text — used by tests and any programmatic edit.
+    #[cfg(test)]
+    pub fn set_input(&mut self, text: &str) {
+        let mut ta = fresh_input();
+        ta.insert_str(text);
+        self.input = ta;
     }
 
     /// Request cancellation of the in-flight turn (TUI-6): flip the shared
@@ -275,6 +313,15 @@ impl App {
             *s = Some(stop);
         }
     }
+}
+
+/// A blank input editor configured for the prompt box: a "message" placeholder
+/// and no whole-line cursor highlight (the cursor itself marks the point).
+fn fresh_input() -> TextArea<'static> {
+    let mut ta = TextArea::default();
+    ta.set_placeholder_text("message");
+    ta.set_cursor_line_style(Style::default());
+    ta
 }
 
 /// The top row index to render so the displayed window is always within bounds
@@ -372,7 +419,7 @@ mod tests {
         app.apply(Intent::ToggleReasoning);
         assert!(!app.reasoning_expanded);
 
-        app.input = "hi".into();
+        app.set_input("hi");
         app.apply(Intent::Submit);
         app.on_engine_event(EngineEvent::Started { turn_id: 0 });
         app.on_engine_event(EngineEvent::Done {
@@ -393,7 +440,7 @@ mod tests {
         app.apply(Intent::Cancel); // nothing in flight: harmless
         assert!(app.in_flight.is_none());
 
-        app.input = "hi".into();
+        app.set_input("hi");
         app.apply(Intent::Submit);
         let control = app.in_flight.as_ref().unwrap().control.clone();
         assert!(!control.is_cancelled());
@@ -426,7 +473,7 @@ mod tests {
         // upholds: TUI-3 — fragments mutate the last entry, never append. A turn
         // adds exactly two entries (User on submit, Assistant on Started).
         let (mut app, _rx) = test_app();
-        app.input = "hi".into();
+        app.set_input("hi");
         app.apply(Intent::Submit);
         assert_eq!(app.transcript.len(), 1); // User
         app.on_engine_event(EngineEvent::Started { turn_id: 0 });
@@ -454,7 +501,7 @@ mod tests {
         // non-seeded batch answer must NOT clobber the empty streamed answer
         // (else reasoning and answer show the same text).
         let (mut app, _rx) = test_app();
-        app.input = "hi".into();
+        app.set_input("hi");
         app.apply(Intent::Submit);
         app.on_engine_event(EngineEvent::Started { turn_id: 0 });
         app.on_engine_event(EngineEvent::Fragment {
@@ -486,7 +533,7 @@ mod tests {
         // /reset is the in-session recovery: it clears the UI mirror and tells
         // the engine to reset its authoritative history — no turn is submitted.
         let (mut app, rx) = test_app();
-        app.input = "hi".into();
+        app.set_input("hi");
         app.apply(Intent::Submit);
         app.on_engine_event(EngineEvent::Started { turn_id: 0 });
         app.on_engine_event(EngineEvent::Done {
@@ -498,7 +545,7 @@ mod tests {
         assert!(!app.transcript.is_empty());
         let _ = rx.try_recv(); // drain the Submit
 
-        app.input = "/reset".into();
+        app.set_input("/reset");
         app.apply(Intent::Submit);
         assert!(app.transcript.is_empty(), "reset clears the mirror");
         assert!(app.in_flight.is_none(), "reset does not start a turn");
@@ -509,15 +556,15 @@ mod tests {
     fn submit_is_blocked_while_in_flight() {
         // upholds: TUI-7 — a new prompt cannot start while a turn is active.
         let (mut app, rx) = test_app();
-        app.input = "first".into();
+        app.set_input("first");
         app.apply(Intent::Submit);
         assert!(app.in_flight.is_some());
         assert!(matches!(rx.try_recv(), Ok(EngineRequest::Submit { .. })));
 
         // A second submit while in flight is a no-op: no new request, input kept.
-        app.input = "second".into();
+        app.set_input("second");
         app.apply(Intent::Submit);
-        assert_eq!(app.input, "second");
+        assert_eq!(app.input_text(), "second");
         assert!(rx.try_recv().is_err(), "no second Submit while in flight");
     }
 
@@ -576,7 +623,62 @@ mod tests {
             Intent::Quit
         );
         assert_eq!(App::classify(key(KeyCode::Enter)), Intent::Submit);
-        assert_eq!(App::classify(key(KeyCode::Char('a'))), Intent::Insert('a'));
         assert_eq!(App::classify(key(KeyCode::PageUp)), Intent::ScrollUp);
+        // An unowned key routes to the editor as an Edit intent.
+        assert_eq!(
+            App::classify(key(KeyCode::Char('a'))),
+            Intent::Edit(KeyEvent::from(KeyCode::Char('a')).into())
+        );
+    }
+
+    #[test]
+    fn editor_keys_edit_the_prompt_buffer() {
+        // The readline keymap lives in the editor: type, then Ctrl+A (start) and
+        // Ctrl+K (kill to end) clear the line — proof the keys reach it.
+        let (mut app, _rx) = test_app();
+        for c in "hello".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input_text(), "hello");
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.input_text(), "", "Ctrl+A then Ctrl+K kills the line");
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_without_submitting() {
+        // Enter submits; Alt+Enter composes a multi-line prompt instead.
+        assert_eq!(
+            App::classify(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Intent::Newline
+        );
+        let (mut app, rx) = test_app();
+        for c in "line one".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        for c in "line two".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input_text(), "line one\nline two");
+        assert!(app.in_flight.is_none(), "Alt+Enter must not submit");
+        assert!(rx.try_recv().is_err(), "no turn submitted");
+    }
+
+    #[test]
+    fn alt_arrows_move_by_word() {
+        // Alt+← / Alt+→ jump word boundaries (the keys the user named), landing
+        // the cursor at the start of the previous word.
+        assert_eq!(
+            App::classify(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            Intent::WordBack
+        );
+        let (mut app, _rx) = test_app();
+        app.set_input("alpha beta gamma"); // cursor is at end after set
+        app.input.move_cursor(CursorMove::End);
+        app.apply(Intent::WordBack);
+        // Now at the start of "gamma" (col 11); typing inserts there.
+        app.on_key(key(KeyCode::Char('!')));
+        assert_eq!(app.input_text(), "alpha beta !gamma");
     }
 }
