@@ -758,6 +758,23 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **More chat templates** — Llama-3, Zephyr/TinyLlama (same shape as Gemma/Mistral).
 - **Sampling quality** — `top_p`/`top_k` nucleus sampling (only temperature
   today) for better free-text on smaller models; download integrity/resume.
+- **Model-analysis suite + REASON-2 hardening** — onboarding a new model today
+  means discovering undocumented facts by *live trial* (pre-seed vs emit `<think>`,
+  whether reasoning markers are *special* tokens — the bug where QwQ's `</think>`
+  was dropped by `skip_special_tokens` and the answer was mislabeled reasoning
+  forever, the EOS set, quant dtype, footprint, format). Build a `yatima inspect`
+  (static: GGUF metadata + tokenizer only, no GPU — arch, context length, quant
+  dtype + candle support so `IQ*`/"unknown dtype 20" is caught before a 20 GB
+  download, EOS ids, memory estimate vs this machine per MEM-1/2, and a **marker
+  audit**: run each reasoning dialect marker through the *real* `TokenOutputStream`
+  and report whether it survives) and a gated `yatima probe` (tiny generation:
+  reasoning span present? pre-seed vs emit? does the answer channel actually flip?
+  degeneration?). The two together emit a **draft `ModelProfile`** for a human to
+  review and paste (advisory, like `invariant_reviewer`, never auto-merged). The
+  marker-audit logic does double duty as the hardening: **REASON-2** — a load-time
+  canary (`tracing::warn` when a configured model would drop a marker under the
+  stream's decode) plus a test sweep over cached models asserting markers survive.
+  So the suite *is* the hardening, productized — not a one-off check.
 
 ### Embedding (library surface)
 - **`ChatSession` — done.** The multi-turn fold is a public lib type
