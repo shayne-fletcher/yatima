@@ -95,11 +95,13 @@ pub enum EngineEvent {
         channel: Channel,
         text: String,
     },
-    /// The turn finished: the answer (reasoning stripped) and why it stopped.
+    /// The turn finished: the answer (reasoning stripped), why it stopped, and
+    /// the prompt's token count (for the context meter), if known.
     Done {
         turn_id: TurnId,
         answer: String,
         stop: StopReason,
+        prompt_tokens: Option<usize>,
     },
     /// The turn failed.
     Error { turn_id: TurnId, message: String },
@@ -122,6 +124,9 @@ pub struct Ready {
     pub backend: String,
     pub arch: Arch,
     pub format: ChatFormat,
+    /// The model's context window in tokens (for the meter denominator), if the
+    /// model declares it.
+    pub context_length: Option<usize>,
     pub model_label: String,
 }
 
@@ -174,6 +179,8 @@ fn actor_main(
     };
     let backend = engine.backend();
     let arch = engine.arch();
+    // Capture before the session borrows the engine (for the context meter).
+    let context_length = engine.context_length();
     let (format, _mismatch) = resolve_format(arch, config.format);
 
     let template = format.template();
@@ -187,6 +194,7 @@ fn actor_main(
             backend,
             arch,
             format,
+            context_length,
             model_label: config.model_label,
         }))
         .is_err()
@@ -262,6 +270,7 @@ fn run_turn(
                 turn_id,
                 answer,
                 stop,
+                prompt_tokens: session.last_prompt_tokens(),
             });
         }
         Err(e) => {

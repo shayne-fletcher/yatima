@@ -25,12 +25,14 @@
 //!   [`App::push_entry`](app::App::push_entry); fragments mutate the last entry.
 //! - **TUI-4 ui-liveness** — generation runs on the engine thread, so the event
 //!   loop services input while a turn is in flight (the keystone).
+//! - **TUI-5 reasoning-foldable** — a completed turn's reasoning collapses to a
+//!   one-line summary (Ctrl+R toggles); the in-flight turn always streams it
+//!   live. The reasoning is never lost (REASON-1 carried into the UI).
 //! - **TUI-7 single-in-flight** — at most one turn at a time; a submit while one
 //!   is active is a no-op.
 //!
-//! Deferred to later slices: TUI-5 reasoning-foldable (Slice 2), TUI-6
-//! prompt-cancel (Slice 3 — needs a stoppable streaming callback in the lib; the
-//! control plane is plumbed but inert here).
+//! Deferred: TUI-6 prompt-cancel (Slice 3 — needs a stoppable streaming callback
+//! in the lib; the control plane is plumbed but inert here).
 
 pub mod app;
 pub mod engine_actor;

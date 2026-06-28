@@ -49,6 +49,10 @@ pub struct Status {
     pub model_label: String,
     pub backend: String,
     pub format: String,
+    /// The model's context window (meter denominator), if declared.
+    pub context_length: Option<usize>,
+    /// Tokens in the most recent prompt (meter numerator), once a turn completes.
+    pub prompt_tokens: Option<usize>,
 }
 
 /// What a key press means (classified pure of effects).
@@ -61,6 +65,8 @@ pub enum Intent {
     Insert(char),
     ScrollUp,
     ScrollDown,
+    /// Expand/collapse the reasoning regions of completed turns (TUI-5).
+    ToggleReasoning,
 }
 
 /// The UI render model.
@@ -73,6 +79,9 @@ pub struct App {
     pub scroll_back: usize,
     pub in_flight: Option<InFlight>,
     pub status: Status,
+    /// Whether completed turns' reasoning is expanded (TUI-5). The in-flight
+    /// turn always streams its reasoning live regardless.
+    pub reasoning_expanded: bool,
     pub should_quit: bool,
     next_turn_id: TurnId,
 }
@@ -89,7 +98,10 @@ impl App {
                 model_label: ready.model_label,
                 backend: ready.backend,
                 format: ready.format.to_string(),
+                context_length: ready.context_length,
+                prompt_tokens: None,
             },
+            reasoning_expanded: false,
             should_quit: false,
             next_turn_id: 0,
         }
@@ -101,6 +113,7 @@ impl App {
         match key.code {
             KeyCode::Char('c') if ctrl => Intent::Quit,
             KeyCode::Char('d') if ctrl => Intent::Quit,
+            KeyCode::Char('r') if ctrl => Intent::ToggleReasoning,
             KeyCode::PageUp => Intent::ScrollUp,
             KeyCode::PageDown => Intent::ScrollDown,
             KeyCode::Enter => Intent::Submit,
@@ -126,6 +139,7 @@ impl App {
             Intent::Insert(c) => self.input.push(c),
             Intent::ScrollUp => self.scroll_back = self.scroll_back.saturating_add(3),
             Intent::ScrollDown => self.scroll_back = self.scroll_back.saturating_sub(3),
+            Intent::ToggleReasoning => self.reasoning_expanded = !self.reasoning_expanded,
         }
     }
 
@@ -204,8 +218,10 @@ impl App {
                 turn_id,
                 answer,
                 stop,
+                prompt_tokens,
             } if self.is_current(turn_id) => {
                 self.finish_assistant(answer, stop);
+                self.status.prompt_tokens = prompt_tokens;
                 self.in_flight = None;
             }
             EngineEvent::Error { turn_id, message } if self.is_current(turn_id) => {
@@ -308,6 +324,7 @@ mod tests {
             backend: "test".into(),
             arch: Arch::Qwen2,
             format: ChatFormat::Qwen,
+            context_length: Some(32768),
             model_label: "test-model".into(),
         };
         (App::new(tx, ready), rx)
@@ -315,6 +332,33 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn ctrl_r_toggles_reasoning_and_done_records_prompt_tokens() {
+        // upholds: TUI-5 — Ctrl+R flips the reasoning fold; Done carries the
+        // prompt-token count for the context meter.
+        let (mut app, _rx) = test_app();
+        assert_eq!(
+            App::classify(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Intent::ToggleReasoning
+        );
+        assert!(!app.reasoning_expanded);
+        app.apply(Intent::ToggleReasoning);
+        assert!(app.reasoning_expanded);
+        app.apply(Intent::ToggleReasoning);
+        assert!(!app.reasoning_expanded);
+
+        app.input = "hi".into();
+        app.apply(Intent::Submit);
+        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
+        app.on_engine_event(EngineEvent::Done {
+            turn_id: 0,
+            answer: "ok".into(),
+            stop: StopReason::Eos,
+            prompt_tokens: Some(2048),
+        });
+        assert_eq!(app.status.prompt_tokens, Some(2048));
     }
 
     #[test]
@@ -354,6 +398,7 @@ mod tests {
             turn_id: 0,
             answer: "xxxxx".into(),
             stop: StopReason::Eos,
+            prompt_tokens: Some(123),
         });
         assert_eq!(app.transcript.len(), 2, "fragments/done must not append");
     }
@@ -370,6 +415,7 @@ mod tests {
             turn_id: 0,
             answer: "ok".into(),
             stop: StopReason::Eos,
+            prompt_tokens: Some(123),
         });
         assert!(!app.transcript.is_empty());
         let _ = rx.try_recv(); // drain the Submit

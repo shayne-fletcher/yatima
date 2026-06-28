@@ -55,7 +55,8 @@ pub fn ui(frame: &mut Frame, app: &App) {
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
-    for entry in &app.transcript {
+    let last = app.transcript.len().saturating_sub(1);
+    for (idx, entry) in app.transcript.iter().enumerate() {
         match entry {
             Entry::User(text) => {
                 lines.push(Line::from(Span::styled(
@@ -79,12 +80,30 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(Modifier::BOLD),
                 )));
                 if !reasoning.is_empty() {
-                    // Slice 2 will make this foldable; for now it is dimmed.
-                    push_wrapped(
-                        &mut lines,
-                        reasoning,
-                        Style::default().add_modifier(Modifier::DIM),
-                    );
+                    // The in-flight turn streams its reasoning live; completed
+                    // turns collapse to a one-line summary unless expanded (TUI-5,
+                    // Ctrl+R). Collapsing keeps the answer from being buried.
+                    let streaming = app.in_flight.is_some() && idx == last;
+                    if app.reasoning_expanded || streaming {
+                        lines.push(Line::from(Span::styled(
+                            if streaming {
+                                "▾ reasoning (live)".to_string()
+                            } else {
+                                "▾ reasoning".to_string()
+                            },
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                        push_wrapped(
+                            &mut lines,
+                            reasoning,
+                            Style::default().add_modifier(Modifier::DIM),
+                        );
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            format!("▸ reasoning ({} lines · Ctrl+R)", reasoning.lines().count()),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
                 }
                 push_wrapped(&mut lines, answer, Style::default());
                 // Surface a non-EOS stop so a truncated / collapsed turn is not
@@ -179,19 +198,41 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.in_flight.is_some() {
         "^C quit (cancel: soon)"
     } else {
-        "^C quit · /reset · PgUp/PgDn scroll"
+        "^C quit · /reset · ^R reasoning · PgUp/PgDn"
     };
-    let parts = [
+    let mut parts = vec![
         app.status.model_label.clone(),
         format!("[{}]", app.status.backend),
         format!("fmt:{}", app.status.format),
-        hint.to_string(),
     ];
+    if let Some(ctx) = context_label(app.status.prompt_tokens, app.status.context_length) {
+        parts.push(ctx);
+    }
+    parts.push(hint.to_string());
     let status = Line::from(Span::styled(
         parts.join("  ·  "),
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(status), area);
+}
+
+/// Compact token count, e.g. `2.1k`, `512`.
+fn kfmt(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// The context-meter label, or `None` before the first turn / tokenizer-less
+/// completer. `ctx 2.1k/32k` when the window is known, else `ctx 2.1k`.
+fn context_label(prompt_tokens: Option<usize>, context_length: Option<usize>) -> Option<String> {
+    let used = prompt_tokens?;
+    Some(match context_length {
+        Some(total) => format!("ctx {}/{}", kfmt(used), kfmt(total)),
+        None => format!("ctx {}", kfmt(used)),
+    })
 }
 
 #[cfg(test)]
@@ -209,6 +250,16 @@ mod tests {
         assert!(line.contains("0:03"));
         // The rate is shown — the slow-vs-stalled signal.
         assert!(line.contains("tok/s"));
+    }
+
+    #[test]
+    fn context_label_formats_used_and_total() {
+        assert_eq!(context_label(None, Some(32768)), None); // before any turn
+        assert_eq!(
+            context_label(Some(2100), Some(32768)).unwrap(),
+            "ctx 2.1k/32.8k"
+        );
+        assert_eq!(context_label(Some(512), None).unwrap(), "ctx 512");
     }
 
     #[test]

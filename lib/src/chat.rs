@@ -45,6 +45,9 @@ pub struct ChatSession<'a, C: Completer, T: PromptTemplate> {
     /// The most recent reply's reasoning span, if it was a reasoning model;
     /// `None` otherwise. Kept out of the transcript (REASON-1) but surfaced here.
     last_reasoning: Option<String>,
+    /// Tokens in the most recent rendered prompt (for a host's context meter),
+    /// if the completer exposes a tokenizer; `None` otherwise.
+    last_prompt_tokens: Option<usize>,
 }
 
 impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
@@ -59,6 +62,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             system_len: 0,
             last_stop: None,
             last_reasoning: None,
+            last_prompt_tokens: None,
         }
     }
 
@@ -91,6 +95,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             content: user.to_string(),
         });
         let prompt = self.template.render(&self.turns);
+        self.last_prompt_tokens = self.completer.count_tokens(&prompt);
         // Just await: the Completer impl owns whether this is sync compute (the
         // local Engine, under run_blocking) or I/O (a remote completer). CMP-1.
         // A turn is atomic (CHAT-1): on error, roll back the user turn so a failed
@@ -134,6 +139,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             content: user.to_string(),
         });
         let prompt = self.template.render(&self.turns);
+        self.last_prompt_tokens = self.completer.count_tokens(&prompt);
         // Atomic on error (CHAT-1): roll back the user turn. Any fragments already
         // streamed to `on_token` cannot be un-emitted, but the *stored* history
         // stays clean, so the next turn re-renders consistent prompt history.
@@ -178,6 +184,14 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
     /// (REASON-1); this is the only place it is surfaced.
     pub fn last_reasoning(&self) -> Option<&str> {
         self.last_reasoning.as_deref()
+    }
+
+    /// Tokens in the most recent rendered prompt, if the completer exposes a
+    /// tokenizer — for a host's context-usage meter (with
+    /// [`crate::Engine::context_length`] as the denominator). `None` before any
+    /// turn or for a tokenizer-less completer.
+    pub fn last_prompt_tokens(&self) -> Option<usize> {
+        self.last_prompt_tokens
     }
 
     /// Clear the conversation back to the seeded system prompt.

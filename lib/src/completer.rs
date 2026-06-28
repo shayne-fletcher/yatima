@@ -99,6 +99,14 @@ pub trait Completer {
         stops: &[String],
     ) -> Result<Completion>;
 
+    /// Token count of `text` under this backend's tokenizer, if it has one — for
+    /// a host's context-usage meter. The default returns `None` (a remote or
+    /// scripted completer may not expose a tokenizer); the local [`Engine`]
+    /// overrides it.
+    fn count_tokens(&self, _text: &str) -> Option<usize> {
+        None
+    }
+
     /// Like [`complete`](Completer::complete), but delivers text to `on_token` as
     /// it is produced (for live UIs / streaming chat). The default emits the whole
     /// completion once — so every `Completer` works unchanged; backends that can
@@ -199,6 +207,10 @@ impl Completer for Engine {
         stops: &[String],
     ) -> Result<Completion> {
         run_blocking_island(|island| self.complete_on(island, prompt, opts, stops))
+    }
+
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        Engine::token_count(self, text).ok()
     }
 
     async fn complete_streaming(
