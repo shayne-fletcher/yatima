@@ -6,10 +6,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{
+    Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use futures::stream::Stream;
 use ratatui::backend::CrosstermBackend;
@@ -114,11 +118,11 @@ async fn main() -> Result<()> {
     eprintln!("loading model… (first run may fetch weights)");
     let handle = engine_actor::spawn(config).await?;
 
-    let mut terminal = enter_terminal()?;
+    let (mut terminal, enhanced) = enter_terminal()?;
     let app = App::new(handle.req_tx, handle.ready);
     let key_events = key_event_stream();
     let result = run_loop(&mut terminal, app, handle.event_rx, key_events).await;
-    restore_terminal(&mut terminal)?;
+    restore_terminal(&mut terminal, enhanced)?;
     result
 }
 
@@ -128,14 +132,33 @@ fn key_event_stream() -> impl Stream<Item = io::Result<Event>> + Unpin {
     EventStream::new()
 }
 
-fn enter_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+/// Enter raw mode and the alternate screen. Returns whether the kitty keyboard
+/// protocol was enabled: where the terminal supports it (kitty, ghostty, wezterm,
+/// foot, iTerm2 with the setting), disambiguating escape codes makes modified
+/// Enter — Shift+Enter / Alt+Enter for a newline — arrive as distinct keys.
+/// Apple Terminal does not support it (returns false); there, enable "Use Option
+/// as Meta key" so Option+Return is delivered as Alt+Enter.
+fn enter_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool)> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    Ok((Terminal::new(CrosstermBackend::new(stdout))?, enhanced))
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    enhanced: bool,
+) -> Result<()> {
+    if enhanced {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;

@@ -149,6 +149,7 @@ impl App {
     pub fn classify(key: KeyEvent) -> Intent {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Char('c') if ctrl => Intent::Quit,
             KeyCode::Char('d') if ctrl => Intent::Quit,
@@ -156,7 +157,9 @@ impl App {
             KeyCode::Esc => Intent::Cancel,
             KeyCode::PageUp => Intent::ScrollUp,
             KeyCode::PageDown => Intent::ScrollDown,
-            KeyCode::Enter if alt => Intent::Newline,
+            // Alt+Enter / Shift+Enter insert a newline (the latter needs a
+            // terminal that reports modified Enter — see `enter_terminal`).
+            KeyCode::Enter if alt || shift => Intent::Newline,
             KeyCode::Enter => Intent::Submit,
             // Alt+←/→ jump by word (the editor's own Ctrl+←/→ and Alt+B/F still
             // work; these add the arrow combo regardless of Option-as-Meta).
@@ -731,6 +734,10 @@ mod tests {
         // Enter submits; Alt+Enter composes a multi-line prompt instead.
         assert_eq!(
             App::classify(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Intent::Newline
+        );
+        assert_eq!(
+            App::classify(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
             Intent::Newline
         );
         let (mut app, rx) = test_app();
