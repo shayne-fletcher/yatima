@@ -69,12 +69,19 @@ regimes also argues against any scheduling race: races are flaky, this is
 clockwork.
 
 What remains is a deterministic compute defect at kv ≥ 8,192 that only
-manifests in the composed model — something the isolated-op probes (which
-are clean at these exact shapes) do not replicate: candidates include
-encoder/command-buffer batching state, a shape- or offset-dependent kernel
-path only reached with the model's exact tensor provenance (8-head cache →
-`repeat_kv` cat → offset views), or dispatch behavior that differs once
-multiple large tensors coexist. The hunt was stopped here on cost grounds.
+manifests in the composed model. The provenance gap was closed too:
+`metal_attn_replica_probe.rs` replays one decode step exactly as
+`quantized_qwen2::forward_attn` does (4D batch shapes, 8-head KV cache
+grown by `cat`, `repeat_kv` cat-of-5 + reshape, RoPE through narrowed
+table views at the true positions, no mask) at positions 8,189–8,194 —
+every intermediate agrees across devices at float-epsilon, with no anomaly
+at the crossing. So the attention data path is clean even with exact
+provenance; what the replica still lacks is what the real model adds: the
+quantized weight matmuls (QMatMul) interleaved in the same stream, the
+rest of the layer (RMSNorm, MLP), and 64 layers of encoder/command-buffer
+batching per step. Localizing further requires layer-by-layer dumps inside
+a vendored copy of the model on the 32B weights — the expensive hunt. The
+cheap, model-free methods end here; stopped on cost grounds.
 
 (A *global* no-reuse switch is not viable for experiments: fresh Metal
 buffers for every op balloon unboundedly — a run took the machine down at
