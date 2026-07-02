@@ -52,23 +52,33 @@ carrying a 40k-char `read_page` result).
 The corruption appears only in the composed model run, precisely at the KV
 depth where the K/V cache tensors reach exactly 2^25 bytes (8 kv-heads ×
 8,192 positions × 128 dim × 4 bytes = 32 MiB — 4,096 bytes per position, so
-depth 8,192 is the unique power-of-two crossing). candle's Metal allocator
-buckets buffers by `next_power_of_two` and recycles them when the host-side
-`Arc` count drops to 1; all buffers are created with
-`HazardTrackingModeUntracked`, so correctness relies on every kernel
-annotating written buffers (`Output::new`) for the encoder's RAW-hazard
-tracking. At kv = 8,192 the cache `cat` is served from the long-idle 32 MiB
-bucket (confirmed by allocation logging on the instrumented local candle,
-branch `metal-pool-debug` in the sibling clone) rather than the
-steadily-recycled 64 MiB bucket, and the KV state is poisoned from that
-step on.
+depth 8,192 is the unique power-of-two crossing).
 
-The remaining unknown is the exact racing/un-annotated kernel. A global
-"no pool reuse" kill-switch was tried to prove causation and is **not
-viable**: fresh Metal buffers for every op balloon unboundedly (the run
-took the machine down at 228 GB+). A scoped variant (skip reuse only for
-power-of-two requests ≥ 16 MiB — a few hundred buffers) is implemented on
-the candle branch for whoever resumes the hunt.
+**The allocator is exonerated.** The leading suspect was candle's Metal
+buffer pool (power-of-two buckets, reuse on `Arc` count 1, all buffers
+`HazardTrackingModeUntracked`): at kv = 8,192 the cache `cat` is served
+from the long-idle 32 MiB bucket rather than the steadily-recycled 64 MiB
+one (confirmed by allocation logging on the instrumented local candle,
+branch `metal-pool-debug` in the sibling clone). But a scoped kill-switch
+(`CANDLE_METAL_NO_REUSE_POW2=1`: fresh buffers for exact power-of-two
+requests ≥ 16 MiB, allocation logging confirming zero reuse at the
+crossing) produced output **byte-identical** to the baseline — same clean
+prefix, same derailment at kv ≈ 8,196, same garbage. Fresh buffers do not
+move the cliff. The byte-identical determinism across two allocation
+regimes also argues against any scheduling race: races are flaky, this is
+clockwork.
+
+What remains is a deterministic compute defect at kv ≥ 8,192 that only
+manifests in the composed model — something the isolated-op probes (which
+are clean at these exact shapes) do not replicate: candidates include
+encoder/command-buffer batching state, a shape- or offset-dependent kernel
+path only reached with the model's exact tensor provenance (8-head cache →
+`repeat_kv` cat → offset views), or dispatch behavior that differs once
+multiple large tensors coexist. The hunt was stopped here on cost grounds.
+
+(A *global* no-reuse switch is not viable for experiments: fresh Metal
+buffers for every op balloon unboundedly — a run took the machine down at
+228 GB+. The scoped variant on the candle branch is bounded by design.)
 
 ## Status / mitigation
 
