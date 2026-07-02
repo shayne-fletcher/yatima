@@ -1,4 +1,4 @@
-# Metal KV corruption at depth 8,192 (CTX-2)
+# Metal KV corruption at depth 8,192
 
 ## Symptom
 
@@ -129,21 +129,22 @@ mode) and asserts the generation survives with a sane alphabetic ratio.
 Pass → upstream fixed it, drop the fork and repin upstream. Fail →
 cherry-pick the workaround commits onto the new rev, push the branch,
 repin. With the workaround the canary passes today (a coherent summary,
-every token generated past the cliff); CTX-2's warning stays for anyone
-on stock candle.
+every token generated past the cliff).
 
 (A *global* no-reuse switch is not viable for experiments: fresh Metal
 buffers for every op balloon unboundedly — a run took the machine down at
 228 GB+. The scoped variant on the candle branch is bounded by design.)
 
-## Status / mitigation
+## Status
 
-- The engine warns (CTX-2, `warn_metal_kv_cliff`) when a Metal run will
-  reach depth 8,192. A warning, not a refusal: the depth is empirical and
-  per-stack (validated on Qwen2.5-32B Q4_K_M, macOS 26 / M-series 48 GB,
-  candle 0.11.0 = upstream main at 31f35b1).
-- Hosts keep working prompts under the cliff: the TUI's `read_page` budget
-  is 12k chars (≈ 3.3k tokens) for latency *and* headroom.
+- Fixed for yatima by the fork pin above. The interim engine warning
+  (CTX-2, `warn_metal_kv_cliff`) was retired once the pin carried the
+  workaround — a warning that is wrong in every practical run trains its
+  reader to ignore warnings; the canary is the guard that matters now
+  (validated on Qwen2.5-32B Q4_K_M, macOS 26 / M-series 48 GB, candle
+  0.11.0 = upstream main at 31f35b1).
+- The TUI's 12k-char `read_page` budget stays on latency grounds alone
+  (a 40k-char tool result cost ~2.5 min of prefill per agent step).
 - Upstream: candle issue to be filed with this diagnosis; the pin already
   contains all recent Metal sync fixes (#3532, #3595, #3394), so the defect
   is live on their main.
