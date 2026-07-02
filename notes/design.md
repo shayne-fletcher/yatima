@@ -339,18 +339,28 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   `read_page` result must not ride along in every later prompt). Interrupted or
   step-exhausted runs persist nothing, so the caller can simply re-ask. One-shot
   use (the CLI) is the fresh-agent-per-run special case.
-- **Hosted by the TUI** (`--web-origin <url>`): the engine actor grants
-  `read_url`/`read_page` on that origin (CAP-2) and serves turns through one
-  sessionful agent instead of the plain `ChatSession`. Agent reasoning and tool
-  activity ride the `Reasoning` fragment channel (tool rounds are working
-  matter, so the reasoning pane is their honest home); the final answer rides
-  `Answer`. Chat-only formats are rejected at startup (CAPS-1) — the tool loop
-  needs a tool-trained codec (`qwen` or `plain`). Cancellation takes effect at
-  event boundaries (step granularity) — the agent path's decode is not yet
-  token-cancellable, unlike the chat path; token streaming through the agent
-  loop is roadmap. `Tool` is the downstream extension seam: a consumer crate
-  (e.g. a sieve CLI) registers its own domain tools via `Tools::with` and gets
-  the same hosting for free.
+- **Hosted by the TUI, authorized at runtime (CAP-3).** Sessions launch with
+  zero web authority — no flag. Authority derives only from user utterances:
+  a URL typed in a message auto-grants its origin for the session
+  (`origins_in` scans *only* user-typed text — a URL inside fetched content
+  mints nothing), and `/grant`, `/grants`, `/revoke` manage the set
+  explicitly. Grants accumulate into a shared, growable `WebOrigins`
+  (CAP-2 generalizes to the origin *set*) held by `read_url`/`read_page`;
+  while empty, the web tools omit themselves from the advertised specs, and
+  once granted their descriptions enumerate the set (CAP-3a — the prompt
+  always states the model's true authority). `/reset` clears conversation,
+  not grants. On a tool-trained format the session starts on the streaming
+  chat path and the **first grant transplants the chat history into one
+  sessionful agent** (a one-way switch; both histories are user/answer
+  turns, so the seam is invisible). Agent reasoning and tool activity ride
+  the `Reasoning` fragment channel (tool rounds are working matter, so the
+  reasoning pane is their honest home); the final answer rides `Answer`.
+  Chat-only formats refuse grants with a clear message (CAPS-1).
+  Cancellation takes effect at event boundaries (step granularity) — the
+  agent path's decode is not yet token-cancellable, unlike the chat path;
+  token streaming through the agent loop is roadmap. `Tool` is the
+  downstream extension seam: a consumer crate (e.g. a sieve CLI) registers
+  its own domain tools via `Tools::with` and gets the same hosting for free.
 
 **Speaking the model's native format (hard-won).** Getting a base model to
 *reliably* act took three corrections, each now a guarded invariant:

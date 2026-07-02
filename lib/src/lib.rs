@@ -133,7 +133,21 @@
 //! - **CAP-2** the agent's effects ⊆ the union of its tools' capabilities —
 //!   enforced for omission (AGENT-2) and containment (CAP-1); by construction
 //!   otherwise (tools hold their caps, no ambient `std::fs` or arbitrary
-//!   network destination). Stated, not compiler-absolute — see `notes/design.md`.
+//!   network destination). A web tool's authority is exactly its held origin
+//!   *set* ([`WebOrigins`]): membership checked at call time, escapes refused
+//!   before any network I/O, relative targets resolving only when exactly one
+//!   origin is granted. Stated, not compiler-absolute — see `notes/design.md`.
+//! - **CAP-3** web authority derives only from **user utterances**: an origin
+//!   enters a session's [`WebOrigins`] iff the user typed a URL (auto-grant,
+//!   scanned by [`origins_in`]) or issued an explicit grant command. Grants
+//!   accumulate (session authority is the union), never persist across
+//!   sessions, and shrink only by explicit revoke. Nothing a tool returns or
+//!   the model generates reaches [`WebOrigins::grant`] — no such code path
+//!   exists, so a fetched page cannot mint authority.
+//! - **CAP-3a** the rendered tool specs state the model's live authority: a
+//!   tool whose capability is empty is absent from [`Tools::specs`] (the
+//!   model never sees a tool it cannot use), and a web tool's description
+//!   enumerates its granted origins.
 //! - **FETCH-1** within a session, [`ReadPage`] fetches each resolved URL at
 //!   most once: repeat and continuation (`offset`) reads are served from a
 //!   per-tool, FIFO-bounded cache and never touch the network — re-fetching
@@ -188,7 +202,7 @@ mod transcript;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
 pub use cancel::Cancel;
-pub use capability::{Dir, NtfyTopic, WebOrigin, WriteDir};
+pub use capability::{origins_in, Dir, NtfyTopic, WebOrigin, WebOrigins, WriteDir};
 pub use chat::ChatSession;
 pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]

@@ -29,7 +29,6 @@ async fn actor_runs_a_turn() -> anyhow::Result<()> {
         },
         format: None,
         system: None,
-        web_origin: None,
         model_label: repo.into(),
     };
     let mut handle = engine_actor::spawn(config).await?;
@@ -55,6 +54,7 @@ async fn actor_runs_a_turn() -> anyhow::Result<()> {
                 break;
             }
             EngineEvent::Error { message, .. } => panic!("engine error: {message}"),
+            EngineEvent::Grants { .. } => {}
         }
     }
     handle.req_tx.send(EngineRequest::Shutdown)?;
@@ -92,7 +92,6 @@ async fn actor_cancels_a_turn_in_flight() -> anyhow::Result<()> {
         },
         format: None,
         system: None,
-        web_origin: None,
         model_label: repo.into(),
     };
     let mut handle = engine_actor::spawn(config).await?;

@@ -26,8 +26,8 @@ use tokio::sync::oneshot;
 use yatima_lib::{
     device, resolve_format, Agent, AgentEvent, AgentStop, Arch, Cancel, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, PlainTemplate, PromptTemplate,
-    QwenToolCall, ReadPage, ReadUrl, ReasoningSplitter, StopReason, ToolCallCodec, ToolOutcome,
-    Tools, WebOrigin,
+    QwenToolCall, ReadPage, ReadUrl, ReasoningSplitter, Role, StopReason, ToolCallCodec,
+    ToolOutcome, Tools, Turn, WebOrigins,
 };
 
 /// A turn identifier, monotonic per session. Lets the UI ignore stale events.
@@ -43,8 +43,17 @@ pub enum EngineRequest {
         user: String,
         control: Cancel,
     },
-    /// Clear the conversation back to the system prompt.
+    /// Clear the conversation back to the system prompt. Granted origins are
+    /// capability state, not conversation state — a reset keeps them (CAP-3).
     Reset,
+    /// Grant a web origin for the session (CAP-3: the UI sends this only for
+    /// user utterances — a typed URL or an explicit /grant). The first grant
+    /// on a tool-trained format switches the session to the agent path.
+    Grant { origin: String },
+    /// Revoke a previously granted origin.
+    Revoke { origin: String },
+    /// Report the granted origins (a `Grants` event answers).
+    ListGrants,
     /// Stop the actor and drop the engine.
     Shutdown,
 }
@@ -71,6 +80,12 @@ pub enum EngineEvent {
     },
     /// The turn failed.
     Error { turn_id: TurnId, message: String },
+    /// The granted-origin set after a grant/revoke/list, with a line for the
+    /// transcript ("granted read access to …", an error, or the listing).
+    Grants {
+        origins: Vec<String>,
+        message: String,
+    },
 }
 
 /// What the actor needs to load a model (all `Send`, so it crosses into the
@@ -81,10 +96,6 @@ pub struct EngineConfig {
     pub opts: GenOpts,
     pub format: Option<ChatFormat>,
     pub system: Option<String>,
-    /// Grant the model HTTP tools (`read_url`, `read_page`) scoped to this
-    /// origin (CAP-2). When set, turns run through the sessionful tool-calling
-    /// [`Agent`] instead of the plain [`ChatSession`].
-    pub web_origin: Option<String>,
     pub model_label: String,
 }
 
@@ -171,15 +182,15 @@ fn actor_main(
     let context_length = engine.context_length();
     let (format, _mismatch) = resolve_format(arch, config.format);
 
-    // Build the granted tools before reporting ready, so a bad origin or a
-    // chat-only format fails the load cleanly (before the alternate screen).
-    let tools = match agent_tools(config.web_origin.as_deref(), format) {
-        Ok(tools) => tools,
-        Err(e) => {
-            let _ = ready_tx.send(Err(e.to_string()));
-            return;
-        }
-    };
+    // Tool-trained formats always carry the web tools, initially with an
+    // empty origin set — hidden from the model (CAP-3a) and inert until a
+    // grant arrives (sandbox by omission; CAP-3: grants come only from the
+    // user, via the UI). Chat-only formats get none.
+    let tool_trained = matches!(format, ChatFormat::Qwen | ChatFormat::Plain);
+    let origins = WebOrigins::new();
+    // Client construction cannot practically fail; degrade to empty tools
+    // (the model simply never sees web tools) rather than dying.
+    let tools = tool_trained.then(|| web_tools(&origins).unwrap_or_default());
 
     if ready_tx
         .send(Ok(Ready {
@@ -194,59 +205,77 @@ fn actor_main(
         return; // the UI gave up during load.
     }
 
-    match tools {
-        None => serve_chat(
+    // Phase 1: the streaming chat path, until the first grant (or forever,
+    // for chat-only formats). Phase 2: the sessionful agent, seeded with the
+    // chat history — a one-way switch; the seam is invisible (AGENT-3).
+    let history = match serve_chat(
+        &mut engine,
+        format,
+        config.system.clone(),
+        config.opts.clone(),
+        &req_rx,
+        &event_tx,
+        tools.as_ref().map(|_| &origins),
+    ) {
+        ChatEnd::Shutdown => return,
+        ChatEnd::SwitchToAgent { history } => history,
+    };
+    let tools = tools.expect("agent switch only offered with tools");
+    let system = config
+        .system
+        .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
+    match format {
+        ChatFormat::Qwen => serve_agent(
             &mut engine,
-            format,
-            config.system,
+            &tools,
+            QwenToolCall,
+            ChatMlTemplate,
+            system,
             config.opts,
+            history,
+            &origins,
             req_rx,
             event_tx,
         ),
-        // A `--web-origin` grant routes turns through the sessionful agent.
-        // The codec/template pair is monomorphic per format (as in the CLI);
-        // `agent_tools` has already rejected chat-only formats (CAPS-1).
-        Some(tools) => {
-            let system = config
-                .system
-                .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
-            match format {
-                ChatFormat::Qwen => serve_agent(
-                    &mut engine,
-                    &tools,
-                    QwenToolCall,
-                    ChatMlTemplate,
-                    system,
-                    config.opts,
-                    req_rx,
-                    event_tx,
-                ),
-                ChatFormat::Plain => serve_agent(
-                    &mut engine,
-                    &tools,
-                    JsonToolCall,
-                    PlainTemplate,
-                    system,
-                    config.opts,
-                    req_rx,
-                    event_tx,
-                ),
-                _ => unreachable!("agent_tools rejects chat-only formats"),
-            }
-        }
+        ChatFormat::Plain => serve_agent(
+            &mut engine,
+            &tools,
+            JsonToolCall,
+            PlainTemplate,
+            system,
+            config.opts,
+            history,
+            &origins,
+            req_rx,
+            event_tx,
+        ),
+        _ => unreachable!("the switch is only offered on tool-trained formats"),
     }
 }
 
-/// The chat serve loop: the plain [`ChatSession`], no tools (the pre-agent
-/// behavior, byte for byte).
+/// Why the chat phase ended.
+enum ChatEnd {
+    /// The first origin grant arrived: switch to the agent path, seeded with
+    /// the conversation so far (user/assistant turns; the agent renders its
+    /// own system prompt).
+    SwitchToAgent {
+        history: Vec<Turn>,
+    },
+    Shutdown,
+}
+
+/// The chat serve loop: the plain streaming [`ChatSession`]. `origins` is
+/// `Some` on tool-trained formats — a grant then ends this phase; on
+/// chat-only formats it is `None` and grants are refused (CAPS-1).
 fn serve_chat(
     engine: &mut Engine,
     format: ChatFormat,
     system: Option<String>,
     opts: GenOpts,
-    req_rx: Receiver<EngineRequest>,
-    event_tx: UnboundedSender<EngineEvent>,
-) {
+    req_rx: &Receiver<EngineRequest>,
+    event_tx: &UnboundedSender<EngineEvent>,
+    origins: Option<&WebOrigins>,
+) -> ChatEnd {
     let template = format.template();
     let mut session = ChatSession::new(engine, template).with_opts(opts);
     if let Some(system) = system {
@@ -259,15 +288,57 @@ fn serve_chat(
                 turn_id,
                 user,
                 control,
-            } => run_turn(&mut session, &event_tx, format, turn_id, &user, &control),
+            } => run_turn(&mut session, event_tx, format, turn_id, &user, &control),
             EngineRequest::Reset => session.reset(),
-            EngineRequest::Shutdown => break,
+            EngineRequest::Grant { origin } => match origins {
+                None => {
+                    let _ = event_tx.send(EngineEvent::Grants {
+                        origins: vec![],
+                        message: format!(
+                            "cannot grant {origin}: the {format} format is chat-only \
+                             (tool calling needs qwen or plain)"
+                        ),
+                    });
+                }
+                Some(origins) => match origins.grant(&origin) {
+                    Ok(_) => {
+                        let _ = event_tx.send(EngineEvent::Grants {
+                            origins: origins.list(),
+                            message: format!("granted read access to {origin} — web tools enabled"),
+                        });
+                        // Transplant the conversation (sans system turns) into
+                        // the agent path.
+                        let history: Vec<Turn> = session
+                            .history()
+                            .iter()
+                            .filter(|t| matches!(t.role, Role::User | Role::Assistant))
+                            .cloned()
+                            .collect();
+                        return ChatEnd::SwitchToAgent { history };
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(EngineEvent::Grants {
+                            origins: origins.list(),
+                            message: format!("grant failed: {e}"),
+                        });
+                    }
+                },
+            },
+            EngineRequest::Revoke { origin } => {
+                report_revoke(event_tx, origins, &origin);
+            }
+            EngineRequest::ListGrants => {
+                report_grants(event_tx, origins);
+            }
+            EngineRequest::Shutdown => return ChatEnd::Shutdown,
         }
     }
+    ChatEnd::Shutdown
 }
 
 /// The agent serve loop: one sessionful [`Agent`] (AGENT-3) serves every turn,
-/// so exchanges remember each other while tool rounds stay ephemeral.
+/// seeded with the chat phase's history. Later grants/revokes mutate the
+/// shared origin set in place — the specs re-render each run (CAP-3a).
 #[allow(clippy::too_many_arguments)]
 fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
     engine: &mut Engine,
@@ -276,11 +347,14 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
     template: T,
     system: String,
     opts: GenOpts,
+    history: Vec<Turn>,
+    origins: &WebOrigins,
     req_rx: Receiver<EngineRequest>,
     event_tx: UnboundedSender<EngineEvent>,
 ) {
-    let mut agent =
-        Agent::new(engine, tools, codec, template, system, AGENT_MAX_STEPS).with_opts(opts);
+    let mut agent = Agent::new(engine, tools, codec, template, system, AGENT_MAX_STEPS)
+        .with_opts(opts)
+        .with_history(history);
 
     while let Ok(req) = req_rx.recv() {
         match req {
@@ -290,32 +364,92 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
                 control,
             } => run_agent_turn(&mut agent, &event_tx, turn_id, &user, &control),
             EngineRequest::Reset => agent.reset(),
+            EngineRequest::Grant { origin } => match origins.grant(&origin) {
+                Ok(true) => {
+                    let _ = event_tx.send(EngineEvent::Grants {
+                        origins: origins.list(),
+                        message: format!("granted read access to {origin}"),
+                    });
+                }
+                Ok(false) => {
+                    let _ = event_tx.send(EngineEvent::Grants {
+                        origins: origins.list(),
+                        message: format!("{origin} was already granted"),
+                    });
+                }
+                Err(e) => {
+                    let _ = event_tx.send(EngineEvent::Grants {
+                        origins: origins.list(),
+                        message: format!("grant failed: {e}"),
+                    });
+                }
+            },
+            EngineRequest::Revoke { origin } => {
+                report_revoke(&event_tx, Some(origins), &origin);
+            }
+            EngineRequest::ListGrants => {
+                report_grants(&event_tx, Some(origins));
+            }
             EngineRequest::Shutdown => break,
         }
     }
 }
 
-/// The HTTP tools granted by `--web-origin`, or `None` without one. Rejects
-/// chat-only formats: the tool loop needs a tool-trained codec (CAPS-1).
-fn agent_tools(origin: Option<&str>, format: ChatFormat) -> Result<Option<Tools>> {
-    let Some(origin) = origin else {
-        return Ok(None);
+/// Answer a revoke request (both phases).
+fn report_revoke(
+    event_tx: &UnboundedSender<EngineEvent>,
+    origins: Option<&WebOrigins>,
+    origin: &str,
+) {
+    let Some(origins) = origins else {
+        let _ = event_tx.send(EngineEvent::Grants {
+            origins: vec![],
+            message: "nothing granted (chat-only format)".to_string(),
+        });
+        return;
     };
-    if !matches!(format, ChatFormat::Qwen | ChatFormat::Plain) {
-        anyhow::bail!(
-            "--web-origin needs a tool-trained chat format (qwen or plain); \
-             {format} is chat-only"
-        );
-    }
-    Ok(Some(
-        Tools::new()
-            .with(ReadUrl::new(WebOrigin::new(origin)?)?)
-            .with(ReadPage::with_limits(
-                WebOrigin::new(origin)?,
-                READ_PAGE_MAX_INPUT_BYTES,
-                READ_PAGE_MAX_CHARS,
-            )?),
-    ))
+    let message = match origins.revoke(origin) {
+        Ok(true) => format!("revoked {origin}"),
+        Ok(false) => format!("{origin} was not granted"),
+        Err(e) => format!("revoke failed: {e}"),
+    };
+    let _ = event_tx.send(EngineEvent::Grants {
+        origins: origins.list(),
+        message,
+    });
+}
+
+/// Answer a list request (both phases).
+fn report_grants(event_tx: &UnboundedSender<EngineEvent>, origins: Option<&WebOrigins>) {
+    let (list, message) = match origins {
+        None => (vec![], "no web tools (chat-only format)".to_string()),
+        Some(origins) => {
+            let list = origins.list();
+            let message = if list.is_empty() {
+                "no origins granted — type a URL or /grant <origin>".to_string()
+            } else {
+                format!("granted: {}", list.join(", "))
+            };
+            (list, message)
+        }
+    };
+    let _ = event_tx.send(EngineEvent::Grants {
+        origins: list,
+        message,
+    });
+}
+
+/// The web tools over a shared (growable) origin set. Present from the start
+/// on tool-trained formats; hidden from the model while the set is empty
+/// (CAP-3a).
+fn web_tools(origins: &WebOrigins) -> Result<Tools> {
+    Ok(Tools::new()
+        .with(ReadUrl::new(origins.clone())?)
+        .with(ReadPage::with_limits(
+            origins.clone(),
+            READ_PAGE_MAX_INPUT_BYTES,
+            READ_PAGE_MAX_CHARS,
+        )?))
 }
 
 fn load_engine(config: &EngineConfig) -> Result<Engine> {

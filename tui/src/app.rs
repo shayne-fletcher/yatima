@@ -32,6 +32,9 @@ pub enum Entry {
         stop: Option<StopReason>,
     },
     Error(String),
+    /// A host notice (grant/revoke confirmations and the like) — visible
+    /// authority changes belong in the transcript (CAP-3).
+    Notice(String),
 }
 
 /// The single in-flight turn (TUI-7: at most one at a time).
@@ -58,6 +61,8 @@ pub struct Status {
     pub context_length: Option<usize>,
     /// Tokens in the most recent prompt (meter numerator), once a turn completes.
     pub prompt_tokens: Option<usize>,
+    /// The granted web origins (CAP-3) — the session's live web authority.
+    pub grants: Vec<String>,
 }
 
 /// What a key press means (classified pure of effects). The keys the app owns
@@ -136,6 +141,7 @@ impl App {
                 format: ready.format.to_string(),
                 context_length: ready.context_length,
                 prompt_tokens: None,
+                grants: Vec::new(),
             },
             reasoning_expanded: false,
             should_quit: false,
@@ -221,13 +227,42 @@ impl App {
         }
         self.remember(&user);
         // `/reset` clears the conversation — the in-session recovery/escape hatch
-        // (clears the engine's authoritative history and the UI mirror).
+        // (clears the engine's authoritative history and the UI mirror). Granted
+        // origins survive: capability state is not conversation state (CAP-3).
         if user == "/reset" {
             let _ = self.req_tx.send(EngineRequest::Reset);
             self.transcript.clear();
             self.input = fresh_input();
             self.scroll_back = 0;
             return;
+        }
+        // Grant management (CAP-3: these, plus URLs typed in a message, are
+        // the *only* sources of web authority).
+        if user == "/grants" {
+            let _ = self.req_tx.send(EngineRequest::ListGrants);
+            self.input = fresh_input();
+            return;
+        }
+        if let Some(origin) = user.strip_prefix("/grant ") {
+            let _ = self.req_tx.send(EngineRequest::Grant {
+                origin: origin.trim().to_string(),
+            });
+            self.input = fresh_input();
+            return;
+        }
+        if let Some(origin) = user.strip_prefix("/revoke ") {
+            let _ = self.req_tx.send(EngineRequest::Revoke {
+                origin: origin.trim().to_string(),
+            });
+            self.input = fresh_input();
+            return;
+        }
+        // Auto-grant: a URL in the *user's own message* is authorization for
+        // its origin (CAP-3) — granted before the turn runs, so the model can
+        // act on it immediately. URLs from any other source never pass
+        // through here.
+        for origin in yatima_lib::origins_in(&user) {
+            let _ = self.req_tx.send(EngineRequest::Grant { origin });
         }
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
@@ -368,6 +403,12 @@ impl App {
             EngineEvent::Error { turn_id, message } if self.is_current(turn_id) => {
                 self.push_entry(Entry::Error(message));
                 self.in_flight = None;
+            }
+            // Authority changes are always current (not tied to a turn): show
+            // the notice and refresh the status rail's grant list (CAP-3).
+            EngineEvent::Grants { origins, message } => {
+                self.status.grants = origins;
+                self.push_entry(Entry::Notice(message));
             }
             _ => {} // stale event for a turn that is no longer current.
         }
@@ -650,6 +691,70 @@ mod tests {
         app.apply(Intent::Submit);
         assert_eq!(app.input_text(), "second");
         assert!(rx.try_recv().is_err(), "no second Submit while in flight");
+    }
+
+    #[test]
+    fn user_typed_urls_auto_grant_before_the_turn() {
+        // upholds: CAP-3 — a URL in the user's own message grants its origin,
+        // and the Grant request precedes the Submit so the model can act on
+        // it immediately. Duplicate origins collapse.
+        let (mut app, rx) = test_app();
+        app.set_input(
+            "compare https://en.wikipedia.org/wiki/A and https://en.wikipedia.org/wiki/B",
+        );
+        app.apply(Intent::Submit);
+        match rx.try_recv() {
+            Ok(EngineRequest::Grant { origin }) => {
+                assert_eq!(origin, "https://en.wikipedia.org")
+            }
+            other => panic!("expected Grant first, got {:?}", other.is_ok()),
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(EngineRequest::Submit { .. })),
+            "Submit follows the grant"
+        );
+        assert!(rx.try_recv().is_err(), "one grant per distinct origin");
+    }
+
+    #[test]
+    fn grant_commands_manage_authority_without_starting_turns() {
+        // upholds: CAP-3 — /grant, /grants, and /revoke are user utterances
+        // that manage authority; none of them submits a turn.
+        let (mut app, rx) = test_app();
+        for input in [
+            "/grant https://a.example",
+            "/grants",
+            "/revoke https://a.example",
+        ] {
+            app.set_input(input);
+            app.apply(Intent::Submit);
+            assert!(app.in_flight.is_none(), "{input}: no turn starts");
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(EngineRequest::Grant { origin }) if origin == "https://a.example"
+        ));
+        assert!(matches!(rx.try_recv(), Ok(EngineRequest::ListGrants)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(EngineRequest::Revoke { origin }) if origin == "https://a.example"
+        ));
+    }
+
+    #[test]
+    fn grants_events_update_status_and_leave_a_notice() {
+        // upholds: CAP-3 — authority changes are visible: the status rail
+        // mirrors the granted set and the transcript records the change.
+        let (mut app, _rx) = test_app();
+        app.on_engine_event(EngineEvent::Grants {
+            origins: vec!["https://a.example".into()],
+            message: "granted read access to https://a.example".into(),
+        });
+        assert_eq!(app.status.grants, ["https://a.example"]);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Entry::Notice(text)) if text.contains("granted read access")
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -14,7 +14,7 @@
 //! fallback for a model with no known native format. Schemas follow the de-facto
 //! standard (JSON Schema params, name + JSON args).
 
-use crate::capability::{Dir, NtfyTopic, WebOrigin, WriteDir};
+use crate::capability::{Dir, NtfyTopic, WebOrigins, WriteDir};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -268,6 +268,14 @@ impl ToolTask {
 pub trait Tool: Send + Sync {
     /// What the model is told about this tool.
     fn spec(&self) -> ToolSpec;
+    /// Whether the tool currently has any authority to act (CAP-3a): a tool
+    /// whose capability is empty — e.g. a web tool before any origin grant —
+    /// returns `false` and is left out of the advertised specs, so the prompt
+    /// never names a tool the model cannot use. Calls still dispatch (and fail
+    /// with the tool's own clear error) if the model tries anyway.
+    fn available(&self) -> bool {
+        true
+    }
     /// Run the tool. Returning `Err` is fine — [`Tools::dispatch_async`] turns it
     /// into a typed [`ToolOutcome`]; the tool need not format failures itself.
     async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String>;
@@ -292,9 +300,14 @@ impl Tools {
         self
     }
 
-    /// The specs to advertise to the model.
+    /// The specs to advertise to the model: available tools only (CAP-3a) —
+    /// the prompt always states the model's true, current authority.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|t| t.spec()).collect()
+        self.tools
+            .iter()
+            .filter(|t| t.available())
+            .map(|t| t.spec())
+            .collect()
     }
 
     /// Dispatch a call to the named tool from synchronous code. This returns the
@@ -705,7 +718,7 @@ impl Tool for WriteFile {
     }
 }
 
-/// Read a text response from a URL under a [`WebOrigin`] capability.
+/// Read a text response from a URL under a [`WebOrigins`] capability.
 /// The `User-Agent` for every web-touching tool. Many origins (Wikipedia's bot
 /// policy, SEC EDGAR) reject or throttle anonymous clients — a descriptive UA
 /// with a contact URL is required politeness, and reqwest sends none by
@@ -717,23 +730,23 @@ const WEB_USER_AGENT: &str = concat!(
 );
 
 pub struct ReadUrl {
-    origin: WebOrigin,
+    origins: WebOrigins,
     client: Client,
     max_bytes: usize,
 }
 
 impl ReadUrl {
-    pub fn new(origin: WebOrigin) -> Result<ReadUrl> {
-        Self::with_max_bytes(origin, DEFAULT_READ_URL_MAX_BYTES)
+    pub fn new(origins: WebOrigins) -> Result<ReadUrl> {
+        Self::with_max_bytes(origins, DEFAULT_READ_URL_MAX_BYTES)
     }
 
-    pub fn with_max_bytes(origin: WebOrigin, max_bytes: usize) -> Result<ReadUrl> {
+    pub fn with_max_bytes(origins: WebOrigins, max_bytes: usize) -> Result<ReadUrl> {
         let client = Client::builder()
             .user_agent(WEB_USER_AGENT)
             .timeout(Duration::from_secs(10))
             .build()?;
         Ok(ReadUrl {
-            origin,
+            origins,
             client,
             max_bytes,
         })
@@ -745,13 +758,17 @@ impl Tool for ReadUrl {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_url".to_string(),
-            description: "Read a UTF-8/text web URL under the configured origin.".to_string(),
+            // The spec states the tool's live authority (CAP-3a).
+            description: format!(
+                "Read a UTF-8/text web URL. May read only these origins: {}.",
+                self.origins.list().join(", ")
+            ),
             params: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "absolute same-origin URL or path relative to the configured origin"
+                        "description": "absolute URL on a granted origin (or a relative path when exactly one origin is granted)"
                     }
                 },
                 "required": ["url"]
@@ -759,9 +776,13 @@ impl Tool for ReadUrl {
         }
     }
 
+    fn available(&self) -> bool {
+        !self.origins.is_empty()
+    }
+
     async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
         let target = required_string(&args, "read_url", "url")?;
-        let url = self.origin.resolve(target)?;
+        let url = self.origins.resolve(target)?;
         let response = self.client.get(url).send().await?;
         let status = response.status();
         let body = response.bytes().await?;
@@ -782,7 +803,7 @@ impl Tool for ReadUrl {
     }
 }
 
-/// Read the **readable main content** of an HTML page under a [`WebOrigin`]
+/// Read the **readable main content** of an HTML page under a [`WebOrigins`]
 /// capability: fetch, extract the article (title + text) with a readability pass,
 /// and return it as plain text truncated to a budget.
 ///
@@ -793,7 +814,7 @@ impl Tool for ReadUrl {
 /// and emits plain text (link `href`s are dropped; a markdown-with-links variant
 /// is a possible v2).
 pub struct ReadPage {
-    origin: WebOrigin,
+    origins: WebOrigins,
     client: Client,
     max_input_bytes: usize,
     max_output_chars: usize,
@@ -835,9 +856,9 @@ impl PageCache {
 
 impl ReadPage {
     /// A capability-scoped page reader with default budgets.
-    pub fn new(origin: WebOrigin) -> Result<ReadPage> {
+    pub fn new(origins: WebOrigins) -> Result<ReadPage> {
         Self::with_limits(
-            origin,
+            origins,
             DEFAULT_READ_PAGE_MAX_BYTES,
             DEFAULT_READ_PAGE_MAX_CHARS,
         )
@@ -845,7 +866,7 @@ impl ReadPage {
 
     /// A capability-scoped page reader with explicit input/output budgets.
     pub fn with_limits(
-        origin: WebOrigin,
+        origins: WebOrigins,
         max_input_bytes: usize,
         max_output_chars: usize,
     ) -> Result<ReadPage> {
@@ -854,7 +875,7 @@ impl ReadPage {
             .timeout(Duration::from_secs(15))
             .build()?;
         Ok(ReadPage {
-            origin,
+            origins,
             client,
             max_input_bytes,
             max_output_chars,
@@ -908,20 +929,23 @@ impl Tool for ReadPage {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_page".to_string(),
-            description: "Read the readable main content (title + article text) of an HTML page \
-                          under the configured origin. Long articles are returned one window at \
-                          a time; a truncation marker gives the offset to pass to read the next \
-                          window (continuations are served from cache — no refetch). For raw or \
-                          non-HTML responses (JSON, plaintext, APIs) use read_url instead. \
-                          Server-rendered HTML only — no JavaScript, paywalls, or cross-origin \
-                          links."
-                .to_string(),
+            // The spec states the tool's live authority (CAP-3a).
+            description: format!(
+                "Read the readable main content (title + article text) of an HTML page. \
+                 May read only these origins: {}. Long articles are returned one window \
+                 at a time; a truncation marker gives the offset to pass to read the \
+                 next window (continuations are served from cache — no refetch). For \
+                 raw or non-HTML responses (JSON, plaintext, APIs) use read_url \
+                 instead. Server-rendered HTML only — no JavaScript, paywalls, or \
+                 cross-origin links.",
+                self.origins.list().join(", ")
+            ),
             params: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "absolute same-origin URL or path relative to the configured origin"
+                        "description": "absolute URL on a granted origin (or a relative path when exactly one origin is granted)"
                     },
                     "offset": {
                         "type": "integer",
@@ -933,6 +957,10 @@ impl Tool for ReadPage {
         }
     }
 
+    fn available(&self) -> bool {
+        !self.origins.is_empty()
+    }
+
     async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
         let target = required_string(&args, "read_page", "url")?;
         let offset = match args.get("offset") {
@@ -941,7 +969,7 @@ impl Tool for ReadPage {
                 anyhow!("read_page: `offset` must be a non-negative integer, got {v}")
             })? as usize,
         };
-        let url = self.origin.resolve(target)?;
+        let url = self.origins.resolve(target)?;
 
         // Fetch-once: a cached extraction serves every continuation without
         // touching the network (or a throttled host's request budget).
@@ -1604,7 +1632,7 @@ mod tests {
             .await;
 
         let server_uri = server.uri();
-        let origin = WebOrigin::new(&server_uri).unwrap();
+        let origin = WebOrigins::one(&server_uri).unwrap();
         let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
@@ -1637,7 +1665,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let origin = WebOrigin::new(&server.uri()).unwrap();
+        let origin = WebOrigins::one(&server.uri()).unwrap();
         let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
@@ -1656,14 +1684,14 @@ mod tests {
     #[test]
     fn read_url_rejects_escaping_origins_before_network() {
         // upholds: CAP-2 — an arbitrary host cannot be smuggled through args.
-        let origin = WebOrigin::new("https://example.com").unwrap();
+        let origin = WebOrigins::one("https://example.com").unwrap();
         let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
         let result = tools.dispatch(&ToolCall {
             name: "read_url".to_string(),
             args: json(r#"{"url": "https://evil.example/doc"}"#),
         });
         assert!(result.is_error);
-        assert!(result.content.contains("escapes web origin"));
+        assert!(result.content.contains("escapes the granted web origins"));
     }
 
     // A realistic article with nav/script/footer noise around the body.
@@ -1697,7 +1725,7 @@ position over the coming years.</p>
             .await;
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
                 name: "read_page".to_string(),
@@ -1716,14 +1744,14 @@ position over the coming years.</p>
     #[test]
     fn read_page_rejects_escaping_origins_before_network() {
         // upholds: CAP-2 — same origin discipline as read_url.
-        let origin = WebOrigin::new("https://example.com").unwrap();
+        let origin = WebOrigins::one("https://example.com").unwrap();
         let tools = Tools::new().with(ReadPage::new(origin).unwrap());
         let result = tools.dispatch(&ToolCall {
             name: "read_page".to_string(),
             args: json(r#"{"url": "https://evil.example/doc"}"#),
         });
         assert!(result.is_error);
-        assert!(result.content.contains("escapes web origin"));
+        assert!(result.content.contains("escapes the granted web origins"));
     }
 
     #[tokio::test]
@@ -1739,7 +1767,7 @@ position over the coming years.</p>
 
         // Tiny output budget; generous input budget.
         let reader =
-            ReadPage::with_limits(WebOrigin::new(&server.uri()).unwrap(), 1_000_000, 50).unwrap();
+            ReadPage::with_limits(WebOrigins::one(&server.uri()).unwrap(), 1_000_000, 50).unwrap();
         let result = Tools::new()
             .with(reader)
             .dispatch_async(&ToolCall {
@@ -1772,7 +1800,7 @@ position over the coming years.</p>
             .await;
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
                 name: "read_page".to_string(),
@@ -1797,7 +1825,7 @@ position over the coming years.</p>
             .await;
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
                 name: "read_page".to_string(),
@@ -1823,7 +1851,7 @@ position over the coming years.</p>
 
         // Input cap far below the body size → guarded before extraction.
         let reader =
-            ReadPage::with_limits(WebOrigin::new(&server.uri()).unwrap(), 100, 40_000).unwrap();
+            ReadPage::with_limits(WebOrigins::one(&server.uri()).unwrap(), 100, 40_000).unwrap();
         let result = Tools::new()
             .with(reader)
             .dispatch_async(&ToolCall {
@@ -1846,7 +1874,7 @@ position over the coming years.</p>
             .await;
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
                 name: "read_page".to_string(),
@@ -1870,7 +1898,7 @@ position over the coming years.</p>
             .await;
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
                 name: "read_page".to_string(),
@@ -1896,7 +1924,7 @@ position over the coming years.</p>
             .await;
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         let result = tools
             .dispatch_async(&ToolCall {
                 name: "read_page".to_string(),
@@ -1958,7 +1986,7 @@ position over the coming years.</p>
             .await;
 
         let tools = Tools::new().with(
-            ReadPage::with_limits(WebOrigin::new(&server.uri()).unwrap(), 1_000_000, 80).unwrap(),
+            ReadPage::with_limits(WebOrigins::one(&server.uri()).unwrap(), 1_000_000, 80).unwrap(),
         );
         let mut windows = 0;
         let mut offset = 0;
@@ -1990,7 +2018,7 @@ position over the coming years.</p>
             .mount(&server)
             .await;
 
-        let origin = || WebOrigin::new(&server.uri()).unwrap();
+        let origin = || WebOrigins::one(&server.uri()).unwrap();
         let paged = Tools::new().with(ReadPage::with_limits(origin(), 1_000_000, 80).unwrap());
         let whole = Tools::new().with(ReadPage::new(origin()).unwrap());
 
@@ -2029,7 +2057,7 @@ position over the coming years.</p>
             .await;
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         let result = read_window(&tools, "/post", 999_999).await;
         assert!(result.is_error);
         assert!(
@@ -2058,12 +2086,40 @@ position over the coming years.</p>
         }
 
         let tools =
-            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
         for url in ["/a", "/b", "/a", "/b"] {
             let result = read_window(&tools, url, 0).await;
             assert!(!result.is_error, "{url}: {}", result.content);
         }
         // MockServer verifies each expect(1) on drop.
+    }
+
+    #[test]
+    fn web_tool_specs_reflect_live_authority() {
+        // upholds: CAP-3a — an empty origin set hides the web tools from the
+        // advertised specs; a grant surfaces them with the origin enumerated
+        // in the description; revoking back to empty hides them again.
+        let origins = WebOrigins::new();
+        let tools = Tools::new()
+            .with(ReadPage::new(origins.clone()).unwrap())
+            .with(ReadUrl::new(origins.clone()).unwrap());
+        assert!(
+            tools.specs().is_empty(),
+            "no grants → no web tools advertised"
+        );
+
+        origins.grant("https://a.example").unwrap();
+        let specs = tools.specs();
+        assert_eq!(specs.len(), 2);
+        assert!(
+            specs
+                .iter()
+                .all(|s| s.description.contains("https://a.example")),
+            "the spec names the granted origin"
+        );
+
+        origins.revoke("https://a.example").unwrap();
+        assert!(tools.specs().is_empty(), "revoked back to hidden");
     }
 
     #[test]

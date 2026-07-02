@@ -148,6 +148,18 @@ pub fn ui(frame: &mut Frame, app: &App) {
     render_status(frame, chunks[2], app);
 }
 
+/// The user's speaker label: their login name (`$USER`), falling back to
+/// "you". Resolved once — it cannot change mid-session.
+fn user_label() -> &'static str {
+    static LABEL: OnceLock<String> = OnceLock::new();
+    LABEL.get_or_init(|| {
+        std::env::var("USER")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| "you".to_string())
+    })
+}
+
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let inner_width = area.width.saturating_sub(2); // borders
     let mut lines: Vec<Line> = Vec::new();
@@ -156,7 +168,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         match entry {
             Entry::User(text) => {
                 lines.push(Line::from(Span::styled(
-                    "you",
+                    user_label(),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -170,7 +182,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 stop,
             } => {
                 lines.push(Line::from(Span::styled(
-                    "assistant",
+                    "yatima",
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
@@ -226,6 +238,16 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     &mut lines,
                     &format!("error: {text}"),
                     Style::default().fg(Color::Red),
+                );
+                lines.push(Line::from(""));
+            }
+            // Host notices (grants and the like): dim, quiet, but on the
+            // record — authority changes are visible history (CAP-3).
+            Entry::Notice(text) => {
+                push_wrapped(
+                    &mut lines,
+                    &format!("◆ {text}"),
+                    Style::default().fg(Color::Indexed(140)),
                 );
                 lines.push(Line::from(""));
             }
@@ -1029,6 +1051,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(ctx) = context_label(app.status.prompt_tokens, app.status.context_length) {
         parts.push(ctx);
     }
+    if let Some(web) = grants_label(&app.status.grants) {
+        parts.push(web);
+    }
     parts.push(hint.to_string());
     let status = Line::from(Span::styled(
         parts.join("  ·  "),
@@ -1043,6 +1068,20 @@ fn kfmt(n: usize) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+/// The status rail's web-authority label (CAP-3), or `None` before any grant:
+/// the lone origin's host, or a count when several are granted.
+fn grants_label(grants: &[String]) -> Option<String> {
+    match grants {
+        [] => None,
+        [one] => Some(format!(
+            "web:{}",
+            one.trim_start_matches("https://")
+                .trim_start_matches("http://")
+        )),
+        many => Some(format!("web:{} origins", many.len())),
     }
 }
 

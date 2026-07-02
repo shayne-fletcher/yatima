@@ -46,11 +46,6 @@ struct Args {
     /// Optional system instruction (applies for the whole session).
     #[arg(long)]
     system: Option<String>,
-    /// Grant the model HTTP tools (`read_url`, `read_page`) scoped to this
-    /// origin (CAP-2): turns then run through the tool-calling agent. Needs a
-    /// tool-trained format (qwen or plain).
-    #[arg(long)]
-    web_origin: Option<String>,
     #[arg(long, default_value_t = 1024)]
     max_tokens: usize,
     #[arg(long, default_value_t = 0.0)]
@@ -117,7 +112,6 @@ async fn main() -> Result<()> {
         opts,
         format,
         system: args.system.clone(),
-        web_origin: args.web_origin.clone(),
         model_label,
     };
 

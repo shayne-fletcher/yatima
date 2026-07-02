@@ -120,6 +120,99 @@ impl WebOrigin {
     }
 }
 
+/// A **growable set** of HTTP(S) origins — the runtime-grant generalization of
+/// [`WebOrigin`] (CAP-2: a web tool's authority is exactly its held origin
+/// set). The set is shared: the host keeps a clone and grants/revokes
+/// mid-session (CAP-3 — grants derive only from user utterances; nothing a
+/// tool or the model produces reaches [`grant`](WebOrigins::grant)); tools
+/// holding the same instance see the change on their next call, and their
+/// rendered specs reflect it (CAP-3a). Starts empty: sandbox-by-omission
+/// holds at every launch.
+#[derive(Debug, Clone, Default)]
+pub struct WebOrigins {
+    origins: std::sync::Arc<std::sync::RwLock<Vec<WebOrigin>>>,
+}
+
+impl WebOrigins {
+    /// An empty origin set — no web authority at all.
+    pub fn new() -> WebOrigins {
+        WebOrigins::default()
+    }
+
+    /// A set holding a single pre-granted origin — the one-shot (CLI) shape.
+    pub fn one(origin: &str) -> Result<WebOrigins> {
+        let set = WebOrigins::new();
+        set.grant(origin)?;
+        Ok(set)
+    }
+
+    /// Grant `origin` (e.g. `https://example.com`) for the rest of the
+    /// session. Idempotent; returns whether the set actually grew.
+    pub fn grant(&self, origin: &str) -> Result<bool> {
+        let o = WebOrigin::new(origin)?;
+        let mut set = self.origins.write().expect("origin set poisoned");
+        if set.iter().any(|w| same_origin(w.origin(), o.origin())) {
+            return Ok(false);
+        }
+        set.push(o);
+        Ok(true)
+    }
+
+    /// Revoke `origin`; returns whether it was present.
+    pub fn revoke(&self, origin: &str) -> Result<bool> {
+        let o = WebOrigin::new(origin)?;
+        let mut set = self.origins.write().expect("origin set poisoned");
+        let before = set.len();
+        set.retain(|w| !same_origin(w.origin(), o.origin()));
+        Ok(set.len() < before)
+    }
+
+    /// The granted origins, render-ready (scheme://host[:port], no trailing /).
+    pub fn list(&self) -> Vec<String> {
+        self.origins
+            .read()
+            .expect("origin set poisoned")
+            .iter()
+            .map(|w| w.origin().as_str().trim_end_matches('/').to_string())
+            .collect()
+    }
+
+    /// True when no origin has been granted.
+    pub fn is_empty(&self) -> bool {
+        self.origins.read().expect("origin set poisoned").is_empty()
+    }
+
+    /// Resolve `target` against the set: an absolute URL must match a granted
+    /// origin; a relative path resolves only when exactly one origin is
+    /// granted (with several, relative targets are ambiguous and refused).
+    pub fn resolve(&self, target: &str) -> Result<Url> {
+        let set = self.origins.read().expect("origin set poisoned");
+        if set.is_empty() {
+            bail!("no web origin granted");
+        }
+        if let Ok(url) = Url::parse(target) {
+            let Some(origin) = set.iter().find(|w| same_origin(w.origin(), &url)) else {
+                bail!(
+                    "url {url} escapes the granted web origins [{}]",
+                    set.iter()
+                        .map(|w| w.origin().as_str().trim_end_matches('/'))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            };
+            return origin.resolve(target);
+        }
+        match set.as_slice() {
+            [only] => only.resolve(target),
+            _ => bail!(
+                "relative url {target:?} is ambiguous with {} origins granted; \
+                 use an absolute url",
+                set.len()
+            ),
+        }
+    }
+}
+
 /// Authority to publish notifications to one pre-shared ntfy topic.
 ///
 /// ntfy topics are created outside Yatima by the user subscribing/publishing to
@@ -194,6 +287,40 @@ fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
+/// The HTTP(S) origins named by URLs appearing in `text`.
+///
+/// This is the auto-grant scanner and it is only ever fed **user utterances**
+/// (CAP-3): a URL the model or a fetched page produces must never pass
+/// through here. Mid-sentence URLs are found, trailing punctuation is
+/// trimmed, duplicates collapse (first occurrence wins), and non-HTTP
+/// schemes are ignored.
+pub fn origins_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let Some(at) = word.find("http://").or_else(|| word.find("https://")) else {
+            continue;
+        };
+        let candidate =
+            word[at..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'', '>']);
+        let Ok(url) = Url::parse(candidate) else {
+            continue;
+        };
+        if url.host_str().is_none() {
+            continue;
+        }
+        let origin = format!(
+            "{}://{}{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            url.port().map(|p| format!(":{p}")).unwrap_or_default()
+        );
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    out
+}
+
 fn validate_ntfy_topic(topic: &str) -> Result<()> {
     if topic.is_empty() || topic.len() > 64 {
         bail!("ntfy topic must be 1 to 64 characters");
@@ -210,6 +337,71 @@ fn validate_ntfy_topic(topic: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_origins_grant_accumulates_and_resolves_by_membership() {
+        // upholds: CAP-2 (origin-set form) — authority is exactly the granted
+        // set: in-set absolute URLs resolve, out-of-set are refused, and the
+        // set is the union of grants.
+        let set = WebOrigins::new();
+        assert!(set.resolve("https://a.example/x").is_err(), "empty = none");
+        assert!(set.grant("https://a.example").unwrap());
+        assert!(!set.grant("https://a.example").unwrap(), "idempotent");
+        assert!(set.grant("https://b.example").unwrap());
+        assert!(set.resolve("https://a.example/x").is_ok());
+        assert!(set.resolve("https://b.example/y").is_ok());
+        let err = set.resolve("https://c.example/z").unwrap_err().to_string();
+        assert!(err.contains("escapes the granted web origins"), "{err}");
+        assert_eq!(set.list(), ["https://a.example", "https://b.example"]);
+    }
+
+    #[test]
+    fn web_origins_relative_needs_exactly_one_origin() {
+        // upholds: CAP-2 — a relative path is unambiguous only with a single
+        // granted origin; with several it is refused, not guessed.
+        let set = WebOrigins::one("https://a.example").unwrap();
+        assert_eq!(
+            set.resolve("/wiki/x").unwrap().as_str(),
+            "https://a.example/wiki/x"
+        );
+        set.grant("https://b.example").unwrap();
+        let err = set.resolve("/wiki/x").unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn web_origins_revoke_shrinks_authority() {
+        // upholds: CAP-3 — /revoke is the only way authority shrinks, and it
+        // works immediately.
+        let set = WebOrigins::one("https://a.example").unwrap();
+        assert!(set.revoke("https://a.example").unwrap());
+        assert!(!set.revoke("https://a.example").unwrap(), "already gone");
+        assert!(set.is_empty());
+        assert!(set.resolve("https://a.example/x").is_err());
+    }
+
+    #[test]
+    fn origins_in_finds_user_typed_urls_only_by_construction() {
+        // upholds: CAP-3 — the auto-grant scanner: mid-sentence URLs found,
+        // trailing punctuation trimmed, duplicates collapsed, non-HTTP
+        // schemes ignored. (That it is only ever fed user utterances is the
+        // host's obligation; the lib offers no other grant path.)
+        assert_eq!(
+            origins_in("summarize https://en.wikipedia.org/wiki/Roger_Penrose please"),
+            ["https://en.wikipedia.org"]
+        );
+        assert_eq!(
+            origins_in("see (https://a.example/x), and http://b.example:8080/y."),
+            ["https://a.example", "http://b.example:8080"]
+        );
+        assert_eq!(
+            origins_in("https://a.example/1 then https://a.example/2"),
+            ["https://a.example"],
+            "duplicates collapse"
+        );
+        assert!(origins_in("ftp://files.example/x and no urls").is_empty());
+        assert!(origins_in("plain text").is_empty());
+    }
 
     #[test]
     fn dir_resolve_contains_paths() {
