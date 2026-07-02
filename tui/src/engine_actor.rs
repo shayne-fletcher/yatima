@@ -24,8 +24,10 @@ use anyhow::Result;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use yatima_lib::{
-    device, resolve_format, Arch, Cancel, Channel, ChatFormat, ChatSession, Engine, GenOpts,
-    ReasoningSplitter, StopReason,
+    device, resolve_format, Agent, AgentEvent, AgentStop, Arch, Cancel, Channel, ChatFormat,
+    ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, PlainTemplate, PromptTemplate,
+    QwenToolCall, ReadPage, ReadUrl, ReasoningSplitter, StopReason, ToolCallCodec, ToolOutcome,
+    Tools, WebOrigin,
 };
 
 /// A turn identifier, monotonic per session. Lets the UI ignore stale events.
@@ -79,8 +81,30 @@ pub struct EngineConfig {
     pub opts: GenOpts,
     pub format: Option<ChatFormat>,
     pub system: Option<String>,
+    /// Grant the model HTTP tools (`read_url`, `read_page`) scoped to this
+    /// origin (CAP-2). When set, turns run through the sessionful tool-calling
+    /// [`Agent`] instead of the plain [`ChatSession`].
+    pub web_origin: Option<String>,
     pub model_label: String,
 }
+
+/// Tool rounds per turn before the agent gives up (AGENT-1); mirrors the CLI's
+/// `--max-steps` default.
+const AGENT_MAX_STEPS: usize = 6;
+
+/// The base system prompt for tool-enabled sessions when `--system` is absent.
+const DEFAULT_AGENT_SYSTEM: &str =
+    "You are a helpful assistant. You can fetch web pages with the provided \
+     tools. Call a tool when it helps, then answer.";
+
+/// `read_page`'s readable-text budget for interactive use. The tool's own
+/// default (40k chars ≈ 10–12k tokens) makes the next step's prefill take
+/// minutes on a 32B local model; ~12k chars is plenty for summarize-and-answer
+/// and keeps a tool turn interactive.
+const READ_PAGE_MAX_CHARS: usize = 12_000;
+
+/// `read_page`'s raw-input cap (unchanged from the tool's default).
+const READ_PAGE_MAX_INPUT_BYTES: usize = 4_000_000;
 
 /// Model metadata reported once after a successful load — for the status bar.
 #[derive(Clone)]
@@ -147,11 +171,15 @@ fn actor_main(
     let context_length = engine.context_length();
     let (format, _mismatch) = resolve_format(arch, config.format);
 
-    let template = format.template();
-    let mut session = ChatSession::new(&mut engine, template).with_opts(config.opts);
-    if let Some(system) = config.system {
-        session = session.with_system(system);
-    }
+    // Build the granted tools before reporting ready, so a bad origin or a
+    // chat-only format fails the load cleanly (before the alternate screen).
+    let tools = match agent_tools(config.web_origin.as_deref(), format) {
+        Ok(tools) => tools,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e.to_string()));
+            return;
+        }
+    };
 
     if ready_tx
         .send(Ok(Ready {
@@ -166,6 +194,65 @@ fn actor_main(
         return; // the UI gave up during load.
     }
 
+    match tools {
+        None => serve_chat(
+            &mut engine,
+            format,
+            config.system,
+            config.opts,
+            req_rx,
+            event_tx,
+        ),
+        // A `--web-origin` grant routes turns through the sessionful agent.
+        // The codec/template pair is monomorphic per format (as in the CLI);
+        // `agent_tools` has already rejected chat-only formats (CAPS-1).
+        Some(tools) => {
+            let system = config
+                .system
+                .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
+            match format {
+                ChatFormat::Qwen => serve_agent(
+                    &mut engine,
+                    &tools,
+                    QwenToolCall,
+                    ChatMlTemplate,
+                    system,
+                    config.opts,
+                    req_rx,
+                    event_tx,
+                ),
+                ChatFormat::Plain => serve_agent(
+                    &mut engine,
+                    &tools,
+                    JsonToolCall,
+                    PlainTemplate,
+                    system,
+                    config.opts,
+                    req_rx,
+                    event_tx,
+                ),
+                _ => unreachable!("agent_tools rejects chat-only formats"),
+            }
+        }
+    }
+}
+
+/// The chat serve loop: the plain [`ChatSession`], no tools (the pre-agent
+/// behavior, byte for byte).
+fn serve_chat(
+    engine: &mut Engine,
+    format: ChatFormat,
+    system: Option<String>,
+    opts: GenOpts,
+    req_rx: Receiver<EngineRequest>,
+    event_tx: UnboundedSender<EngineEvent>,
+) {
+    let template = format.template();
+    let mut session = ChatSession::new(engine, template).with_opts(opts);
+    if let Some(system) = system {
+        session = session.with_system(system);
+    }
+
     while let Ok(req) = req_rx.recv() {
         match req {
             EngineRequest::Submit {
@@ -177,6 +264,58 @@ fn actor_main(
             EngineRequest::Shutdown => break,
         }
     }
+}
+
+/// The agent serve loop: one sessionful [`Agent`] (AGENT-3) serves every turn,
+/// so exchanges remember each other while tool rounds stay ephemeral.
+#[allow(clippy::too_many_arguments)]
+fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
+    engine: &mut Engine,
+    tools: &Tools,
+    codec: K,
+    template: T,
+    system: String,
+    opts: GenOpts,
+    req_rx: Receiver<EngineRequest>,
+    event_tx: UnboundedSender<EngineEvent>,
+) {
+    let mut agent =
+        Agent::new(engine, tools, codec, template, system, AGENT_MAX_STEPS).with_opts(opts);
+
+    while let Ok(req) = req_rx.recv() {
+        match req {
+            EngineRequest::Submit {
+                turn_id,
+                user,
+                control,
+            } => run_agent_turn(&mut agent, &event_tx, turn_id, &user, &control),
+            EngineRequest::Reset => agent.reset(),
+            EngineRequest::Shutdown => break,
+        }
+    }
+}
+
+/// The HTTP tools granted by `--web-origin`, or `None` without one. Rejects
+/// chat-only formats: the tool loop needs a tool-trained codec (CAPS-1).
+fn agent_tools(origin: Option<&str>, format: ChatFormat) -> Result<Option<Tools>> {
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    if !matches!(format, ChatFormat::Qwen | ChatFormat::Plain) {
+        anyhow::bail!(
+            "--web-origin needs a tool-trained chat format (qwen or plain); \
+             {format} is chat-only"
+        );
+    }
+    Ok(Some(
+        Tools::new()
+            .with(ReadUrl::new(WebOrigin::new(origin)?)?)
+            .with(ReadPage::with_limits(
+                WebOrigin::new(origin)?,
+                READ_PAGE_MAX_INPUT_BYTES,
+                READ_PAGE_MAX_CHARS,
+            )?),
+    ))
 }
 
 fn load_engine(config: &EngineConfig) -> Result<Engine> {
@@ -244,5 +383,97 @@ fn run_turn(
                 message: e.to_string(),
             });
         }
+    }
+}
+
+/// Run one agent turn, folding [`AgentEvent`]s onto the event plane. Reasoning
+/// and tool activity ride the [`Channel::Reasoning`] fragments — tool rounds
+/// are working matter, so the reasoning pane is their honest home — and the
+/// final answer rides [`Channel::Answer`]. The fold polls `cancel`, so a
+/// cancel takes effect at the next event boundary (step granularity: the
+/// agent's decode itself is not yet token-cancellable, unlike the chat path).
+fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
+    agent: &mut Agent<'_, Engine, K, T>,
+    event_tx: &UnboundedSender<EngineEvent>,
+    turn_id: TurnId,
+    user: &str,
+    cancel: &Cancel,
+) {
+    let _ = event_tx.send(EngineEvent::Started { turn_id });
+
+    let fragment = |channel: Channel, text: String| {
+        let _ = event_tx.send(EngineEvent::Fragment {
+            turn_id,
+            channel,
+            text,
+        });
+    };
+
+    let result = agent.run_with(user, (), |(), event| {
+        match event {
+            AgentEvent::Reasoning(text) => fragment(Channel::Reasoning, format!("{text}\n")),
+            AgentEvent::ToolCall(call) => fragment(
+                Channel::Reasoning,
+                format!("\n⚙ {} {}\n", call.name, clip(&call.args.to_string(), 160)),
+            ),
+            AgentEvent::ToolStarted(_) => {}
+            AgentEvent::ToolProgress(message) => {
+                fragment(Channel::Reasoning, format!("  {message}\n"));
+            }
+            AgentEvent::ToolOutcome(outcome) => {
+                let note = match &outcome {
+                    ToolOutcome::Success { content } => {
+                        format!("  ✓ {} chars\n", content.chars().count())
+                    }
+                    other => format!("  ✗ {}\n", clip(&other.render_for_model("").content, 160)),
+                };
+                fragment(Channel::Reasoning, note);
+            }
+            AgentEvent::Final(text) => fragment(Channel::Answer, text),
+        }
+        Ok(if cancel.is_cancelled() {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        })
+    });
+
+    match result {
+        Ok(((), run)) => {
+            let stop = match run.stop {
+                AgentStop::Final => StopReason::Eos,
+                AgentStop::Stopped => StopReason::Stopped,
+                AgentStop::MaxSteps => {
+                    fragment(
+                        Channel::Reasoning,
+                        format!("\n⚠ tool-step budget exhausted ({AGENT_MAX_STEPS})\n"),
+                    );
+                    StopReason::MaxTokens
+                }
+            };
+            let _ = event_tx.send(EngineEvent::Done {
+                turn_id,
+                answer: run.answer,
+                stop,
+                prompt_tokens: None,
+            });
+        }
+        Err(e) => {
+            let _ = event_tx.send(EngineEvent::Error {
+                turn_id,
+                message: e.to_string(),
+            });
+        }
+    }
+}
+
+/// Truncate a note payload to `max` characters (with an ellipsis) — activity
+/// lines summarize; the model, not the pane, consumes full payloads.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
     }
 }

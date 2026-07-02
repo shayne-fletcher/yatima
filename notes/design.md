@@ -324,10 +324,29 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   defense for tool-call validity (constrained decoding was tried and shelved; see
   Deferred).
 - **`Agent`** — `run_async` collects the final answer; `run_with_async` is the
-  fold a future actor/TUI streams `AgentEvent`s into (`run_async` is the `acc =
-  ()` specialization). Synchronous `run` / `run_with` wrappers remain for simple
+  fold an actor/TUI streams `AgentEvent`s into (`run_async` is the `acc = ()`
+  specialization). Synchronous `run` / `run_with` wrappers remain for simple
   callers. Bounded by `max_steps`; `AgentStop` is `Final` / `MaxSteps` /
   `Stopped` (the last when the caller's fold returns `ControlFlow::Break`).
+- **Sessionful (AGENT-3).** Successive `run`s form one conversation: each
+  completed exchange persists its user turn and final answer into the agent's
+  history and is re-rendered into later prompts; tool rounds and reasoning stay
+  ephemeral to their run (the working-matter analogue of REASON-1 — a 40k-char
+  `read_page` result must not ride along in every later prompt). Interrupted or
+  step-exhausted runs persist nothing, so the caller can simply re-ask. One-shot
+  use (the CLI) is the fresh-agent-per-run special case.
+- **Hosted by the TUI** (`--web-origin <url>`): the engine actor grants
+  `read_url`/`read_page` on that origin (CAP-2) and serves turns through one
+  sessionful agent instead of the plain `ChatSession`. Agent reasoning and tool
+  activity ride the `Reasoning` fragment channel (tool rounds are working
+  matter, so the reasoning pane is their honest home); the final answer rides
+  `Answer`. Chat-only formats are rejected at startup (CAPS-1) — the tool loop
+  needs a tool-trained codec (`qwen` or `plain`). Cancellation takes effect at
+  event boundaries (step granularity) — the agent path's decode is not yet
+  token-cancellable, unlike the chat path; token streaming through the agent
+  loop is roadmap. `Tool` is the downstream extension seam: a consumer crate
+  (e.g. a sieve CLI) registers its own domain tools via `Tools::with` and gets
+  the same hosting for free.
 
 **Speaking the model's native format (hard-won).** Getting a base model to
 *reliably* act took three corrections, each now a guarded invariant:

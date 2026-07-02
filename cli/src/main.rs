@@ -72,6 +72,9 @@ struct GenerateArgs {
     temperature: f64,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Repetition penalty over the recent window; 1.0 disables it.
+    #[arg(long, default_value_t = 1.1)]
+    repeat_penalty: f32,
     /// Prompt prefill chunk size in tokens. Omit for model/backend default; use
     /// 0 to force one full-prompt prefill.
     #[arg(long)]
@@ -537,8 +540,8 @@ async fn generate(args: GenerateArgs) -> Result<()> {
     let opts = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::from_temperature(args.temperature, args.seed),
+        repeat_penalty: args.repeat_penalty,
         prefill_chunk: args.prefill_chunk,
-        ..Default::default()
     };
     let mut stdout = std::io::stdout();
     // Generation is the synchronous compute island (RT-1).

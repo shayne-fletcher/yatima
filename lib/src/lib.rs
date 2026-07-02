@@ -111,6 +111,10 @@
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
 //!   name is an `is_error` result, never ambient execution (sandbox by omission).
+//! - **AGENT-3** across runs, an [`Agent`]'s session history carries only each
+//!   completed exchange's user turn and final answer — tool rounds and
+//!   reasoning are ephemeral to their run (the working-matter analogue of
+//!   REASON-1), and an interrupted run leaves history untouched.
 //! - **TOOL-1** tool calls are async task executions: they can be awaited,
 //!   joined, watched through [`ToolEvent`], and cooperatively cancelled without
 //!   changing their argument schema.

@@ -702,6 +702,16 @@ impl Tool for WriteFile {
 }
 
 /// Read a text response from a URL under a [`WebOrigin`] capability.
+/// The `User-Agent` for every web-touching tool. Many origins (Wikipedia's bot
+/// policy, SEC EDGAR) reject or throttle anonymous clients — a descriptive UA
+/// with a contact URL is required politeness, and reqwest sends none by
+/// default.
+const WEB_USER_AGENT: &str = concat!(
+    "yatima/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/shayne-fletcher/yatima)"
+);
+
 pub struct ReadUrl {
     origin: WebOrigin,
     client: Client,
@@ -714,7 +724,10 @@ impl ReadUrl {
     }
 
     pub fn with_max_bytes(origin: WebOrigin, max_bytes: usize) -> Result<ReadUrl> {
-        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let client = Client::builder()
+            .user_agent(WEB_USER_AGENT)
+            .timeout(Duration::from_secs(10))
+            .build()?;
         Ok(ReadUrl {
             origin,
             client,
@@ -812,7 +825,10 @@ impl ReadPage {
         max_input_bytes: usize,
         max_output_chars: usize,
     ) -> Result<ReadPage> {
-        let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
+        let client = Client::builder()
+            .user_agent(WEB_USER_AGENT)
+            .timeout(Duration::from_secs(15))
+            .build()?;
         Ok(ReadPage {
             origin,
             client,
@@ -1032,7 +1048,10 @@ struct NtfyPublisher {
 
 impl NtfyPublisher {
     fn new(topic: NtfyTopic) -> Result<NtfyPublisher> {
-        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let client = Client::builder()
+            .user_agent(WEB_USER_AGENT)
+            .timeout(Duration::from_secs(10))
+            .build()?;
         Ok(NtfyPublisher { topic, client })
     }
 
@@ -1168,7 +1187,7 @@ impl Tool for ListDir {
 mod tests {
     use super::*;
     use std::io::Write;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn json(s: &str) -> Value {
@@ -1522,6 +1541,35 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/doc");
+    }
+
+    #[tokio::test]
+    async fn web_tools_send_a_descriptive_user_agent() {
+        // Wikipedia's bot policy and SEC EDGAR both reject anonymous clients:
+        // the descriptive UA must actually go out on the wire.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/doc"))
+            .and(header("user-agent", WEB_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let origin = WebOrigin::new(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_url".to_string(),
+                args: json(r#"{"url": "/doc"}"#),
+            })
+            .await;
+        assert_eq!(
+            result,
+            ToolOutcome::Success {
+                content: "ok".to_string()
+            }
+        );
     }
 
     #[test]

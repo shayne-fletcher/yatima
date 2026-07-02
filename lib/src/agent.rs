@@ -58,6 +58,12 @@ pub struct Run {
 /// An agent: a [`Completer`] driven against a set of [`Tools`], using a
 /// [`PromptTemplate`] to speak the model's native format and a [`ToolCallCodec`]
 /// to encode/parse tool calls, bounded by `max_steps`.
+///
+/// The agent is **sessionful**: successive [`run`](Agent::run)s form one
+/// conversation. Each completed exchange persists its user turn and final
+/// answer into [`history`](Agent::history) and is rendered into later prompts;
+/// tool rounds and reasoning stay ephemeral to their run (AGENT-3). One-shot
+/// use is the fresh-`Agent`-per-run special case, unchanged.
 pub struct Agent<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> {
     completer: &'a mut C,
     tools: &'a Tools,
@@ -66,6 +72,11 @@ pub struct Agent<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> {
     system: String,
     max_steps: usize,
     opts: GenOpts,
+    /// Session memory across runs: the user turn and final answer of each
+    /// completed exchange, in order (AGENT-3). Tool rounds and reasoning are
+    /// ephemeral to their run and never re-enter a later prompt; an
+    /// interrupted or step-exhausted run leaves this untouched.
+    history: Vec<Turn>,
 }
 
 impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
@@ -88,6 +99,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             system: system.into(),
             max_steps,
             opts: GenOpts::default(),
+            history: Vec::new(),
         }
     }
 
@@ -95,6 +107,17 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
     pub fn with_opts(mut self, opts: GenOpts) -> Agent<'a, C, K, T> {
         self.opts = opts;
         self
+    }
+
+    /// The session history: each completed exchange's user turn and final
+    /// answer, in order (AGENT-3). Empty until a run reaches a final answer.
+    pub fn history(&self) -> &[Turn] {
+        &self.history
+    }
+
+    /// Clear the session history (the system prompt and tools are unchanged).
+    pub fn reset(&mut self) {
+        self.history.clear();
     }
 
     /// Run to a final answer (or `max_steps`), discarding per-step events.
@@ -142,16 +165,19 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             self.system,
             self.codec.render_system(&self.tools.specs())
         );
-        let mut transcript = vec![
-            Turn {
-                role: Role::System,
-                content: system,
-            },
-            Turn {
-                role: Role::User,
-                content: user.to_string(),
-            },
-        ];
+        // Seed the working transcript with the session history (AGENT-3): prior
+        // exchanges' user/answer turns only — their tool rounds and reasoning
+        // were ephemeral to their runs.
+        let mut transcript = Vec::with_capacity(self.history.len() + 2);
+        transcript.push(Turn {
+            role: Role::System,
+            content: system,
+        });
+        transcript.extend(self.history.iter().cloned());
+        transcript.push(Turn {
+            role: Role::User,
+            content: user.to_string(),
+        });
 
         let stops = self.codec.stop_strings();
         let mut acc = init;
@@ -161,10 +187,14 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
 
         loop {
             let prompt = self.template.render(&transcript);
+            tracing::trace!(step = steps, prompt_chars = prompt.len(), prompt = %prompt,
+                "agent step prompt");
             // Await the completion; the Completer impl owns its operational shape
             // (the local Engine runs sync decode under run_blocking so it never
             // stalls the executor; a remote completer awaits I/O). CMP-1 / RT-1.
             let completion = self.completer.complete(&prompt, &self.opts, &stops).await?;
+            tracing::trace!(step = steps, completion_stop = ?completion.stop,
+                completion = %completion.text, "agent step completion");
             // Split off the reasoning span at the completion→turn boundary: the
             // transcript (re-rendered into the next prompt) carries only the
             // answer, never the chain-of-thought (REASON-1). The reply still
@@ -301,6 +331,20 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         }
 
         tracing::info!(steps, stop = ?stop, "agent run finished");
+        // Persist the exchange into session history only when it completed
+        // (AGENT-3): the user turn and the final answer. Interrupted or
+        // step-exhausted runs leave history untouched, so the caller can
+        // simply re-ask.
+        if stop == AgentStop::Final {
+            self.history.push(Turn {
+                role: Role::User,
+                content: user.to_string(),
+            });
+            self.history.push(Turn {
+                role: Role::Assistant,
+                content: answer.clone(),
+            });
+        }
         Ok((
             acc,
             Run {
@@ -330,9 +374,12 @@ mod tests {
 
     /// A [`Completer`] that replays canned completions — the agent's laws are
     /// provable with no model. Panics if the loop asks for more than scripted.
+    /// Records every rendered prompt so tests can assert what a later step (or
+    /// a later run, AGENT-3) actually re-renders.
     struct Scripted {
         script: Vec<Completion>,
         i: usize,
+        prompts: Vec<String>,
     }
 
     impl Scripted {
@@ -344,12 +391,22 @@ mod tests {
                     stop: StopReason::Stopped,
                 })
                 .collect();
-            Scripted { script, i: 0 }
+            Scripted {
+                script,
+                i: 0,
+                prompts: Vec::new(),
+            }
         }
     }
 
     impl Completer for Scripted {
-        async fn complete(&mut self, _: &str, _: &GenOpts, _: &[String]) -> Result<Completion> {
+        async fn complete(
+            &mut self,
+            prompt: &str,
+            _: &GenOpts,
+            _: &[String],
+        ) -> Result<Completion> {
+            self.prompts.push(prompt.to_string());
             let c = self
                 .script
                 .get(self.i)
@@ -592,6 +649,82 @@ mod tests {
         assert_eq!(run.stop, AgentStop::Final);
         assert_eq!(run.steps, 0);
         assert_eq!(run.answer, "The answer is 42.");
+    }
+
+    #[test]
+    fn session_history_carries_across_runs() {
+        // upholds: AGENT-3 — a second run's prompt re-renders the first
+        // exchange's user turn and final answer.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&["Paris.", "About two million."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+
+        let run1 = agent.run("What is the capital of France?").unwrap();
+        assert_eq!(run1.answer, "Paris.");
+        let run2 = agent.run("And its population?").unwrap();
+        assert_eq!(run2.answer, "About two million.");
+
+        // History holds both completed exchanges, in order.
+        let roles: Vec<Role> = agent.history().iter().map(|t| t.role).collect();
+        assert_eq!(
+            roles,
+            [Role::User, Role::Assistant, Role::User, Role::Assistant]
+        );
+
+        drop(agent);
+        let second_prompt = &model.prompts[1];
+        assert!(second_prompt.contains("What is the capital of France?"));
+        assert!(second_prompt.contains("Paris."));
+        assert!(second_prompt.contains("And its population?"));
+    }
+
+    #[test]
+    fn tool_rounds_are_ephemeral_across_runs() {
+        // upholds: AGENT-3 — run 1's tool result is fed back within run 1 but
+        // never re-rendered into run 2's prompt; only the final answer is.
+        let tmp = tmp_with_file("note.txt", "SECRET-77");
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let mut model = Scripted::new(&[
+            &call("read_file", "note.txt"),
+            "The note mentions a number.",
+            "Yes, just one.",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+
+        let run1 = agent.run("What does note.txt mention?").unwrap();
+        assert_eq!(run1.answer, "The note mentions a number.");
+        let run2 = agent.run("Just one?").unwrap();
+        assert_eq!(run2.answer, "Yes, just one.");
+
+        drop(agent);
+        // Within run 1 the tool result was visible (step 2's prompt)…
+        assert!(model.prompts[1].contains("SECRET-77"));
+        // …but run 2's prompt carries only the exchange's conclusion.
+        let run2_prompt = model.prompts.last().unwrap();
+        assert!(run2_prompt.contains("The note mentions a number."));
+        assert!(!run2_prompt.contains("SECRET-77"));
+    }
+
+    #[test]
+    fn interrupted_runs_leave_history_untouched() {
+        // upholds: AGENT-3 — MaxSteps and Stopped runs persist nothing; a
+        // subsequent completed run starts the history.
+        let tmp = tmp_with_file("note.txt", "x");
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let looping = call("read_file", "note.txt");
+        let mut model = Scripted::new(&[&looping, &looping, "Done: x."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 2);
+
+        let run1 = agent.run("read forever").unwrap();
+        assert_eq!(run1.stop, AgentStop::MaxSteps);
+        assert!(agent.history().is_empty());
+
+        let run2 = agent.run("and now?").unwrap();
+        assert_eq!(run2.stop, AgentStop::Final);
+        assert_eq!(agent.history().len(), 2);
+
+        agent.reset();
+        assert!(agent.history().is_empty());
     }
 
     #[test]

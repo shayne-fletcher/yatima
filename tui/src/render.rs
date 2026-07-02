@@ -624,10 +624,20 @@ fn sub_superscripts(s: &str) -> String {
                     continue;
                 }
             } else if let Some(first) = rest.chars().next() {
-                if let Some(m) = script_char(first, sup) {
-                    out.push(m);
-                    i += 1 + first.len_utf8();
-                    continue;
+                // Identifier guard: `read_page`, `foo_bar` are snake_case, not
+                // subscripts — leave `_x` alone when the run continues as a
+                // word (the next char is alphanumeric or another underscore).
+                let word_continues = !sup
+                    && rest
+                        .chars()
+                        .nth(1)
+                        .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_');
+                if !word_continues {
+                    if let Some(m) = script_char(first, sup) {
+                        out.push(m);
+                        i += 1 + first.len_utf8();
+                        continue;
+                    }
                 }
             }
             out.push(c);
@@ -1058,6 +1068,18 @@ fn context_label(prompt_tokens: Option<usize>, context_length: Option<usize>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscripts_map_math_but_spare_snake_case_identifiers() {
+        // Math subscripts still map…
+        assert_eq!(sub_superscripts("x_i"), "xᵢ");
+        assert_eq!(sub_superscripts("a_1 + a_2"), "a₁ + a₂");
+        // …but snake_case identifiers pass through untouched (a tool name in an
+        // activity line must not become `readₚage`).
+        assert_eq!(sub_superscripts("read_page"), "read_page");
+        assert_eq!(sub_superscripts("foo_bar_baz"), "foo_bar_baz");
+        assert_eq!(sub_superscripts("max_tokens=42"), "max_tokens=42");
+    }
 
     #[test]
     fn activity_text_shows_phase_elapsed_tokens_and_rate() {
