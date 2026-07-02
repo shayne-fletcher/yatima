@@ -24,6 +24,11 @@ clap = { version = "4.5", features = ["derive", "env"] }
 eframe = { version = "0.35", default-features = false, features = [
   "wgpu",
   "default_fonts",
+  # Window-system backends for Linux (CI builds the workspace on ubuntu;
+  # winit emits a hard compile_error there without one). Both are
+  # target-gated inside winit, so they cost nothing on macOS.
+  "x11",
+  "wayland",
 ] }
 # Decode artifact images (matplotlib PNGs) to upload as egui textures. PNG only
 # for the spike — keep the dep light.
