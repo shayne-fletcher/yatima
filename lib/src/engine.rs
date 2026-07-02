@@ -2063,6 +2063,89 @@ mod tests {
         Ok(())
     }
 
+    // Upgrade canary for the Metal KV cliff (CTX-2, notes/metal-kv-cliff.md):
+    // a >8,192-token prompt puts the corruption crossing inside prefill, so on
+    // a broken stack the very first sampled tokens are garbage (repeat penalty
+    // off makes that degenerate hard and trip the guard). Run it when bumping
+    // candle, against pure upstream (local `[patch]` disabled): a clean pass
+    // means the sync-workaround branch can be dropped; a failure means keep
+    // cherry-picking it. Gated on `YATIMA_KV_CLIFF_CANARY=1` (loads the 32B
+    // GGUF on Metal; several minutes).
+    #[test]
+    fn metal_kv_cliff_canary() -> Result<()> {
+        if std::env::var_os("YATIMA_KV_CLIFF_CANARY").is_none() {
+            eprintln!("skipping: set YATIMA_KV_CLIFF_CANARY=1 to run");
+            return Ok(());
+        }
+        let id = crate::ModelId::parse("bartowski/Qwen2.5-32B-Instruct-GGUF").unwrap();
+        let dir = crate::model_dir(&crate::models_root(), &id);
+        if !is_model_present(&dir) {
+            eprintln!("skip: {id:?} not cached");
+            return Ok(());
+        }
+        let dev = device(false)?;
+        if !dev.is_metal() {
+            eprintln!("skip: canary needs the Metal backend");
+            return Ok(());
+        }
+        let mut engine = Engine::load(&dir, dev)?;
+
+        // Varied filler (repetitive text would make even a healthy greedy
+        // continuation degenerate); grown until the prompt clears the cliff.
+        let mut doc = String::new();
+        let mut i = 0usize;
+        let mut prompt;
+        loop {
+            for _ in 0..64 {
+                i += 1;
+                doc.push_str(&format!(
+                    "Section {i}: item {} carries code {:x} and weight {}. ",
+                    i * 7 % 1000,
+                    i * 2654435761usize % 100000,
+                    i * 13 % 97
+                ));
+            }
+            prompt = format!(
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+                 <|im_start|>user\nSummarize the following inventory in a few \
+                 sentences:\n\n{doc}\n<|im_end|>\n<|im_start|>assistant\n"
+            );
+            if engine.token_count(&prompt)? > METAL_KV_CLIFF + 60 {
+                break;
+            }
+        }
+
+        let opts = GenOpts {
+            max_tokens: 60,
+            sampling: Sampling::Greedy,
+            repeat_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        let gen = engine.generate(&prompt, &opts, |s| {
+            out.push_str(s);
+            Ok(())
+        })?;
+        eprintln!("canary output: {out}");
+        assert!(
+            !matches!(gen.stop, StopReason::Repetition),
+            "degeneration guard fired past the KV cliff — the Metal corruption \
+             is present on this candle; keep the sync workaround"
+        );
+        // A real summary is mostly words; the observed corruption modes are
+        // either non-ASCII waves (`퓮퓮…`) or ASCII punctuation soup
+        // (`8888, The 0, 0, , , , …`) — both collapse the alphabetic ratio.
+        let total = out.chars().count();
+        let alpha = out.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        assert!(
+            total > 0 && alpha * 5 >= total * 2,
+            "output past the KV cliff is garbage (alphabetic ratio {alpha}/{total}) \
+             — the Metal corruption is present on this candle; keep the sync \
+             workaround: {out}"
+        );
+        Ok(())
+    }
+
     // Per-family load+generate over the real models. Gated on `YATIMA_E2E=1`;
     // each family is skipped if its weights aren't cached, so this passes
     // whether one or all six are present. One representative model per arch.

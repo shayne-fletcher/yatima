@@ -4,15 +4,20 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 
-# candle pinned to the 0.11.0 release tag — newer architectures (qwen3,
-# qwen3-moe, gemma3, deepseek2) and staying on the frontier. NB: 0.11 still has
-# no i-quant GGUF support (dtypes 0-15 + BF16 only), so GGUFs using IQ* tensors
-# do not load — see memory yatima-candle-gguf-dtype-support. Re-validate the
-# Metal prefill behavior on each bump (notes/glm4-prefill-reproducer.md).
+# candle from our fork: upstream 0.11.0 plus one workaround commit — a device
+# sync around KV crossings of 8,192 on Metal, without which quantized GGUF
+# generation deterministically corrupts past that depth (the full diagnosis is
+# notes/metal-kv-cliff.md). On each candle bump, run the KV-cliff canary
+# against pure upstream first (YATIMA_KV_CLIFF_CANARY=1, see the note): pass →
+# drop the fork and repin upstream; fail → cherry-pick the workaround onto the
+# new rev and update the branch. NB: 0.11 still has no i-quant GGUF support
+# (dtypes 0-15 + BF16 only), so GGUFs using IQ* tensors do not load — see
+# memory yatima-candle-gguf-dtype-support. Re-validate Metal prefill behavior
+# on each bump (notes/glm4-prefill-reproducer.md).
 [dependencies]
-candle-core = { git = "https://github.com/huggingface/candle", tag = "0.11.0" }
-candle-nn = { git = "https://github.com/huggingface/candle", tag = "0.11.0" }
-candle-transformers = { git = "https://github.com/huggingface/candle", tag = "0.11.0" }
+candle-core = { git = "https://github.com/shayne-fletcher/candle", branch = "yatima-0.11.0-metal-kv-sync" }
+candle-nn = { git = "https://github.com/shayne-fletcher/candle", branch = "yatima-0.11.0-metal-kv-sync" }
+candle-transformers = { git = "https://github.com/shayne-fletcher/candle", branch = "yatima-0.11.0-metal-kv-sync" }
 tokenizers = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

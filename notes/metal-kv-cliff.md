@@ -68,20 +68,69 @@ move the cliff. The byte-identical determinism across two allocation
 regimes also argues against any scheduling race: races are flaky, this is
 clockwork.
 
-What remains is a deterministic compute defect at kv ≥ 8,192 that only
-manifests in the composed model. The provenance gap was closed too:
-`metal_attn_replica_probe.rs` replays one decode step exactly as
-`quantized_qwen2::forward_attn` does (4D batch shapes, 8-head KV cache
-grown by `cat`, `repeat_kv` cat-of-5 + reshape, RoPE through narrowed
-table views at the true positions, no mask) at positions 8,189–8,194 —
-every intermediate agrees across devices at float-epsilon, with no anomaly
-at the crossing. So the attention data path is clean even with exact
-provenance; what the replica still lacks is what the real model adds: the
-quantized weight matmuls (QMatMul) interleaved in the same stream, the
-rest of the layer (RMSNorm, MLP), and 64 layers of encoder/command-buffer
-batching per step. Localizing further requires layer-by-layer dumps inside
-a vendored copy of the model on the 32B weights — the expensive hunt. The
-cheap, model-free methods end here; stopped on cost grounds.
+The provenance gap was closed too: `metal_attn_replica_probe.rs` replays
+one decode step exactly as `quantized_qwen2::forward_attn` does (4D batch
+shapes, 8-head KV cache grown by `cat`, `repeat_kv` cat-of-5 + reshape,
+RoPE through narrowed table views at the true positions, no mask) at
+positions 8,189–8,194 — every intermediate agrees across devices at
+float-epsilon. The attention data path is clean even with exact provenance.
+
+## Resolution: a missing synchronization (Heisenbug, pinned by bisection)
+
+Instrumenting the real model settled it. Per-layer stat readbacks (each a
+forced GPU sync) around the crossing **make the corruption vanish** — and
+the bisection narrowed the rescue to almost nothing:
+
+- syncs at positions 8,186–8,200, all 64 layers, 3 taps each: clean;
+- syncs at positions 8,191–8,192 only: clean;
+- one tap (layer output) only: clean;
+- **layers 0 and 1 only — four readbacks in total: clean, the entire
+  120-token generation coherent through the exact byte where the
+  unsynced baseline derails.**
+
+So the poison forms once, early in the crossing step, and an early flush
+re-phases the encoder stream so everything downstream computes correctly.
+The earlier "byte-identical ⇒ not a race" inference was a red herring:
+candle runs every Metal buffer with `HazardTrackingModeUntracked` and
+substitutes its own fence map (buffer pointer → last-writer fence, fed by
+`Output::new` annotations); under Metal's fixed encoder schedule, a
+dependency that escapes that map is misread the *same way every run* —
+deterministic, yet a synchronization defect. The exact escaping edge
+(likely tied to the kernel/dispatch change at dimension 8,192) is left
+for upstream; the fence system is where to look.
+
+## Workaround (fork branch, pinned in the manifest) and upgrade drill
+
+`lib/Cargo.toml` pins candle to
+`shayne-fletcher/candle` branch `yatima-0.11.0-metal-kv-sync` — upstream
+0.11.0 plus the workaround — so the fix travels with the repo (any
+machine, any user; no machine-local override). The sibling clone at
+`~/project/candle` is the dev workspace that pushes to that fork.
+
+- `quantized_qwen2::forward` synchronizes the device during any forward
+  whose KV positions cross a multiple of 8,192: after layers 0 and 1 for
+  a decode step (the bisection-proven minimum), and after **every** layer
+  for a prefill chunk — prefill-side crossings empirically need the wider
+  net (the canary caught the two-layer version failing there, with a new
+  ASCII-punctuation-soup garbage mode, `8888, The 0, 0, , , …`, that is
+  also *nondeterministic across runs*). Non-crossing steps are untouched.
+- Debug instrumentation (env-gated layer stats, scoped pool kill-switch,
+  allocation logging) rides the same branch.
+
+**On every candle bump**, repin to pure upstream and run the canary:
+
+```bash
+YATIMA_KV_CLIFF_CANARY=1 cargo test -p yatima-lib --release \
+  --features metal -- metal_kv_cliff_canary --nocapture
+```
+
+It builds a >8,192-token prompt (crossing inside prefill — the harder
+mode) and asserts the generation survives with a sane alphabetic ratio.
+Pass → upstream fixed it, drop the fork and repin upstream. Fail →
+cherry-pick the workaround commits onto the new rev, push the branch,
+repin. With the workaround the canary passes today (a coherent summary,
+every token generated past the cliff); CTX-2's warning stays for anyone
+on stock candle.
 
 (A *global* no-reuse switch is not viable for experiments: fresh Metal
 buffers for every op balloon unboundedly — a run took the machine down at
