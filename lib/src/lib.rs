@@ -84,6 +84,11 @@
 //!   An undeclared window imposes no constraint. (Hosts use the same budget to
 //!   trim/compact a transcript — the higher rungs of the ladder in
 //!   `notes/design.md`.)
+//! - **CTX-2** on Metal, a generation whose KV would reach depth 8,192 is
+//!   warned before decode: candle's Metal backend deterministically corrupts
+//!   the KV state from that depth (an upstream defect, diagnosed in
+//!   `notes/metal-kv-cliff.md`), so output past the cliff is not trustworthy.
+//!   A warning, not a refusal — the depth is empirical, not architectural.
 //!
 //! Runtime & concurrency (async-first, one owned runtime):
 //! - **RT-1** the library owns exactly one (multi-thread) runtime and never

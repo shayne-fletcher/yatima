@@ -36,6 +36,13 @@ const DEFAULT_REPEAT_PENALTY: f32 = 1.1;
 const REPEAT_LAST_N: usize = 64;
 const METAL_PREFILL_CHUNK: usize = 64;
 
+/// The KV depth at which candle's Metal backend corrupts generation
+/// (CTX-2): deterministic on quantized 32B GGUF — coherent through
+/// position 8,191, garbage from 8,192 on, however the depth is reached
+/// (long prompt or long decode; prefill chunking does not help). See
+/// `notes/metal-kv-cliff.md` for the diagnosis.
+const METAL_KV_CLIFF: usize = 8_192;
+
 /// How the next token is chosen. Replaces the old `temperature <= 0` sentinel
 /// with an explicit choice — greedy carries no temperature, and seed is
 /// meaningless for greedy.
@@ -548,6 +555,49 @@ fn context_length_from_config(config: &serde_json::Value) -> Option<usize> {
         .get("max_position_embeddings")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
+}
+
+/// How a generation relates to [`METAL_KV_CLIFF`] (CTX-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliffCrossing {
+    /// The prompt alone already sits past the cliff.
+    AlreadyPast,
+    /// The prompt fits, but decoding `max_tokens` may run past the cliff.
+    MayCross,
+}
+
+/// CTX-2 classification: does this generation reach KV depth
+/// [`METAL_KV_CLIFF`] (the first corrupt depth)? Pure so it is testable
+/// without a model; `None` means the whole run stays under the cliff.
+fn metal_kv_cliff_crossing(prompt_tokens: usize, max_tokens: usize) -> Option<CliffCrossing> {
+    if prompt_tokens >= METAL_KV_CLIFF {
+        Some(CliffCrossing::AlreadyPast)
+    } else if prompt_tokens.saturating_add(max_tokens) >= METAL_KV_CLIFF {
+        Some(CliffCrossing::MayCross)
+    } else {
+        None
+    }
+}
+
+/// CTX-2: warn (never refuse — the depth is empirical, not architectural)
+/// when a Metal generation will run KV positions past [`METAL_KV_CLIFF`].
+fn warn_metal_kv_cliff(prompt_tokens: usize, max_tokens: usize) {
+    match metal_kv_cliff_crossing(prompt_tokens, max_tokens) {
+        Some(CliffCrossing::AlreadyPast) => tracing::warn!(
+            prompt_tokens,
+            cliff = METAL_KV_CLIFF,
+            "prompt already exceeds the Metal KV corruption depth; output may \
+             be garbage (CTX-2)"
+        ),
+        Some(CliffCrossing::MayCross) => tracing::warn!(
+            prompt_tokens,
+            max_tokens,
+            cliff = METAL_KV_CLIFF,
+            "generation may cross the Metal KV corruption depth; output past \
+             the cliff may be garbage (CTX-2)"
+        ),
+        None => {}
+    }
 }
 
 /// CTX-1: refuse a generation that cannot fit the model's context window —
@@ -1137,6 +1187,13 @@ impl Engine {
         let prompt_tokens = tokens.len();
         // CTX-1: refuse rather than silently overflow the context window.
         within_context(prompt_tokens, opts.max_tokens, self.context_length)?;
+        // CTX-2: warn when the run will cross the depth at which candle's
+        // Metal backend corrupts the KV state (deterministic on quantized
+        // 32B GGUF: coherent through position 8,191, garbage from 8,192 —
+        // notes/metal-kv-cliff.md). Output past the cliff is not trustworthy.
+        if self.device.is_metal() {
+            warn_metal_kv_cliff(prompt_tokens, opts.max_tokens);
+        }
 
         let mut logits_processor = opts.sampling.logits_processor();
         let mut acc = init;
@@ -1776,6 +1833,24 @@ mod tests {
         assert!(within_context(4096, 0, Some(4096)).is_ok()); // exactly fits
         assert!(within_context(4000, 256, Some(4096)).is_err()); // 4256 > 4096
         assert!(within_context(10_000, 10_000, None).is_ok()); // unknown = no limit
+    }
+
+    #[test]
+    fn metal_kv_cliff_classification() {
+        // upholds: CTX-2 — the cliff (8,192) is the first corrupt KV depth: a
+        // run whose deepest position stays below it is unflagged; one that
+        // decodes to or past it is MayCross; a prompt already at it is
+        // AlreadyPast.
+        assert_eq!(metal_kv_cliff_crossing(8_000, 191), None); // peak 8,191
+        assert_eq!(
+            metal_kv_cliff_crossing(8_000, 192), // peak == cliff
+            Some(CliffCrossing::MayCross)
+        );
+        assert_eq!(
+            metal_kv_cliff_crossing(8_192, 0),
+            Some(CliffCrossing::AlreadyPast)
+        );
+        assert_eq!(metal_kv_cliff_crossing(8_191, 0), None); // last good depth
     }
 
     #[test]

@@ -1,0 +1,102 @@
+# Metal KV corruption at depth 8,192 (CTX-2)
+
+## Symptom
+
+Quantized GGUF generation on Metal degrades into deterministic garbage the
+moment the KV cache reaches 8,192 entries — however that depth is reached:
+
+- A prompt of ≥ 8,192 tokens produces garbage from the first sampled token
+  (with the default 1.1 repeat penalty the garbage argmax lands on tokens
+  like `</tool_call>`, which a tool-call codec then misreads as an answer;
+  with the penalty off it is naked degeneration, `000퓮퓮퓮…`, halted by the
+  degeneration guard).
+- A shorter prompt with a long decode derails mid-generation exactly when
+  the cache crosses 8,192: an 8,100-token prompt produced fluent text
+  through generated token 93 (kv 8,193) then word-salad; an 8,018-token
+  prompt derailed at generated token ~175 (kv ≈ 8,193) across two
+  independent runs. Past the crossing many sampled tokens are UTF-8
+  fragments the incremental detokenizer never completes, so a host sees the
+  stream stall as well as corrupt.
+
+First observed as "the model answered `</tool_call>`" in the TUI acceptance
+run for HTTP tools (Qwen2.5-32B-Instruct Q4_K_M, 11.6k-token step-2 prompt
+carrying a 40k-char `read_page` result).
+
+## What it is not (each exonerated by direct experiment)
+
+- Not the transcript/codec machinery: the failing step-2 prompt was captured
+  via agent trace logging and is byte-perfect ChatML; the stop marker is kept
+  (`first_stop_end` truncates *past* it).
+- Not tokenization: `<tool_call>`/`</tool_call>` are added tokens in the
+  sibling tokenizer.json, encoded as single pieces.
+- Not the context window: 11.6k ≪ 32k, and CTX-1 would have refused loudly.
+- Not content: identical scaffold with the tool response cut to N tokens
+  flips from clean (≤ 8,100) to garbage (≥ 8,300) regardless of content; the
+  bracket was tightened to (8,100 … 8,300) with pinned-token prompts, and
+  decode-crossing runs put the onset at kv 8,192–8,194.
+- Not prefill scheduling: chunk 64 (the GLM-4 mitigation), 32, and 16 all
+  fail identically; chunk-64 prefill necessarily passes through kv = 8,192
+  for any prompt ≥ 8,192 (64·128), which is why every long-prompt run hit it.
+- Not the f32 attention ops in isolation: `lib/examples/metal_depth_probe.rs`
+  compares q·kᵀ, softmax (masked and unmasked), probs·v, and cat on Metal vs
+  CPU at kv ∈ {8,000 … 11,605} for decode and prefill-chunk shapes — max
+  |Δ| ≈ 1e-7 everywhere.
+- Not the RoPE tables or kernel: `metal_trig_probe.rs` (table values at
+  positions to 32,767) and `metal_rope_probe.rs` (the rope op with offset
+  views and contiguous copies at positions to 16,384) are both clean.
+  (candle #3520 — bf16 RoPE tables in `models/qwen2.rs` — is the same
+  disease in the safetensors path, but the GGUF path builds tables in f32.)
+
+## Where the evidence points
+
+The corruption appears only in the composed model run, precisely at the KV
+depth where the K/V cache tensors reach exactly 2^25 bytes (8 kv-heads ×
+8,192 positions × 128 dim × 4 bytes = 32 MiB — 4,096 bytes per position, so
+depth 8,192 is the unique power-of-two crossing). candle's Metal allocator
+buckets buffers by `next_power_of_two` and recycles them when the host-side
+`Arc` count drops to 1; all buffers are created with
+`HazardTrackingModeUntracked`, so correctness relies on every kernel
+annotating written buffers (`Output::new`) for the encoder's RAW-hazard
+tracking. At kv = 8,192 the cache `cat` is served from the long-idle 32 MiB
+bucket (confirmed by allocation logging on the instrumented local candle,
+branch `metal-pool-debug` in the sibling clone) rather than the
+steadily-recycled 64 MiB bucket, and the KV state is poisoned from that
+step on.
+
+The remaining unknown is the exact racing/un-annotated kernel. A global
+"no pool reuse" kill-switch was tried to prove causation and is **not
+viable**: fresh Metal buffers for every op balloon unboundedly (the run
+took the machine down at 228 GB+). A scoped variant (skip reuse only for
+power-of-two requests ≥ 16 MiB — a few hundred buffers) is implemented on
+the candle branch for whoever resumes the hunt.
+
+## Status / mitigation
+
+- The engine warns (CTX-2, `warn_metal_kv_cliff`) when a Metal run will
+  reach depth 8,192. A warning, not a refusal: the depth is empirical and
+  per-stack (validated on Qwen2.5-32B Q4_K_M, macOS 26 / M-series 48 GB,
+  candle 0.11.0 = upstream main at 31f35b1).
+- Hosts keep working prompts under the cliff: the TUI's `read_page` budget
+  is 12k chars (≈ 3.3k tokens) for latency *and* headroom.
+- Upstream: candle issue to be filed with this diagnosis; the pin already
+  contains all recent Metal sync fixes (#3532, #3595, #3394), so the defect
+  is live on their main.
+
+## Reproducing
+
+Any ≥ 8,192-token prompt through `yatima generate` on a Metal quantized
+32B GGUF shows it (greedy, so deterministic):
+
+```bash
+python3 - <<'EOF' > /tmp/prompt.txt
+print("<|im_start|>user\nSummarize this:\n" + ("lorem ipsum " * 4000) +
+      "\n<|im_end|>\n<|im_start|>assistant\n")
+EOF
+yatima generate --repo bartowski/Qwen2.5-32B-Instruct-GGUF \
+  --gguf Qwen2.5-32B-Instruct-Q4_K_M.gguf --max-tokens 60 < /tmp/prompt.txt
+```
+
+Sharper: a prompt pinned to 8,100 tokens with `--max-tokens 300` derails
+mid-decode at generated token ~92. The probes
+(`lib/examples/metal_{depth,trig,rope}_probe.rs`) document the exonerated
+ops.
