@@ -303,7 +303,11 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   measured), the CPU extraction runs on `spawn_blocking`, output is truncated to
   a char budget rather than failing, and obvious non-HTML is rejected with a
   "use read_url" message. Server-rendered HTML only — no JS, paywalls, or
-  cross-origin links.
+  cross-origin links. Long articles page **model-drivenly**: each window's
+  truncation marker names the `offset` for the next call, and continuations are
+  served from a per-tool fetch-once cache (FETCH-1/WIN-1) — one network fetch
+  per URL per session, which is the shape a throttled host (sieve's EDGAR)
+  requires: re-fetching is the expensive act, re-reading is free.
 - **`Tool` is a downstream extension point.** `Tool` is `pub` and `Tools::with`
   takes any `impl Tool`, so a consumer crate (e.g. `sieve`) can define and
   register its own domain tools — they implement `Tool` (needs the `async-trait`
@@ -872,8 +876,8 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **A GPU frontend (the "render anything" direction).** The terminal frontend
   has hard ceilings — no glyph shaping, RTL, proportional layout, typeset math,
   or inline media; the emulator owns all of that. (Felt sharply when the model
-  wrote yatima's own name in Arabic, يَتِيمَة, which a TTY cannot shape — the
-  idle TUI title now carries it as a standing reminder.) The answer is a
+  wrote yatima's own name in Arabic, يَتِيمَة, which a TTY cannot shape — it
+  briefly signed the idle TUI title before being dropped as clutter.) The answer is a
   **separate** frontend, not a TTY upgrade: a sibling edge (`yatima-gui`) over
   `yatima-lib`, reusing the engine-actor's three planes unchanged (the actor is
   already frontend-agnostic — preserve that as an invariant). Rust build path,

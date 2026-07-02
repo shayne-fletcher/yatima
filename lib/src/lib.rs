@@ -84,11 +84,14 @@
 //!   An undeclared window imposes no constraint. (Hosts use the same budget to
 //!   trim/compact a transcript — the higher rungs of the ladder in
 //!   `notes/design.md`.)
-//! - **CTX-2** *(retired)* stock candle's Metal backend deterministically
-//!   corrupts the KV state from depth 8,192 (`notes/metal-kv-cliff.md`); the
-//!   pinned candle fork carries the sync workaround, so no generation-time
-//!   guard remains. The `metal_kv_cliff_canary` test is the drill for every
-//!   candle bump: green on pure upstream means the fork can be dropped.
+//! - **CTX-2** stock candle's Metal backend deterministically corrupts the
+//!   KV state from depth 8,192 (`notes/metal-kv-cliff.md`). The pinned candle
+//!   fork's sync workaround restores correctness at moderate depths
+//!   (canary-validated ~8.4k, field-observed to ~15.5k) but not in the
+//!   deepest water (garbage at ≥18k despite the syncs), so the engine flags
+//!   Metal runs entering the band: debug-level through the validated depth,
+//!   a warning past it. The `metal_kv_cliff_canary` test is the drill for
+//!   every candle bump: green on pure upstream means the fork can be dropped.
 //!
 //! Runtime & concurrency (async-first, one owned runtime):
 //! - **RT-1** the library owns exactly one (multi-thread) runtime and never
@@ -131,6 +134,15 @@
 //!   enforced for omission (AGENT-2) and containment (CAP-1); by construction
 //!   otherwise (tools hold their caps, no ambient `std::fs` or arbitrary
 //!   network destination). Stated, not compiler-absolute — see `notes/design.md`.
+//! - **FETCH-1** within a session, [`ReadPage`] fetches each resolved URL at
+//!   most once: repeat and continuation (`offset`) reads are served from a
+//!   per-tool, FIFO-bounded cache and never touch the network — re-fetching
+//!   is the expensive act for throttled hosts (EDGAR), re-reading is free.
+//! - **WIN-1** `read_page` windows tile: successive windows are adjacent and
+//!   non-overlapping, concatenating them in offset order reconstructs the
+//!   article prefix exactly, and every truncation marker names the next
+//!   window's `offset` (the marker is the pagination API). An offset at or
+//!   past the end is a helpful error naming the length, never silent-empty.
 //! - **PROTO-1** a malformed/unknown tool call becomes a typed non-success
 //!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
 //!   from, never a silent mis-execution.

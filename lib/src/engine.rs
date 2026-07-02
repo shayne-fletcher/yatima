@@ -38,12 +38,18 @@ const METAL_PREFILL_CHUNK: usize = 64;
 
 /// The KV depth at which stock candle's Metal backend corrupts generation
 /// (coherent through position 8,191, garbage from 8,192 — diagnosis in
-/// `notes/metal-kv-cliff.md`). The pinned candle fork carries the sync
-/// workaround, so this is not enforced at generation time; the
-/// `metal_kv_cliff_canary` test uses it to size its prompt for the
-/// candle-upgrade drill.
-#[cfg(test)]
+/// `notes/metal-kv-cliff.md`). The pinned candle fork's sync workaround
+/// restores correctness at moderate depths (canary-validated to ~8.4k,
+/// coherent to ~15.5k in the field) but NOT in the deepest water (garbage
+/// observed at ≥18k despite the syncs), so CTX-2 warns past the cliff and
+/// the canary sizes its prompt with it.
 const METAL_KV_CLIFF: usize = 8_192;
+
+/// The deepest KV depth at which the workaround has been observed to hold
+/// (a coherent 15.5k-token prefill mid-marathon); ≥18k is known garbage.
+/// CTX-2 warns for the band and hard-warns past this. See
+/// `notes/metal-kv-cliff.md`.
+const METAL_KV_VALIDATED: usize = 15_000;
 
 /// How the next token is chosen. Replaces the old `temperature <= 0` sentinel
 /// with an explicit choice — greedy carries no temperature, and seed is
@@ -557,6 +563,49 @@ fn context_length_from_config(config: &serde_json::Value) -> Option<usize> {
         .get("max_position_embeddings")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
+}
+
+/// CTX-2: how a Metal generation relates to the corruption depths — `None`
+/// under the cliff, `Mitigated` in the band the fork's sync workaround is
+/// validated for, `Unreliable` past the deepest depth it has been seen to
+/// hold. Pure so it is testable without a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvDepthRisk {
+    Mitigated,
+    Unreliable,
+}
+
+fn metal_kv_depth_risk(prompt_tokens: usize, max_tokens: usize) -> Option<KvDepthRisk> {
+    let deepest = prompt_tokens.saturating_add(max_tokens);
+    if deepest > METAL_KV_VALIDATED {
+        Some(KvDepthRisk::Unreliable)
+    } else if deepest >= METAL_KV_CLIFF {
+        Some(KvDepthRisk::Mitigated)
+    } else {
+        None
+    }
+}
+
+/// CTX-2: warn (never refuse — the depths are empirical) when a Metal run
+/// enters the corruption band. See `notes/metal-kv-cliff.md`.
+fn warn_metal_kv_depth(prompt_tokens: usize, max_tokens: usize) {
+    match metal_kv_depth_risk(prompt_tokens, max_tokens) {
+        Some(KvDepthRisk::Unreliable) => tracing::warn!(
+            prompt_tokens,
+            max_tokens,
+            validated = METAL_KV_VALIDATED,
+            "run exceeds the deepest KV depth the Metal corruption workaround \
+             is known to hold at; output is likely garbage (CTX-2)"
+        ),
+        Some(KvDepthRisk::Mitigated) => tracing::debug!(
+            prompt_tokens,
+            max_tokens,
+            cliff = METAL_KV_CLIFF,
+            "run crosses the Metal KV cliff; the pinned candle's sync \
+             workaround covers this depth (CTX-2)"
+        ),
+        None => {}
+    }
 }
 
 /// CTX-1: refuse a generation that cannot fit the model's context window —
@@ -1146,6 +1195,10 @@ impl Engine {
         let prompt_tokens = tokens.len();
         // CTX-1: refuse rather than silently overflow the context window.
         within_context(prompt_tokens, opts.max_tokens, self.context_length)?;
+        // CTX-2: flag Metal runs entering the KV corruption band.
+        if self.device.is_metal() {
+            warn_metal_kv_depth(prompt_tokens, opts.max_tokens);
+        }
 
         let mut logits_processor = opts.sampling.logits_processor();
         let mut acc = init;
@@ -1785,6 +1838,31 @@ mod tests {
         assert!(within_context(4096, 0, Some(4096)).is_ok()); // exactly fits
         assert!(within_context(4000, 256, Some(4096)).is_err()); // 4256 > 4096
         assert!(within_context(10_000, 10_000, None).is_ok()); // unknown = no limit
+    }
+
+    #[test]
+    fn metal_kv_depth_risk_bands() {
+        // upholds: CTX-2 — under the cliff is unflagged; the cliff through
+        // the validated depth is Mitigated (the fork's sync workaround
+        // covers it); past the validated depth is Unreliable (garbage
+        // observed at ≥18k despite the syncs).
+        assert_eq!(metal_kv_depth_risk(8_000, 100), None); // peak 8,100
+        assert_eq!(
+            metal_kv_depth_risk(8_000, 192), // peak == cliff
+            Some(KvDepthRisk::Mitigated)
+        );
+        assert_eq!(
+            metal_kv_depth_risk(14_000, 500),
+            Some(KvDepthRisk::Mitigated)
+        );
+        assert_eq!(
+            metal_kv_depth_risk(15_000, 1), // just past validated
+            Some(KvDepthRisk::Unreliable)
+        );
+        assert_eq!(
+            metal_kv_depth_risk(18_200, 60), // the observed failure
+            Some(KvDepthRisk::Unreliable)
+        );
     }
 
     #[test]

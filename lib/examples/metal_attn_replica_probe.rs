@@ -81,6 +81,7 @@ struct Step {
     out: Tensor,
 }
 
+#[allow(clippy::too_many_arguments)] // a probe, mirroring the model's signature
 fn decode_step(
     device: &Device,
     cos: &Tensor,

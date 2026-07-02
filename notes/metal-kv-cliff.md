@@ -135,14 +135,35 @@ every token generated past the cliff).
 buffers for every op balloon unboundedly — a run took the machine down at
 228 GB+. The scoped variant on the candle branch is bounded by design.)
 
+## The workaround's limits (deep water)
+
+The sync workaround is depth-bounded. Field evidence from the paginated
+full-article TUI run (six agent steps, transcripts growing each step):
+
+- prefills through ~15.5k tokens (crossing 8,192): coherent, correct tool
+  calls — the workaround holds;
+- the final ~18.2k-token prefill (first to cross 16,384, where the K/V
+  cache passes 2^26 bytes): garbage (`!!!!…`) as the answer.
+
+Escalating the sync from boundary-crossing forwards to **every** forward
+past 8,192 (all layers in prefill chunks, first two in decode steps) did
+not rescue the 18.2k case — whatever breaks in the deepest water is not
+interruptible by these syncs. The fork keeps the blanket variant (it is
+the more conservative of the two in the band that does work).
+
 ## Status
 
-- Fixed for yatima by the fork pin above. The interim engine warning
-  (CTX-2, `warn_metal_kv_cliff`) was retired once the pin carried the
-  workaround — a warning that is wrong in every practical run trains its
-  reader to ignore warnings; the canary is the guard that matters now
-  (validated on Qwen2.5-32B Q4_K_M, macOS 26 / M-series 48 GB, candle
-  0.11.0 = upstream main at 31f35b1).
+- Yatima is correct on Metal to moderate depth: canary-validated at ~8.4k,
+  field-coherent to ~15.5k; **unreliable from somewhere in (15.5k, 18.2k]**
+  despite the workaround (validated on Qwen2.5-32B Q4_K_M, macOS 26 /
+  M-series 48 GB, candle 0.11.0 = upstream main at 31f35b1).
+- CTX-2 (reinstated after briefly being retired on over-optimism) flags
+  Metal runs entering the band: debug-level through the validated depth
+  (~15k), a hard warning past it — output there is likely garbage.
+- Follow-on for hosts: an exchange whose final answer looks degenerate
+  should not be committed to session history (AGENT-3 already skips
+  non-Final stops; "Final but degenerate" is the missing case — a poisoned
+  answer poisons every later turn).
 - The TUI's 12k-char `read_page` budget stays on latency grounds alone
   (a 40k-char tool result cost ~2.5 min of prefill per agent step).
 - Upstream: candle issue to be filed with this diagnosis; the pin already

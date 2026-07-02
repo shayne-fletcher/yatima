@@ -41,6 +41,10 @@ const READ_PAGE_MAX_ELEMENTS: usize = 100_000;
 /// Below this many non-whitespace chars, an extraction is treated as "no
 /// readable content" (extractors return title-only/boilerplate on non-articles).
 const READ_PAGE_MIN_TEXT_CHARS: usize = 20;
+/// How many extracted pages a `ReadPage` keeps for continuation reads before
+/// evicting the oldest (fetch-once: `offset` calls re-read the cache, never
+/// the network — re-fetching is the expensive act for throttled hosts).
+const READ_PAGE_CACHE_PAGES: usize = 16;
 
 /// What a tool advertises to the model: its name, a description, and a JSON
 /// Schema for its arguments.
@@ -778,20 +782,6 @@ impl Tool for ReadUrl {
     }
 }
 
-/// Truncate `text` to at most `max_chars` characters on a char boundary.
-/// Returns the (possibly shortened) text and `Some((kept, total))` if truncated.
-fn truncate_chars(text: &str, max_chars: usize) -> (String, Option<(usize, usize)>) {
-    let total = text.chars().count();
-    if total <= max_chars {
-        (text.to_string(), None)
-    } else {
-        (
-            text.chars().take(max_chars).collect(),
-            Some((max_chars, total)),
-        )
-    }
-}
-
 /// Read the **readable main content** of an HTML page under a [`WebOrigin`]
 /// capability: fetch, extract the article (title + text) with a readability pass,
 /// and return it as plain text truncated to a budget.
@@ -807,6 +797,40 @@ pub struct ReadPage {
     client: Client,
     max_input_bytes: usize,
     max_output_chars: usize,
+    /// Fetch-once cache: resolved URL → extracted page, so `offset`
+    /// continuation calls are pure cache reads (zero network, zero throttle
+    /// spend). FIFO-evicted at [`READ_PAGE_CACHE_PAGES`]; session-lifetime
+    /// only. A std `Mutex` — never held across an `.await`.
+    cache: std::sync::Mutex<PageCache>,
+}
+
+/// The extracted article a continuation call re-reads.
+struct CachedPage {
+    title: String,
+    text: String,
+}
+
+#[derive(Default)]
+struct PageCache {
+    pages: std::collections::HashMap<String, Arc<CachedPage>>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl PageCache {
+    fn get(&self, url: &str) -> Option<Arc<CachedPage>> {
+        self.pages.get(url).cloned()
+    }
+
+    fn insert(&mut self, url: String, page: Arc<CachedPage>) {
+        if self.pages.insert(url.clone(), page).is_none() {
+            self.order.push_back(url);
+            while self.order.len() > READ_PAGE_CACHE_PAGES {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.pages.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 impl ReadPage {
@@ -834,7 +858,48 @@ impl ReadPage {
             client,
             max_input_bytes,
             max_output_chars,
+            cache: std::sync::Mutex::new(PageCache::default()),
         })
+    }
+
+    /// Render one `max_output_chars` window of a cached page, starting at
+    /// `offset` (in characters of the readable text). The trailing marker
+    /// tells the model how to continue, so pagination is model-driven.
+    fn render_window(&self, url: &str, page: &CachedPage, offset: usize) -> Result<String> {
+        let total = page.text.chars().count();
+        if offset >= total && !(offset == 0 && total == 0) {
+            bail!(
+                "read_page: offset {offset} is past the end of the article \
+                 ({total} chars) at {url}"
+            );
+        }
+        let body: String = page
+            .text
+            .chars()
+            .skip(offset)
+            .take(self.max_output_chars)
+            .collect();
+        let end = offset + body.chars().count();
+
+        let mut out = String::new();
+        let title = page.title.trim();
+        if !title.is_empty() {
+            out.push_str("# ");
+            out.push_str(title);
+            out.push('\n');
+        }
+        out.push_str(url);
+        out.push_str("\n\n");
+        out.push_str(&body);
+        if end < total {
+            out.push_str(&format!(
+                "\n\n[chars {offset}..{end} of {total}; call read_page again \
+                 with offset={end} for the rest]"
+            ));
+        } else if offset > 0 {
+            out.push_str(&format!("\n\n[chars {offset}..{end} of {total}; end]"));
+        }
+        Ok(out)
     }
 }
 
@@ -844,9 +909,12 @@ impl Tool for ReadPage {
         ToolSpec {
             name: "read_page".to_string(),
             description: "Read the readable main content (title + article text) of an HTML page \
-                          under the configured origin. For raw or non-HTML responses (JSON, \
-                          plaintext, APIs) use read_url instead. Server-rendered HTML only — no \
-                          JavaScript, paywalls, or cross-origin links."
+                          under the configured origin. Long articles are returned one window at \
+                          a time; a truncation marker gives the offset to pass to read the next \
+                          window (continuations are served from cache — no refetch). For raw or \
+                          non-HTML responses (JSON, plaintext, APIs) use read_url instead. \
+                          Server-rendered HTML only — no JavaScript, paywalls, or cross-origin \
+                          links."
                 .to_string(),
             params: serde_json::json!({
                 "type": "object",
@@ -854,6 +922,10 @@ impl Tool for ReadPage {
                     "url": {
                         "type": "string",
                         "description": "absolute same-origin URL or path relative to the configured origin"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "character offset to continue a previously truncated read from (default 0)"
                     }
                 },
                 "required": ["url"]
@@ -863,7 +935,24 @@ impl Tool for ReadPage {
 
     async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
         let target = required_string(&args, "read_page", "url")?;
+        let offset = match args.get("offset") {
+            None | Some(Value::Null) => 0,
+            Some(v) => v.as_u64().ok_or_else(|| {
+                anyhow!("read_page: `offset` must be a non-negative integer, got {v}")
+            })? as usize,
+        };
         let url = self.origin.resolve(target)?;
+
+        // Fetch-once: a cached extraction serves every continuation without
+        // touching the network (or a throttled host's request budget).
+        let cached = self
+            .cache
+            .lock()
+            .expect("read_page cache poisoned")
+            .get(url.as_str());
+        if let Some(page) = cached {
+            return self.render_window(url.as_str(), &page, offset);
+        }
 
         let mut response = self.client.get(url.clone()).send().await?;
         let status = response.status();
@@ -939,23 +1028,15 @@ impl Tool for ReadPage {
             bail!("read_page: no readable article content at {url}; use read_url for raw content");
         }
 
-        // Truncate the *text portion* to the char budget (the header/marker may
-        // push the full string past it — that is intended).
-        let (body, truncated) = truncate_chars(text, self.max_output_chars);
-        let mut out = String::new();
-        let title = title.trim();
-        if !title.is_empty() {
-            out.push_str("# ");
-            out.push_str(title);
-            out.push('\n');
-        }
-        out.push_str(url.as_str());
-        out.push_str("\n\n");
-        out.push_str(&body);
-        if let Some((kept, total)) = truncated {
-            out.push_str(&format!("\n\n[truncated: kept {kept} of {total} chars]"));
-        }
-        Ok(out)
+        let page = Arc::new(CachedPage {
+            title,
+            text: text.to_string(),
+        });
+        self.cache
+            .lock()
+            .expect("read_page cache poisoned")
+            .insert(url.to_string(), page.clone());
+        self.render_window(url.as_str(), &page, offset)
     }
 }
 
@@ -1669,7 +1750,13 @@ position over the coming years.</p>
             .render_for_model("read_page");
 
         assert!(!result.is_error, "got error: {}", result.content);
-        assert!(result.content.contains("[truncated: kept 50 of"));
+        // upholds: WIN-1 — the marker names the next window's offset.
+        assert!(
+            result.content.contains("[chars 0..50 of"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("offset=50"), "{}", result.content);
         assert!(result.content.contains("Acme Corporation")); // start of the text kept
     }
 
@@ -1820,6 +1907,190 @@ position over the coming years.</p>
 
         assert!(result.is_error);
         assert!(result.content.contains("read_url"));
+    }
+
+    /// Strip a `read_page` window down to its article-text body: drop the
+    /// title/URL header and the trailing `[chars …]` marker.
+    fn window_body(content: &str) -> &str {
+        let body = match content.find("\n\n") {
+            Some(i) => &content[i + 2..],
+            None => content,
+        };
+        match body.rfind("\n\n[chars ") {
+            Some(i) => &body[..i],
+            None => body,
+        }
+    }
+
+    /// The next-window offset a truncation marker names, if any.
+    fn next_offset(content: &str) -> Option<usize> {
+        let at = content.rfind("offset=")? + "offset=".len();
+        let digits: String = content[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    }
+
+    async fn read_window(tools: &Tools, url: &str, offset: usize) -> ToolResult {
+        tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(&format!(r#"{{"url": "{url}", "offset": {offset}}}"#)),
+            })
+            .await
+            .render_for_model("read_page")
+    }
+
+    #[tokio::test]
+    async fn read_page_fetches_once_across_windows() {
+        // upholds: FETCH-1 — continuation reads are cache hits; the mock's
+        // expect(1) proves the network was touched exactly once.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/post"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tools = Tools::new().with(
+            ReadPage::with_limits(WebOrigin::new(&server.uri()).unwrap(), 1_000_000, 80).unwrap(),
+        );
+        let mut windows = 0;
+        let mut offset = 0;
+        loop {
+            let result = read_window(&tools, "/post", offset).await;
+            assert!(!result.is_error, "window at {offset}: {}", result.content);
+            windows += 1;
+            match next_offset(&result.content) {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert!(windows >= 3, "expected several windows, got {windows}");
+        // MockServer verifies expect(1) on drop.
+    }
+
+    #[tokio::test]
+    async fn read_page_windows_tile_exactly() {
+        // upholds: WIN-1 — windows are adjacent and non-overlapping, and
+        // their concatenation reconstructs the whole-article read exactly.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/post"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .expect(2) // one fetch for the paged reader, one for the reference
+            .mount(&server)
+            .await;
+
+        let origin = || WebOrigin::new(&server.uri()).unwrap();
+        let paged = Tools::new().with(ReadPage::with_limits(origin(), 1_000_000, 80).unwrap());
+        let whole = Tools::new().with(ReadPage::new(origin()).unwrap());
+
+        let mut assembled = String::new();
+        let mut offset = 0;
+        loop {
+            let result = read_window(&paged, "/post", offset).await;
+            assert!(!result.is_error, "window at {offset}: {}", result.content);
+            assembled.push_str(window_body(&result.content));
+            match next_offset(&result.content) {
+                Some(next) => {
+                    // Adjacent: the marker names exactly where this window ended.
+                    assert_eq!(next, offset + window_body(&result.content).chars().count());
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        let reference = read_window(&whole, "/post", 0).await;
+        assert!(!reference.is_error);
+        assert_eq!(assembled, window_body(&reference.content));
+    }
+
+    #[tokio::test]
+    async fn read_page_offset_past_end_is_helpful() {
+        // upholds: WIN-1 — an offset past the article is an error naming the
+        // length, never a silent empty window.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/post"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        let result = read_window(&tools, "/post", 999_999).await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("past the end"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("chars"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn read_page_cache_is_per_url() {
+        // upholds: FETCH-1 — the cache keys on the resolved URL: two pages
+        // fetch once each, and re-reads of either stay off the network.
+        let server = MockServer::start().await;
+        for p in ["/a", "/b"] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html; charset=utf-8"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigin::new(&server.uri()).unwrap()).unwrap());
+        for url in ["/a", "/b", "/a", "/b"] {
+            let result = read_window(&tools, url, 0).await;
+            assert!(!result.is_error, "{url}: {}", result.content);
+        }
+        // MockServer verifies each expect(1) on drop.
+    }
+
+    #[test]
+    fn page_cache_evicts_oldest() {
+        // upholds: FETCH-1's bound — the cache is FIFO-capped, so a session
+        // reading many pages cannot grow memory without limit.
+        let mut cache = PageCache::default();
+        for i in 0..=READ_PAGE_CACHE_PAGES {
+            cache.insert(
+                format!("https://example.com/{i}"),
+                Arc::new(CachedPage {
+                    title: String::new(),
+                    text: format!("page {i}"),
+                }),
+            );
+        }
+        assert!(
+            cache.get("https://example.com/0").is_none(),
+            "oldest evicted"
+        );
+        assert!(
+            cache
+                .get(&format!("https://example.com/{READ_PAGE_CACHE_PAGES}"))
+                .is_some(),
+            "newest present"
+        );
+        assert!(cache.order.len() <= READ_PAGE_CACHE_PAGES);
     }
 
     #[test]
