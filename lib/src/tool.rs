@@ -1363,7 +1363,9 @@ impl Tool for Plot {
                  code). A series is either literal data (y required, x \
                  optional) or a function of x: {PLOT_EXPR_EXAMPLE} — grammar: \
                  numbers, x, pi, e, + - * / ^, parentheses, and sin cos tan \
-                 exp ln sqrt abs. Prefer expr for mathematical functions; \
+                 sinh cosh tanh asin acos atan exp ln log log10 log2 sqrt \
+                 abs floor ceil round sign. Prefer expr for mathematical \
+                 functions; \
                  never enumerate function values by hand. Or name a \
                  registered dataset.{datasets} Returns the file path."
             ),

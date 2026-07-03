@@ -13,7 +13,9 @@
 //! power  := atom  ('^' unary)?               -- right-associative
 //! atom   := number | 'x' | 'pi' | 'e'
 //!         | func '(' expr ')' | '(' expr ')'
-//! func   := sin | cos | tan | exp | ln | sqrt | abs
+//! func   := sin | cos | tan | sinh | cosh | tanh | asin | acos | atan
+//!         | exp | ln | log | log10 | log2 | sqrt | abs
+//!         | floor | ceil | round | sign      -- 'log' is an alias for 'ln'
 //! number := digits ('.' digits)?             -- no exponent form: 'e' is Euler
 //! ```
 //!
@@ -31,7 +33,8 @@ use anyhow::{anyhow, bail, Result};
 /// One line of teaching, embedded in every rejection: the model reads tool
 /// errors as instructions, so a rejection must name the legal alphabet.
 pub(crate) const ALPHABET: &str = "the grammar is numbers, x, pi, e, \
-     + - * / ^, parentheses, and sin cos tan exp ln sqrt abs";
+     + - * / ^, parentheses, and sin cos tan sinh cosh tanh asin acos atan \
+     exp ln log log10 log2 sqrt abs floor ceil round sign";
 
 /// Longest accepted source text. Expressions are short by nature; anything
 /// longer is data trying to be code.
@@ -50,16 +53,29 @@ pub(crate) enum Op {
     Pow,
 }
 
-/// A whitelisted function — the entire function alphabet.
+/// A whitelisted function — the entire function alphabet. (`log` lexes as an
+/// alias for [`Func::Ln`]: python-trained models mean `math.log`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Func {
     Sin,
     Cos,
     Tan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asin,
+    Acos,
+    Atan,
     Exp,
     Ln,
+    Log10,
+    Log2,
     Sqrt,
     Abs,
+    Floor,
+    Ceil,
+    Round,
+    Sign,
 }
 
 impl Func {
@@ -68,10 +84,22 @@ impl Func {
             Func::Sin => "sin",
             Func::Cos => "cos",
             Func::Tan => "tan",
+            Func::Sinh => "sinh",
+            Func::Cosh => "cosh",
+            Func::Tanh => "tanh",
+            Func::Asin => "asin",
+            Func::Acos => "acos",
+            Func::Atan => "atan",
             Func::Exp => "exp",
             Func::Ln => "ln",
+            Func::Log10 => "log10",
+            Func::Log2 => "log2",
             Func::Sqrt => "sqrt",
             Func::Abs => "abs",
+            Func::Floor => "floor",
+            Func::Ceil => "ceil",
+            Func::Round => "round",
+            Func::Sign => "sign",
         }
     }
 }
@@ -110,10 +138,31 @@ impl Expr {
                     Func::Sin => a.sin(),
                     Func::Cos => a.cos(),
                     Func::Tan => a.tan(),
+                    Func::Sinh => a.sinh(),
+                    Func::Cosh => a.cosh(),
+                    Func::Tanh => a.tanh(),
+                    Func::Asin => a.asin(),
+                    Func::Acos => a.acos(),
+                    Func::Atan => a.atan(),
                     Func::Exp => a.exp(),
                     Func::Ln => a.ln(),
+                    Func::Log10 => a.log10(),
+                    Func::Log2 => a.log2(),
                     Func::Sqrt => a.sqrt(),
                     Func::Abs => a.abs(),
+                    Func::Floor => a.floor(),
+                    Func::Ceil => a.ceil(),
+                    Func::Round => a.round(),
+                    // Mathematical sgn: sign(0) = 0 (f64::signum gives ±1
+                    // for signed zeros, which is not the function models
+                    // mean).
+                    Func::Sign => {
+                        if a == 0.0 {
+                            0.0
+                        } else {
+                            a.signum()
+                        }
+                    }
                 }
             }
         }
@@ -234,8 +283,11 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
                 toks.push(Tok::Num(n));
             }
             b'a'..=b'z' => {
+                // Names start with a letter and may end in digits (log10).
                 let start = i;
-                while i < bytes.len() && bytes[i].is_ascii_lowercase() {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_lowercase() || bytes[i].is_ascii_digit())
+                {
                     i += 1;
                 }
                 toks.push(match &src[start..i] {
@@ -245,10 +297,22 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
                     "sin" => Tok::Func(Func::Sin),
                     "cos" => Tok::Func(Func::Cos),
                     "tan" => Tok::Func(Func::Tan),
+                    "sinh" => Tok::Func(Func::Sinh),
+                    "cosh" => Tok::Func(Func::Cosh),
+                    "tanh" => Tok::Func(Func::Tanh),
+                    "asin" => Tok::Func(Func::Asin),
+                    "acos" => Tok::Func(Func::Acos),
+                    "atan" => Tok::Func(Func::Atan),
                     "exp" => Tok::Func(Func::Exp),
-                    "ln" => Tok::Func(Func::Ln),
+                    "ln" | "log" => Tok::Func(Func::Ln),
+                    "log10" => Tok::Func(Func::Log10),
+                    "log2" => Tok::Func(Func::Log2),
                     "sqrt" => Tok::Func(Func::Sqrt),
                     "abs" => Tok::Func(Func::Abs),
+                    "floor" => Tok::Func(Func::Floor),
+                    "ceil" => Tok::Func(Func::Ceil),
+                    "round" => Tok::Func(Func::Round),
+                    "sign" => Tok::Func(Func::Sign),
                     name => bail!("plot expr: unknown name {name:?} — {ALPHABET}"),
                 });
             }
@@ -413,6 +477,17 @@ mod tests {
             ("(1+2)*(3+4)", 0.0, 21.0),
             (".5 * 4", 0.0, 2.0),
             ("10 - 2 - 3", 0.0, 5.0),
+            ("tanh(0) + cosh(0) + sinh(0)", 0.0, 1.0),
+            ("asin(1)", 0.0, std::f64::consts::FRAC_PI_2),
+            ("acos(1)", 0.0, 0.0),
+            ("atan(1) * 4", 0.0, std::f64::consts::PI),
+            ("log(e)", 0.0, 1.0),
+            ("log10(1000)", 0.0, 3.0),
+            ("log2(8)", 0.0, 3.0),
+            ("floor(2.7) + ceil(2.2)", 0.0, 5.0),
+            ("round(2.5)", 0.0, 3.0),
+            ("sign(0.0 - 3) + sign(0)", 0.0, -1.0),
+            ("sign(sin(x))", 4.0, -1.0),
         ];
         for (src, x, want) in cases {
             let got = parse(src).expect(src).eval(x);
@@ -465,15 +540,27 @@ mod tests {
                 Just(Op::Div),
                 Just(Op::Pow),
             ];
-            let func = prop_oneof![
-                Just(Func::Sin),
-                Just(Func::Cos),
-                Just(Func::Tan),
-                Just(Func::Exp),
-                Just(Func::Ln),
-                Just(Func::Sqrt),
-                Just(Func::Abs),
-            ];
+            let func = proptest::sample::select(vec![
+                Func::Sin,
+                Func::Cos,
+                Func::Tan,
+                Func::Sinh,
+                Func::Cosh,
+                Func::Tanh,
+                Func::Asin,
+                Func::Acos,
+                Func::Atan,
+                Func::Exp,
+                Func::Ln,
+                Func::Log10,
+                Func::Log2,
+                Func::Sqrt,
+                Func::Abs,
+                Func::Floor,
+                Func::Ceil,
+                Func::Round,
+                Func::Sign,
+            ]);
             prop_oneof![
                 inner.clone().prop_map(|e| Expr::Neg(Box::new(e))),
                 (op, inner.clone(), inner.clone()).prop_map(|(o, l, r)| Expr::Bin(
