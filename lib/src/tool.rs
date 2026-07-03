@@ -438,6 +438,12 @@ const CLOSE: &str = "</tool_call>";
 
 impl ToolCallCodec for JsonToolCall {
     fn render_system(&self, specs: &[ToolSpec]) -> String {
+        // No advertised tools → no tool-calling instructions: the prompt
+        // states the model's true authority (CAP-3a), and an agent session
+        // with nothing granted reads as plain chat.
+        if specs.is_empty() {
+            return String::new();
+        }
         let mut s = String::from(
             "You may call a tool. To do so, emit exactly one block and then stop:\n\
              <tool_call>{\"name\": \"<tool>\", \"args\": { ... }}</tool_call>\n\
@@ -501,6 +507,11 @@ const QWEN_CLOSE: &str = "</tool_call>";
 
 impl ToolCallCodec for QwenToolCall {
     fn render_system(&self, specs: &[ToolSpec]) -> String {
+        // As for the JSON codec: zero advertised tools, zero instructions
+        // (CAP-3a — the prompt never claims authority the model lacks).
+        if specs.is_empty() {
+            return String::new();
+        }
         let mut s = String::from(
             "# Tools\n\nYou may call one or more functions to assist with the user \
              query.\n\nYou are provided with function signatures within \
@@ -3259,6 +3270,21 @@ position over the coming years.</p>
         let result = plot_call(&tools, r#"{"kind": "line", "dataset": "curve"}"#);
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("wrote "), "{}", result.content);
+    }
+
+    #[test]
+    fn empty_specs_render_no_tool_instructions() {
+        // upholds: CAP-3a — a codec renders zero tool-calling instructions
+        // for zero advertised tools: an agent session with nothing granted
+        // reads as plain chat; the prompt never claims absent authority.
+        assert_eq!(QwenToolCall.render_system(&[]), "");
+        assert_eq!(JsonToolCall.render_system(&[]), "");
+        let spec = ToolSpec {
+            name: "plot".into(),
+            description: "d".into(),
+            params: serde_json::json!({}),
+        };
+        assert!(!QwenToolCall.render_system(&[spec]).is_empty());
     }
 
     #[test]

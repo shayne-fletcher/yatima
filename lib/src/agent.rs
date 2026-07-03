@@ -217,11 +217,12 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             tool_count = self.tools.specs().len(),
             "agent run started"
         );
-        let system = format!(
-            "{}\n\n{}",
-            self.system,
-            self.codec.render_system(&self.tools.specs())
-        );
+        let rendered_tools = self.codec.render_system(&self.tools.specs());
+        let system = if rendered_tools.is_empty() {
+            self.system.clone()
+        } else {
+            format!("{}\n\n{rendered_tools}", self.system)
+        };
         // Seed the working transcript with the session history (AGENT-3): prior
         // exchanges' user/answer turns only — their tool rounds and reasoning
         // were ephemeral to their runs.

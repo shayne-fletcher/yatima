@@ -40,7 +40,7 @@ swappable dependency.
   is in the crate doc. Built in slices: Slice 1 chat + streaming + reasoning
   split, Slice 2 foldable reasoning + context meter, Slice 3 Esc cancellation.
 - **`yatima-gui`** — the GPU frontend (egui/eframe, wgpu → Metal): the same
-  two-phase runner (chat → agent on first grant), the same toolset and CAP-3
+  runner (the agent from turn one, as the TUI), the same toolset and CAP-3
   grant rules as the TUI — the model cannot tell hosts apart — plus inline
   image artifacts (plot PNGs as textures on the `Ev` event plane, the seam a
   future `yatima-serve` puts a websocket through). Markdown via
@@ -392,10 +392,14 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   while empty, the web tools omit themselves from the advertised specs, and
   once granted their descriptions enumerate the set (CAP-3a — the prompt
   always states the model's true authority). `/reset` clears conversation,
-  not grants. On a tool-trained format the session starts on the streaming
-  chat path and the **first grant transplants the chat history into one
-  sessionful agent** (a one-way switch; both histories are user/answer
-  turns, so the seam is invisible). Agent decodes **stream** (AGENT-4):
+  not grants. A tool-trained format serves **one sessionful agent from turn
+  one**: pre-grant, the model sees exactly the no-authority tools (plot) —
+  with zero advertised tools a codec renders zero tool-calling instructions
+  (CAP-3a all the way down) — and a grant surfaces the web tools
+  mid-session. `/grant` mints authority; it is not a mode switch. (The
+  earlier chat→agent transplant is gone: plotting needed no web authority
+  and was hostage to web ceremony.) Chat-only formats keep the plain chat
+  path and refuse grants. Agent decodes **stream** (AGENT-4):
   classified fragments arrive live — reasoning and tool activity on the
   `Reasoning` channel (tool rounds are working matter, so the reasoning pane
   is their honest home), answer prose on `Answer` — with codec markup

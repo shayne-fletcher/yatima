@@ -205,7 +205,27 @@ fn expand_latex_braces(s: &str) -> String {
 /// delimiters, expand brace commands, map symbols/Greek, and split `\\` math
 /// line-breaks. Fenced code blocks are passed through untouched so code is never
 /// mangled.
+/// How `x^2` / `s_j` render: as Unicode super/subscript glyphs (terminals
+/// carry them) or as plain `^(…)`/`_(…)` (for hosts whose embedded fonts
+/// lack the script blocks — egui shows tofu for `⁻ˣ`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptStyle {
+    Unicode,
+    Plain,
+}
+
+/// Super/subscripts map to their Unicode forms (see [`prettify_math_plain_scripts`]).
 pub fn prettify_math(src: &str) -> String {
+    prettify(src, ScriptStyle::Unicode)
+}
+
+/// [`prettify_math`] with super/subscripts kept plain (`e^(-x)`, `s_(j)`)
+/// — for hosts whose fonts would render the Unicode script glyphs as tofu.
+pub fn prettify_math_plain_scripts(src: &str) -> String {
+    prettify(src, ScriptStyle::Plain)
+}
+
+fn prettify(src: &str, scripts: ScriptStyle) -> String {
     let mut out = String::with_capacity(src.len());
     let mut in_fence = false;
     for line in src.split_inclusive('\n') {
@@ -215,7 +235,7 @@ pub fn prettify_math(src: &str) -> String {
         } else if in_fence {
             out.push_str(line);
         } else {
-            out.push_str(&prettify_math_line(line));
+            out.push_str(&prettify_math_line(line, scripts));
         }
     }
     out
@@ -255,7 +275,7 @@ fn strip_environments(s: &str) -> String {
     }
 }
 
-fn prettify_math_line(line: &str) -> String {
+fn prettify_math_line(line: &str, scripts: ScriptStyle) -> String {
     let mut s = strip_environments(line);
     for d in ["\\[", "\\]", "\\(", "\\)", "\\left", "\\right", "$$"] {
         s = s.replace(d, "");
@@ -266,7 +286,7 @@ fn prettify_math_line(line: &str) -> String {
     for (from, to) in LATEX_SYMBOLS {
         s = s.replace(from, to);
     }
-    sub_superscripts(&s)
+    sub_superscripts(&s, scripts)
 }
 
 /// The Unicode super/subscript for `c`, if one exists. Digits, signs and the
@@ -350,7 +370,7 @@ fn script_run(s: &str, sup: bool) -> Option<String> {
 
 /// Convert `x^2`, `s_j`, `^{N}`, `_{j=k+1}` to Unicode super/subscripts. A group
 /// that can't be fully mapped is left as `^(…)` / `_(…)` so it stays readable.
-fn sub_superscripts(s: &str) -> String {
+fn sub_superscripts(s: &str, style: ScriptStyle) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
@@ -360,7 +380,11 @@ fn sub_superscripts(s: &str) -> String {
             let rest = &s[i + 1..];
             if rest.starts_with('{') {
                 if let Some((inner, end)) = brace_group(s, i + 1) {
-                    match script_run(&inner, sup) {
+                    let mapped = match style {
+                        ScriptStyle::Unicode => script_run(&inner, sup),
+                        ScriptStyle::Plain => None,
+                    };
+                    match mapped {
                         Some(mapped) => out.push_str(&mapped),
                         None => {
                             out.push(c);
@@ -381,7 +405,7 @@ fn sub_superscripts(s: &str) -> String {
                         .chars()
                         .nth(1)
                         .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_');
-                if !word_continues {
+                if !word_continues && style == ScriptStyle::Unicode {
                     if let Some(m) = script_char(first, sup) {
                         out.push(m);
                         i += 1 + first.len_utf8();
@@ -437,6 +461,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_scripts_never_emit_script_glyphs() {
+        // The GUI's fonts lack the Unicode script blocks (⁻ˣ is tofu), so
+        // its variant renders exponents plainly — readable everywhere.
+        assert_eq!(prettify_math_plain_scripts("\\( e^{-x} \\)"), " e^(-x) ");
+        assert_eq!(prettify_math_plain_scripts("x^2"), "x^2");
+        assert_eq!(prettify_math("\\( e^{-x} \\)"), " e⁻ˣ ");
+    }
+
+    #[test]
     fn markdown_images_tame_to_links_or_vanish() {
         // A file:// echo of an inline artifact drops; a remote image becomes
         // an honest link (frontends never fetch model-written URLs); prose
@@ -461,13 +494,25 @@ mod tests {
     #[test]
     fn subscripts_map_math_but_spare_snake_case_identifiers() {
         // Math subscripts still map…
-        assert_eq!(sub_superscripts("x_i"), "xᵢ");
-        assert_eq!(sub_superscripts("a_1 + a_2"), "a₁ + a₂");
+        assert_eq!(sub_superscripts("x_i", ScriptStyle::Unicode), "xᵢ");
+        assert_eq!(
+            sub_superscripts("a_1 + a_2", ScriptStyle::Unicode),
+            "a₁ + a₂"
+        );
         // …but snake_case identifiers pass through untouched (a tool name in an
         // activity line must not become `readₚage`).
-        assert_eq!(sub_superscripts("read_page"), "read_page");
-        assert_eq!(sub_superscripts("foo_bar_baz"), "foo_bar_baz");
-        assert_eq!(sub_superscripts("max_tokens=42"), "max_tokens=42");
+        assert_eq!(
+            sub_superscripts("read_page", ScriptStyle::Unicode),
+            "read_page"
+        );
+        assert_eq!(
+            sub_superscripts("foo_bar_baz", ScriptStyle::Unicode),
+            "foo_bar_baz"
+        );
+        assert_eq!(
+            sub_superscripts("max_tokens=42", ScriptStyle::Unicode),
+            "max_tokens=42"
+        );
     }
 
     #[test]

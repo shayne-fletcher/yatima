@@ -30,9 +30,9 @@ use yatima_lib::{
     device, resolve_format, Agent, AgentEvent, AgentStop, Cancel, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, ModelProfile, ModelSource,
     PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl,
-    ReasoningSplitter, Role, Sampling, ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
+    ReasoningSplitter, Sampling, ToolCallCodec, ToolOutcome, Tools, WebOrigins,
 };
-use yatima_text::{prettify_math, tame_markdown_images};
+use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
 
 /// Interactive GUI chat over a local model.
 #[derive(Parser)]
@@ -202,10 +202,10 @@ const AGENT_MAX_STEPS: usize = 6;
 
 /// The base system prompt for tool-enabled sessions when `--system` is absent.
 const DEFAULT_AGENT_SYSTEM: &str =
-    "You are a helpful assistant. You can fetch web pages with the provided \
-     tools. Call a tool when it helps, then answer. Markdown image links do \
-     not render here: to show the user an image or chart, call read_image \
-     (or plot) — its result is displayed automatically.";
+    "You are a helpful assistant. Call a tool when it helps, then answer. \
+     Markdown image links do not render here: to show the user an image or \
+     chart, call read_image (or plot) — its result is displayed \
+     automatically.";
 
 /// `read_page` budgets for interactive use (see the TUI's rationale: the
 /// tool's own 40k default makes the next prefill take minutes on a local
@@ -290,20 +290,22 @@ fn runner(cfg: RunConfig, req_rx: Receiver<Req>, ev_tx: Sender<Ev>, ctx: egui::C
     let _ = ev_tx.send(Ev::Ready(info));
     ctx.request_repaint();
 
-    let history = match serve_chat(
-        &mut engine,
-        format,
-        cfg.system.clone(),
-        cfg.opts.clone(),
-        tools.as_ref().map(|_| &origins),
-        &req_rx,
-        &ev_tx,
-        &ctx,
-    ) {
-        ChatEnd::Shutdown => return,
-        ChatEnd::SwitchToAgent { history } => history,
+    // Tool-trained formats serve the agent from turn one: web tools hide
+    // themselves while the origin set is empty (CAP-3a), so pre-grant the
+    // model sees exactly the no-authority tools (plot); a grant surfaces
+    // the web tools mid-session. Chat-only formats stay chat forever.
+    let Some(tools) = tools else {
+        serve_chat(
+            &mut engine,
+            format,
+            cfg.system.clone(),
+            cfg.opts.clone(),
+            &req_rx,
+            &ev_tx,
+            &ctx,
+        );
+        return;
     };
-    let tools = tools.expect("agent switch only offered with tools");
     let system = cfg
         .system
         .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
@@ -315,7 +317,6 @@ fn runner(cfg: RunConfig, req_rx: Receiver<Req>, ev_tx: Sender<Ev>, ctx: egui::C
             ChatMlTemplate,
             system,
             cfg.opts,
-            history,
             &origins,
             req_rx,
             ev_tx,
@@ -328,7 +329,6 @@ fn runner(cfg: RunConfig, req_rx: Receiver<Req>, ev_tx: Sender<Ev>, ctx: egui::C
             PlainTemplate,
             system,
             cfg.opts,
-            history,
             &origins,
             req_rx,
             ev_tx,
@@ -338,30 +338,19 @@ fn runner(cfg: RunConfig, req_rx: Receiver<Req>, ev_tx: Sender<Ev>, ctx: egui::C
     }
 }
 
-/// Why the chat phase ended.
-enum ChatEnd {
-    /// The first origin grant arrived: switch to the agent path, seeded with
-    /// the conversation so far.
-    SwitchToAgent {
-        history: Vec<Turn>,
-    },
-    Shutdown,
-}
-
-/// The chat serve loop: the plain streaming [`ChatSession`]. `origins` is
-/// `Some` on tool-trained formats — a grant then ends this phase; on
-/// chat-only formats grants are refused.
-#[allow(clippy::too_many_arguments)]
+/// The chat serve loop for chat-only formats: the plain streaming
+/// [`ChatSession`]. Grants are always refused here (a chat-only format
+/// cannot enter the tool path); tool-trained formats never enter this loop
+/// (they serve the agent from turn one).
 fn serve_chat(
     engine: &mut Engine,
     format: ChatFormat,
     system: Option<String>,
     opts: GenOpts,
-    origins: Option<&WebOrigins>,
     req_rx: &Receiver<Req>,
     ev_tx: &Sender<Ev>,
     ctx: &egui::Context,
-) -> ChatEnd {
+) {
     let pre_seeds = format.pre_seeds_reasoning();
     let template = format.template();
     let mut session = ChatSession::new(engine, template).with_opts(opts);
@@ -410,54 +399,23 @@ fn serve_chat(
                 ctx.request_repaint();
             }
             Req::Reset => session.reset(),
-            Req::Grant(origin) => match origins {
-                None => {
-                    let _ = ev_tx.send(Ev::Note(format!(
-                        "cannot grant {origin}: the {format} format is chat-only \
-                         (tool calling needs qwen or plain)"
-                    )));
-                    ctx.request_repaint();
-                }
-                Some(origins) => match origins.grant(&origin) {
-                    Ok(_) => {
-                        let _ = ev_tx.send(Ev::Note(format!(
-                            "granted read access to {origin} — web tools enabled"
-                        )));
-                        ctx.request_repaint();
-                        // Transplant the conversation (sans system turns) into
-                        // the agent path.
-                        let history: Vec<Turn> = session
-                            .history()
-                            .iter()
-                            .filter(|t| matches!(t.role, Role::User | Role::Assistant))
-                            .cloned()
-                            .collect();
-                        return ChatEnd::SwitchToAgent { history };
-                    }
-                    Err(e) => {
-                        let _ = ev_tx.send(Ev::Note(format!("grant failed: {e}")));
-                        ctx.request_repaint();
-                    }
-                },
-            },
-            Req::Revoke(origin) => {
-                let _ = ev_tx.send(Ev::Note(match origins {
-                    None => "nothing granted (chat-only format)".to_string(),
-                    Some(origins) => match origins.revoke(&origin) {
-                        Ok(true) => format!("revoked {origin}"),
-                        Ok(false) => format!("{origin} was not granted"),
-                        Err(e) => format!("revoke failed: {e}"),
-                    },
-                }));
+            Req::Grant(origin) => {
+                let _ = ev_tx.send(Ev::Note(format!(
+                    "cannot grant {origin}: the {format} format is chat-only \
+                     (tool calling needs qwen or plain)"
+                )));
+                ctx.request_repaint();
+            }
+            Req::Revoke(_) => {
+                let _ = ev_tx.send(Ev::Note("nothing granted (chat-only format)".to_string()));
                 ctx.request_repaint();
             }
             Req::ListGrants => {
-                let _ = ev_tx.send(Ev::Note(grants_note(origins)));
+                let _ = ev_tx.send(Ev::Note(grants_note(None)));
                 ctx.request_repaint();
             }
         }
     }
-    ChatEnd::Shutdown
 }
 
 /// The agent serve loop: one sessionful [`Agent`] (AGENT-3) serves every
@@ -471,15 +429,13 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
     template: T,
     system: String,
     opts: GenOpts,
-    history: Vec<Turn>,
     origins: &WebOrigins,
     req_rx: Receiver<Req>,
     ev_tx: Sender<Ev>,
     ctx: egui::Context,
 ) {
-    let mut agent = Agent::new(engine, tools, codec, template, system, AGENT_MAX_STEPS)
-        .with_opts(opts)
-        .with_history(history);
+    let mut agent =
+        Agent::new(engine, tools, codec, template, system, AGENT_MAX_STEPS).with_opts(opts);
 
     while let Ok(req) = req_rx.recv() {
         match req {
@@ -489,6 +445,9 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
             Req::Reset => agent.reset(),
             Req::Grant(origin) => {
                 let _ = ev_tx.send(Ev::Note(match origins.grant(&origin) {
+                    Ok(true) if origins.list().len() == 1 => {
+                        format!("granted read access to {origin} — web tools enabled")
+                    }
                     Ok(true) => format!("granted read access to {origin}"),
                     Ok(false) => format!("{origin} was already granted"),
                     Err(e) => format!("grant failed: {e}"),
@@ -1187,10 +1146,12 @@ impl GuiApp {
                     // this is the UI mirror.
                     let reasoning = std::mem::take(&mut self.streaming_reasoning);
                     if let Some(buf) = self.streaming.take() {
-                        let answer = prettify_math(&tame_markdown_images(&buf));
+                        // Plain scripts: egui's fonts lack the Unicode
+                        // super/subscript blocks (e⁻ˣ would be tofu).
+                        let answer = prettify_math_plain_scripts(&tame_markdown_images(&buf));
                         if !answer.trim().is_empty() {
                             let reasoning = (!reasoning.trim().is_empty())
-                                .then(|| prettify_math(reasoning.trim()));
+                                .then(|| prettify_math_plain_scripts(reasoning.trim()));
                             self.transcript.push(Msg::Assistant { answer, reasoning });
                         }
                     }
