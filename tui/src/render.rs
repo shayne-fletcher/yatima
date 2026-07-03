@@ -282,7 +282,9 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
 /// `tui-markdown` does not render — are pulled out and drawn as aligned columns
 /// by [`render_table`]; everything else goes through [`render_markdown_block`].
 fn render_answer(answer: &str, width: u16) -> Vec<Line<'static>> {
-    let answer = prettify_math(answer);
+    // Images first (file:// artifact echoes drop, remote ones become plain
+    // links) — tui-markdown would only warn-and-vanish them.
+    let answer = prettify_math(&yatima_text::tame_markdown_images(answer));
     let lines: Vec<&str> = answer.lines().collect();
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut buf: Vec<&str> = Vec::new();

@@ -32,7 +32,7 @@ use yatima_lib::{
     PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl,
     ReasoningSplitter, Role, Sampling, ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
 };
-use yatima_text::prettify_math;
+use yatima_text::{prettify_math, tame_markdown_images};
 
 /// Interactive GUI chat over a local model.
 #[derive(Parser)]
@@ -203,7 +203,9 @@ const AGENT_MAX_STEPS: usize = 6;
 /// The base system prompt for tool-enabled sessions when `--system` is absent.
 const DEFAULT_AGENT_SYSTEM: &str =
     "You are a helpful assistant. You can fetch web pages with the provided \
-     tools. Call a tool when it helps, then answer.";
+     tools. Call a tool when it helps, then answer. Markdown image links do \
+     not render here: to show the user an image or chart, call read_image \
+     (or plot) — its result is displayed automatically.";
 
 /// `read_page` budgets for interactive use (see the TUI's rationale: the
 /// tool's own 40k default makes the next prefill take minutes on a local
@@ -512,7 +514,8 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
 /// One agent turn, folding [`AgentEvent`]s onto the `Ev` plane (the TUI's
 /// `run_agent_turn`, on this host's events). Streamed answer prose that
 /// turns out to precede a tool call is retracted and replayed as reasoning
-/// (AGENT-4); tool activity renders as ⚙/✓ lines on the reasoning channel;
+/// (AGENT-4); tool activity renders as ⚙/ok lines on the reasoning
+/// channel (ASCII markers: egui's built-in fonts lack ✓/✗/⊘ — tofu);
 /// a successful plot's PNG is read back and shipped as an [`Ev::Image`].
 fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     agent: &mut Agent<'_, Engine, K, T>,
@@ -567,19 +570,22 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     ToolOutcome::Success { content } => {
                         let flat = content.trim();
                         if flat.chars().count() <= TOOL_NOTE_MAX_CHARS && !flat.contains('\n') {
-                            format!("  ✓ {flat}\n")
+                            format!("  ok {flat}\n")
                         } else {
-                            format!("  ✓ {} chars\n", content.chars().count())
+                            format!("  ok {} chars\n", content.chars().count())
                         }
                     }
-                    other => format!("  ✗ {}\n", clip(&other.render_for_model("").content, 160)),
+                    other => format!(
+                        "  failed: {}\n",
+                        clip(&other.render_for_model("").content, 160)
+                    ),
                 };
                 send(Ev::Reasoning(note));
                 if matches!(pending_tool.as_str(), "plot" | "read_image") {
                     if let ToolOutcome::Success { content } = &outcome {
                         match artifact_bytes(content) {
                             Ok(bytes) => send(Ev::Image(bytes)),
-                            Err(e) => send(Ev::Reasoning(format!("  ✗ artifact: {e}\n"))),
+                            Err(e) => send(Ev::Reasoning(format!("  failed: artifact: {e}\n"))),
                         }
                     }
                 }
@@ -645,20 +651,6 @@ fn rasterize_svg(data: &[u8]) -> Result<Vec<u8>> {
     pixmap
         .encode_png()
         .map_err(|e| anyhow::anyhow!("svg raster: {e}"))
-}
-
-/// Drop markdown image lines whose target is a local file — the plot
-/// artifact is already inline as a texture; its `![](file://…)` echo is
-/// plumbing, not prose. Display-only: the runner's session (what the model
-/// sees) is untouched.
-fn strip_local_image_links(text: &str) -> String {
-    text.lines()
-        .filter(|line| {
-            let t = line.trim();
-            !(t.starts_with("![") && t.contains("](file://"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// The grants report, both phases.
@@ -785,6 +777,14 @@ struct GuiApp {
     /// The in-flight turn's stop handle (token-level, as in the TUI): Esc or
     /// the stop button cancels; the runner returns the partial turn.
     turn_cancel: Option<Cancel>,
+    /// Everything submitted this session (prompts and commands alike —
+    /// /grant is worth recalling), consecutive duplicates collapsed.
+    prompt_history: Vec<String>,
+    /// Where Up/Down is currently pointing in the history, if navigating.
+    history_nav: Option<usize>,
+    /// The unfinished input stashed when navigation began; Down past the
+    /// newest entry restores it.
+    draft: String,
     /// Decorative motion — splash draw-on, avatar life, the continuous
     /// repaint they need. Off by default (`--whimsy` / a `/stats` toggle):
     /// built to prove egui, kept for demos, silenced for work. The avatar
@@ -825,6 +825,9 @@ impl GuiApp {
             strawberry_start: None,
             md_cache: egui_commonmark::CommonMarkCache::default(),
             turn_cancel: None,
+            prompt_history: Vec::new(),
+            history_nav: None,
+            draft: String::new(),
             whimsy,
         }
     }
@@ -1094,7 +1097,7 @@ impl GuiApp {
     fn cancel_turn(&mut self) {
         if let Some(cancel) = self.turn_cancel.take() {
             cancel.cancel();
-            self.transcript.push(Msg::Note("⊘ interrupted".to_string()));
+            self.transcript.push(Msg::Note("— interrupted".to_string()));
         }
     }
 
@@ -1184,7 +1187,7 @@ impl GuiApp {
                     // this is the UI mirror.
                     let reasoning = std::mem::take(&mut self.streaming_reasoning);
                     if let Some(buf) = self.streaming.take() {
-                        let answer = prettify_math(&strip_local_image_links(&buf));
+                        let answer = prettify_math(&tame_markdown_images(&buf));
                         if !answer.trim().is_empty() {
                             let reasoning = (!reasoning.trim().is_empty())
                                 .then(|| prettify_math(reasoning.trim()));
@@ -1212,6 +1215,11 @@ impl GuiApp {
     fn submit(&mut self, now: f32) {
         let prompt = self.input.trim().to_string();
         self.help_open = false; // any submit dismisses the help overlay
+        if !prompt.is_empty() && self.prompt_history.last() != Some(&prompt) {
+            self.prompt_history.push(prompt.clone());
+        }
+        self.history_nav = None;
+        self.draft.clear();
         if prompt == "/quit" {
             self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -1429,13 +1437,16 @@ impl eframe::App for GuiApp {
                             egui::Sense::hover(),
                         );
                         let content = self.ticker_text(t);
-                        draw_ticker(
-                            &ui.painter_at(trect),
-                            trect,
-                            &content,
-                            t,
-                            with_alpha(face_col, 90),
-                        );
+                        // Whimsy tints the ticker with the live aurora; the
+                        // frozen phase-0 aurora at this alpha is pale mint —
+                        // invisible on a light theme — so plain weak text
+                        // ink otherwise.
+                        let ink = if self.whimsy {
+                            with_alpha(face_col, 90)
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        draw_ticker(&ui.painter_at(trect), trect, &content, t, ink);
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1533,6 +1544,53 @@ impl eframe::App for GuiApp {
                         .hint_text("message — /help for commands")
                         .desired_width(f32::INFINITY),
                 );
+                // Up/Down recall the prompt history (readline-style) while
+                // the box has focus — arrows are no-ops in a singleline edit,
+                // so the keys are free. Typing leaves navigation mode.
+                if edit.changed() {
+                    self.history_nav = None;
+                }
+                if edit.has_focus() && !self.prompt_history.is_empty() {
+                    let (up, down) = ui.input(|i| {
+                        (
+                            i.key_pressed(egui::Key::ArrowUp),
+                            i.key_pressed(egui::Key::ArrowDown),
+                        )
+                    });
+                    let mut recalled = false;
+                    if up {
+                        let next = match self.history_nav {
+                            None => {
+                                self.draft = self.input.clone();
+                                self.prompt_history.len() - 1
+                            }
+                            Some(i) => i.saturating_sub(1),
+                        };
+                        self.history_nav = Some(next);
+                        self.input = self.prompt_history[next].clone();
+                        recalled = true;
+                    } else if down {
+                        if let Some(i) = self.history_nav {
+                            if i + 1 < self.prompt_history.len() {
+                                self.history_nav = Some(i + 1);
+                                self.input = self.prompt_history[i + 1].clone();
+                            } else {
+                                self.history_nav = None;
+                                self.input = std::mem::take(&mut self.draft);
+                            }
+                            recalled = true;
+                        }
+                    }
+                    if recalled {
+                        // Park the cursor at the end of the recalled text.
+                        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), edit.id) {
+                            let end = egui::text::CCursor::new(self.input.chars().count());
+                            st.cursor
+                                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                            st.store(ui.ctx(), edit.id);
+                        }
+                    }
+                }
                 let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 // As a rule: whenever idle and ready, the input holds focus —
                 // unless the user has deliberately focused something else (e.g.

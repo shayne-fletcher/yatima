@@ -399,9 +399,64 @@ fn sub_superscripts(s: &str) -> String {
     out
 }
 
+/// Rewrite markdown image tags in a model answer for hosts that cannot (or
+/// deliberately will not) load them. `![alt](file://…)` — a model echoing an
+/// artifact the host already displays inline — is dropped. Any other
+/// `![alt](url)` becomes the plain link `[alt](url)`: frontends never fetch
+/// remote URLs the model wrote (that would bypass the capability doctrine),
+/// so rendering a broken-image glyph would be noise where a clickable link
+/// is honest.
+pub fn tame_markdown_images(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(bang) = rest.find("![") {
+        let Some(mid) = rest[bang..].find("](") else {
+            break;
+        };
+        let Some(close) = rest[bang + mid..].find(')') else {
+            break;
+        };
+        let alt = &rest[bang + 2..bang + mid];
+        let url = &rest[bang + mid + 2..bang + mid + close];
+        out.push_str(&rest[..bang]);
+        if !url.trim_start().starts_with("file://") {
+            out.push('[');
+            out.push_str(if alt.trim().is_empty() { "image" } else { alt });
+            out.push_str("](");
+            out.push_str(url);
+            out.push(')');
+        }
+        rest = &rest[bang + mid + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_images_tame_to_links_or_vanish() {
+        // A file:// echo of an inline artifact drops; a remote image becomes
+        // an honest link (frontends never fetch model-written URLs); prose
+        // around them survives byte-for-byte.
+        assert_eq!(
+            tame_markdown_images("see ![tri](file:///tmp/a.png) here"),
+            "see  here"
+        );
+        assert_eq!(
+            tame_markdown_images("see ![cube](https://x.example/c.svg) here"),
+            "see [cube](https://x.example/c.svg) here"
+        );
+        assert_eq!(
+            tame_markdown_images("![](https://x.example/c.svg)"),
+            "[image](https://x.example/c.svg)"
+        );
+        assert_eq!(tame_markdown_images("no images at all"), "no images at all");
+        // Malformed tags pass through rather than eating the answer.
+        assert_eq!(tame_markdown_images("a ![dangling"), "a ![dangling");
+    }
 
     #[test]
     fn subscripts_map_math_but_spare_snake_case_identifiers() {

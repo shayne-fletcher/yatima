@@ -936,7 +936,10 @@ impl ReadPage {
         // header/body/marker window structure is untouched — WIN-1), once,
         // in the first window.
         if offset == 0 && !page.images.is_empty() {
-            out.push_str("\n[images — fetch one with read_image:");
+            out.push_str(
+                "\n[images — call read_image to display one; markdown image \
+                 links do not render:",
+            );
             for (src, alt) in &page.images {
                 out.push_str("\n  ");
                 out.push_str(src);
@@ -2424,7 +2427,7 @@ well known works of art depicting paradoxical architecture.</p>
         assert!(
             first
                 .content
-                .contains("[images — fetch one with read_image:"),
+                .contains("[images — call read_image to display one"),
             "{}",
             first.content
         );

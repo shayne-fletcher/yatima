@@ -110,7 +110,9 @@ const AGENT_MAX_STEPS: usize = 6;
 /// The base system prompt for tool-enabled sessions when `--system` is absent.
 const DEFAULT_AGENT_SYSTEM: &str =
     "You are a helpful assistant. You can fetch web pages with the provided \
-     tools. Call a tool when it helps, then answer.";
+     tools. Call a tool when it helps, then answer. Markdown image links do \
+     not render here: to show the user an image or chart, call read_image \
+     (or plot) — its result is displayed automatically.";
 
 /// `read_page`'s readable-text budget for interactive use. The tool's own
 /// default (40k chars ≈ 10–12k tokens) makes the next step's prefill take
