@@ -166,6 +166,22 @@
 //!   article prefix exactly, and every truncation marker names the next
 //!   window's `offset` (the marker is the pagination API). An offset at or
 //!   past the end is a helpful error naming the length, never silent-empty.
+//! - **PLOT-1** the [`Plot`] tool executes no model-authored code, ever: the
+//!   model submits a declarative spec against a **closed schema** (unknown
+//!   fields, unknown kinds, and anything code-shaped are typed rejections),
+//!   and the sandbox's pinned interpreter runs only the library's generator.
+//!   Function series (`expr`) are parsed and evaluated **host-side in Rust**
+//!   against a closed grammar — numbers, `x`, `pi`, `e`, arithmetic, and a
+//!   whitelisted function alphabet; the interpreter still receives only
+//!   literal arrays. Data arrives inline, by expression, or by naming a
+//!   host-registered dataset — the program supplies numbers, the model
+//!   supplies labels and choices.
+//! - **PLOT-2** plot output is confined to the [`PlotSandbox`]'s directory
+//!   (CAP-1 containment reused); one PNG per call; the model never chooses
+//!   the path.
+//! - **PLOT-3** rendering is deterministic per machine (Agg backend, fixed
+//!   size/dpi, stable metadata, spec-hash filenames): the same spec yields
+//!   the same artifact — a plot can be journaled like any other evidence.
 //! - **PROTO-1** a malformed/unknown tool call becomes a typed non-success
 //!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
 //!   from, never a silent mis-execution.
@@ -201,6 +217,7 @@ mod capability;
 mod chat;
 mod completer;
 mod engine;
+mod expr;
 mod host;
 mod reasoning;
 mod runtime;
@@ -211,7 +228,7 @@ mod transcript;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
 pub use cancel::Cancel;
-pub use capability::{origins_in, Dir, NtfyTopic, WebOrigin, WebOrigins, WriteDir};
+pub use capability::{origins_in, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir};
 pub use chat::ChatSession;
 pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
@@ -231,9 +248,9 @@ pub use template::{
     MistralTemplate, PlainTemplate, PromptTemplate,
 };
 pub use tool::{
-    JsonToolCall, ListDir, QwenToolCall, ReadFile, ReadPage, ReadUrl, SendNotification, Tool,
-    ToolCall, ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolFailure, ToolOutcome,
-    ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
+    JsonToolCall, ListDir, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile, ReadPage, ReadUrl,
+    SendNotification, Tool, ToolCall, ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolFailure,
+    ToolOutcome, ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
 };
 pub use transcript::{Role, Turn};
 

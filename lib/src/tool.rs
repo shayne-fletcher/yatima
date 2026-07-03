@@ -14,7 +14,7 @@
 //! fallback for a model with no known native format. Schemas follow the de-facto
 //! standard (JSON Schema params, name + JSON args).
 
-use crate::capability::{Dir, NtfyTopic, WebOrigins, WriteDir};
+use crate::capability::{Dir, NtfyTopic, PlotSandbox, WebOrigins, WriteDir};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -342,7 +342,12 @@ impl Tools {
         // span guard across await points inside the task.
         let join = tokio::spawn(
             async move {
-                tracing::debug!(call_id, tool = %task_call.name, "tool started");
+                tracing::debug!(
+                    call_id,
+                    tool = %task_call.name,
+                    args = %task_call.args,
+                    "tool started"
+                );
                 let _ = events_tx.send(ToolEvent::Started {
                     call_id,
                     call: task_call.clone(),
@@ -1079,6 +1084,422 @@ impl Tool for ReadPage {
             .insert(url.to_string(), page.clone());
         self.render_window(url.as_str(), &page, offset)
     }
+}
+
+/// The generator the plot tool runs — the **only** code the sandbox's
+/// interpreter ever executes (PLOT-1: the model supplies a declarative spec,
+/// never code). Reads the validated spec as JSON on stdin; renders with the
+/// Agg backend at fixed size/dpi and stable metadata, so the same spec
+/// re-renders byte-identical on a machine (PLOT-3).
+const PLOT_GENERATOR: &str = r#"
+import sys, json
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+spec = json.load(sys.stdin)
+fig, ax = plt.subplots(figsize=(8, 4.5), dpi=120)
+kind = spec["kind"]
+for s in spec["series"]:
+    y = s["y"]
+    x = s.get("x") or list(range(len(y)))
+    name = s.get("name")
+    if kind == "line":
+        ax.plot(x, y, label=name)
+    elif kind == "scatter":
+        ax.scatter(x, y, label=name, s=14)
+    elif kind == "bar":
+        ax.bar(x, y, label=name)
+    elif kind == "hist":
+        ax.hist(y, bins=spec.get("bins") or 30, label=name)
+if spec.get("aspect") == "equal":
+    ax.set_aspect("equal")
+if spec.get("title"):
+    ax.set_title(spec["title"])
+if spec.get("xlabel"):
+    ax.set_xlabel(spec["xlabel"])
+if spec.get("ylabel"):
+    ax.set_ylabel(spec["ylabel"])
+if any(s.get("name") for s in spec["series"]):
+    ax.legend()
+ax.grid(True, alpha=0.25)
+fig.tight_layout()
+fig.savefig(spec["_out"], metadata={"Software": "yatima plot"})
+"#;
+
+/// Cap on series and total points — a plot is a summary, not a data dump.
+const PLOT_MAX_SERIES: usize = 16;
+const PLOT_MAX_POINTS: usize = 200_000;
+
+/// Sample count for an `expr` series when the spec doesn't say — enough for
+/// a smooth curve at the fixed render size.
+const PLOT_EXPR_DEFAULT_SAMPLES: usize = 400;
+
+/// The legal move, quoted in every rejection that stems from trying to put
+/// code where numbers belong: tool errors are prompts, and one example
+/// teaches better than six retries.
+const PLOT_EXPR_EXAMPLE: &str = r#"{"expr": "sin(x)", "from": 0, "to": "2 * pi", "samples": 512}"#;
+
+/// The chart vocabulary — closed by construction (PLOT-1): serde rejects
+/// anything outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlotKind {
+    Line,
+    Bar,
+    Scatter,
+    Hist,
+}
+
+/// Axis aspect ratio — `equal` makes circles circles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlotAspect {
+    Auto,
+    Equal,
+}
+
+/// One series, inline in the spec or host-registered by name. Two forms:
+/// **data** (literal `y`, optional `x`) and **function** (`expr` over
+/// `from..to`, sampled host-side — see [`crate::expr`]); exactly one of
+/// `y` / `expr`.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlotSeries {
+    /// Legend label; a function series defaults to its expression text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional x values (data form); indices 0..n when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<Vec<f64>>,
+    /// Literal y values (data form).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<Vec<f64>>,
+    /// A function of `x` in the closed plot grammar (function form),
+    /// e.g. `sin(x) * exp(-x/10)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
+    /// Sample range start (function form; required with `expr`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<PlotBound>,
+    /// Sample range end (function form; required with `expr`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<PlotBound>,
+    /// Sample count (function form; default [`PLOT_EXPR_DEFAULT_SAMPLES`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<u32>,
+}
+
+/// A range bound: a number, or a **constant** expression in the same closed
+/// grammar — models speak trig ranges symbolically (`"9 * pi"`, `"2*pi"`),
+/// and making them hand-compute 28.274 is the enumerate-by-hand failure in
+/// miniature.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum PlotBound {
+    Num(f64),
+    Expr(String),
+}
+
+impl PlotBound {
+    fn resolve(&self, which: &str) -> Result<f64> {
+        match self {
+            PlotBound::Num(n) => Ok(*n),
+            PlotBound::Expr(src) => {
+                let e = crate::expr::parse(src)?;
+                if e.references_x() {
+                    bail!("plot: {which} must be a constant — it bounds the range x samples over");
+                }
+                let v = e.eval(0.0);
+                if !v.is_finite() {
+                    bail!("plot: {which} {src:?} is not finite");
+                }
+                Ok(v)
+            }
+        }
+    }
+}
+
+/// Resolve one series to literal data: a data series validates and passes
+/// through; a function series is parsed against the closed grammar and
+/// sampled **here, in Rust** (PLOT-1: the interpreter still only ever sees
+/// literal arrays). Every rejection teaches the legal move.
+fn resolve_plot_series(s: &PlotSeries) -> Result<PlotSeries> {
+    match (&s.y, &s.expr) {
+        (Some(_), Some(_)) => bail!("plot: a series takes y or expr, not both"),
+        (None, None) => bail!(
+            "plot: a series needs y (literal numbers) or expr (a function \
+             of x), e.g. {PLOT_EXPR_EXAMPLE}"
+        ),
+        (Some(y), None) => {
+            if s.from.is_some() || s.to.is_some() || s.samples.is_some() {
+                bail!("plot: from/to/samples belong to expr series");
+            }
+            if y.is_empty() {
+                bail!("plot: a series has no y values");
+            }
+            if let Some(x) = &s.x {
+                if x.len() != y.len() {
+                    bail!(
+                        "plot: series x/y length mismatch ({} vs {})",
+                        x.len(),
+                        y.len()
+                    );
+                }
+            }
+            Ok(s.clone())
+        }
+        (None, Some(src)) => {
+            if s.x.is_some() {
+                bail!("plot: an expr series samples its own x; give from/to instead");
+            }
+            let (from, to) = match (&s.from, &s.to) {
+                (Some(f), Some(t)) => (f.resolve("from")?, t.resolve("to")?),
+                _ => bail!("plot: expr needs from and to, e.g. {PLOT_EXPR_EXAMPLE}"),
+            };
+            if !from.is_finite() || !to.is_finite() || from >= to {
+                bail!("plot: expr needs finite from < to");
+            }
+            let n = s.samples.map_or(PLOT_EXPR_DEFAULT_SAMPLES, |v| v as usize);
+            if !(2..=PLOT_MAX_POINTS).contains(&n) {
+                bail!("plot: samples must be between 2 and {PLOT_MAX_POINTS}");
+            }
+            let f = crate::expr::parse(src)?;
+            let step = (to - from) / (n - 1) as f64;
+            let xs: Vec<f64> = (0..n).map(|i| from + step * i as f64).collect();
+            let ys: Vec<f64> = xs.iter().map(|&x| f.eval(x)).collect();
+            if let Some(i) = ys.iter().position(|y| !y.is_finite()) {
+                bail!(
+                    "plot: {src:?} is non-finite at x = {} (asymptote or \
+                     domain edge) — adjust from/to",
+                    xs[i]
+                );
+            }
+            Ok(PlotSeries {
+                name: s.name.clone().or_else(|| Some(src.clone())),
+                x: Some(xs),
+                y: Some(ys),
+                ..PlotSeries::default()
+            })
+        }
+    }
+}
+
+/// The model-facing spec (PLOT-1): a closed schema — unknown fields, unknown
+/// kinds, and anything code-shaped are typed rejections, never executed.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PlotSpec {
+    kind: PlotKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xlabel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ylabel: Option<String>,
+    /// Histogram bin count (hist only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bins: Option<u32>,
+    /// Axis aspect; `equal` for shapes whose geometry matters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect: Option<PlotAspect>,
+    /// Inline data. Exactly one of `series` / `dataset`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    series: Option<Vec<PlotSeries>>,
+    /// A host-registered dataset name. Exactly one of `series` / `dataset`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset: Option<String>,
+}
+
+/// Render charts from a declarative spec inside a [`PlotSandbox`].
+///
+/// The model never writes code (PLOT-1): it submits a spec against a closed
+/// schema, and the sandbox's pinned interpreter runs only the library's
+/// generator. Data arrives inline (small series the model already holds),
+/// as a **function of x** (`expr` — parsed against the closed grammar in
+/// [`crate::expr`] and sampled host-side, so symbolic intent has a legal
+/// channel and the interpreter still sees only literal arrays), or by naming
+/// a **host-registered dataset** — the embedding program supplies the
+/// numbers, the model supplies at most labels and choices. Output is one
+/// PNG per call, confined to the sandbox (PLOT-2), named by the resolved
+/// spec's hash so identical requests share an artifact (PLOT-3: same spec,
+/// same bytes).
+pub struct Plot {
+    sandbox: PlotSandbox,
+    datasets: std::collections::HashMap<String, Vec<PlotSeries>>,
+}
+
+impl Plot {
+    pub fn new(sandbox: PlotSandbox) -> Plot {
+        Plot {
+            sandbox,
+            datasets: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a named dataset (builder style) — the program-supplies-data
+    /// shape: the model may reference it by name but never sees or alters
+    /// the numbers.
+    pub fn with_dataset(mut self, name: impl Into<String>, series: Vec<PlotSeries>) -> Plot {
+        self.datasets.insert(name.into(), series);
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for Plot {
+    fn spec(&self) -> ToolSpec {
+        let datasets = if self.datasets.is_empty() {
+            String::new()
+        } else {
+            let mut names: Vec<&str> = self.datasets.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            format!(" Registered datasets: {}.", names.join(", "))
+        };
+        ToolSpec {
+            name: "plot".to_string(),
+            description: format!(
+                "Render a chart to a PNG file from a declarative spec (no \
+                 code). A series is either literal data (y required, x \
+                 optional) or a function of x: {PLOT_EXPR_EXAMPLE} — grammar: \
+                 numbers, x, pi, e, + - * / ^, parentheses, and sin cos tan \
+                 exp ln sqrt abs. Prefer expr for mathematical functions; \
+                 never enumerate function values by hand. Or name a \
+                 registered dataset.{datasets} Returns the file path."
+            ),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["line", "bar", "scatter", "hist"] },
+                    "title": { "type": "string" },
+                    "xlabel": { "type": "string" },
+                    "ylabel": { "type": "string" },
+                    "bins": { "type": "integer", "description": "histogram bins (hist only)" },
+                    "aspect": { "type": "string", "enum": ["auto", "equal"], "description": "equal makes circles circles" },
+                    "series": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "x": { "type": "array", "items": { "type": "number" } },
+                                "y": { "type": "array", "items": { "type": "number" } },
+                                "expr": { "type": "string", "description": "function of x, e.g. sin(x)*exp(-x/10) — instead of y" },
+                                "from": { "type": ["number", "string"], "description": "expr range start — a number or constant expression like \"2 * pi\"" },
+                                "to": { "type": ["number", "string"], "description": "expr range end — a number or constant expression like \"9 * pi\"" },
+                                "samples": { "type": "integer", "description": "expr sample count (default 400)" }
+                            }
+                        }
+                    },
+                    "dataset": { "type": "string", "description": "a registered dataset name (instead of series)" }
+                },
+                "required": ["kind"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+        // PLOT-1: the closed schema is the whole authority story — unknown
+        // fields (e.g. anything code-shaped) fail deserialization, and the
+        // rejection teaches the legal channel for symbolic intent.
+        let spec: PlotSpec = serde_json::from_value(args).map_err(|e| {
+            anyhow!(
+                "plot: invalid spec (closed schema): {e} — series data must \
+                 be literal numbers; to plot a function of x, use an expr \
+                 series, e.g. {PLOT_EXPR_EXAMPLE}"
+            )
+        })?;
+
+        let series: Vec<PlotSeries> = match (&spec.series, &spec.dataset) {
+            (Some(s), None) => s.clone(),
+            (None, Some(name)) => self
+                .datasets
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("plot: unknown dataset {name:?}"))?,
+            (Some(_), Some(_)) => bail!("plot: give either series or dataset, not both"),
+            (None, None) => bail!("plot: give series or a dataset name"),
+        };
+        if series.is_empty() || series.len() > PLOT_MAX_SERIES {
+            bail!("plot: between 1 and {PLOT_MAX_SERIES} series");
+        }
+        // Resolve every series to literal data (expr series sample here, in
+        // Rust) before anything is counted, hashed, or rendered.
+        let series: Vec<PlotSeries> = series
+            .iter()
+            .map(resolve_plot_series)
+            .collect::<Result<_>>()?;
+        let points: usize = series
+            .iter()
+            .map(|s| s.y.as_ref().map_or(0, Vec::len))
+            .sum();
+        if points > PLOT_MAX_POINTS {
+            bail!("plot: {points} points exceeds the {PLOT_MAX_POINTS} cap");
+        }
+
+        // Resolved spec: the data the generator actually renders. Its hash
+        // names the artifact (PLOT-3: identical request, identical file).
+        let resolved = serde_json::json!({
+            "kind": spec.kind,
+            "title": spec.title,
+            "xlabel": spec.xlabel,
+            "ylabel": spec.ylabel,
+            "bins": spec.bins,
+            "aspect": spec.aspect,
+            "series": series,
+        });
+        let payload = serde_json::to_string(&resolved)?;
+        let mut hash = 0xcbf29ce484222325u64; // FNV-1a
+        for b in payload.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let name = format!("plot-{hash:016x}.png");
+        let out = self.sandbox.resolve(&name)?; // PLOT-2 confinement
+
+        let mut full = resolved;
+        full["_out"] = serde_json::Value::String(out.display().to_string());
+
+        let mut child = tokio::process::Command::new(self.sandbox.python())
+            .args(["-c", PLOT_GENERATOR])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("plot: could not run the interpreter: {e}"))?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin
+                .write_all(serde_json::to_string(&full)?.as_bytes())
+                .await?;
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            bail!(
+                "plot: render failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let bytes = tokio::fs::read(&out).await?;
+        let (w, h) = png_dims(&bytes)
+            .ok_or_else(|| anyhow!("plot: generator produced an unreadable PNG"))?;
+        Ok(format!(
+            "wrote {} ({w}x{h}, {} bytes)",
+            out.display(),
+            bytes.len()
+        ))
+    }
+}
+
+/// Width/height from a PNG's IHDR chunk.
+fn png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    Some((be(&bytes[16..20]), be(&bytes[20..24])))
 }
 
 /// Send a notification to a fixed ntfy topic held as a capability.
@@ -2105,6 +2526,258 @@ position over the coming years.</p>
             assert!(!result.is_error, "{url}: {}", result.content);
         }
         // MockServer verifies each expect(1) on drop.
+    }
+
+    /// A sandbox for plot tests, or None (skip) when python3/matplotlib is
+    /// unavailable on this machine.
+    fn plot_sandbox() -> Option<(tempfile::TempDir, PlotSandbox)> {
+        let dir = tempfile::tempdir().unwrap();
+        match PlotSandbox::system(dir.path().join("plots")) {
+            Ok(sb) => Some((dir, sb)),
+            Err(e) => {
+                eprintln!("skip: {e}");
+                None
+            }
+        }
+    }
+
+    fn plot_call(tools: &Tools, args: &str) -> ToolResult {
+        tools.dispatch(&ToolCall {
+            name: "plot".to_string(),
+            args: json(args),
+        })
+    }
+
+    #[test]
+    fn plot_rejects_code_shaped_and_unknown_specs() {
+        // upholds: PLOT-1 — the schema is closed: unknown fields (anything
+        // code-shaped), unknown kinds, and dataset/series confusion are
+        // typed rejections; nothing is ever executed for them.
+        let Some((_tmp, sb)) = plot_sandbox() else {
+            return;
+        };
+        let tools = Tools::new().with(Plot::new(sb));
+
+        let smuggled = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"y": [1.0]}], "code": "import os"}"#,
+        );
+        assert!(smuggled.is_error, "unknown field must reject");
+        assert!(
+            smuggled.content.contains("closed schema"),
+            "{}",
+            smuggled.content
+        );
+
+        let bad_kind = plot_call(&tools, r#"{"kind": "exec", "series": [{"y": [1.0]}]}"#);
+        assert!(bad_kind.is_error, "unknown kind must reject");
+
+        let bad_aspect = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"y": [1.0]}], "aspect": "round"}"#,
+        );
+        assert!(bad_aspect.is_error, "unknown aspect must reject");
+
+        let neither = plot_call(&tools, r#"{"kind": "line"}"#);
+        assert!(neither.is_error, "series or dataset required");
+
+        let unknown_ds = plot_call(&tools, r#"{"kind": "line", "dataset": "nope"}"#);
+        assert!(unknown_ds.is_error);
+        assert!(
+            unknown_ds.content.contains("unknown dataset"),
+            "{}",
+            unknown_ds.content
+        );
+
+        let mismatch = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"x": [1.0, 2.0], "y": [1.0]}]}"#,
+        );
+        assert!(mismatch.is_error, "x/y length mismatch must reject");
+
+        // Code smuggled as data — the live incident: a comprehension where
+        // numbers belong. The rejection must teach the expr channel.
+        let smuggled_y = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"y": ["Math.sin(x) for x in range(628)"]}]}"#,
+        );
+        assert!(smuggled_y.is_error);
+        assert!(
+            smuggled_y.content.contains("expr"),
+            "the rejection teaches the legal move: {}",
+            smuggled_y.content
+        );
+    }
+
+    #[test]
+    fn plot_expr_is_a_closed_grammar_not_code() {
+        // upholds: PLOT-1 — expr series are parsed against the closed
+        // grammar and sampled host-side; anything code-shaped, rangeless,
+        // over-sampled, or non-finite is a typed rejection that teaches.
+        let Some((_tmp, sb)) = plot_sandbox() else {
+            return;
+        };
+        let tools = Tools::new().with(Plot::new(sb));
+
+        let code = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"expr": "__import__('os')", "from": 0, "to": 1}]}"#,
+        );
+        assert!(code.is_error);
+        assert!(
+            code.content.contains("sin cos tan"),
+            "the rejection names the alphabet: {}",
+            code.content
+        );
+
+        let both = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"expr": "x", "y": [1.0], "from": 0, "to": 1}]}"#,
+        );
+        assert!(both.is_error, "y and expr are exclusive");
+
+        let rangeless = plot_call(&tools, r#"{"kind": "line", "series": [{"expr": "x"}]}"#);
+        assert!(rangeless.is_error);
+        assert!(
+            rangeless.content.contains("from and to"),
+            "{}",
+            rangeless.content
+        );
+
+        let backwards = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"expr": "x", "from": 1, "to": 0}]}"#,
+        );
+        assert!(backwards.is_error, "from must precede to");
+
+        let oversampled = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"expr": "x", "from": 0, "to": 1, "samples": 4000000}]}"#,
+        );
+        assert!(oversampled.is_error, "samples over the points cap reject");
+
+        let asymptote = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"expr": "ln(x)", "from": 0, "to": 1}]}"#,
+        );
+        assert!(asymptote.is_error);
+        assert!(
+            asymptote.content.contains("non-finite"),
+            "domain edges teach a range fix: {}",
+            asymptote.content
+        );
+
+        // Range bounds are constants in the same grammar: x is out of scope
+        // there, and a bound that fails the grammar teaches the alphabet.
+        let x_bound = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"expr": "sin(x)", "from": 0, "to": "x + 1"}]}"#,
+        );
+        assert!(x_bound.is_error);
+        assert!(x_bound.content.contains("constant"), "{}", x_bound.content);
+
+        let bad_bound = plot_call(
+            &tools,
+            r#"{"kind": "line", "series": [{"expr": "sin(x)", "from": 0, "to": "range(10)"}]}"#,
+        );
+        assert!(bad_bound.is_error);
+        assert!(
+            bad_bound.content.contains("plot expr"),
+            "{}",
+            bad_bound.content
+        );
+    }
+
+    #[test]
+    fn plot_expr_series_render_smooth_and_deterministic() {
+        // upholds: PLOT-1 + PLOT-3 — symbolic intent renders through the
+        // legal channel (sampled in Rust, literal arrays to the generator),
+        // lands in the sandbox, and re-renders byte-identical.
+        let Some((_tmp, sb)) = plot_sandbox() else {
+            return;
+        };
+        let root = _tmp.path().join("plots");
+        let tools = Tools::new().with(Plot::new(sb));
+        // The live incident, verbatim: a symbolic bound ("9 * pi") — legal.
+        // aspect exercises the generator's equal-aspect path end to end.
+        let spec = r#"{"kind": "line", "title": "sine", "aspect": "equal",
+            "series": [{"expr": "sin(x)", "from": 0, "to": "9 * pi", "samples": 64}]}"#;
+
+        let first = plot_call(&tools, spec);
+        assert!(!first.is_error, "{}", first.content);
+        let path = first
+            .content
+            .split_whitespace()
+            .nth(1)
+            .expect("wrote <path>");
+        assert!(
+            std::path::Path::new(path).starts_with(&root),
+            "PLOT-2: {path} inside {root:?}"
+        );
+        let bytes1 = std::fs::read(path).unwrap();
+
+        let second = plot_call(&tools, spec);
+        assert!(!second.is_error);
+        assert!(second.content.contains(path), "same expr, same artifact");
+        assert_eq!(bytes1, std::fs::read(path).unwrap(), "PLOT-3 holds");
+    }
+
+    #[test]
+    fn plot_renders_confined_and_deterministic() {
+        // upholds: PLOT-2 + PLOT-3 — the artifact lands inside the sandbox
+        // (at a spec-hash name the model never chose), and the same spec
+        // re-renders byte-identical.
+        let Some((_tmp, sb)) = plot_sandbox() else {
+            return;
+        };
+        let root = _tmp.path().join("plots");
+        let tools = Tools::new().with(Plot::new(sb));
+        let spec =
+            r#"{"kind": "line", "title": "t", "series": [{"name": "s", "y": [1.0, 3.0, 2.0]}]}"#;
+
+        let first = plot_call(&tools, spec);
+        assert!(!first.is_error, "{}", first.content);
+        let path = first
+            .content
+            .split_whitespace()
+            .nth(1)
+            .expect("wrote <path>");
+        assert!(
+            std::path::Path::new(path).starts_with(&root),
+            "PLOT-2: {path} is inside {root:?}"
+        );
+        let bytes1 = std::fs::read(path).unwrap();
+        assert!(bytes1.len() > 1000, "a real PNG");
+
+        let second = plot_call(&tools, spec);
+        assert!(!second.is_error);
+        assert!(second.content.contains(path), "same spec, same artifact");
+        let bytes2 = std::fs::read(path).unwrap();
+        assert_eq!(bytes1, bytes2, "PLOT-3: byte-identical re-render");
+    }
+
+    #[test]
+    fn plot_datasets_are_host_supplied() {
+        // upholds: PLOT-1 — a registered dataset renders by name (the
+        // program supplied the numbers), and the spec advertises it.
+        let Some((_tmp, sb)) = plot_sandbox() else {
+            return;
+        };
+        let tools = Tools::new().with(Plot::new(sb).with_dataset(
+            "curve",
+            vec![PlotSeries {
+                name: Some("equity".into()),
+                y: Some(vec![1.0, 1.1, 1.3, 1.2]),
+                ..PlotSeries::default()
+            }],
+        ));
+        assert!(
+            tools.specs()[0].description.contains("curve"),
+            "the spec names registered datasets"
+        );
+        let result = plot_call(&tools, r#"{"kind": "line", "dataset": "curve"}"#);
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("wrote "), "{}", result.content);
     }
 
     #[test]

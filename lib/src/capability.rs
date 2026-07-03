@@ -213,6 +213,58 @@ impl WebOrigins {
     }
 }
 
+/// Authority to render plots: a confined output directory plus a pinned
+/// Python interpreter, both fixed at construction (PLOT-2). The interpreter
+/// is probed for matplotlib up front, so a missing dependency fails at build
+/// time — never mid-turn. The tool holding this never executes model-authored
+/// code (PLOT-1); the interpreter only ever runs the generator script the
+/// library ships.
+#[derive(Debug, Clone)]
+pub struct PlotSandbox {
+    out_dir: WriteDir,
+    python: PathBuf,
+}
+
+impl PlotSandbox {
+    /// A sandbox writing under `out_dir`, rendering with `python`. Probes the
+    /// interpreter for matplotlib and creates the output directory.
+    pub fn new(out_dir: impl Into<PathBuf>, python: impl Into<PathBuf>) -> Result<PlotSandbox> {
+        let out_dir = out_dir.into();
+        let python = python.into();
+        std::fs::create_dir_all(&out_dir)?;
+        let probe = std::process::Command::new(&python)
+            .args(["-c", "import matplotlib"])
+            .output()
+            .map_err(|e| anyhow::anyhow!("plot sandbox: cannot run {python:?}: {e}"))?;
+        if !probe.status.success() {
+            bail!(
+                "plot sandbox: {python:?} has no matplotlib ({})",
+                String::from_utf8_lossy(&probe.stderr).trim()
+            );
+        }
+        Ok(PlotSandbox {
+            out_dir: WriteDir::new(out_dir),
+            python,
+        })
+    }
+
+    /// A sandbox using the system `python3`.
+    pub fn system(out_dir: impl Into<PathBuf>) -> Result<PlotSandbox> {
+        Self::new(out_dir, "python3")
+    }
+
+    /// Resolve an output filename inside the sandbox (PLOT-2 confinement —
+    /// reuses the [`WriteDir`] containment check).
+    pub fn resolve(&self, name: &str) -> Result<PathBuf> {
+        self.out_dir.resolve(name)
+    }
+
+    /// The pinned interpreter.
+    pub fn python(&self) -> &Path {
+        &self.python
+    }
+}
+
 /// Authority to publish notifications to one pre-shared ntfy topic.
 ///
 /// ntfy topics are created outside Yatima by the user subscribing/publishing to

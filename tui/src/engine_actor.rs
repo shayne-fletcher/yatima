@@ -25,9 +25,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use yatima_lib::{
     device, resolve_format, Agent, AgentEvent, AgentStop, Arch, Cancel, Channel, ChatFormat,
-    ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, PlainTemplate, PromptTemplate,
-    QwenToolCall, ReadPage, ReadUrl, ReasoningSplitter, Role, StopReason, ToolCallCodec,
-    ToolOutcome, Tools, Turn, WebOrigins,
+    ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, PlainTemplate, Plot, PlotSandbox,
+    PromptTemplate, QwenToolCall, ReadPage, ReadUrl, ReasoningSplitter, Role, StopReason,
+    ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
 };
 
 /// A turn identifier, monotonic per session. Lets the UI ignore stale events.
@@ -120,6 +120,13 @@ const READ_PAGE_MAX_CHARS: usize = 12_000;
 
 /// `read_page`'s raw-input cap (unchanged from the tool's default).
 const READ_PAGE_MAX_INPUT_BYTES: usize = 4_000_000;
+
+/// A successful tool result at most this long (and single-line) is shown
+/// verbatim in the reasoning fold; anything bigger is summarized as a char
+/// count. Short results — a file path, a count, an ID — *are* the
+/// deliverable, and counting their characters would hide them (the plot
+/// tool's "wrote <path> …" being the motivating case).
+const TOOL_NOTE_MAX_CHARS: usize = 200;
 
 /// Model metadata reported once after a successful load — for the status bar.
 #[derive(Clone)]
@@ -445,15 +452,27 @@ fn report_grants(event_tx: &UnboundedSender<EngineEvent>, origins: Option<&WebOr
 
 /// The web tools over a shared (growable) origin set. Present from the start
 /// on tool-trained formats; hidden from the model while the set is empty
-/// (CAP-3a).
+/// (CAP-3a). The plot tool rides along when a python-with-matplotlib is
+/// present (PLOT-1..3: declarative specs only, output confined to
+/// `~/.cache/yatima/plots` — stable and discoverable, and content-hash
+/// names make re-renders idempotent across sessions) — and quietly doesn't
+/// when it isn't; the model never sees a tool it cannot use.
 fn web_tools(origins: &WebOrigins) -> Result<Tools> {
-    Ok(Tools::new()
+    let mut tools = Tools::new()
         .with(ReadUrl::new(origins.clone())?)
         .with(ReadPage::with_limits(
             origins.clone(),
             READ_PAGE_MAX_INPUT_BYTES,
             READ_PAGE_MAX_CHARS,
-        )?))
+        )?);
+    let plot_dir = std::env::home_dir()
+        .map(|home| home.join(".cache/yatima/plots"))
+        .unwrap_or_else(|| std::env::temp_dir().join("yatima-plots"));
+    match PlotSandbox::system(&plot_dir) {
+        Ok(sandbox) => tools = tools.with(Plot::new(sandbox)),
+        Err(e) => eprintln!("plot tool unavailable: {e}"),
+    }
+    Ok(tools)
 }
 
 fn load_engine(config: &EngineConfig) -> Result<Engine> {
@@ -524,6 +543,28 @@ fn run_turn(
     }
 }
 
+/// Pop a just-rendered plot in the platform image viewer (macOS `open`).
+/// Fire-and-forget: viewing is a courtesy, never an error — failures are
+/// ignored and a reaper thread waits the child so no zombies accrue. The
+/// path is parsed from the plot tool's `wrote <path> (WxH, N bytes)`
+/// summary and so always points inside the tool's own sandbox (PLOT-2);
+/// this only ever fires for a plot the user just asked for.
+fn open_plot(content: &str) {
+    #[cfg(target_os = "macos")]
+    if let Some((path, _)) = content
+        .strip_prefix("wrote ")
+        .and_then(|rest| rest.rsplit_once(" ("))
+    {
+        if let Ok(mut child) = std::process::Command::new("open").arg(path).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = content;
+}
+
 /// Run one agent turn, folding [`AgentEvent`]s onto the event plane. Each
 /// step's decode **streams** (AGENT-4): classified fragments arrive live —
 /// reasoning and tool activity on [`Channel::Reasoning`], answer prose on
@@ -552,6 +593,10 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     // it was narration, not answer — retract and reclassify.
     let mut step_answer = String::new();
 
+    // Name of the tool whose outcome we're awaiting, so the outcome handler
+    // knows who produced it (the plot tool's success pops a viewer).
+    let mut pending_tool = String::new();
+
     let result = agent.run_with_cancellable(user, cancel, (), |(), event| {
         match event {
             AgentEvent::Fragment { channel, text } => {
@@ -571,6 +616,7 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     });
                     fragment(Channel::Reasoning, format!("{}\n", narration.trim_end()));
                 }
+                pending_tool = call.name.clone();
                 fragment(
                     Channel::Reasoning,
                     format!("\n⚙ {} {}\n", call.name, clip(&call.args.to_string(), 160)),
@@ -583,11 +629,21 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
             AgentEvent::ToolOutcome(outcome) => {
                 let note = match &outcome {
                     ToolOutcome::Success { content } => {
-                        format!("  ✓ {} chars\n", content.chars().count())
+                        let flat = content.trim();
+                        if flat.chars().count() <= TOOL_NOTE_MAX_CHARS && !flat.contains('\n') {
+                            format!("  ✓ {flat}\n")
+                        } else {
+                            format!("  ✓ {} chars\n", content.chars().count())
+                        }
                     }
                     other => format!("  ✗ {}\n", clip(&other.render_for_model("").content, 160)),
                 };
                 fragment(Channel::Reasoning, note);
+                if pending_tool == "plot" {
+                    if let ToolOutcome::Success { content } = &outcome {
+                        open_plot(content);
+                    }
+                }
                 step_answer.clear();
             }
             // Already streamed fragment-by-fragment; Done carries the answer.

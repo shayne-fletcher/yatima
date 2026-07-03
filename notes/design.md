@@ -295,7 +295,7 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   only the model-facing projection the transcript receives (PROTO-1).
   `Tools::spawn` returns a `ToolTask` with `ToolEvent`s, `join`, and cooperative
   cancellation. Current tools: `ReadFile`, `ListDir`, `WriteFile`, `ReadUrl`,
-  `ReadPage`, and `SendNotification`, each holding its own capability.
+  `ReadPage`, `Plot`, and `SendNotification`, each holding its own capability.
   `ReadUrl` returns a body **verbatim** (JSON/plaintext/APIs); `ReadPage` fetches
   an HTML page under the same `WebOrigin` capability and returns the **readable
   main article** (title + text) via a readability pass (`dom_smoothie`),
@@ -308,6 +308,24 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   served from a per-tool fetch-once cache (FETCH-1/WIN-1) — one network fetch
   per URL per session, which is the shape a throttled host (sieve's EDGAR)
   requires: re-fetching is the expensive act, re-reading is free.
+- **`Plot`** renders charts (line/bar/scatter/hist) to PNG via a
+  matplotlib-bearing python held as a `PlotSandbox` capability. The model never
+  writes code (PLOT-1): it submits a declarative spec against a **closed
+  schema** — unknown fields, unknown kinds, and anything code-shaped are typed
+  rejections — and the interpreter runs only the library's fixed generator.
+  Data arrives three ways: literal series, a **function of x** (`expr`:
+  `sin(x) * exp(-x/10)` — parsed and sampled *host-side in Rust* against a
+  closed grammar of numbers, `x`, `pi`, `e`, arithmetic, and a whitelisted
+  function alphabet, so symbolic intent has a legal channel and python still
+  receives only literal arrays; the grammar is total, bounded, and
+  property-tested `parse ∘ print = id`; range bounds accept **constant**
+  expressions in the same grammar — `"to": "9 * pi"` — because models speak
+  trig ranges symbolically), or a **host-registered dataset**
+  named by the program. Output is confined to the sandbox (PLOT-2) at a
+  spec-hash filename, so rendering is deterministic per machine (PLOT-3) and
+  a plot can be journaled like any other evidence. Rejections teach: schema
+  and grammar errors quote the legal expr form, because a local model reads
+  tool errors as its instructions for the retry.
 - **`Tool` is a downstream extension point.** `Tool` is `pub` and `Tools::with`
   takes any `impl Tool`, so a consumer crate (e.g. `sieve`) can define and
   register its own domain tools — they implement `Tool` (needs the `async-trait`

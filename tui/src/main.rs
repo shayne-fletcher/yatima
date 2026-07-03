@@ -68,6 +68,8 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    init_file_logging()?;
+
     // Resolve the profile (if any) → model dir + format + gen defaults. Done
     // before touching the terminal so an error prints normally.
     let profile = match &args.profile {
@@ -124,6 +126,34 @@ async fn main() -> Result<()> {
     let result = run_loop(&mut terminal, app, handle.event_rx, key_events).await;
     restore_terminal(&mut terminal, enhanced)?;
     result
+}
+
+/// Install a file-writing tracing subscriber when `$YATIMA_LOG` is set (its
+/// value is the filter, e.g. `debug` or `yatima_lib=trace`) — OBS-1: the lib
+/// emits spans/events, the host decides where they go. The terminal belongs
+/// to ratatui, so logs append to `~/.cache/yatima/tui.log`; `debug` shows
+/// each tool call with its full args JSON and outcome, `trace` adds whole
+/// prompts and completions. No env var, no subscriber, no cost.
+fn init_file_logging() -> Result<()> {
+    if std::env::var_os("YATIMA_LOG").is_none() {
+        return Ok(());
+    }
+    let dir = std::env::home_dir()
+        .map(|home| home.join(".cache/yatima"))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("tui.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_env("YATIMA_LOG"))
+        .with_writer(file)
+        .with_ansi(false)
+        .init();
+    eprintln!("logging to {}", path.display());
+    Ok(())
 }
 
 /// The crossterm key-event stream, dropping non-key/errored events upstream of
