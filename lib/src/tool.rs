@@ -1276,7 +1276,9 @@ impl Tool for ReadImage {
             // The spec states the tool's live authority (CAP-3a).
             description: format!(
                 "Fetch an image (SVG/PNG/JPEG) and save it for the user to \
-                 view. May read only these origins: {}. Returns the file path.",
+                 view. Use an exact URL from a read_page [images] list — do \
+                 not construct URLs. May read only these origins: {}. \
+                 Returns the file path.",
                 self.origins.list().join(", ")
             ),
             params: serde_json::json!({
@@ -1302,7 +1304,12 @@ impl Tool for ReadImage {
         let mut response = self.client.get(url.clone()).send().await?;
         let status = response.status();
         if !status.is_success() {
-            bail!("read_image failed with HTTP {status} for {url}");
+            bail!(
+                "read_image failed with HTTP {status} for {url} — image URLs \
+                 must be copied exactly from a read_page [images] list, never \
+                 constructed (thumbnail URLs encode content hashes and a \
+                 fixed size whitelist — both unguessable)"
+            );
         }
         let content_type = response
             .headers()
