@@ -1,0 +1,13 @@
+[package]
+name = "yatima-text"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+# Host-neutral text prettification for model output. Deliberately
+# dependency-free and pure std: every yatima frontend (TUI, GUI, and the
+# future yatima-serve WASM client) renders the same model text, and this
+# crate must compile anywhere they do — including wasm32. yatima-lib is NOT
+# a valid home for this code: it drags candle/tokenizers/reqwest and will
+# never target a browser.
+[dependencies]

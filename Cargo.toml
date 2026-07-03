@@ -5,4 +5,5 @@ members = [
   "cli",
   "tui",
   "gui",
+  "text",
 ]

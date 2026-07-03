@@ -32,6 +32,7 @@ use yatima_lib::{
     PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadPage, ReadUrl,
     ReasoningSplitter, Role, Sampling, ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
 };
+use yatima_text::prettify_math;
 
 /// Interactive GUI chat over a local model.
 #[derive(Parser)]
@@ -155,8 +156,11 @@ struct ModelInfo {
 /// runner's phases see them in order (CAP-3: the UI sends `Grant` only for
 /// user utterances — a typed URL or an explicit `/grant`).
 enum Req {
-    /// A user turn.
-    Submit(String),
+    /// A user turn; `cancel` is the UI's token-level stop handle for it.
+    Submit { prompt: String, cancel: Cancel },
+    /// Clear the conversation back to the system prompt (granted origins
+    /// survive — authority is the user's utterance, not the transcript's).
+    Reset,
     /// Grant a web origin for the session; the first grant switches the
     /// runner from the chat phase to the agent phase (tools live).
     Grant(String),
@@ -364,8 +368,7 @@ fn serve_chat(
 
     while let Ok(req) = req_rx.recv() {
         match req {
-            Req::Submit(prompt) => {
-                let cancel = Cancel::new();
+            Req::Submit { prompt, cancel } => {
                 // Classify the stream into reasoning vs answer as it arrives,
                 // so the UI can fold the chain-of-thought away unless toggled.
                 let mut splitter = if pre_seeds {
@@ -403,6 +406,7 @@ fn serve_chat(
                 });
                 ctx.request_repaint();
             }
+            Req::Reset => session.reset(),
             Req::Grant(origin) => match origins {
                 None => {
                     let _ = ev_tx.send(Ev::Note(format!(
@@ -476,7 +480,10 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
 
     while let Ok(req) = req_rx.recv() {
         match req {
-            Req::Submit(prompt) => run_agent_turn(&mut agent, &prompt, &ev_tx, &ctx),
+            Req::Submit { prompt, cancel } => {
+                run_agent_turn(&mut agent, &prompt, &cancel, &ev_tx, &ctx)
+            }
+            Req::Reset => agent.reset(),
             Req::Grant(origin) => {
                 let _ = ev_tx.send(Ev::Note(match origins.grant(&origin) {
                     Ok(true) => format!("granted read access to {origin}"),
@@ -509,6 +516,7 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
 fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     agent: &mut Agent<'_, Engine, K, T>,
     user: &str,
+    cancel: &Cancel,
     ev_tx: &Sender<Ev>,
     ctx: &egui::Context,
 ) {
@@ -524,8 +532,7 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     // its PNG as an image artifact).
     let mut pending_tool = String::new();
 
-    let cancel = Cancel::new(); // no cancel UI yet; a turn runs to completion
-    let result = agent.run_with_cancellable(user, &cancel, (), |(), event| {
+    let result = agent.run_with_cancellable(user, cancel, (), |(), event| {
         match event {
             AgentEvent::Fragment { channel, text } => {
                 if channel == Channel::Answer {
@@ -621,50 +628,6 @@ fn strip_local_image_links(text: &str) -> String {
         .join("\n")
 }
 
-/// Inline-LaTeX prettifier — a deliberate *subset* of the TUI's
-/// (`tui/src/render.rs`): delimiters dropped, common commands mapped to
-/// Unicode. The full pipeline (environments, brace expansion,
-/// sub/superscripts) gets extracted to a shared crate when `yatima-serve`'s
-/// client becomes its third consumer; until then this covers the shapes
-/// chat answers actually produce (`\( 9\pi \)`, `\sin(x)`).
-fn prettify_math(text: &str) -> String {
-    const DELIMS: &[&str] = &["\\[", "\\]", "\\(", "\\)", "$$", "\\left", "\\right"];
-    const SYMBOLS: &[(&str, &str)] = &[
-        ("\\sin", "sin"),
-        ("\\cos", "cos"),
-        ("\\tan", "tan"),
-        ("\\ln", "ln"),
-        ("\\log", "log"),
-        ("\\exp", "exp"),
-        ("\\sqrt", "√"),
-        ("\\pi", "π"),
-        ("\\theta", "θ"),
-        ("\\alpha", "α"),
-        ("\\beta", "β"),
-        ("\\lambda", "λ"),
-        ("\\mu", "μ"),
-        ("\\sigma", "σ"),
-        ("\\Delta", "Δ"),
-        ("\\times", "×"),
-        ("\\cdot", "·"),
-        ("\\leq", "≤"),
-        ("\\geq", "≥"),
-        ("\\neq", "≠"),
-        ("\\approx", "≈"),
-        ("\\infty", "∞"),
-        ("\\to", "→"),
-        ("\\pm", "±"),
-    ];
-    let mut s = text.to_string();
-    for d in DELIMS {
-        s = s.replace(d, "");
-    }
-    for (from, to) in SYMBOLS {
-        s = s.replace(from, to);
-    }
-    s
-}
-
 /// The grants report, both phases.
 fn grants_note(origins: Option<&WebOrigins>) -> String {
     match origins {
@@ -702,6 +665,7 @@ commands
   /grant <origin>   grant web read access (or just type a URL in a message)
   /revoke <origin>  withdraw an origin
   /grants           list granted origins
+  /reset            clear the conversation (the model forgets; grants stay)
   /stats            toggle the system panel — state + controls   (alias /control)
   /cls              clear the screen                              (Ctrl+L)
   /about            about yatima
@@ -709,6 +673,7 @@ commands
   /quit             exit
 
 granting an origin enables the web + plot tools (ask for a chart!).
+esc (or the stop button) interrupts a running turn.
 reasoning is hidden by default — turn on \"show reasoning\" in /stats.";
 
 /// A rendered transcript entry (the UI mirror; the runner's session is truth).
@@ -784,6 +749,9 @@ struct GuiApp {
     strawberry_start: Option<f32>,
     /// Parse/image cache for the markdown viewer (egui_commonmark).
     md_cache: egui_commonmark::CommonMarkCache,
+    /// The in-flight turn's stop handle (token-level, as in the TUI): Esc or
+    /// the stop button cancels; the runner returns the partial turn.
+    turn_cancel: Option<Cancel>,
     /// Decorative motion — splash draw-on, avatar life, the continuous
     /// repaint they need. Off by default (`--whimsy` / a `/stats` toggle):
     /// built to prove egui, kept for demos, silenced for work. The avatar
@@ -823,6 +791,7 @@ impl GuiApp {
             roll_start: None,
             strawberry_start: None,
             md_cache: egui_commonmark::CommonMarkCache::default(),
+            turn_cancel: None,
             whimsy,
         }
     }
@@ -1087,6 +1056,15 @@ impl GuiApp {
         self.streaming.is_some()
     }
 
+    /// Stop the in-flight turn (token-level). The runner finishes with what
+    /// streamed so far; Done still arrives and commits the partial answer.
+    fn cancel_turn(&mut self) {
+        if let Some(cancel) = self.turn_cancel.take() {
+            cancel.cancel();
+            self.transcript.push(Msg::Note("⊘ interrupted".to_string()));
+        }
+    }
+
     /// The idle ticker content: uptime and context usage.
     fn ticker_text(&self, now: f32) -> String {
         let mut parts = vec![format!("uptime {}", fmt_uptime(now))];
@@ -1164,6 +1142,7 @@ impl GuiApp {
                         .push(Msg::Error(format!("image decode: {e}"))),
                 },
                 Ev::Done => {
+                    self.turn_cancel = None;
                     // Drop the streaming buffers; only commit a reply if the
                     // answer carried text (a fully-retracted turn streams none).
                     // Committed text is display-polished: local image links
@@ -1181,6 +1160,7 @@ impl GuiApp {
                     }
                 }
                 Ev::Error(message) => {
+                    self.turn_cancel = None;
                     self.streaming = None;
                     self.streaming_reasoning.clear();
                     self.transcript.push(Msg::Error(message));
@@ -1244,6 +1224,14 @@ impl GuiApp {
             self.input.clear();
             return;
         }
+        if prompt == "/reset" {
+            let _ = self.req_tx.send(Req::Reset);
+            self.clear();
+            self.transcript
+                .push(Msg::Note("conversation reset".to_string()));
+            self.input.clear();
+            return;
+        }
         // Grant management (CAP-3: these, plus URLs typed in a message, are
         // the *only* sources of web authority).
         if prompt == "/grants" {
@@ -1275,7 +1263,9 @@ impl GuiApp {
         self.streaming_reasoning.clear();
         self.turn_start = None;
         self.gen_tokens = 0;
-        let _ = self.req_tx.send(Req::Submit(prompt));
+        let cancel = Cancel::new();
+        self.turn_cancel = Some(cancel.clone());
+        let _ = self.req_tx.send(Req::Submit { prompt, cancel });
         self.input.clear();
         self.splash_anim_start = None; // replay the draw-on if we return to it
     }
@@ -1291,6 +1281,11 @@ impl eframe::App for GuiApp {
         // Ctrl+L clears the screen, emacs-style (same as `/cls`).
         if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::L)) {
             self.clear();
+        }
+
+        // Esc stops the in-flight turn (token-level cancel, as in the TUI).
+        if self.in_flight() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_turn();
         }
 
         egui::Panel::top("status").show(ui, |ui| {
@@ -1491,7 +1486,14 @@ impl eframe::App for GuiApp {
             ui.add_space(4.0);
             let ready = matches!(self.status, Status::Ready(_)) && !self.in_flight();
             ui.horizontal(|ui| {
-                let send = ui.add_enabled(ready, egui::Button::new("send")).clicked();
+                let send = if self.in_flight() {
+                    if ui.button("stop").clicked() {
+                        self.cancel_turn();
+                    }
+                    false
+                } else {
+                    ui.add_enabled(ready, egui::Button::new("send")).clicked()
+                };
                 let edit = ui.add_enabled(
                     ready,
                     egui::TextEdit::singleline(&mut self.input)
@@ -2132,8 +2134,38 @@ fn decode_texture(ctx: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHand
     Ok(ctx.load_texture("artifact", color, egui::TextureOptions::default()))
 }
 
+/// Install a file-writing tracing subscriber when `$YATIMA_LOG` is set (its
+/// value is the filter, e.g. `debug` or `yatima_lib=trace`) — OBS-1: the lib
+/// emits spans/events, the host decides where they go. Logs append to
+/// `~/.cache/yatima/gui.log`; `debug` shows each tool call with its full
+/// args JSON and outcome, `trace` adds whole prompts and completions. No env
+/// var, no subscriber, no cost. (The TUI's twin writes `tui.log` — separate
+/// files so two hosts never interleave.)
+fn init_file_logging() -> Result<()> {
+    if std::env::var_os("YATIMA_LOG").is_none() {
+        return Ok(());
+    }
+    let dir = std::env::home_dir()
+        .map(|home| home.join(".cache/yatima"))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("gui.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_env("YATIMA_LOG"))
+        .with_writer(file)
+        .with_ansi(false)
+        .init();
+    eprintln!("logging to {}", path.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    init_file_logging()?;
     let cfg = resolve(&args)?;
     let title = format!("yatima — {}", cfg.label);
 

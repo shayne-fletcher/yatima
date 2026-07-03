@@ -39,6 +39,18 @@ swappable dependency.
   single-append, ui-liveness, reasoning-foldable, prompt-cancel, single-in-flight)
   is in the crate doc. Built in slices: Slice 1 chat + streaming + reasoning
   split, Slice 2 foldable reasoning + context meter, Slice 3 Esc cancellation.
+- **`yatima-gui`** — the GPU frontend (egui/eframe, wgpu → Metal): the same
+  two-phase runner (chat → agent on first grant), the same toolset and CAP-3
+  grant rules as the TUI — the model cannot tell hosts apart — plus inline
+  image artifacts (plot PNGs as textures on the `Ev` event plane, the seam a
+  future `yatima-serve` puts a websocket through). Markdown via
+  `egui_commonmark`; decorative animation behind `--whimsy` (off by default).
+- **`yatima-text`** — host-neutral prettification of model output (the LaTeX
+  → Unicode pipeline, fence-aware). Deliberately dependency-free, pure std,
+  WASM-clean: every frontend — TUI, GUI, serve's browser client — runs the
+  same pass, and it must compile anywhere they do. Extracted from the TUI's
+  renderer when the GUI became its second consumer; `yatima-lib` (candle,
+  tokenizers, reqwest) can never be its home.
 
 ## Module layering (LAYER-1)
 

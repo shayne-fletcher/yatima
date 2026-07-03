@@ -14,6 +14,11 @@ fetch = ["yatima-lib/fetch"]
 
 [dependencies]
 yatima-lib = { path = "../lib" }
+# Shared model-text prettification (LaTeX → Unicode); pure std, WASM-clean.
+yatima-text = { path = "../text" }
+# File logging behind $YATIMA_LOG (OBS-1: the lib emits tracing, the host
+# installs the subscriber). Logs go to ~/.cache/yatima/gui.log.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 # Immediate-mode GUI on wgpu (Metal on macOS). egui 0.35 shapes text via
