@@ -404,6 +404,14 @@ impl App {
                 self.push_entry(Entry::Error(message));
                 self.in_flight = None;
             }
+            // A step that became a tool call retracts its streamed narration
+            // from the answer (the actor replays it as reasoning) — AGENT-4.
+            EngineEvent::RetractAnswer { turn_id, chars } if self.is_current(turn_id) => {
+                if let Some(Entry::Assistant { answer, .. }) = self.transcript.last_mut() {
+                    let keep = answer.chars().count().saturating_sub(chars);
+                    *answer = answer.chars().take(keep).collect();
+                }
+            }
             // Authority changes are always current (not tied to a turn): show
             // the notice and refresh the status rail's grant list (CAP-3).
             EngineEvent::Grants { origins, message } => {
@@ -755,6 +763,32 @@ mod tests {
             app.transcript.last(),
             Some(Entry::Notice(text)) if text.contains("granted read access")
         ));
+    }
+
+    #[test]
+    fn retract_answer_pulls_narration_out_of_the_live_entry() {
+        // upholds: AGENT-4 — when a streamed step turns out to be a tool
+        // call, RetractAnswer removes exactly its narration chars from the
+        // live answer (the actor replays them as reasoning).
+        let (mut app, _rx) = test_app();
+        app.set_input("go");
+        app.apply(Intent::Submit);
+        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
+        for text in ["Let me ", "fetch that."] {
+            app.on_engine_event(EngineEvent::Fragment {
+                turn_id: 0,
+                channel: Channel::Answer,
+                text: text.into(),
+            });
+        }
+        app.on_engine_event(EngineEvent::RetractAnswer {
+            turn_id: 0,
+            chars: "Let me fetch that.".chars().count(),
+        });
+        let Some(Entry::Assistant { answer, .. }) = app.transcript.last() else {
+            panic!("expected a live assistant entry");
+        };
+        assert!(answer.is_empty(), "narration retracted, got {answer:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

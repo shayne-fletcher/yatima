@@ -352,15 +352,17 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   not grants. On a tool-trained format the session starts on the streaming
   chat path and the **first grant transplants the chat history into one
   sessionful agent** (a one-way switch; both histories are user/answer
-  turns, so the seam is invisible). Agent reasoning and tool activity ride
-  the `Reasoning` fragment channel (tool rounds are working matter, so the
-  reasoning pane is their honest home); the final answer rides `Answer`.
-  Chat-only formats refuse grants with a clear message (CAPS-1).
-  Cancellation takes effect at event boundaries (step granularity) — the
-  agent path's decode is not yet token-cancellable, unlike the chat path;
-  token streaming through the agent loop is roadmap. `Tool` is the
-  downstream extension seam: a consumer crate (e.g. a sieve CLI) registers
-  its own domain tools via `Tools::with` and gets the same hosting for free.
+  turns, so the seam is invisible). Agent decodes **stream** (AGENT-4):
+  classified fragments arrive live — reasoning and tool activity on the
+  `Reasoning` channel (tool rounds are working matter, so the reasoning pane
+  is their honest home), answer prose on `Answer` — with codec markup
+  withheld from the answer by the opener gate, and cancellation landing at
+  **token** granularity on both paths (TUI-6). A step that turns out to be a
+  tool call retracts its streamed narration from the answer pane and replays
+  it as reasoning, ahead of the ⚙ activity line. Chat-only formats refuse
+  grants with a clear message (CAPS-1). `Tool` is the downstream extension
+  seam: a consumer crate (e.g. a sieve CLI) registers its own domain tools
+  via `Tools::with` and gets the same hosting for free.
 
 **Speaking the model's native format (hard-won).** Getting a base model to
 *reliably* act took three corrections, each now a guarded invariant:

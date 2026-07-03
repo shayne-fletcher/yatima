@@ -18,7 +18,7 @@ use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
     ModelProfile, ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage,
-    ReasoningSplitter, Sampling, ToolCallCodec, Tools, WebOrigin,
+    ReasoningSplitter, Sampling, ToolCallCodec, Tools, WebOrigins,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -399,7 +399,7 @@ fn agent_tools(root: &std::path::Path, web_origin: Option<&str>) -> Result<Tools
         .with(ReadFile::new(cap.clone()))
         .with(ListDir::new(cap));
     if let Some(origin) = web_origin {
-        tools = tools.with(ReadPage::new(WebOrigin::new(origin)?)?);
+        tools = tools.with(ReadPage::new(WebOrigins::one(origin)?)?);
     }
     Ok(tools)
 }

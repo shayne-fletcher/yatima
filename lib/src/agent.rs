@@ -11,14 +11,15 @@
 //! turn.
 
 use crate::completer::Completer;
-use crate::reasoning::{split_reasoning, Reasoned};
+use crate::reasoning::{split_reasoning, Channel, Reasoned, ReasoningSplitter};
 use crate::template::PromptTemplate;
 use crate::tool::{
     ToolCall, ToolCallCodec, ToolEvent, ToolOutcome, ToolRejection, ToolResult, Tools,
 };
 use crate::transcript::{Role, Turn};
-use crate::GenOpts;
+use crate::{Cancel, GenOpts};
 use anyhow::Result;
+use std::cell::RefCell;
 use std::ops::ControlFlow;
 
 /// An observable step of a run, delivered to [`Agent::run_with`]'s fold.
@@ -28,9 +29,23 @@ pub enum AgentEvent {
     ToolStarted(ToolCall),
     ToolProgress(String),
     ToolOutcome(ToolOutcome),
+    /// A live slice of the current step's decode (AGENT-4), classified as it
+    /// streams: chain-of-thought on [`Channel::Reasoning`], prose on
+    /// [`Channel::Answer`]. Codec markup never reaches the answer channel —
+    /// text that turns out to open a tool call is withheld; the call itself
+    /// arrives as [`AgentEvent::ToolCall`]. Answer fragments of a step that
+    /// ends in a tool call are *narration* (prose the model wrote before
+    /// calling): the following `ToolCall` event licenses a consumer to fold
+    /// them into working matter.
+    Fragment {
+        channel: Channel,
+        text: String,
+    },
     /// A reasoning model's chain-of-thought for the step just completed. Emitted
     /// before the resulting `ToolCall`/`Final`; observational (for UIs/logging).
-    /// The trace is *not* re-fed into the transcript (REASON-1).
+    /// The trace is *not* re-fed into the transcript (REASON-1). Streaming
+    /// consumers get the same text incrementally via [`AgentEvent::Fragment`];
+    /// this remains the complete per-step record.
     Reasoning(String),
     Final(String),
 }
@@ -156,11 +171,44 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         crate::runtime::block_on(self.run_with_async(user, init, &mut step))
     }
 
+    /// [`Agent::run_with`] with a token-level cancel (sync shim).
+    pub fn run_with_cancellable<A>(
+        &mut self,
+        user: &str,
+        cancel: &Cancel,
+        init: A,
+        mut step: impl FnMut(A, AgentEvent) -> Result<ControlFlow<A, A>>,
+    ) -> Result<(A, Run)> {
+        crate::runtime::block_on(self.run_with_cancellable_async(user, cancel, init, &mut step))
+    }
+
     /// Run while folding each [`AgentEvent`] into an accumulator. Returning
-    /// `ControlFlow::Break` stops the run early ([`AgentStop::Stopped`]).
+    /// `ControlFlow::Break` stops the run early ([`AgentStop::Stopped`]). The
+    /// decode streams (AGENT-4) but without an external cancel handle a stop
+    /// still lands at the next fragment; see
+    /// [`run_with_cancellable_async`](Agent::run_with_cancellable_async).
     pub async fn run_with_async<A>(
         &mut self,
         user: &str,
+        init: A,
+        mut step: impl FnMut(A, AgentEvent) -> Result<ControlFlow<A, A>>,
+    ) -> Result<(A, Run)> {
+        let cancel = Cancel::new();
+        self.run_with_cancellable_async(user, &cancel, init, &mut step)
+            .await
+    }
+
+    /// Run while folding each [`AgentEvent`] into an accumulator, with a
+    /// token-level cancel. Each step's decode **streams** (AGENT-4): fragments
+    /// arrive live as [`AgentEvent::Fragment`], classified reasoning/answer,
+    /// with codec markup withheld from the answer channel. Flipping `cancel`
+    /// (or returning `ControlFlow::Break` from the fold, which flips it too)
+    /// stops the decode at the next token — [`AgentStop::Stopped`], history
+    /// untouched (AGENT-3).
+    pub async fn run_with_cancellable_async<A>(
+        &mut self,
+        user: &str,
+        cancel: &Cancel,
         init: A,
         mut step: impl FnMut(A, AgentEvent) -> Result<ControlFlow<A, A>>,
     ) -> Result<(A, Run)> {
@@ -198,10 +246,88 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             let prompt = self.template.render(&transcript);
             tracing::trace!(step = steps, prompt_chars = prompt.len(), prompt = %prompt,
                 "agent step prompt");
-            // Await the completion; the Completer impl owns its operational shape
-            // (the local Engine runs sync decode under run_blocking so it never
-            // stalls the executor; a remote completer awaits I/O). CMP-1 / RT-1.
-            let completion = self.completer.complete(&prompt, &self.opts, &stops).await?;
+            // Stream the step's decode (AGENT-4): fragments are classified
+            // live — reasoning via the splitter, answer text through the
+            // opener gate (codec markup withheld) — and folded as they
+            // arrive. A fold `Break` (or error) flips `cancel`, so the
+            // decode stops at the next token; the Completer impl owns its
+            // operational shape (CMP-1 / RT-1).
+            let fold = RefCell::new(StepFold {
+                acc: Some(acc),
+                broke: false,
+                error: None,
+            });
+            let completion = {
+                let mut deliver = |channel: Channel, text: String| {
+                    let mut f = fold.borrow_mut();
+                    if f.broke || f.error.is_some() {
+                        return;
+                    }
+                    let Some(a) = f.acc.take() else { return };
+                    match step(a, AgentEvent::Fragment { channel, text }) {
+                        Ok(ControlFlow::Continue(a)) => f.acc = Some(a),
+                        Ok(ControlFlow::Break(a)) => {
+                            f.acc = Some(a);
+                            f.broke = true;
+                            cancel.cancel();
+                        }
+                        Err(e) => {
+                            f.error = Some(e);
+                            cancel.cancel();
+                        }
+                    }
+                };
+                let mut splitter = ReasoningSplitter::new();
+                let mut gate = AnswerGate::new(self.codec.open_marker());
+                let mut on_token = |frag: &str| {
+                    splitter.push(frag, |channel, text| match channel {
+                        Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
+                        Channel::Answer => {
+                            if let Some(safe) = gate.push(text) {
+                                deliver(Channel::Answer, safe);
+                            }
+                        }
+                    });
+                };
+                let completion = self
+                    .completer
+                    .complete_streaming(&prompt, &self.opts, &stops, cancel, &mut on_token)
+                    .await?;
+                // Flush the splitter's tail through the same pipeline, then
+                // the gate's held answer text (a final step may end on a
+                // partial-opener lookalike that turned out to be prose).
+                splitter.finish(|channel, text| match channel {
+                    Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
+                    Channel::Answer => {
+                        if let Some(safe) = gate.push(text) {
+                            deliver(Channel::Answer, safe);
+                        }
+                    }
+                });
+                if let Some(rest) = gate.finish() {
+                    deliver(Channel::Answer, rest);
+                }
+                completion
+            };
+            let StepFold {
+                acc: a,
+                broke,
+                error,
+            } = fold.into_inner();
+            if let Some(e) = error {
+                return Err(e);
+            }
+            acc = a.expect("fold accumulator survives the stream");
+            // A cancel is detected via the handle, never via `completion.stop`:
+            // the engine reports `Stopped` for *any* early fold break, which
+            // includes ordinary stop-string termination — i.e. every
+            // successful tool-call step (the `</tool_call>` stop). Only the
+            // handle distinguishes "the user stopped us" from "the reply is
+            // complete".
+            if broke || cancel.is_cancelled() {
+                stop = AgentStop::Stopped;
+                break;
+            }
             tracing::trace!(step = steps, completion_stop = ?completion.stop,
                 completion = %completion.text, "agent step completion");
             // Split off the reasoning span at the completion→turn boundary: the
@@ -372,6 +498,81 @@ fn render_result(result: &ToolResult) -> String {
     format!("[{} {}] {}", result.name, tag, result.content)
 }
 
+/// The fold's state while a step streams: the accumulator threads through the
+/// `on_token` pipeline (which cannot return `ControlFlow` itself), and a
+/// `Break`/error is recorded and converted into a token-level cancel.
+struct StepFold<A> {
+    acc: Option<A>,
+    broke: bool,
+    error: Option<anyhow::Error>,
+}
+
+/// Withholds tool-call markup from a live answer stream (AGENT-4): text is
+/// buffered while its tail could still become the codec's open marker; once
+/// the marker completes, everything from it on is suppressed (the parsed call
+/// arrives as [`AgentEvent::ToolCall`] instead); a lookalike that diverges is
+/// released as ordinary prose.
+struct AnswerGate {
+    opener: String,
+    held: String,
+    suppressed: bool,
+}
+
+impl AnswerGate {
+    fn new(opener: String) -> AnswerGate {
+        AnswerGate {
+            opener,
+            held: String::new(),
+            suppressed: false,
+        }
+    }
+
+    /// Feed `text`; returns answer-safe output to emit now (never empty).
+    fn push(&mut self, text: &str) -> Option<String> {
+        if self.suppressed {
+            return None;
+        }
+        self.held.push_str(text);
+        if let Some(at) = self.held.find(&self.opener) {
+            let safe = self.held[..at].to_string();
+            self.suppressed = true;
+            self.held.clear();
+            return (!safe.is_empty()).then_some(safe);
+        }
+        let hold = longest_opener_prefix_suffix(&self.held, &self.opener);
+        let emit = self.held.len() - hold;
+        if emit == 0 {
+            return None;
+        }
+        let safe: String = self.held.drain(..emit).collect();
+        Some(safe)
+    }
+
+    /// The stream ended without a complete opener: release what was held.
+    fn finish(self) -> Option<String> {
+        (!self.suppressed && !self.held.is_empty()).then_some(self.held)
+    }
+}
+
+/// The length of the longest *proper* suffix of `held` that is a prefix of
+/// `opener` (a complete opener is found by `find` before this runs). Both
+/// strings are ASCII markers in practice, but boundaries are checked.
+fn longest_opener_prefix_suffix(held: &str, opener: &str) -> usize {
+    let max = held.len().min(opener.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if !held.is_char_boundary(held.len() - len) {
+            continue;
+        }
+        if opener
+            .as_bytes()
+            .starts_with(&held.as_bytes()[held.len() - len..])
+        {
+            return len;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,7 +598,7 @@ mod tests {
                 .iter()
                 .map(|t| Completion {
                     text: (*t).to_string(),
-                    stop: StopReason::Stopped,
+                    stop: StopReason::Eos,
                 })
                 .collect();
             Scripted {
@@ -423,6 +624,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("scripted completer exhausted at step {}", self.i));
             self.i += 1;
             Ok(c)
+        }
+
+        // Stream in 3-char chunks, honoring `cancel` between chunks — small
+        // enough that markers split across fragments, exercising the gate and
+        // splitter reassembly (AGENT-4).
+        async fn complete_streaming(
+            &mut self,
+            prompt: &str,
+            opts: &GenOpts,
+            stops: &[String],
+            cancel: &Cancel,
+            on_token: &mut dyn FnMut(&str),
+        ) -> Result<Completion> {
+            let completion = self.complete(prompt, opts, stops).await?;
+            let chars: Vec<char> = completion.text.chars().collect();
+            for chunk in chars.chunks(3) {
+                if cancel.is_cancelled() {
+                    return Ok(Completion {
+                        text: completion.text.clone(),
+                        stop: StopReason::Stopped,
+                    });
+                }
+                on_token(&chunk.iter().collect::<String>());
+            }
+            Ok(completion)
         }
     }
 
@@ -554,11 +780,31 @@ mod tests {
         assert_eq!(run_plain.stop, run_folded.stop);
         assert_eq!(run_plain.transcript.len(), run_folded.transcript.len());
 
-        // and run_with saw ToolCall, ToolStarted, ToolOutcome, Final in order
-        assert!(matches!(events[0], AgentEvent::ToolCall(_)));
-        assert!(matches!(events[1], AgentEvent::ToolStarted(_)));
-        assert!(matches!(events[2], AgentEvent::ToolOutcome(_)));
-        assert!(matches!(events[3], AgentEvent::Final(_)));
+        // run_with saw ToolCall, ToolStarted, ToolOutcome, Final in order
+        // (Fragment events interleave — AGENT-4 — and are checked below).
+        let marks: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| !matches!(e, AgentEvent::Fragment { .. }))
+            .collect();
+        assert!(matches!(marks[0], AgentEvent::ToolCall(_)));
+        assert!(matches!(marks[1], AgentEvent::ToolStarted(_)));
+        assert!(matches!(marks[2], AgentEvent::ToolOutcome(_)));
+        assert!(matches!(marks[3], AgentEvent::Final(_)));
+
+        // upholds: AGENT-4 — the streamed answer fragments reconstruct the
+        // final answer (the tool-call step contributed none: markup never
+        // reaches the answer channel).
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Fragment {
+                    channel: Channel::Answer,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed.trim(), run_folded.answer);
     }
 
     #[test]
@@ -685,6 +931,183 @@ mod tests {
         assert!(second_prompt.contains("What is the capital of France?"));
         assert!(second_prompt.contains("Paris."));
         assert!(second_prompt.contains("And its population?"));
+    }
+
+    /// The Answer-channel fragments of a fold's events, concatenated.
+    fn answer_stream(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Fragment {
+                    channel: Channel::Answer,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_call_markup_never_streams_on_the_answer_channel() {
+        // upholds: AGENT-4 — a step that is a tool call emits no answer
+        // fragments (the opener gate withholds from the first marker byte
+        // on); the final prose step streams normally, and its fragments
+        // reconstruct the run's answer.
+        let tmp = tmp_with_file("note.txt", "hello");
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let mut model = Scripted::new(&[&call("read_file", "note.txt"), "All done here."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let (events, run) = agent
+            .run_with("q", Vec::new(), |mut acc, e| {
+                acc.push(e);
+                Ok(ControlFlow::Continue(acc))
+            })
+            .unwrap();
+        let streamed = answer_stream(&events);
+        assert!(
+            !streamed.contains("<tool_call>") && !streamed.contains("</tool_call>"),
+            "markup leaked: {streamed:?}"
+        );
+        assert_eq!(streamed.trim(), run.answer);
+    }
+
+    #[test]
+    fn prose_with_angle_brackets_survives_the_gate() {
+        // upholds: AGENT-4 — text that merely *looks* like it might open a
+        // tool call (a `<` mid-prose, even `<tool…` lookalikes) is released
+        // once it diverges from the marker; nothing is swallowed.
+        let tools = Tools::new();
+        let text = "For x < y, use <toolboxes> as <tool_kits do.";
+        let mut model = Scripted::new(&[text]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let (events, run) = agent
+            .run_with("q", Vec::new(), |mut acc, e| {
+                acc.push(e);
+                Ok(ControlFlow::Continue(acc))
+            })
+            .unwrap();
+        assert_eq!(answer_stream(&events).trim(), text);
+        assert_eq!(run.answer, text);
+    }
+
+    #[test]
+    fn reasoning_streams_on_the_reasoning_channel() {
+        // upholds: AGENT-4 + REASON-1 — chain-of-thought streams live on the
+        // reasoning channel and never contaminates the answer stream; the
+        // answer fragments still reconstruct the surfaced answer.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&["<think>working it out</think>The answer is 42."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let (events, run) = agent
+            .run_with("q", Vec::new(), |mut acc, e| {
+                acc.push(e);
+                Ok(ControlFlow::Continue(acc))
+            })
+            .unwrap();
+        let reasoned: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Fragment {
+                    channel: Channel::Reasoning,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(reasoned.contains("working it out"), "{reasoned:?}");
+        assert!(
+            !reasoned.contains("</think>"),
+            "markers stay out: {reasoned:?}"
+        );
+        let streamed = answer_stream(&events);
+        assert!(!streamed.contains("think"), "{streamed:?}");
+        assert_eq!(streamed.trim(), run.answer);
+        assert_eq!(run.answer, "The answer is 42.");
+    }
+
+    #[test]
+    fn a_break_on_a_fragment_stops_token_level() {
+        // upholds: AGENT-4 + AGENT-3 — breaking the fold on the first
+        // streamed fragment cancels the decode in flight: the run reports
+        // Stopped, the decode never ran to completion, and nothing persists
+        // into session history.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&["a long final answer that will be interrupted early"]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let cancel = Cancel::new();
+        let (fragments, run) = agent
+            .run_with_cancellable("q", &cancel, 0usize, |n, e| {
+                Ok(match e {
+                    AgentEvent::Fragment { .. } => ControlFlow::Break(n + 1),
+                    _ => ControlFlow::Continue(n),
+                })
+            })
+            .unwrap();
+        assert_eq!(fragments, 1, "stopped on the first fragment");
+        assert_eq!(run.stop, AgentStop::Stopped);
+        assert!(cancel.is_cancelled(), "the break flipped the cancel");
+        drop(agent);
+        let mut model2 = Scripted::new(&[]);
+        let agent2 = Agent::new(
+            &mut model2,
+            &tools,
+            JsonToolCall,
+            PlainTemplate,
+            "helper",
+            5,
+        );
+        assert!(agent2.history().is_empty());
+    }
+
+    #[test]
+    fn stop_string_termination_is_not_a_cancel() {
+        // upholds: AGENT-4 — the engine reports `StopReason::Stopped` for
+        // any early fold break, which includes ordinary stop-string
+        // termination (every successful tool-call step ends at
+        // `</tool_call>`). The agent must read the cancel *handle*, not the
+        // ambiguous stop reason: an engine-like script whose tool-call
+        // completion says `Stopped` still runs to a Final answer.
+        let tmp = tmp_with_file("note.txt", "hi");
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let mut model = Scripted {
+            script: vec![
+                Completion {
+                    text: call("read_file", "note.txt"),
+                    stop: StopReason::Stopped, // engine: cut at the stop string
+                },
+                Completion {
+                    text: "Read it.".to_string(),
+                    stop: StopReason::Eos,
+                },
+            ],
+            i: 0,
+            prompts: Vec::new(),
+        };
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+        let run = agent.run("q").unwrap();
+        assert_eq!(run.stop, AgentStop::Final, "not misread as a cancel");
+        assert_eq!(run.answer, "Read it.");
+    }
+
+    #[test]
+    fn answer_gate_holds_markers_and_releases_lookalikes() {
+        // upholds: AGENT-4 — the gate's unit algebra: complete openers
+        // suppress from the marker on; partial-opener tails are held, then
+        // released when they diverge or the stream ends.
+        let mut gate = AnswerGate::new("<tool_call>".to_string());
+        assert_eq!(gate.push("Hello "), Some("Hello ".to_string()));
+        assert_eq!(gate.push("<tool"), None); // could still become the opener
+        assert_eq!(gate.push("boxes> ok"), Some("<toolboxes> ok".to_string()));
+        assert_eq!(gate.push("<tool_call>{}"), None); // suppressed from here on
+        assert_eq!(gate.push("more"), None);
+        assert_eq!(gate.finish(), None);
+
+        let mut gate = AnswerGate::new("<tool_call>".to_string());
+        assert_eq!(
+            gate.push("ends on a cliff <tool_ca"),
+            Some("ends on a cliff ".to_string())
+        );
+        assert_eq!(gate.finish(), Some("<tool_ca".to_string()));
     }
 
     #[test]

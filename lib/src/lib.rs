@@ -123,6 +123,15 @@
 //!   completed exchange's user turn and final answer — tool rounds and
 //!   reasoning are ephemeral to their run (the working-matter analogue of
 //!   REASON-1), and an interrupted run leaves history untouched.
+//! - **AGENT-4** agent steps stream: each decode's text arrives live as
+//!   classified [`AgentEvent::Fragment`]s (reasoning vs answer — REASON-1
+//!   holds mid-stream), codec markup never reaches the answer channel (the
+//!   opener gate withholds it; the parsed call arrives as `ToolCall`), the
+//!   final step's answer fragments concatenate to the run's answer (up to
+//!   surrounding whitespace), and a fold `Break` or external [`Cancel`]
+//!   stops the decode at token granularity — `Stopped`, history untouched.
+//!   Answer fragments of a step that ends in a tool call are narration; the
+//!   following `ToolCall` event licenses folding them into working matter.
 //! - **TOOL-1** tool calls are async task executions: they can be awaited,
 //!   joined, watched through [`ToolEvent`], and cooperatively cancelled without
 //!   changing their argument schema.

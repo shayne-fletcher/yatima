@@ -410,6 +410,11 @@ pub trait ToolCallCodec {
     /// Strings at which generation should stop so the codec sees a complete
     /// call (the stop string is *included* in the completion text).
     fn stop_strings(&self) -> Vec<String>;
+    /// The marker that opens a tool call in this codec's wire format. A
+    /// streaming consumer withholds answer text from the first (possibly
+    /// partial) occurrence on, so codec markup never reaches a live answer
+    /// channel (AGENT-4).
+    fn open_marker(&self) -> String;
     /// Parse a completion: `None` if it is a plain answer (no call attempted),
     /// `Some(Ok(call))` for a well-formed call, `Some(Err(_))` for an attempted
     /// but malformed one (which becomes an error turn — PROTO-1).
@@ -444,6 +449,10 @@ impl ToolCallCodec for JsonToolCall {
 
     fn stop_strings(&self) -> Vec<String> {
         vec![CLOSE.to_string()]
+    }
+
+    fn open_marker(&self) -> String {
+        OPEN.to_string()
     }
 
     fn parse(&self, text: &str) -> Option<Result<ToolCall>> {
@@ -516,6 +525,10 @@ impl ToolCallCodec for QwenToolCall {
 
     fn stop_strings(&self) -> Vec<String> {
         vec![QWEN_CLOSE.to_string()]
+    }
+
+    fn open_marker(&self) -> String {
+        QWEN_OPEN.to_string()
     }
 
     fn parse(&self, text: &str) -> Option<Result<ToolCall>> {

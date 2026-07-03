@@ -80,6 +80,10 @@ pub enum EngineEvent {
     },
     /// The turn failed.
     Error { turn_id: TurnId, message: String },
+    /// Retract the last `chars` characters streamed on the answer channel
+    /// (AGENT-4): the step they belonged to turned out to be a tool call, so
+    /// they were narration — the actor replays them on the reasoning channel.
+    RetractAnswer { turn_id: TurnId, chars: usize },
     /// The granted-origin set after a grant/revoke/list, with a line for the
     /// transcript ("granted read access to …", an error, or the listing).
     Grants {
@@ -520,12 +524,13 @@ fn run_turn(
     }
 }
 
-/// Run one agent turn, folding [`AgentEvent`]s onto the event plane. Reasoning
-/// and tool activity ride the [`Channel::Reasoning`] fragments — tool rounds
-/// are working matter, so the reasoning pane is their honest home — and the
-/// final answer rides [`Channel::Answer`]. The fold polls `cancel`, so a
-/// cancel takes effect at the next event boundary (step granularity: the
-/// agent's decode itself is not yet token-cancellable, unlike the chat path).
+/// Run one agent turn, folding [`AgentEvent`]s onto the event plane. Each
+/// step's decode **streams** (AGENT-4): classified fragments arrive live —
+/// reasoning and tool activity on [`Channel::Reasoning`], answer prose on
+/// [`Channel::Answer`] — and the turn's `cancel` is token-level. A step that
+/// turns out to be a tool call retracts its streamed narration from the
+/// answer pane (RetractAnswer) and replays it as working matter in the
+/// reasoning pane, ahead of the ⚙ activity line.
 fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     agent: &mut Agent<'_, Engine, K, T>,
     event_tx: &UnboundedSender<EngineEvent>,
@@ -543,13 +548,34 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
         });
     };
 
-    let result = agent.run_with(user, (), |(), event| {
+    // Answer prose streamed during the *current* step; a ToolCall event means
+    // it was narration, not answer — retract and reclassify.
+    let mut step_answer = String::new();
+
+    let result = agent.run_with_cancellable(user, cancel, (), |(), event| {
         match event {
-            AgentEvent::Reasoning(text) => fragment(Channel::Reasoning, format!("{text}\n")),
-            AgentEvent::ToolCall(call) => fragment(
-                Channel::Reasoning,
-                format!("\n⚙ {} {}\n", call.name, clip(&call.args.to_string(), 160)),
-            ),
+            AgentEvent::Fragment { channel, text } => {
+                if channel == Channel::Answer {
+                    step_answer.push_str(&text);
+                }
+                fragment(channel, text);
+            }
+            // The per-step aggregate; already streamed via Fragment (AGENT-4).
+            AgentEvent::Reasoning(_) => {}
+            AgentEvent::ToolCall(call) => {
+                if !step_answer.is_empty() {
+                    let narration = std::mem::take(&mut step_answer);
+                    let _ = event_tx.send(EngineEvent::RetractAnswer {
+                        turn_id,
+                        chars: narration.chars().count(),
+                    });
+                    fragment(Channel::Reasoning, format!("{}\n", narration.trim_end()));
+                }
+                fragment(
+                    Channel::Reasoning,
+                    format!("\n⚙ {} {}\n", call.name, clip(&call.args.to_string(), 160)),
+                );
+            }
             AgentEvent::ToolStarted(_) => {}
             AgentEvent::ToolProgress(message) => {
                 fragment(Channel::Reasoning, format!("  {message}\n"));
@@ -562,14 +588,12 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     other => format!("  ✗ {}\n", clip(&other.render_for_model("").content, 160)),
                 };
                 fragment(Channel::Reasoning, note);
+                step_answer.clear();
             }
-            AgentEvent::Final(text) => fragment(Channel::Answer, text),
+            // Already streamed fragment-by-fragment; Done carries the answer.
+            AgentEvent::Final(_) => {}
         }
-        Ok(if cancel.is_cancelled() {
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
-        })
+        Ok(std::ops::ControlFlow::Continue(()))
     });
 
     match result {

@@ -54,7 +54,7 @@ async fn actor_runs_a_turn() -> anyhow::Result<()> {
                 break;
             }
             EngineEvent::Error { message, .. } => panic!("engine error: {message}"),
-            EngineEvent::Grants { .. } => {}
+            EngineEvent::Grants { .. } | EngineEvent::RetractAnswer { .. } => {}
         }
     }
     handle.req_tx.send(EngineRequest::Shutdown)?;
