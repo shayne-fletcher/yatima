@@ -1,17 +1,22 @@
-//! `yatima-gui` — the GPU frontend's first slice: a "hello, engine" window.
+//! `yatima-gui` — the GPU frontend: chat, agent turns, and image artifacts.
 //!
-//! An egui/eframe app (wgpu → Metal on macOS) that loads a local model and
-//! streams one chat turn at a time. It is deliberately minimal — input box,
-//! scrolling transcript, live token streaming — to prove the toolchain, egui's
-//! native text shaping, and that a *second* frontend can drive the engine. No
-//! docking, reasoning split, markdown, math, cancel, or live-tweak yet; those
-//! are later slices (see `plans/text-rendering.plan.md`).
+//! An egui/eframe app (wgpu → Metal on macOS) that loads a local model,
+//! streams chat turns, and — on tool-trained formats, once the user grants a
+//! web origin (CAP-3) — runs real agent turns with the same toolset as the
+//! TUI (`read_url`, `read_page`, `plot`): the model cannot tell hosts apart.
+//! A successful plot ships its PNG over the event plane (`Ev::Image`) and
+//! renders inline as a GPU texture — the artifact plane this app spiked
+//! before the tool existed. No markdown, math, cancel, or live-tweak yet;
+//! those are later slices (see `plans/text-rendering.plan.md`).
 //!
 //! The engine is `!Send`, so — exactly as `yatima-tui`'s actor does — it is
-//! created and owned on a dedicated background thread (`runner`), which serves
-//! prompts over a channel and streams fragments back. Rendering is immediate
-//! mode: `update` is a pure projection of the accumulated state, redrawn each
-//! frame (the same discipline as the TUI's `ui(frame, &App)`).
+//! created and owned on a dedicated background thread (`runner`), which
+//! serves requests over a channel and streams events back. The `Ev` plane is
+//! deliberately narrow: it is the seam a future `yatima-serve` puts a
+//! websocket through, so everything above it must already be viewer-shaped.
+//! Rendering is immediate mode: `update` is a pure projection of the
+//! accumulated state, redrawn each frame (the same discipline as the TUI's
+//! `ui(frame, &App)`).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -22,8 +27,10 @@ use clap::Parser;
 use eframe::egui;
 
 use yatima_lib::{
-    device, resolve_format, Cancel, Channel, ChatFormat, ChatSession, Engine, GenOpts,
-    ModelProfile, ModelSource, ReasoningSplitter, Sampling,
+    device, resolve_format, Agent, AgentEvent, AgentStop, Cancel, Channel, ChatFormat,
+    ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, ModelProfile, ModelSource,
+    PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadPage, ReadUrl,
+    ReasoningSplitter, Role, Sampling, ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
 };
 
 /// Interactive GUI chat over a local model.
@@ -63,6 +70,12 @@ struct Args {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// Enable the decorative animations — the splash draw-on and the living
+    /// avatar (aurora shimmer, blinking, the always-on repaint they need).
+    /// Off by default: they were built to prove egui's capabilities and are
+    /// delightful in a demo, distracting in a workday. Togglable in /stats.
+    #[arg(long)]
+    whimsy: bool,
 }
 
 /// Everything the background runner needs to load a model — all `Send`, so it
@@ -138,6 +151,21 @@ struct ModelInfo {
     context_length: Option<usize>,
 }
 
+/// UI → runner requests. Grants ride the same channel as prompts so the
+/// runner's phases see them in order (CAP-3: the UI sends `Grant` only for
+/// user utterances — a typed URL or an explicit `/grant`).
+enum Req {
+    /// A user turn.
+    Submit(String),
+    /// Grant a web origin for the session; the first grant switches the
+    /// runner from the chat phase to the agent phase (tools live).
+    Grant(String),
+    /// Withdraw an origin.
+    Revoke(String),
+    /// Report the granted origins (a `Note` event answers).
+    ListGrants,
+}
+
 /// Runner → UI events (over `std::sync::mpsc`; the UI drains them each frame).
 enum Ev {
     /// Model loaded and ready to chat (carries what's running).
@@ -146,11 +174,17 @@ enum Ev {
     Answer(String),
     /// A streamed slice of the chain-of-thought (shown only when toggled on).
     Reasoning(String),
+    /// Retract the last `chars` streamed answer chars: they were narration
+    /// ahead of a tool call, not answer — they replay on the reasoning
+    /// channel (AGENT-4's reclassification, mirrored from the TUI).
+    RetractAnswer(usize),
     /// Context tokens used (the most recent rendered prompt) — for the meter.
     Context(usize),
-    /// An image artifact (PNG bytes) produced by the turn — the artifact plane,
-    /// spiked here with a matplotlib chart from `/plot`.
+    /// An image artifact (PNG bytes) produced by the turn — the artifact
+    /// plane: the plot tool's rendered chart, decoded and shown inline.
     Image(Vec<u8>),
+    /// An app-plane message (grant reports and the like) — not model text.
+    Note(String),
     /// The current turn finished.
     Done,
     /// The current turn failed.
@@ -159,10 +193,54 @@ enum Ev {
     Fatal(String),
 }
 
-/// The background engine thread: load the model, then serve prompts one turn at
-/// a time, streaming fragments back. Owns the `!Send` `Engine` for its whole
-/// life (created here, never crossed over a thread boundary).
-fn runner(cfg: RunConfig, req_rx: Receiver<String>, ev_tx: Sender<Ev>, ctx: egui::Context) {
+/// Tool rounds per turn before the agent gives up (AGENT-1); mirrors the TUI.
+const AGENT_MAX_STEPS: usize = 6;
+
+/// The base system prompt for tool-enabled sessions when `--system` is absent.
+const DEFAULT_AGENT_SYSTEM: &str =
+    "You are a helpful assistant. You can fetch web pages with the provided \
+     tools. Call a tool when it helps, then answer.";
+
+/// `read_page` budgets for interactive use (see the TUI's rationale: the
+/// tool's own 40k default makes the next prefill take minutes on a local
+/// 32B; ~12k chars keeps a tool turn interactive).
+const READ_PAGE_MAX_CHARS: usize = 12_000;
+const READ_PAGE_MAX_INPUT_BYTES: usize = 4_000_000;
+
+/// A successful tool result at most this long (single-line) shows verbatim
+/// in the reasoning stream; longer ones summarize as a char count. Short
+/// results — a file path — *are* the deliverable.
+const TOOL_NOTE_MAX_CHARS: usize = 200;
+
+/// The web tools over a shared (growable) origin set — the same toolset, the
+/// same construction, as the TUI: the model cannot tell hosts apart. The
+/// plot tool rides along when a python-with-matplotlib is present (PLOT-1..3;
+/// output confined to `~/.cache/yatima/plots`) and quietly doesn't when it
+/// isn't.
+fn web_tools(origins: &WebOrigins) -> anyhow::Result<Tools> {
+    let mut tools = Tools::new()
+        .with(ReadUrl::new(origins.clone())?)
+        .with(ReadPage::with_limits(
+            origins.clone(),
+            READ_PAGE_MAX_INPUT_BYTES,
+            READ_PAGE_MAX_CHARS,
+        )?);
+    let plot_dir = std::env::home_dir()
+        .map(|home| home.join(".cache/yatima/plots"))
+        .unwrap_or_else(|| std::env::temp_dir().join("yatima-plots"));
+    match PlotSandbox::system(&plot_dir) {
+        Ok(sandbox) => tools = tools.with(Plot::new(sandbox)),
+        Err(e) => eprintln!("plot tool unavailable: {e}"),
+    }
+    Ok(tools)
+}
+
+/// The background engine thread: load the model, then serve requests. Owns
+/// the `!Send` `Engine` for its whole life (created here, never crossed over
+/// a thread boundary). Two phases, exactly the TUI's shape: streaming chat
+/// until the first origin grant, then a sessionful agent seeded with the
+/// chat history — a one-way switch; the seam is invisible (AGENT-3).
+fn runner(cfg: RunConfig, req_rx: Receiver<Req>, ev_tx: Sender<Ev>, ctx: egui::Context) {
     let dev = match device(cfg.cpu) {
         Ok(d) => d,
         Err(e) => return fatal(&ev_tx, &ctx, e),
@@ -172,7 +250,6 @@ fn runner(cfg: RunConfig, req_rx: Receiver<String>, ev_tx: Sender<Ev>, ctx: egui
         Err(e) => return fatal(&ev_tx, &ctx, e),
     };
     let (format, _mismatch) = resolve_format(engine.arch(), cfg.format);
-    let pre_seeds = format.pre_seeds_reasoning();
 
     // Snapshot what's running for the status rail before `cfg.opts` is moved.
     let info = ModelInfo {
@@ -195,64 +272,422 @@ fn runner(cfg: RunConfig, req_rx: Receiver<String>, ev_tx: Sender<Ev>, ctx: egui
         context_length: engine.context_length(),
     };
 
-    let template = format.template();
-    let mut session = ChatSession::new(&mut engine, template).with_opts(cfg.opts);
-    if let Some(system) = cfg.system {
-        session = session.with_system(system);
-    }
+    // Tool-trained formats carry the web tools from the start, initially with
+    // an empty origin set — hidden from the model (CAP-3a) and inert until a
+    // grant arrives (sandbox by omission; CAP-3: grants come only from the
+    // user, via the UI). Chat-only formats get none.
+    let tool_trained = matches!(format, ChatFormat::Qwen | ChatFormat::Plain);
+    let origins = WebOrigins::new();
+    let tools = tool_trained.then(|| web_tools(&origins).unwrap_or_default());
+
     let _ = ev_tx.send(Ev::Ready(info));
     ctx.request_repaint();
 
-    while let Ok(prompt) = req_rx.recv() {
-        // Spike: `/plot` exercises the artifact plane without the model — shell
-        // out to matplotlib, send the PNG back as an Image artifact.
-        if prompt.trim() == "/plot" {
-            let _ = ev_tx.send(match render_demo_chart() {
-                Ok(bytes) => Ev::Image(bytes),
-                Err(e) => Ev::Error(e.to_string()),
-            });
-            let _ = ev_tx.send(Ev::Done);
-            ctx.request_repaint();
-            continue;
-        }
+    let history = match serve_chat(
+        &mut engine,
+        format,
+        cfg.system.clone(),
+        cfg.opts.clone(),
+        tools.as_ref().map(|_| &origins),
+        &req_rx,
+        &ev_tx,
+        &ctx,
+    ) {
+        ChatEnd::Shutdown => return,
+        ChatEnd::SwitchToAgent { history } => history,
+    };
+    let tools = tools.expect("agent switch only offered with tools");
+    let system = cfg
+        .system
+        .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
+    match format {
+        ChatFormat::Qwen => serve_agent(
+            &mut engine,
+            &tools,
+            QwenToolCall,
+            ChatMlTemplate,
+            system,
+            cfg.opts,
+            history,
+            &origins,
+            req_rx,
+            ev_tx,
+            ctx,
+        ),
+        ChatFormat::Plain => serve_agent(
+            &mut engine,
+            &tools,
+            JsonToolCall,
+            PlainTemplate,
+            system,
+            cfg.opts,
+            history,
+            &origins,
+            req_rx,
+            ev_tx,
+            ctx,
+        ),
+        _ => unreachable!("the switch is only offered on tool-trained formats"),
+    }
+}
 
-        let cancel = Cancel::new();
-        // Classify the stream into reasoning vs answer as it arrives, so the UI
-        // can fold the chain-of-thought away unless the user toggles it on.
-        let mut splitter = if pre_seeds {
-            ReasoningSplitter::seeded()
-        } else {
-            ReasoningSplitter::new()
-        };
-        let to_ev = |ch: Channel, text: &str| match ch {
-            Channel::Reasoning => Ev::Reasoning(text.to_string()),
-            Channel::Answer => Ev::Answer(text.to_string()),
-        };
-        let result = {
-            let tx = ev_tx.clone();
-            let ctx = ctx.clone();
-            let mut on_token = |frag: &str| {
-                splitter.push(frag, |ch, text| {
-                    let _ = tx.send(to_ev(ch, text));
+/// Why the chat phase ended.
+enum ChatEnd {
+    /// The first origin grant arrived: switch to the agent path, seeded with
+    /// the conversation so far.
+    SwitchToAgent {
+        history: Vec<Turn>,
+    },
+    Shutdown,
+}
+
+/// The chat serve loop: the plain streaming [`ChatSession`]. `origins` is
+/// `Some` on tool-trained formats — a grant then ends this phase; on
+/// chat-only formats grants are refused.
+#[allow(clippy::too_many_arguments)]
+fn serve_chat(
+    engine: &mut Engine,
+    format: ChatFormat,
+    system: Option<String>,
+    opts: GenOpts,
+    origins: Option<&WebOrigins>,
+    req_rx: &Receiver<Req>,
+    ev_tx: &Sender<Ev>,
+    ctx: &egui::Context,
+) -> ChatEnd {
+    let pre_seeds = format.pre_seeds_reasoning();
+    let template = format.template();
+    let mut session = ChatSession::new(engine, template).with_opts(opts);
+    if let Some(system) = system {
+        session = session.with_system(system);
+    }
+
+    while let Ok(req) = req_rx.recv() {
+        match req {
+            Req::Submit(prompt) => {
+                let cancel = Cancel::new();
+                // Classify the stream into reasoning vs answer as it arrives,
+                // so the UI can fold the chain-of-thought away unless toggled.
+                let mut splitter = if pre_seeds {
+                    ReasoningSplitter::seeded()
+                } else {
+                    ReasoningSplitter::new()
+                };
+                let to_ev = |ch: Channel, text: &str| match ch {
+                    Channel::Reasoning => Ev::Reasoning(text.to_string()),
+                    Channel::Answer => Ev::Answer(text.to_string()),
+                };
+                let result = {
+                    let tx = ev_tx.clone();
+                    let ctx = ctx.clone();
+                    let mut on_token = |frag: &str| {
+                        splitter.push(frag, |ch, text| {
+                            let _ = tx.send(to_ev(ch, text));
+                        });
+                        ctx.request_repaint();
+                    };
+                    session
+                        .turn_streaming_cancellable(&prompt, &cancel, &mut on_token)
+                        .map(|answer| answer.to_string())
+                };
+                // Flush any tail buffered against a straddling marker.
+                splitter.finish(|ch, text| {
+                    let _ = ev_tx.send(to_ev(ch, text));
+                });
+                if let Some(used) = session.last_prompt_tokens() {
+                    let _ = ev_tx.send(Ev::Context(used));
+                }
+                let _ = ev_tx.send(match result {
+                    Ok(_) => Ev::Done,
+                    Err(e) => Ev::Error(e.to_string()),
                 });
                 ctx.request_repaint();
-            };
-            session
-                .turn_streaming_cancellable(&prompt, &cancel, &mut on_token)
-                .map(|answer| answer.to_string())
-        };
-        // Flush any tail buffered against a straddling marker.
-        splitter.finish(|ch, text| {
-            let _ = ev_tx.send(to_ev(ch, text));
-        });
-        if let Some(used) = session.last_prompt_tokens() {
-            let _ = ev_tx.send(Ev::Context(used));
+            }
+            Req::Grant(origin) => match origins {
+                None => {
+                    let _ = ev_tx.send(Ev::Note(format!(
+                        "cannot grant {origin}: the {format} format is chat-only \
+                         (tool calling needs qwen or plain)"
+                    )));
+                    ctx.request_repaint();
+                }
+                Some(origins) => match origins.grant(&origin) {
+                    Ok(_) => {
+                        let _ = ev_tx.send(Ev::Note(format!(
+                            "granted read access to {origin} — web tools enabled"
+                        )));
+                        ctx.request_repaint();
+                        // Transplant the conversation (sans system turns) into
+                        // the agent path.
+                        let history: Vec<Turn> = session
+                            .history()
+                            .iter()
+                            .filter(|t| matches!(t.role, Role::User | Role::Assistant))
+                            .cloned()
+                            .collect();
+                        return ChatEnd::SwitchToAgent { history };
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(Ev::Note(format!("grant failed: {e}")));
+                        ctx.request_repaint();
+                    }
+                },
+            },
+            Req::Revoke(origin) => {
+                let _ = ev_tx.send(Ev::Note(match origins {
+                    None => "nothing granted (chat-only format)".to_string(),
+                    Some(origins) => match origins.revoke(&origin) {
+                        Ok(true) => format!("revoked {origin}"),
+                        Ok(false) => format!("{origin} was not granted"),
+                        Err(e) => format!("revoke failed: {e}"),
+                    },
+                }));
+                ctx.request_repaint();
+            }
+            Req::ListGrants => {
+                let _ = ev_tx.send(Ev::Note(grants_note(origins)));
+                ctx.request_repaint();
+            }
         }
-        let _ = ev_tx.send(match result {
-            Ok(_) => Ev::Done,
-            Err(e) => Ev::Error(e.to_string()),
-        });
+    }
+    ChatEnd::Shutdown
+}
+
+/// The agent serve loop: one sessionful [`Agent`] (AGENT-3) serves every
+/// turn, seeded with the chat phase's history. Later grants/revokes mutate
+/// the shared origin set in place — the specs re-render each run (CAP-3a).
+#[allow(clippy::too_many_arguments)]
+fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
+    engine: &mut Engine,
+    tools: &Tools,
+    codec: K,
+    template: T,
+    system: String,
+    opts: GenOpts,
+    history: Vec<Turn>,
+    origins: &WebOrigins,
+    req_rx: Receiver<Req>,
+    ev_tx: Sender<Ev>,
+    ctx: egui::Context,
+) {
+    let mut agent = Agent::new(engine, tools, codec, template, system, AGENT_MAX_STEPS)
+        .with_opts(opts)
+        .with_history(history);
+
+    while let Ok(req) = req_rx.recv() {
+        match req {
+            Req::Submit(prompt) => run_agent_turn(&mut agent, &prompt, &ev_tx, &ctx),
+            Req::Grant(origin) => {
+                let _ = ev_tx.send(Ev::Note(match origins.grant(&origin) {
+                    Ok(true) => format!("granted read access to {origin}"),
+                    Ok(false) => format!("{origin} was already granted"),
+                    Err(e) => format!("grant failed: {e}"),
+                }));
+                ctx.request_repaint();
+            }
+            Req::Revoke(origin) => {
+                let _ = ev_tx.send(Ev::Note(match origins.revoke(&origin) {
+                    Ok(true) => format!("revoked {origin}"),
+                    Ok(false) => format!("{origin} was not granted"),
+                    Err(e) => format!("revoke failed: {e}"),
+                }));
+                ctx.request_repaint();
+            }
+            Req::ListGrants => {
+                let _ = ev_tx.send(Ev::Note(grants_note(Some(origins))));
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
+/// One agent turn, folding [`AgentEvent`]s onto the `Ev` plane (the TUI's
+/// `run_agent_turn`, on this host's events). Streamed answer prose that
+/// turns out to precede a tool call is retracted and replayed as reasoning
+/// (AGENT-4); tool activity renders as ⚙/✓ lines on the reasoning channel;
+/// a successful plot's PNG is read back and shipped as an [`Ev::Image`].
+fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
+    agent: &mut Agent<'_, Engine, K, T>,
+    user: &str,
+    ev_tx: &Sender<Ev>,
+    ctx: &egui::Context,
+) {
+    let send = |ev: Ev| {
+        let _ = ev_tx.send(ev);
         ctx.request_repaint();
+    };
+
+    // Answer prose streamed during the *current* step; a ToolCall event means
+    // it was narration, not answer — retract and reclassify.
+    let mut step_answer = String::new();
+    // Name of the tool whose outcome we're awaiting (a plot success ships
+    // its PNG as an image artifact).
+    let mut pending_tool = String::new();
+
+    let cancel = Cancel::new(); // no cancel UI yet; a turn runs to completion
+    let result = agent.run_with_cancellable(user, &cancel, (), |(), event| {
+        match event {
+            AgentEvent::Fragment { channel, text } => {
+                if channel == Channel::Answer {
+                    step_answer.push_str(&text);
+                    send(Ev::Answer(text));
+                } else {
+                    send(Ev::Reasoning(text));
+                }
+            }
+            // The per-step aggregate; already streamed via Fragment (AGENT-4).
+            AgentEvent::Reasoning(_) => {}
+            AgentEvent::ToolCall(call) => {
+                if !step_answer.is_empty() {
+                    let narration = std::mem::take(&mut step_answer);
+                    send(Ev::RetractAnswer(narration.chars().count()));
+                    send(Ev::Reasoning(format!("{}\n", narration.trim_end())));
+                }
+                pending_tool = call.name.clone();
+                send(Ev::Reasoning(format!(
+                    "\n⚙ {} {}\n",
+                    call.name,
+                    clip(&call.args.to_string(), 160)
+                )));
+            }
+            AgentEvent::ToolStarted(_) => {}
+            AgentEvent::ToolProgress(message) => {
+                send(Ev::Reasoning(format!("  {message}\n")));
+            }
+            AgentEvent::ToolOutcome(outcome) => {
+                let note = match &outcome {
+                    ToolOutcome::Success { content } => {
+                        let flat = content.trim();
+                        if flat.chars().count() <= TOOL_NOTE_MAX_CHARS && !flat.contains('\n') {
+                            format!("  ✓ {flat}\n")
+                        } else {
+                            format!("  ✓ {} chars\n", content.chars().count())
+                        }
+                    }
+                    other => format!("  ✗ {}\n", clip(&other.render_for_model("").content, 160)),
+                };
+                send(Ev::Reasoning(note));
+                if pending_tool == "plot" {
+                    if let ToolOutcome::Success { content } = &outcome {
+                        match plot_artifact(content) {
+                            Ok(bytes) => send(Ev::Image(bytes)),
+                            Err(e) => send(Ev::Reasoning(format!("  ✗ artifact: {e}\n"))),
+                        }
+                    }
+                }
+                step_answer.clear();
+            }
+            // Already streamed fragment-by-fragment; Done carries the answer.
+            AgentEvent::Final(_) => {}
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    });
+
+    match result {
+        Ok(((), run)) => {
+            if matches!(run.stop, AgentStop::MaxSteps) {
+                send(Ev::Reasoning(format!(
+                    "\n⚠ tool-step budget exhausted ({AGENT_MAX_STEPS})\n"
+                )));
+            }
+            send(Ev::Done);
+        }
+        Err(e) => send(Ev::Error(e.to_string())),
+    }
+}
+
+/// Read back the PNG named by the plot tool's `wrote <path> (WxH, N bytes)`
+/// summary — the path always points inside the tool's own sandbox (PLOT-2).
+fn plot_artifact(content: &str) -> Result<Vec<u8>> {
+    let path = content
+        .strip_prefix("wrote ")
+        .and_then(|rest| rest.rsplit_once(" ("))
+        .map(|(path, _)| path)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized plot summary: {content:?}"))?;
+    Ok(std::fs::read(path)?)
+}
+
+/// Drop markdown image lines whose target is a local file — the plot
+/// artifact is already inline as a texture; its `![](file://…)` echo is
+/// plumbing, not prose. Display-only: the runner's session (what the model
+/// sees) is untouched.
+fn strip_local_image_links(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let t = line.trim();
+            !(t.starts_with("![") && t.contains("](file://"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Inline-LaTeX prettifier — a deliberate *subset* of the TUI's
+/// (`tui/src/render.rs`): delimiters dropped, common commands mapped to
+/// Unicode. The full pipeline (environments, brace expansion,
+/// sub/superscripts) gets extracted to a shared crate when `yatima-serve`'s
+/// client becomes its third consumer; until then this covers the shapes
+/// chat answers actually produce (`\( 9\pi \)`, `\sin(x)`).
+fn prettify_math(text: &str) -> String {
+    const DELIMS: &[&str] = &["\\[", "\\]", "\\(", "\\)", "$$", "\\left", "\\right"];
+    const SYMBOLS: &[(&str, &str)] = &[
+        ("\\sin", "sin"),
+        ("\\cos", "cos"),
+        ("\\tan", "tan"),
+        ("\\ln", "ln"),
+        ("\\log", "log"),
+        ("\\exp", "exp"),
+        ("\\sqrt", "√"),
+        ("\\pi", "π"),
+        ("\\theta", "θ"),
+        ("\\alpha", "α"),
+        ("\\beta", "β"),
+        ("\\lambda", "λ"),
+        ("\\mu", "μ"),
+        ("\\sigma", "σ"),
+        ("\\Delta", "Δ"),
+        ("\\times", "×"),
+        ("\\cdot", "·"),
+        ("\\leq", "≤"),
+        ("\\geq", "≥"),
+        ("\\neq", "≠"),
+        ("\\approx", "≈"),
+        ("\\infty", "∞"),
+        ("\\to", "→"),
+        ("\\pm", "±"),
+    ];
+    let mut s = text.to_string();
+    for d in DELIMS {
+        s = s.replace(d, "");
+    }
+    for (from, to) in SYMBOLS {
+        s = s.replace(from, to);
+    }
+    s
+}
+
+/// The grants report, both phases.
+fn grants_note(origins: Option<&WebOrigins>) -> String {
+    match origins {
+        None => "no tools (chat-only format)".to_string(),
+        Some(origins) => {
+            let list = origins.list();
+            if list.is_empty() {
+                "no origins granted — type a URL or /grant <origin>".to_string()
+            } else {
+                format!("granted: {}", list.join(", "))
+            }
+        }
+    }
+}
+
+/// First `max` chars of `text` with an ellipsis when clipped (single line).
+fn clip(text: &str, max: usize) -> String {
+    let flat = text.replace('\n', " ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let cut: String = flat.chars().take(max).collect();
+        format!("{cut}…")
     }
 }
 
@@ -261,67 +696,19 @@ fn fatal(ev_tx: &Sender<Ev>, ctx: &egui::Context, e: impl std::fmt::Display) {
     ctx.request_repaint();
 }
 
-/// The Python interpreter to use — the seam that, in a real `RunPython` tool,
-/// *is* the capability. Prefers `$YATIMA_PYTHON`, then a project `.venv` (the
-/// pinned environment the plan calls for), then system `python3`.
-fn python_interpreter() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("YATIMA_PYTHON") {
-        return p.into();
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let venv = cwd.join(".venv/bin/python3");
-        if venv.exists() {
-            return venv;
-        }
-    }
-    "python3".into()
-}
-
-/// Spike: produce a matplotlib chart as PNG bytes by shelling out to Python.
-/// A stand-in for a real capability-scoped `RunPython` tool — enough to prove the
-/// artifact → egui-image path. Needs `numpy` + `matplotlib` (see the `.venv`).
-fn render_demo_chart() -> Result<Vec<u8>> {
-    let out = std::env::temp_dir().join("yatima-gui-plot.png");
-    let code = r#"import sys, numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-x = np.linspace(0, 2 * np.pi, 400)
-fig, ax = plt.subplots(figsize=(6, 4))
-ax.plot(x, np.sin(x), label="sin")
-ax.plot(x, np.cos(x), label="cos")
-ax.set_title("yatima-gui artifact spike")
-ax.legend()
-ax.grid(True, alpha=0.3)
-fig.savefig(sys.argv[1], dpi=120, bbox_inches="tight")
-"#;
-    let python = python_interpreter();
-    let output = std::process::Command::new(&python)
-        .arg("-c")
-        .arg(code)
-        .arg(&out)
-        .output()
-        .map_err(|e| anyhow::anyhow!("could not run {}: {e}", python.display()))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{} (numpy/matplotlib) failed: {}",
-            python.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(std::fs::read(&out)?)
-}
-
 /// The `/help` listing.
 const HELP_TEXT: &str = "\
 commands
-  /plot      render a demo matplotlib chart (artifact)
-  /stats     toggle the system panel — state + controls   (alias /control)
-  /cls       clear the screen                              (Ctrl+L)
-  /about     about yatima
-  /help      this message
-  /quit      exit
+  /grant <origin>   grant web read access (or just type a URL in a message)
+  /revoke <origin>  withdraw an origin
+  /grants           list granted origins
+  /stats            toggle the system panel — state + controls   (alias /control)
+  /cls              clear the screen                              (Ctrl+L)
+  /about            about yatima
+  /help             this message
+  /quit             exit
 
+granting an origin enables the web + plot tools (ask for a chart!).
 reasoning is hidden by default — turn on \"show reasoning\" in /stats.";
 
 /// A rendered transcript entry (the UI mirror; the runner's session is truth).
@@ -348,7 +735,7 @@ enum Status {
 }
 
 struct GuiApp {
-    req_tx: Sender<String>,
+    req_tx: Sender<Req>,
     ev_rx: Receiver<Ev>,
     /// A handle to the egui context, for uploading image artifacts as textures
     /// off the render path (in `drain_events`).
@@ -395,11 +782,18 @@ struct GuiApp {
     /// When `strawberry fields` mode began (reality dissolves into drifting
     /// particles), or `None` when off. Esc recovers reality. Secret.
     strawberry_start: Option<f32>,
+    /// Parse/image cache for the markdown viewer (egui_commonmark).
+    md_cache: egui_commonmark::CommonMarkCache,
+    /// Decorative motion — splash draw-on, avatar life, the continuous
+    /// repaint they need. Off by default (`--whimsy` / a `/stats` toggle):
+    /// built to prove egui, kept for demos, silenced for work. The avatar
+    /// itself stays as a static status glyph; its expressions are state.
+    whimsy: bool,
 }
 
 impl GuiApp {
-    fn new(cc: &eframe::CreationContext<'_>, cfg: RunConfig) -> GuiApp {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+    fn new(cc: &eframe::CreationContext<'_>, cfg: RunConfig, whimsy: bool) -> GuiApp {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<Req>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Ev>();
         let ctx = cc.egui_ctx.clone();
         let runner_ctx = ctx.clone();
@@ -428,6 +822,8 @@ impl GuiApp {
             show_ticker: false,
             roll_start: None,
             strawberry_start: None,
+            md_cache: egui_commonmark::CommonMarkCache::default(),
+            whimsy,
         }
     }
 
@@ -448,18 +844,23 @@ impl GuiApp {
         let failed = matches!(self.status, Status::Failed(_));
 
         // The sigil shimmers through the aurora ramp; a failed load is dim and
-        // fully drawn (no animation, no shimmer, no recede).
+        // fully drawn (no animation, no shimmer, no recede). Without whimsy
+        // the mark is static too — fully drawn at a fixed aurora phase; the
+        // draw-on/recede choreography is opt-in (`--whimsy`).
         let (color, animate) = if failed {
             (egui::Color32::from_gray(90), false)
+        } else if !self.whimsy {
+            let a = aurora_at(0.0);
+            (egui::Color32::from_rgb(a.r(), a.g(), a.b()), false)
         } else {
             let a = aurora_at(t * 0.35);
             (egui::Color32::from_rgb(a.r(), a.g(), a.b()), true)
         };
         let elapsed = if animate { t - start } else { 99.0 };
-        let recede = if failed {
-            0.0
-        } else {
+        let recede = if animate {
             smoothstep(time_ease(elapsed, 4.5, 6.2))
+        } else {
+            0.0
         };
 
         let panel = ui.max_rect();
@@ -742,6 +1143,16 @@ impl GuiApp {
                     self.gen_tokens += 1;
                     self.streaming_reasoning.push_str(&text);
                 }
+                Ev::RetractAnswer(chars) => {
+                    // The streamed tail was narration ahead of a tool call —
+                    // pull it back out of the answer; it replays as reasoning.
+                    if let Some(buf) = self.streaming.as_mut() {
+                        let keep = buf.chars().count().saturating_sub(chars);
+                        let cut = buf.char_indices().nth(keep).map_or(buf.len(), |(i, _)| i);
+                        buf.truncate(cut);
+                    }
+                }
+                Ev::Note(message) => self.transcript.push(Msg::Note(message)),
                 Ev::Context(used) => self.context_used = Some(used),
                 Ev::Image(bytes) => match decode_texture(&self.ctx, &bytes) {
                     Ok(tex) => {
@@ -754,16 +1165,18 @@ impl GuiApp {
                 },
                 Ev::Done => {
                     // Drop the streaming buffers; only commit a reply if the
-                    // answer carried text (a `/plot` turn streams none).
+                    // answer carried text (a fully-retracted turn streams none).
+                    // Committed text is display-polished: local image links
+                    // drop (the artifact is already inline as a texture) and
+                    // inline LaTeX prettifies. The runner's session is truth;
+                    // this is the UI mirror.
                     let reasoning = std::mem::take(&mut self.streaming_reasoning);
                     if let Some(buf) = self.streaming.take() {
-                        if !buf.trim().is_empty() {
+                        let answer = prettify_math(&strip_local_image_links(&buf));
+                        if !answer.trim().is_empty() {
                             let reasoning = (!reasoning.trim().is_empty())
-                                .then(|| reasoning.trim().to_string());
-                            self.transcript.push(Msg::Assistant {
-                                answer: buf,
-                                reasoning,
-                            });
+                                .then(|| prettify_math(reasoning.trim()));
+                            self.transcript.push(Msg::Assistant { answer, reasoning });
                         }
                     }
                 }
@@ -831,15 +1244,38 @@ impl GuiApp {
             self.input.clear();
             return;
         }
+        // Grant management (CAP-3: these, plus URLs typed in a message, are
+        // the *only* sources of web authority).
+        if prompt == "/grants" {
+            let _ = self.req_tx.send(Req::ListGrants);
+            self.input.clear();
+            return;
+        }
+        if let Some(origin) = prompt.strip_prefix("/grant ") {
+            let _ = self.req_tx.send(Req::Grant(origin.trim().to_string()));
+            self.input.clear();
+            return;
+        }
+        if let Some(origin) = prompt.strip_prefix("/revoke ") {
+            let _ = self.req_tx.send(Req::Revoke(origin.trim().to_string()));
+            self.input.clear();
+            return;
+        }
         if prompt.is_empty() || self.in_flight() || !matches!(self.status, Status::Ready(_)) {
             return;
+        }
+        // Auto-grant: a URL in the *user's own message* is authorization for
+        // its origin (CAP-3) — granted before the turn runs, so the model can
+        // act on it immediately. URLs from any other source never pass here.
+        for origin in yatima_lib::origins_in(&prompt) {
+            let _ = self.req_tx.send(Req::Grant(origin));
         }
         self.transcript.push(Msg::User(prompt.clone()));
         self.streaming = Some(String::new());
         self.streaming_reasoning.clear();
         self.turn_start = None;
         self.gen_tokens = 0;
-        let _ = self.req_tx.send(prompt);
+        let _ = self.req_tx.send(Req::Submit(prompt));
         self.input.clear();
         self.splash_anim_start = None; // replay the draw-on if we return to it
     }
@@ -859,7 +1295,11 @@ impl eframe::App for GuiApp {
 
         egui::Panel::top("status").show(ui, |ui| {
             let t = ui.input(|i| i.time) as f32;
-            let acc = aurora_at(t * 0.35);
+            // Without whimsy the avatar freezes into a status glyph: fixed
+            // aurora phase, no blink/warp, and — the part that matters for a
+            // workday — no always-on repaint below.
+            let t_anim = if self.whimsy { t } else { 0.0 };
+            let acc = aurora_at(t_anim * 0.35);
             let face_col = egui::Color32::from_rgb(acc.r(), acc.g(), acc.b());
             // yatima's mood follows her state: surprised when an artifact just
             // landed, asleep while loading, sad on failure; mid-turn she thinks
@@ -920,26 +1360,33 @@ impl eframe::App for GuiApp {
             ui.horizontal(|ui| {
                 let (frect, _) =
                     ui.allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::hover());
-                // Barrel roll: one full turn over ~0.8s when triggered.
-                let roll = self
-                    .roll_start
-                    .map(|s| {
+                // Barrel roll: one full turn over ~0.8s when triggered, then
+                // cleared — a lingering Some would pin the repaint gate on.
+                let roll = match self.roll_start {
+                    Some(s) => {
                         let p = (now - s) / 0.8;
                         if p < 1.0 {
                             p * std::f32::consts::TAU
                         } else {
+                            self.roll_start = None;
                             0.0
                         }
-                    })
-                    .unwrap_or(0.0);
+                    }
+                    None => 0.0,
+                };
+                let (warp_x, warp_y) = if self.whimsy {
+                    (warp_at(t, 14.0), warp_at(t + 9.0, 19.0))
+                } else {
+                    (0.0, 0.0)
+                };
                 draw_face(
                     &ui.painter_at(frect),
                     frect,
                     expr,
-                    t,
+                    t_anim,
                     face_col,
-                    warp_at(t, 14.0),       // horizontal-axis teleport
-                    warp_at(t + 9.0, 19.0), // vertical-axis teleport (offset cadence)
+                    warp_x, // horizontal-axis teleport
+                    warp_y, // vertical-axis teleport (offset cadence)
                     roll,
                 );
                 ui.colored_label(color, text);
@@ -967,7 +1414,13 @@ impl eframe::App for GuiApp {
                     ui.weak("/stats");
                 });
             });
-            ui.ctx().request_repaint(); // keep the avatar breathing/blinking
+            // Whimsy keeps the avatar breathing/blinking (a continuous
+            // repaint); a triggered barrel roll or live ticker also needs
+            // frames. Otherwise repaints come only from real events.
+            let idle = matches!(self.status, Status::Ready(_)) && !self.in_flight();
+            if self.whimsy || self.roll_start.is_some() || (self.show_ticker && idle) {
+                ui.ctx().request_repaint();
+            }
         });
 
         // `/stats` (alias `/control`): a right rail of state + controls, usable
@@ -1025,6 +1478,7 @@ impl eframe::App for GuiApp {
                 ui.add_space(4.0);
                 ui.checkbox(&mut self.show_reasoning, "show reasoning");
                 ui.checkbox(&mut self.show_ticker, "status ticker");
+                ui.checkbox(&mut self.whimsy, "whimsy (splash + avatar life)");
                 ui.add(
                     egui::Slider::new(&mut self.opacity, 0.0..=1.0)
                         .text("image opacity")
@@ -1041,7 +1495,7 @@ impl eframe::App for GuiApp {
                 let edit = ui.add_enabled(
                     ready,
                     egui::TextEdit::singleline(&mut self.input)
-                        .hint_text("message — try /plot")
+                        .hint_text("message — /help for commands")
                         .desired_width(f32::INFINITY),
                 );
                 let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1082,7 +1536,7 @@ impl eframe::App for GuiApp {
                 .show(ui, |ui| {
                     let tint = self.image_tint();
                     for msg in &self.transcript {
-                        render_msg(ui, msg, tint, self.show_reasoning);
+                        render_msg(ui, msg, tint, self.show_reasoning, &mut self.md_cache);
                     }
                     if let Some(buf) = &self.streaming {
                         speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
@@ -1098,7 +1552,14 @@ impl eframe::App for GuiApp {
                             // Reasoning is flowing but the answer hasn't begun.
                             ui.label(egui::RichText::new("thinking…").weak());
                         } else {
-                            ui.label(buf);
+                            // Markdown live, so structure appears as it
+                            // streams (unclosed markers render literally
+                            // until their close arrives — harmless).
+                            egui_commonmark::CommonMarkViewer::new().show(
+                                ui,
+                                &mut self.md_cache,
+                                buf,
+                            );
                         }
                         ui.add_space(8.0);
                     }
@@ -1617,7 +2078,13 @@ fn aurora_at(phase: f32) -> egui::Color32 {
     )
 }
 
-fn render_msg(ui: &mut egui::Ui, msg: &Msg, image_tint: egui::Color32, show_reasoning: bool) {
+fn render_msg(
+    ui: &mut egui::Ui,
+    msg: &Msg,
+    image_tint: egui::Color32,
+    show_reasoning: bool,
+    md_cache: &mut egui_commonmark::CommonMarkCache,
+) {
     match msg {
         Msg::User(text) => {
             speaker(ui, "you", egui::Color32::LIGHT_BLUE);
@@ -1631,7 +2098,7 @@ fn render_msg(ui: &mut egui::Ui, msg: &Msg, image_tint: egui::Color32, show_reas
                     ui.add_space(4.0);
                 }
             }
-            ui.label(answer);
+            egui_commonmark::CommonMarkViewer::new().show(ui, md_cache, answer);
         }
         Msg::Image(tex) => {
             speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
@@ -1678,10 +2145,11 @@ fn main() -> Result<()> {
             .with_inner_size([580.0, 410.0]),
         ..Default::default()
     };
+    let whimsy = args.whimsy;
     eframe::run_native(
         &title,
         native,
-        Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, cfg)))),
+        Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, cfg, whimsy)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }

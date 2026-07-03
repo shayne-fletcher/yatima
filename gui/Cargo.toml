@@ -33,3 +33,4 @@ eframe = { version = "0.35", default-features = false, features = [
 # Decode artifact images (matplotlib PNGs) to upload as egui textures. PNG only
 # for the spike — keep the dep light.
 image = { version = "0.25", default-features = false, features = ["png"] }
+egui_commonmark = { version = "0.24", default-features = false, features = ["pulldown_cmark"] }

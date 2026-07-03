@@ -883,6 +883,13 @@ and deliberately shelved — the note records why so we don't repeat them.
     (e.g. `yatima-serve`) mapping tenant → capabilities → budget → model. Builds
     on the capability primitive (`Dir`/`WriteDir`/`WebOrigin`/`NtfyTopic` —
     bounded effects are exactly what isolation needs); never enters the library.
+    **Live trigger (2026-07): remote collaboration on sieve** — serving yatima
+    to a second user. The client plane is the GUI's event stream: everything
+    above `Ev` (decode, textures, egui rendering) compiles to WASM; everything
+    below (engine, tools, python) stays native — serve is "the `Ev` plane over
+    a websocket," artifacts (plot PNGs) crossing as bytes. Stepping stone:
+    wire real agent turns + the shared toolset into the GUI, hardening that
+    seam in-process first.
   - *Clusters / routing / model placement* → a **control-plane** tier above the
     service; the library is the leaf and knows nothing of it.
   - *Model sharding* → engine-internal, **rented from candle/backend**, surfaced
