@@ -307,7 +307,8 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   only the model-facing projection the transcript receives (PROTO-1).
   `Tools::spawn` returns a `ToolTask` with `ToolEvent`s, `join`, and cooperative
   cancellation. Current tools: `ReadFile`, `ListDir`, `WriteFile`, `ReadUrl`,
-  `ReadPage`, `Plot`, and `SendNotification`, each holding its own capability.
+  `ReadPage`, `ReadImage`, `Plot`, and `SendNotification`, each holding its
+  own capability.
   `ReadUrl` returns a body **verbatim** (JSON/plaintext/APIs); `ReadPage` fetches
   an HTML page under the same `WebOrigin` capability and returns the **readable
   main article** (title + text) via a readability pass (`dom_smoothie`),
@@ -319,7 +320,19 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   truncation marker names the `offset` for the next call, and continuations are
   served from a per-tool fetch-once cache (FETCH-1/WIN-1) — one network fetch
   per URL per session, which is the shape a throttled host (sieve's EDGAR)
-  requires: re-fetching is the expensive act, re-reading is free.
+  requires: re-fetching is the expensive act, re-reading is free. The first
+  window's header lists the readable region's images (absolute, alt-labeled,
+  capped) — the discovery seam feeding `read_image`; header metadata rides
+  single-newline lines so the window tiling law is untouched.
+- **`ReadImage`** fetches an image (SVG/PNG/JPEG) from the granted origins
+  and saves it as a viewable artifact (IMG-1): content-type gate with a
+  magic-byte sniff for silent servers, streamed size cap, output confined to
+  a `WriteDir` at a content-hash name. Hosts display it in their idiom —
+  the GUI as an inline texture (SVGs rasterized host-side via `resvg`, pure
+  Rust, WASM-clean), the TUI via the platform viewer. Note the CAP-2
+  honesty: a page's images often live on a different origin (Wikipedia's
+  files are on `upload.wikimedia.org`) — reading the page does not grant the
+  image host; the model is taught to ask.
 - **`Plot`** renders charts (line/bar/scatter/hist) to PNG via a
   matplotlib-bearing python held as a `PlotSandbox` capability. The model never
   writes code (PLOT-1): it submits a declarative spec against a **closed

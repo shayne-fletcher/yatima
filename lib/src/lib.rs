@@ -182,6 +182,13 @@
 //! - **PLOT-3** rendering is deterministic per machine (Agg backend, fixed
 //!   size/dpi, stable metadata, spec-hash filenames): the same spec yields
 //!   the same artifact — a plot can be journaled like any other evidence.
+//! - **IMG-1** the [`ReadImage`] tool fetches only from granted origins
+//!   (CAP-2/CAP-3 reused), gates on image honesty (SVG/PNG/JPEG by
+//!   content-type, magic-byte sniff when the server is silent — anything
+//!   else is a teaching rejection), caps input size while streaming, and
+//!   confines output to its [`WriteDir`] at a content-hash name: the model
+//!   never chooses the path, identical bytes share an artifact, and each
+//!   host displays it in its medium's idiom.
 //! - **PROTO-1** a malformed/unknown tool call becomes a typed non-success
 //!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
 //!   from, never a silent mis-execution.
@@ -248,9 +255,10 @@ pub use template::{
     MistralTemplate, PlainTemplate, PromptTemplate,
 };
 pub use tool::{
-    JsonToolCall, ListDir, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile, ReadPage, ReadUrl,
-    SendNotification, Tool, ToolCall, ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolFailure,
-    ToolOutcome, ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
+    JsonToolCall, ListDir, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile, ReadImage,
+    ReadPage, ReadUrl, SendNotification, Tool, ToolCall, ToolCallCodec, ToolCallId, ToolCtx,
+    ToolEvent, ToolFailure, ToolOutcome, ToolRejection, ToolResult, ToolSpec, ToolTask, Tools,
+    WriteFile,
 };
 pub use transcript::{Role, Turn};
 

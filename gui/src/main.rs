@@ -29,7 +29,7 @@ use eframe::egui;
 use yatima_lib::{
     device, resolve_format, Agent, AgentEvent, AgentStop, Cancel, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, ModelProfile, ModelSource,
-    PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadPage, ReadUrl,
+    PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl,
     ReasoningSplitter, Role, Sampling, ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
 };
 use yatima_text::prettify_math;
@@ -229,10 +229,11 @@ fn web_tools(origins: &WebOrigins) -> anyhow::Result<Tools> {
             READ_PAGE_MAX_INPUT_BYTES,
             READ_PAGE_MAX_CHARS,
         )?);
-    let plot_dir = std::env::home_dir()
-        .map(|home| home.join(".cache/yatima/plots"))
-        .unwrap_or_else(|| std::env::temp_dir().join("yatima-plots"));
-    match PlotSandbox::system(&plot_dir) {
+    let cache = std::env::home_dir()
+        .map(|home| home.join(".cache/yatima"))
+        .unwrap_or_else(std::env::temp_dir);
+    tools = tools.with(ReadImage::new(origins.clone(), cache.join("images"))?);
+    match PlotSandbox::system(cache.join("plots")) {
         Ok(sandbox) => tools = tools.with(Plot::new(sandbox)),
         Err(e) => eprintln!("plot tool unavailable: {e}"),
     }
@@ -574,9 +575,9 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     other => format!("  ✗ {}\n", clip(&other.render_for_model("").content, 160)),
                 };
                 send(Ev::Reasoning(note));
-                if pending_tool == "plot" {
+                if matches!(pending_tool.as_str(), "plot" | "read_image") {
                     if let ToolOutcome::Success { content } = &outcome {
-                        match plot_artifact(content) {
+                        match artifact_bytes(content) {
                             Ok(bytes) => send(Ev::Image(bytes)),
                             Err(e) => send(Ev::Reasoning(format!("  ✗ artifact: {e}\n"))),
                         }
@@ -603,15 +604,47 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     }
 }
 
-/// Read back the PNG named by the plot tool's `wrote <path> (WxH, N bytes)`
-/// summary — the path always points inside the tool's own sandbox (PLOT-2).
-fn plot_artifact(content: &str) -> Result<Vec<u8>> {
+/// Read back the image named by an artifact tool's `wrote <path> (…)`
+/// summary — the path always points inside the tool's own sandbox (PLOT-2 /
+/// IMG-1). Raster formats pass through for the texture decoder; an SVG is
+/// rasterized here (resvg → PNG bytes), so the display path stays one code
+/// path and — being pure Rust — serves unchanged in the WASM client.
+fn artifact_bytes(content: &str) -> Result<Vec<u8>> {
     let path = content
         .strip_prefix("wrote ")
         .and_then(|rest| rest.rsplit_once(" ("))
         .map(|(path, _)| path)
-        .ok_or_else(|| anyhow::anyhow!("unrecognized plot summary: {content:?}"))?;
-    Ok(std::fs::read(path)?)
+        .ok_or_else(|| anyhow::anyhow!("unrecognized artifact summary: {content:?}"))?;
+    let bytes = std::fs::read(path)?;
+    if path.ends_with(".svg") {
+        return rasterize_svg(&bytes);
+    }
+    Ok(bytes)
+}
+
+/// Rasterize an SVG to PNG bytes at a display-friendly size: the intrinsic
+/// size scaled to fit 1024px on the long side (never upscaled past 4x —
+/// tiny icons shouldn't become billboards).
+fn rasterize_svg(data: &[u8]) -> Result<Vec<u8>> {
+    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default())
+        .map_err(|e| anyhow::anyhow!("svg parse: {e}"))?;
+    let size = tree.size();
+    let long = size.width().max(size.height()).max(1.0);
+    let scale = (1024.0 / long).clamp(0.25, 4.0);
+    let (w, h) = (
+        (size.width() * scale).ceil().max(1.0) as u32,
+        (size.height() * scale).ceil().max(1.0) as u32,
+    );
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)
+        .ok_or_else(|| anyhow::anyhow!("svg raster: zero-sized pixmap"))?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    pixmap
+        .encode_png()
+        .map_err(|e| anyhow::anyhow!("svg raster: {e}"))
 }
 
 /// Drop markdown image lines whose target is a local file — the plot
@@ -2154,8 +2187,18 @@ fn init_file_logging() -> Result<()> {
         .create(true)
         .append(true)
         .open(&path)?;
+    // A bare level ("debug") scopes to yatima: third-party internals
+    // (html5ever narrating every HTML token, wgpu, hyper) drown the log at
+    // debug, and the question the log answers is "what is yatima doing".
+    // A spec with '='/',' is honored verbatim.
+    let value = std::env::var("YATIMA_LOG").unwrap_or_default();
+    let spec = if value.contains('=') || value.contains(',') {
+        value
+    } else {
+        format!("warn,yatima_lib={value},yatima_gui={value},yatima_text={value}")
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_env("YATIMA_LOG"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(spec))
         .with_writer(file)
         .with_ansi(false)
         .init();
@@ -2184,4 +2227,28 @@ fn main() -> Result<()> {
         Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, cfg, whimsy)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svg_rasterizes_to_display_png() {
+        // upholds: IMG-1 (host half) — an SVG artifact becomes PNG bytes the
+        // texture decoder accepts, scaled to a display-friendly size.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+            <rect width="20" height="10" fill="#3a7"/></svg>"##;
+        let png = rasterize_svg(svg).unwrap();
+        let img = image::load_from_memory(&png).unwrap();
+        // 20x10 at the 4x upscale clamp → 80x40.
+        assert_eq!((img.width(), img.height()), (80, 40));
+    }
+
+    #[test]
+    fn artifact_summaries_parse_and_teach() {
+        // The `wrote <path> (…)` contract shared by plot and read_image.
+        assert!(artifact_bytes("no such summary").is_err());
+        assert!(artifact_bytes("wrote /nonexistent/x.png (png, 5 bytes)").is_err());
+    }
 }

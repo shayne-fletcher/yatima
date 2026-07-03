@@ -147,16 +147,23 @@ fn init_file_logging() -> Result<()> {
         .create(true)
         .append(true)
         .open(&path)?;
-    // The transcript re-renders every animation frame (immediate mode), so
-    // tui-markdown re-warns about anything it can't render — e.g. an image
-    // link — hundreds of times per minute. Quiet it to errors unless the
-    // filter names it explicitly (an explicit directive wins over ours).
-    let mut filter = tracing_subscriber::EnvFilter::from_env("YATIMA_LOG");
-    if std::env::var("YATIMA_LOG").is_ok_and(|v| !v.contains("tui_markdown")) {
-        filter = filter.add_directive("tui_markdown=error".parse().expect("static directive"));
+    // A bare level ("debug") scopes to yatima: third-party internals
+    // (html5ever narrating every HTML token, hyper, wgpu) drown the log at
+    // debug, and the question the log answers is "what is yatima doing".
+    // A spec with '='/',' is honored verbatim for when those internals are
+    // exactly what's wanted. tui-markdown warns per animation frame about
+    // anything it can't render, so it stays quiet unless named.
+    let value = std::env::var("YATIMA_LOG").unwrap_or_default();
+    let mut spec = if value.contains('=') || value.contains(',') {
+        value
+    } else {
+        format!("warn,yatima_lib={value},yatima_tui={value},yatima_text={value}")
+    };
+    if !spec.contains("tui_markdown") {
+        spec.push_str(",tui_markdown=error");
     }
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(spec))
         .with_writer(file)
         .with_ansi(false)
         .init();

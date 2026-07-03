@@ -17,8 +17,9 @@
 use crate::capability::{Dir, NtfyTopic, PlotSandbox, WebOrigins, WriteDir};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -847,6 +848,9 @@ pub struct ReadPage {
 struct CachedPage {
     title: String,
     text: String,
+    /// `(url, alt)` of the readable region's images, absolute and deduped —
+    /// discovery metadata for `read_image` (listed in window 0's header).
+    images: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -928,6 +932,22 @@ impl ReadPage {
             out.push('\n');
         }
         out.push_str(url);
+        // Image discovery rides in the header (single-newline lines, so the
+        // header/body/marker window structure is untouched — WIN-1), once,
+        // in the first window.
+        if offset == 0 && !page.images.is_empty() {
+            out.push_str("\n[images — fetch one with read_image:");
+            for (src, alt) in &page.images {
+                out.push_str("\n  ");
+                out.push_str(src);
+                if !alt.is_empty() {
+                    out.push_str(" (");
+                    out.push_str(alt);
+                    out.push(')');
+                }
+            }
+            out.push(']');
+        }
         out.push_str("\n\n");
         out.push_str(&body);
         if end < total {
@@ -949,7 +969,8 @@ impl Tool for ReadPage {
             name: "read_page".to_string(),
             // The spec states the tool's live authority (CAP-3a).
             description: format!(
-                "Read the readable main content (title + article text) of an HTML page. \
+                "Read the readable main content (title + article text) of an HTML page, \
+                 listing the article's images (fetch one with read_image). \
                  May read only these origins: {}. Long articles are returned one window \
                  at a time; a truncation marker gives the offset to pass to read the \
                  next window (continuations are served from cache — no refetch). For \
@@ -1049,7 +1070,9 @@ impl Tool for ReadPage {
         // types are `!Send`, so they are created and consumed entirely here and
         // only owned `String`s escape.
         let url_string = url.to_string();
-        let (title, text) = tokio::task::spawn_blocking(move || -> Result<(String, String)> {
+        let base = url.clone();
+        let (title, text, images) = tokio::task::spawn_blocking(
+            move || -> Result<(String, String, Vec<(String, String)>)> {
             let cfg = dom_smoothie::Config {
                 max_elements_to_parse: READ_PAGE_MAX_ELEMENTS,
                 ..Default::default()
@@ -1063,8 +1086,13 @@ impl Tool for ReadPage {
             let article = readability.parse().map_err(|e| {
                 anyhow!("read_page: no readable article at {url_string}: {e}; use read_url for raw content")
             })?;
-            Ok((article.title.to_string(), article.text_content.to_string()))
-        })
+            let images = article_images(&article.content, &base);
+            Ok((
+                article.title.to_string(),
+                article.text_content.to_string(),
+                images,
+            ))
+        },)
         .await??;
 
         // Meaningful-content check (extractors return title-only/boilerplate on
@@ -1077,12 +1105,247 @@ impl Tool for ReadPage {
         let page = Arc::new(CachedPage {
             title,
             text: text.to_string(),
+            images,
         });
         self.cache
             .lock()
             .expect("read_page cache poisoned")
             .insert(url.to_string(), page.clone());
         self.render_window(url.as_str(), &page, offset)
+    }
+}
+
+/// Cap on the images listed per page — discovery metadata, not a sitemap.
+const READ_PAGE_MAX_IMAGES: usize = 12;
+
+/// Cap on a fetched image's size — real diagrams and photos fit; a
+/// pathological body can't buffer unbounded (the guard streams).
+const DEFAULT_READ_IMAGE_MAX_BYTES: usize = 8_000_000;
+
+/// The image types `read_image` will save, with their extensions and magic
+/// signatures (the sniff when a server sends no content-type).
+const IMAGE_TYPES: &[(&str, &str)] = &[
+    ("image/svg+xml", "svg"),
+    ("image/png", "png"),
+    ("image/jpeg", "jpg"),
+];
+
+/// A quoted attribute's value inside an HTML tag body (`src="…"`), with a
+/// boundary check so `srcset`/`data-src` never match as `src`. A scanner,
+/// not a parser: good enough for discovery metadata, never authoritative.
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let mut rest = tag;
+    loop {
+        let at = rest.find(name)?;
+        let boundary = at == 0 || {
+            let b = rest.as_bytes()[at - 1];
+            !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        let after = rest[at + name.len()..].trim_start();
+        if boundary {
+            if let Some(after) = after.strip_prefix('=') {
+                let after = after.trim_start();
+                let quote = after.chars().next()?;
+                if quote == '"' || quote == '\'' {
+                    let inner = &after[1..];
+                    let end = inner.find(quote)?;
+                    return Some(inner[..end].to_string());
+                }
+            }
+        }
+        rest = &rest[at + name.len()..];
+    }
+}
+
+/// The readable region's `<img>` sources with their alt text: resolved
+/// absolute against the page URL, deduped in document order, capped at
+/// [`READ_PAGE_MAX_IMAGES`] — what `read_page` lists so the model can
+/// discover something worth a `read_image` call.
+fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut rest = content_html;
+    while let Some(pos) = rest.find("<img") {
+        rest = &rest[pos + 4..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..end];
+        rest = &rest[end..];
+        let Some(src) = attr_value(tag, "src") else {
+            continue;
+        };
+        let Ok(resolved) = base.join(&src) else {
+            continue;
+        };
+        let url = resolved.to_string();
+        if out.iter().any(|(u, _)| *u == url) {
+            continue;
+        }
+        let alt = attr_value(tag, "alt").unwrap_or_default();
+        out.push((url, alt));
+        if out.len() >= READ_PAGE_MAX_IMAGES {
+            break;
+        }
+    }
+    out
+}
+
+/// FNV-1a over `bytes` — content-hash filenames for artifacts (identical
+/// bytes share an artifact; the model never chooses a path).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Fetch an image from the granted origins and save it as a viewable
+/// artifact.
+///
+/// The artifact-plane sibling of [`ReadUrl`]/[`ReadPage`], on the same
+/// origin-set capability (CAP-2/CAP-3): the deliverable is a *file the user
+/// can see*, and each host displays it in its medium's idiom (IMG-1 — the
+/// GUI as an inline texture, the TUI via the platform viewer). The type
+/// gate is honest: SVG/PNG/JPEG by content-type, magic-byte sniff when the
+/// server is silent, and anything else teaches `read_url`/`read_page`.
+/// Output is confined to the tool's [`WriteDir`] at a content-hash name.
+pub struct ReadImage {
+    origins: WebOrigins,
+    dir: WriteDir,
+    client: Client,
+    max_bytes: usize,
+}
+
+impl ReadImage {
+    pub fn new(origins: WebOrigins, dir: impl Into<PathBuf>) -> Result<ReadImage> {
+        Self::with_max_bytes(origins, dir, DEFAULT_READ_IMAGE_MAX_BYTES)
+    }
+
+    pub fn with_max_bytes(
+        origins: WebOrigins,
+        dir: impl Into<PathBuf>,
+        max_bytes: usize,
+    ) -> Result<ReadImage> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        let client = Client::builder()
+            .user_agent(WEB_USER_AGENT)
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        Ok(ReadImage {
+            origins,
+            dir: WriteDir::new(dir),
+            client,
+            max_bytes,
+        })
+    }
+}
+
+/// The saved-image extension: by content-type when the server sent a real
+/// one, else by magic-byte sniff (`application/octet-stream` counts as "the
+/// server said nothing"). `None` means "not an image we save".
+fn image_ext(content_type: Option<&str>, body: &[u8]) -> Option<&'static str> {
+    if let Some(ct) = content_type {
+        let ct = ct.to_ascii_lowercase();
+        if !ct.contains("application/octet-stream") {
+            return IMAGE_TYPES
+                .iter()
+                .find(|(mime, _)| ct.contains(mime))
+                .map(|(_, ext)| *ext);
+        }
+    }
+    if body.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if body.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else {
+        let head = &body[..body.len().min(512)];
+        let head = String::from_utf8_lossy(head);
+        head.contains("<svg").then_some("svg")
+    }
+}
+
+#[async_trait]
+impl Tool for ReadImage {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_image".to_string(),
+            // The spec states the tool's live authority (CAP-3a).
+            description: format!(
+                "Fetch an image (SVG/PNG/JPEG) and save it for the user to \
+                 view. May read only these origins: {}. Returns the file path.",
+                self.origins.list().join(", ")
+            ),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "absolute image URL on a granted origin"
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    fn available(&self) -> bool {
+        !self.origins.is_empty()
+    }
+
+    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+        let target = required_string(&args, "read_image", "url")?;
+        let url = self.origins.resolve(target)?; // CAP-2 before any network
+        let mut response = self.client.get(url.clone()).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("read_image failed with HTTP {status} for {url}");
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+
+        // Content-Length preflight, then a streamed hard cap: never buffer a
+        // pathological body via `bytes().await`.
+        if let Some(len) = response.content_length() {
+            if len as usize > self.max_bytes {
+                bail!(
+                    "read_image: response too large ({len} bytes > {} byte limit) for {url}",
+                    self.max_bytes
+                );
+            }
+        }
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > self.max_bytes {
+                bail!(
+                    "read_image: response exceeded the {} byte limit for {url}",
+                    self.max_bytes
+                );
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        // Type honesty: only image types a host can show are saved; anything
+        // else teaches the text tools.
+        let Some(ext) = image_ext(content_type.as_deref(), &body) else {
+            bail!(
+                "read_image: {url} is not an SVG/PNG/JPEG image ({}); use \
+                 read_page for HTML or read_url for raw content",
+                content_type.as_deref().unwrap_or("no content-type")
+            );
+        };
+
+        let name = format!("img-{:016x}.{ext}", fnv1a(&body));
+        let out = self.dir.resolve(&name)?; // IMG-1 confinement
+        tokio::fs::write(&out, &body).await?;
+        Ok(format!(
+            "wrote {} ({ext}, {} bytes)",
+            out.display(),
+            body.len()
+        ))
     }
 }
 
@@ -1451,12 +1714,7 @@ impl Tool for Plot {
             "series": series,
         });
         let payload = serde_json::to_string(&resolved)?;
-        let mut hash = 0xcbf29ce484222325u64; // FNV-1a
-        for b in payload.as_bytes() {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        let name = format!("plot-{hash:016x}.png");
+        let name = format!("plot-{:016x}.png", fnv1a(payload.as_bytes()));
         let out = self.sandbox.resolve(&name)?; // PLOT-2 confinement
 
         let mut full = resolved;
@@ -2125,6 +2383,217 @@ mod tests {
         let result = tools.dispatch(&ToolCall {
             name: "read_url".to_string(),
             args: json(r#"{"url": "https://evil.example/doc"}"#),
+        });
+        assert!(result.is_error);
+        assert!(result.content.contains("escapes the granted web origins"));
+    }
+
+    #[tokio::test]
+    async fn read_page_lists_article_images_for_discovery() {
+        // upholds: WIN-1 (header metadata never disturbs the window tiling)
+        // + the read_page → read_image discovery seam: the readable region's
+        // images are listed once, in window 0's header — absolute (relative
+        // srcs resolved against the page), alt-labeled, srcset never
+        // mistaken for src.
+        let html = r#"<!DOCTYPE html><html><head><title>Impossible Objects</title></head>
+<body><article>
+<h1>Impossible Objects</h1>
+<img src="/img/tri.svg" alt="Penrose triangle" srcset="/img/tri-2x.png 2x">
+<p>The Penrose triangle is an impossible object first popularized in the
+nineteen fifties, appearing widely in art and mathematical illustration as a
+canonical example of a figure that cannot be realized in three dimensions.</p>
+<img src="https://files.example/stairs.png" alt="Penrose stairs">
+<p>The related Penrose stairs construction loops a staircase back onto
+itself, ascending forever within a closed circuit, and features in several
+well known works of art depicting paradoxical architecture.</p>
+</article></body></html>"#;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/objects"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadPage::with_limits(origins, 1_000_000, 80).unwrap());
+        let first = read_window(&tools, "/objects", 0).await;
+        assert!(!first.is_error, "{}", first.content);
+        assert!(
+            first
+                .content
+                .contains("[images — fetch one with read_image:"),
+            "{}",
+            first.content
+        );
+        assert!(
+            first
+                .content
+                .contains(&format!("{}/img/tri.svg (Penrose triangle)", server.uri())),
+            "relative src resolves absolute, alt rides along: {}",
+            first.content
+        );
+        assert!(
+            first
+                .content
+                .contains("https://files.example/stairs.png (Penrose stairs)"),
+            "{}",
+            first.content
+        );
+        assert!(
+            !first.content.contains("tri-2x"),
+            "srcset is not src: {}",
+            first.content
+        );
+
+        // Discovery rides window 0 only; continuations stay pure text.
+        let next = next_offset(&first.content).expect("truncated at 80 chars");
+        let cont = read_window(&tools, "/objects", next).await;
+        assert!(!cont.is_error);
+        assert!(
+            !cont.content.contains("[images"),
+            "listed once, in the first window: {}",
+            cont.content
+        );
+    }
+
+    #[tokio::test]
+    async fn read_image_saves_typed_confined_and_content_hashed() {
+        // upholds: IMG-1 — the artifact lands inside the tool's WriteDir at
+        // a content-hash name with an honest extension; identical bytes
+        // share an artifact.
+        let server = MockServer::start().await;
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-image-bytes";
+        Mock::given(method("GET"))
+            .and(path("/tri.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(png),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadImage::new(origins, dir.path().join("images")).unwrap());
+        let call = || ToolCall {
+            name: "read_image".to_string(),
+            args: json(r#"{"url": "/tri.png"}"#),
+        };
+        let first = tools.dispatch_async(&call()).await;
+        let ToolOutcome::Success { content } = &first else {
+            panic!("{first:?}");
+        };
+        assert!(content.starts_with("wrote "), "{content}");
+        let path = content.split_whitespace().nth(1).unwrap();
+        assert!(
+            std::path::Path::new(path).starts_with(dir.path().join("images")),
+            "IMG-1 confinement: {path}"
+        );
+        assert!(path.ends_with(".png"), "honest extension: {path}");
+        assert_eq!(std::fs::read(path).unwrap(), png, "bytes saved verbatim");
+
+        let second = tools.dispatch_async(&call()).await;
+        assert!(
+            second.render_for_model("").content.contains(path),
+            "identical bytes share an artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_image_sniffs_svg_when_the_server_is_silent() {
+        // upholds: IMG-1 — an absent/octet-stream content-type falls back
+        // to a magic-byte sniff; an SVG body saves as .svg.
+        let server = MockServer::start().await;
+        let svg = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>"#;
+        Mock::given(method("GET"))
+            .and(path("/penrose"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(svg.as_slice()))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadImage::new(origins, dir.path()).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_image".to_string(),
+                args: json(r#"{"url": "/penrose"}"#),
+            })
+            .await;
+        let ToolOutcome::Success { content } = &result else {
+            panic!("{result:?}");
+        };
+        assert!(content.contains(".svg"), "sniffed as svg: {content}");
+    }
+
+    #[tokio::test]
+    async fn read_image_gates_non_images_and_size() {
+        // upholds: IMG-1 — a non-image response is a teaching rejection
+        // (never saved), and the input cap trips while streaming.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html>not an image</html>"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/huge.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadImage::new(origins.clone(), dir.path()).unwrap());
+        let capped = Tools::new().with(ReadImage::with_max_bytes(origins, dir.path(), 16).unwrap());
+
+        let html = tools
+            .dispatch_async(&ToolCall {
+                name: "read_image".to_string(),
+                args: json(r#"{"url": "/page"}"#),
+            })
+            .await
+            .render_for_model("read_image");
+        assert!(html.is_error);
+        assert!(
+            html.content.contains("read_page"),
+            "teaches the text tools: {}",
+            html.content
+        );
+
+        let huge = capped
+            .dispatch_async(&ToolCall {
+                name: "read_image".to_string(),
+                args: json(r#"{"url": "/huge.png"}"#),
+            })
+            .await
+            .render_for_model("read_image");
+        assert!(huge.is_error);
+        assert!(huge.content.contains("byte limit"), "{}", huge.content);
+    }
+
+    #[test]
+    fn read_image_rejects_escaping_origins_before_network() {
+        // upholds: CAP-2 — an arbitrary host cannot be smuggled through args.
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one("https://example.com").unwrap();
+        let tools = Tools::new().with(ReadImage::new(origins, dir.path()).unwrap());
+        let result = tools.dispatch(&ToolCall {
+            name: "read_image".to_string(),
+            args: json(r#"{"url": "https://evil.example/tri.svg"}"#),
         });
         assert!(result.is_error);
         assert!(result.content.contains("escapes the granted web origins"));
@@ -2821,6 +3290,7 @@ position over the coming years.</p>
                 Arc::new(CachedPage {
                     title: String::new(),
                     text: format!("page {i}"),
+                    images: Vec::new(),
                 }),
             );
         }

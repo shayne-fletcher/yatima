@@ -26,8 +26,8 @@ use tokio::sync::oneshot;
 use yatima_lib::{
     device, resolve_format, Agent, AgentEvent, AgentStop, Arch, Cancel, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, PlainTemplate, Plot, PlotSandbox,
-    PromptTemplate, QwenToolCall, ReadPage, ReadUrl, ReasoningSplitter, Role, StopReason,
-    ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
+    PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl, ReasoningSplitter, Role,
+    StopReason, ToolCallCodec, ToolOutcome, Tools, Turn, WebOrigins,
 };
 
 /// A turn identifier, monotonic per session. Lets the UI ignore stale events.
@@ -465,10 +465,11 @@ fn web_tools(origins: &WebOrigins) -> Result<Tools> {
             READ_PAGE_MAX_INPUT_BYTES,
             READ_PAGE_MAX_CHARS,
         )?);
-    let plot_dir = std::env::home_dir()
-        .map(|home| home.join(".cache/yatima/plots"))
-        .unwrap_or_else(|| std::env::temp_dir().join("yatima-plots"));
-    match PlotSandbox::system(&plot_dir) {
+    let cache = std::env::home_dir()
+        .map(|home| home.join(".cache/yatima"))
+        .unwrap_or_else(std::env::temp_dir);
+    tools = tools.with(ReadImage::new(origins.clone(), cache.join("images"))?);
+    match PlotSandbox::system(cache.join("plots")) {
         Ok(sandbox) => tools = tools.with(Plot::new(sandbox)),
         Err(e) => eprintln!("plot tool unavailable: {e}"),
     }
@@ -543,13 +544,14 @@ fn run_turn(
     }
 }
 
-/// Pop a just-rendered plot in the platform image viewer (macOS `open`).
-/// Fire-and-forget: viewing is a courtesy, never an error — failures are
-/// ignored and a reaper thread waits the child so no zombies accrue. The
-/// path is parsed from the plot tool's `wrote <path> (WxH, N bytes)`
-/// summary and so always points inside the tool's own sandbox (PLOT-2);
-/// this only ever fires for a plot the user just asked for.
-fn open_plot(content: &str) {
+/// Pop a just-produced image artifact (a plot render, a fetched image) in
+/// the platform viewer (macOS `open`). Fire-and-forget: viewing is a
+/// courtesy, never an error — failures are ignored and a reaper thread
+/// waits the child so no zombies accrue. The path is parsed from the
+/// tool's `wrote <path> (…)` summary and so always points inside the
+/// tool's own sandbox (PLOT-2 / IMG-1); this only ever fires for an
+/// artifact the user just asked for.
+fn open_artifact(content: &str) {
     #[cfg(target_os = "macos")]
     if let Some((path, _)) = content
         .strip_prefix("wrote ")
@@ -639,9 +641,9 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     other => format!("  ✗ {}\n", clip(&other.render_for_model("").content, 160)),
                 };
                 fragment(Channel::Reasoning, note);
-                if pending_tool == "plot" {
+                if matches!(pending_tool.as_str(), "plot" | "read_image") {
                     if let ToolOutcome::Success { content } = &outcome {
-                        open_plot(content);
+                        open_artifact(content);
                     }
                 }
                 step_answer.clear();
