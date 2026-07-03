@@ -36,6 +36,12 @@ That command exercises the core path: local model load, prompt rendering, an
 agent turn, a capability-scoped `read_file` tool call under `--root`, and a
 grounded final answer.
 
+The CLI agent also takes `--web-origin <url>` to pre-grant one HTTP(S) origin
+for a one-shot run — the batch shape. For interactive work prefer the
+[TUI](tui.md), where web authority is granted at runtime by simply typing a
+URL (CAP-3), grants accumulate across the session, and long pages stream and
+paginate live.
+
 ## Generate and chat
 
 ```bash

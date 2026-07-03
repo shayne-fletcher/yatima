@@ -19,7 +19,10 @@ yatima is async-first: the agent loop and tool dispatch are async, and inference
 runs as a synchronous compute island that never stalls the executor. From an
 async program, call the `_async` APIs (`turn_async`, `Agent::run_async`,
 `Tools::dispatch_async`) directly; the synchronous methods above are thin shims
-over them for non-async embedders.
+over them for non-async embedders. Agent runs stream (AGENT-4):
+`Agent::run_with_cancellable_async` folds live, classified fragments —
+reasoning, answer prose, tool activity — under a token-level `Cancel`, which
+is how the TUI renders tool-calling turns as they decode.
 
 ```rust
 // inside #[tokio::main(flavor = "multi_thread")]
