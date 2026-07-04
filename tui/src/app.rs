@@ -18,7 +18,9 @@ use ratatui::style::Style;
 use ratatui::Terminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui_textarea::{CursorMove, Input, TextArea};
-use yatima_host::{CancelGate, Channel, HostEvent, HostRequest, ModelInfo, StopKind, TurnId};
+use yatima_host::{
+    CancelGate, Channel, HostEvent, HostRequest, ModelInfo, StopKind, ToolNoteKind, TurnId,
+};
 
 use crate::render;
 
@@ -409,12 +411,19 @@ impl App {
                 }
                 self.append_fragment(channel, &text);
             }
-            // Tool activity (⚙ lines, ok/failed outcomes, the budget warning)
-            // folds into the reasoning pane; a produced artifact carries the
+            // Tool activity folds into the reasoning pane under the terminal's
+            // marker vocabulary (HOST-4: the wire carries kind + payload; the
+            // glyphs are this view's). A successful artifact write carries the
             // `wrote <path>` contract, which opens in the platform viewer.
-            HostEvent::ToolNote { turn_id, text } if self.is_current(turn_id) => {
-                self.append_fragment(Channel::Reasoning, &text);
-                open_artifact(&text);
+            HostEvent::ToolNote {
+                turn_id,
+                kind,
+                text,
+            } if self.is_current(turn_id) => {
+                self.append_fragment(Channel::Reasoning, &tool_note_line(kind, &text));
+                if kind == ToolNoteKind::Success {
+                    open_artifact(&text);
+                }
             }
             // The most recent prompt's token count (the meter numerator); a
             // status fact, set outside the turn guard (single-in-flight, TUI-7).
@@ -475,12 +484,27 @@ impl App {
     }
 }
 
+/// Render a tool-note payload as a line in the terminal's marker vocabulary
+/// (HOST-4: the wire carries `(kind, payload)`; glyphs and indentation are the
+/// view's). A kind this build doesn't know renders unmarked — the protocol
+/// enum is `#[non_exhaustive]`, and the payload alone is still legible.
+fn tool_note_line(kind: ToolNoteKind, text: &str) -> String {
+    match kind {
+        ToolNoteKind::Call => format!("\n⚙ {text}\n"),
+        ToolNoteKind::Success => format!("  ✓ {text}\n"),
+        ToolNoteKind::Failure => format!("  ✗ {text}\n"),
+        ToolNoteKind::Warning => format!("\n⚠ {text}\n"),
+        // Progress, and any kind newer than this build, renders unmarked.
+        _ => format!("  {text}\n"),
+    }
+}
+
 /// Open a just-written image artifact (a plot render, a fetched image) in the
-/// platform viewer (macOS `open`), parsed from a tool outcome note carrying the
-/// `wrote <path> (…)` contract (PLOT-2 / IMG-1). Fire-and-forget: viewing is a
-/// courtesy, never an error — failures are ignored and a reaper thread waits the
-/// child so no zombies accrue. This only ever fires for an artifact the user
-/// just asked for.
+/// platform viewer (macOS `open`), parsed from a successful tool outcome's
+/// payload carrying the `wrote <path> (…)` contract (PLOT-2 / IMG-1).
+/// Fire-and-forget: viewing is a courtesy, never an error — failures are
+/// ignored and a reaper thread waits the child so no zombies accrue. This only
+/// ever fires for an artifact the user just asked for.
 fn open_artifact(note: &str) {
     #[cfg(target_os = "macos")]
     if let Some((path, _)) = note
@@ -745,6 +769,44 @@ mod tests {
             let y = scroll_y(total, viewport, back);
             assert!(y <= total.saturating_sub(viewport), "y={y} total={total}");
         }
+    }
+
+    #[test]
+    fn tool_notes_render_in_the_terminal_vocabulary() {
+        // upholds: HOST-4 — the wire carries (kind, payload); the ✓/✗/⚙/⚠
+        // markers and the fold's indentation are this view's own, and the
+        // rendered line folds into the reasoning pane.
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Call, "plot {…}"),
+            "\n⚙ plot {…}\n"
+        );
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Progress, "fetching"),
+            "  fetching\n"
+        );
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Success, "142 chars"),
+            "  ✓ 142 chars\n"
+        );
+        assert_eq!(tool_note_line(ToolNoteKind::Failure, "boom"), "  ✗ boom\n");
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Warning, "tool-step budget exhausted (6)"),
+            "\n⚠ tool-step budget exhausted (6)\n"
+        );
+
+        let (mut app, _rx) = test_app();
+        app.set_input("hi");
+        app.apply(Intent::Submit);
+        app.on_engine_event(HostEvent::Started { turn_id: 0 });
+        app.on_engine_event(HostEvent::ToolNote {
+            turn_id: 0,
+            kind: ToolNoteKind::Failure,
+            text: "boom".into(),
+        });
+        let Some(Entry::Assistant { reasoning, .. }) = app.transcript.last() else {
+            panic!("expected an assistant entry");
+        };
+        assert_eq!(reasoning, "  ✗ boom\n");
     }
 
     #[test]

@@ -49,8 +49,11 @@ swappable dependency.
   at the next boundary — `StopKind::Stopped`, partial output kept). Its laws:
   `HOST-1` frontends drive turns only through the protocol (none constructs an
   `Agent`/`ChatSession`), `HOST-2` the grant/refusal wording lives only here,
-  `HOST-3` one thread owns the `!Send` engine. Native only — it drags
-  `yatima-lib`; the WASM client consumes only `yatima-protocol`.
+  `HOST-3` one thread owns the `!Send` engine, `HOST-4` tool activity crosses
+  the wire as `(ToolNoteKind, payload)` — clipping is host policy, but the
+  marker vocabulary (the TUI's `✓`/`✗`, egui's glyph-safe `ok`/`failed:`) is
+  each view's own. Native only — it drags `yatima-lib`; the WASM client
+  consumes only `yatima-protocol`.
 - **`yatima-tui`** — an interactive terminal UI (`ratatui`/`crossterm`), a thin
   view over `yatima-host` kept a separate crate so its UI deps never touch the
   lean CLI. It holds only a render *mirror* rebuilt from `HostEvent`s plus

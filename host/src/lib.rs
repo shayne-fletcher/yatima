@@ -35,6 +35,10 @@
 //! - **HOST-3** one engine thread owns the `!Send` engine and session for the
 //!   whole run; the `!Send` types are created inside the thread and never
 //!   cross a thread boundary.
+//! - **HOST-4** tool activity crosses the wire as `(kind, payload)` —
+//!   [`ToolNoteKind`] carries the semantics, and this crate emits no marker
+//!   glyphs or note indentation; the vocabulary a note renders under is view
+//!   policy (cited by `notes_carry_kind_not_typography`).
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -54,7 +58,7 @@ pub mod knobs;
 mod logging;
 
 pub use logging::init_file_logging;
-pub use yatima_protocol::{Channel, HostEvent, HostRequest, ModelInfo, StopKind};
+pub use yatima_protocol::{Channel, HostEvent, HostRequest, ModelInfo, StopKind, ToolNoteKind};
 
 /// A turn identifier, monotonic per session. Lets a frontend ignore stale events.
 pub type TurnId = u64;
@@ -547,9 +551,9 @@ fn run_turn(
 /// [`Channel::Reasoning`], answer prose on [`Channel::Answer`], tool activity as
 /// [`HostEvent::ToolNote`] — and the turn's `cancel` is token-level. A step that
 /// turns out to be a tool call retracts its streamed narration from the answer
-/// pane ([`HostEvent::RetractAnswer`]) and replays it as reasoning, ahead of the
-/// `⚙` activity line. A successful plot/read_image ships its bytes as
-/// [`HostEvent::Image`].
+/// pane ([`HostEvent::RetractAnswer`]) and replays it as reasoning, ahead of
+/// the [`ToolNoteKind::Call`] activity line. A successful plot/read_image
+/// ships its bytes as [`HostEvent::Image`].
 fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     agent: &mut Agent<'_, Engine, K, T>,
     event_tx: &UnboundedSender<HostEvent>,
@@ -566,8 +570,12 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
             text,
         });
     };
-    let note = |text: String| {
-        let _ = event_tx.send(HostEvent::ToolNote { turn_id, text });
+    let note = |kind: ToolNoteKind, text: String| {
+        let _ = event_tx.send(HostEvent::ToolNote {
+            turn_id,
+            kind,
+            text,
+        });
     };
 
     // Answer prose streamed during the *current* step; a ToolCall event means it
@@ -597,36 +605,36 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     fragment(LibChannel::Reasoning, format!("{}\n", narration.trim_end()));
                 }
                 pending_tool = call.name.clone();
-                note(format!(
-                    "\n⚙ {} {}\n",
-                    call.name,
-                    clip(&call.args.to_string(), 160)
-                ));
+                note(
+                    ToolNoteKind::Call,
+                    format!("{} {}", call.name, clip(&call.args.to_string(), 160)),
+                );
             }
             AgentEvent::ToolStarted(_) => {}
             AgentEvent::ToolProgress(message) => {
-                note(format!("  {message}\n"));
+                note(ToolNoteKind::Progress, message);
             }
             AgentEvent::ToolOutcome(outcome) => {
-                // Plain `ok`/`failed:` vocabulary: shared host text renders in
-                // egui too, whose built-in fonts lack ✓/✗ (they show as tofu).
-                let text = match &outcome {
+                // Bare payloads under a semantic kind (HOST-4): clipping is
+                // host policy; the marker each frontend draws is its own.
+                let (kind, text) = match &outcome {
                     ToolOutcome::Success { content } => {
                         let flat = content.trim();
-                        if flat.chars().count() <= knobs::TOOL_NOTE_MAX_CHARS
+                        let text = if flat.chars().count() <= knobs::TOOL_NOTE_MAX_CHARS
                             && !flat.contains('\n')
                         {
-                            format!("  ok {flat}\n")
+                            flat.to_string()
                         } else {
-                            format!("  ok {} chars\n", content.chars().count())
-                        }
+                            format!("{} chars", content.chars().count())
+                        };
+                        (ToolNoteKind::Success, text)
                     }
-                    other => format!(
-                        "  failed: {}\n",
-                        clip(&other.render_for_model("").content, 160)
+                    other => (
+                        ToolNoteKind::Failure,
+                        clip(&other.render_for_model("").content, 160),
                     ),
                 };
-                note(text);
+                note(kind, text);
                 if matches!(pending_tool.as_str(), "plot" | "read_image") {
                     if let ToolOutcome::Success { content } = &outcome {
                         match read_artifact(content) {
@@ -637,7 +645,7 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                                     name,
                                 });
                             }
-                            Err(e) => note(format!("  failed: artifact: {e}\n")),
+                            Err(e) => note(ToolNoteKind::Failure, format!("artifact: {e}")),
                         }
                     }
                 }
@@ -655,10 +663,10 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                 AgentStop::Final => StopReason::Eos,
                 AgentStop::Stopped => StopReason::Stopped,
                 AgentStop::MaxSteps => {
-                    note(format!(
-                        "\n⚠ tool-step budget exhausted ({})\n",
-                        knobs::AGENT_MAX_STEPS
-                    ));
+                    note(
+                        ToolNoteKind::Warning,
+                        format!("tool-step budget exhausted ({})", knobs::AGENT_MAX_STEPS),
+                    );
                     StopReason::MaxTokens
                 }
             };
@@ -813,5 +821,24 @@ mod tests {
     fn clip_is_char_safe() {
         assert_eq!(clip("hello", 10), "hello");
         assert_eq!(clip("hello", 3), "hel…");
+    }
+
+    #[test]
+    fn notes_carry_kind_not_typography() {
+        // upholds: HOST-4 — the wire carries meaning, never typography: no
+        // marker glyph appears anywhere in this crate's source (the escapes
+        // below keep the scan from tripping on this test itself). The
+        // frontends own the vocabulary a ToolNoteKind renders under.
+        let src = concat!(
+            include_str!("lib.rs"),
+            include_str!("knobs.rs"),
+            include_str!("logging.rs")
+        );
+        for glyph in ['\u{2713}', '\u{2717}', '\u{2699}', '\u{26a0}'] {
+            assert!(
+                !src.contains(glyph),
+                "the host emits marker glyph {glyph}; markers are view policy"
+            );
+        }
     }
 }

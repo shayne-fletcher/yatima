@@ -27,7 +27,7 @@ use eframe::egui;
 
 use yatima_host::{
     init_file_logging, spawn_nonblocking, CancelGate, Channel, HostConfig, HostEvent, HostRequest,
-    ModelInfo,
+    ModelInfo, ToolNoteKind,
 };
 use yatima_lib::{GenOpts, ModelProfile, ModelSource, Sampling};
 use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
@@ -654,13 +654,15 @@ impl GuiApp {
                     self.gen_tokens += 1;
                     self.streaming_reasoning.push_str(&text);
                 }
-                // Tool activity (host text, not model tokens) folds into the
-                // reasoning pane without touching the token counter.
-                HostEvent::ToolNote { text, .. } => {
+                // Tool activity (host events, not model tokens) folds into
+                // the reasoning pane without touching the token counter,
+                // rendered in this view's glyph-safe vocabulary (HOST-4).
+                HostEvent::ToolNote { kind, text, .. } => {
                     if self.turn_start.is_none() {
                         self.turn_start = Some(now);
                     }
-                    self.streaming_reasoning.push_str(&text);
+                    self.streaming_reasoning
+                        .push_str(&tool_note_line(kind, &text));
                 }
                 HostEvent::RetractAnswer { chars, .. } => {
                     // The streamed tail was narration ahead of a tool call —
@@ -1205,6 +1207,23 @@ impl eframe::App for GuiApp {
 
 fn speaker(ui: &mut egui::Ui, who: &str, color: egui::Color32) {
     ui.label(egui::RichText::new(who).strong().color(color));
+}
+
+/// Render a tool-note payload as a line in this view's marker vocabulary
+/// (HOST-4: the wire carries `(kind, payload)`; markers are the view's).
+/// Outcomes are spelled in words — egui's built-in fonts lack `✓`/`✗`, which
+/// render as tofu — while `⚙`/`⚠` are in its emoji fallback and survive. A
+/// kind this build doesn't know renders unmarked (the protocol enum is
+/// `#[non_exhaustive]`, and the payload alone is still legible).
+fn tool_note_line(kind: ToolNoteKind, text: &str) -> String {
+    match kind {
+        ToolNoteKind::Call => format!("\n⚙ {text}\n"),
+        ToolNoteKind::Success => format!("  ok {text}\n"),
+        ToolNoteKind::Failure => format!("  failed: {text}\n"),
+        ToolNoteKind::Warning => format!("\n⚠ {text}\n"),
+        // Progress, and any kind newer than this build, renders unmarked.
+        _ => format!("  {text}\n"),
+    }
 }
 
 /// Format an elapsed-seconds duration as `M:SS` for the status readout.
@@ -1796,5 +1815,32 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap();
         // 20x10 at the 4x upscale clamp → 80x40.
         assert_eq!((img.width(), img.height()), (80, 40));
+    }
+
+    #[test]
+    fn tool_notes_render_in_the_glyph_safe_vocabulary() {
+        // upholds: HOST-4 — the wire carries (kind, payload); this view spells
+        // outcomes in words because egui's built-in fonts lack ✓/✗ (tofu),
+        // while ⚙/⚠ survive via the emoji fallback.
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Call, "plot {…}"),
+            "\n⚙ plot {…}\n"
+        );
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Progress, "fetching"),
+            "  fetching\n"
+        );
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Success, "142 chars"),
+            "  ok 142 chars\n"
+        );
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Failure, "boom"),
+            "  failed: boom\n"
+        );
+        assert_eq!(
+            tool_note_line(ToolNoteKind::Warning, "tool-step budget exhausted (6)"),
+            "\n⚠ tool-step budget exhausted (6)\n"
+        );
     }
 }

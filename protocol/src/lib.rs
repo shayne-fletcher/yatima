@@ -11,12 +11,13 @@
 //!
 //! [`Channel`] and [`StopKind`] mirror the yatima-lib enums of the same
 //! shape; yatima-host owns the conversions (this crate cannot, without
-//! depending on the lib). Tool activity crosses the wire pre-formatted
-//! ([`HostEvent::ToolNote`]) rather than as structured tool data: the
-//! clip/verbatim rules and the plain `ok`/`failed:` vocabulary (egui's fonts
-//! lack `✓`/`✗`, which render as tofu) are host policy, identical across
-//! frontends; a structured variant can arrive later without breaking a
-//! `#[non_exhaustive]` consumer.
+//! depending on the lib). Tool activity crosses the wire as a semantic
+//! [`ToolNoteKind`] plus a bare payload ([`HostEvent::ToolNote`]): the
+//! clip/verbatim rules are host policy, identical across frontends, while
+//! the marker vocabulary is each view's own — a terminal draws `✓`/`✗`,
+//! egui (whose built-in fonts lack those glyphs) spells `ok`/`failed:`.
+//! The wire carries meaning, never typography (HOST-4, registered in
+//! yatima-host).
 //!
 //! # Invariant & law registry
 //!
@@ -53,6 +54,29 @@ pub enum StopKind {
     Stopped,
     /// The degeneration guard stopped a short repeating cycle.
     Repetition,
+}
+
+/// What a [`HostEvent::ToolNote`] line reports — the semantic half of tool
+/// activity. The rendered marker (a terminal's `✓`/`✗`, egui's `ok`/
+/// `failed:`) and the fold's indentation are view policy; the wire carries
+/// meaning, never typography (HOST-4).
+///
+/// `#[non_exhaustive]`: consumers must carry a wildcard arm (rendering the
+/// payload unmarked is a fine fallback), so a new kind is a non-breaking
+/// addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ToolNoteKind {
+    /// The model called a tool (payload: the name and clipped arguments).
+    Call,
+    /// A mid-run progress message from the tool.
+    Progress,
+    /// The tool succeeded (payload: the clipped content or a size summary).
+    Success,
+    /// The tool failed (payload: the clipped error).
+    Failure,
+    /// A host warning (e.g. the tool-step budget was exhausted).
+    Warning,
 }
 
 /// What is running, reported once the model is ready. Every field is a
@@ -102,9 +126,15 @@ pub enum HostEvent {
     /// step they belonged to turned out to be a tool call, so they were
     /// narration and replay on the reasoning channel (AGENT-4).
     RetractAnswer { turn_id: u64, chars: usize },
-    /// A pre-formatted line of tool activity (the `⚙ name {args}` line, an
-    /// `ok`/`failed:` outcome, the tool-budget warning) for the reasoning fold.
-    ToolNote { turn_id: u64, text: String },
+    /// A line of tool activity for the reasoning fold. `kind` carries the
+    /// semantics; `text` is the bare payload, already clipped by host policy.
+    /// The marker it renders under — glyph, word, indentation — is the view's
+    /// (HOST-4).
+    ToolNote {
+        turn_id: u64,
+        kind: ToolNoteKind,
+        text: String,
+    },
     /// An image artifact the turn produced (a plot render, a fetched image):
     /// the file's bytes, already read by the host, and its filename. A
     /// frontend textures/ships them; the terminal frontend may instead open
@@ -181,7 +211,25 @@ mod tests {
     /// A sample of every [`HostEvent`] variant (kept exhaustive by the match
     /// below, which fails to compile if a variant is added without a sample).
     fn every_event() -> Vec<HostEvent> {
-        let all = vec![
+        // Every ToolNoteKind rides the wire (kept exhaustive by this match:
+        // a new kind added without a sample here is a compile error).
+        let kinds = [
+            ToolNoteKind::Call,
+            ToolNoteKind::Progress,
+            ToolNoteKind::Success,
+            ToolNoteKind::Failure,
+            ToolNoteKind::Warning,
+        ];
+        for kind in &kinds {
+            match kind {
+                ToolNoteKind::Call
+                | ToolNoteKind::Progress
+                | ToolNoteKind::Success
+                | ToolNoteKind::Failure
+                | ToolNoteKind::Warning => {}
+            }
+        }
+        let mut all = vec![
             HostEvent::Ready(model_info()),
             HostEvent::Started { turn_id: 1 },
             HostEvent::Fragment {
@@ -192,10 +240,6 @@ mod tests {
             HostEvent::RetractAnswer {
                 turn_id: 1,
                 chars: 7,
-            },
-            HostEvent::ToolNote {
-                turn_id: 1,
-                text: "⚙ plot {…}".into(),
             },
             HostEvent::Image {
                 turn_id: 1,
@@ -220,6 +264,11 @@ mod tests {
             },
             HostEvent::Fatal("no model".into()),
         ];
+        all.extend(kinds.iter().map(|&kind| HostEvent::ToolNote {
+            turn_id: 1,
+            kind,
+            text: "plot {…}".into(),
+        }));
         // Exhaustiveness guard: this match must name every variant, so adding
         // one without adding it to `all` above is a compile error.
         for ev in &all {
