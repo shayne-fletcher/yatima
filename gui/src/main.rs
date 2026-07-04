@@ -157,7 +157,7 @@ commands
   /grants           list granted origins
   /reset            clear the conversation (the model forgets; grants stay)
   /stats            toggle the system panel — state + controls   (alias /control)
-  /cls              clear the screen                              (Ctrl+L)
+  ctrl+l            clear the screen                              (alias /cls)
   /about            about yatima
   /help             this message
   /quit             exit
@@ -206,6 +206,9 @@ struct GuiApp {
     /// When the splash animation began (engine time), so the sigil draws on
     /// once. Reset to `None` on submit so it replays on a return to the splash.
     splash_anim_start: Option<f32>,
+    /// Set by a clear (Ctrl+L / `/cls`): the splash is a welcome, shown before
+    /// the first exchange only — a cleared pane stays empty.
+    splash_retired: bool,
     /// What's running, for the status rail (set once the model is ready).
     info: Option<ModelInfo>,
     /// Whether the `/stats` panel (state + controls) is open.
@@ -262,9 +265,35 @@ struct GuiApp {
     whimsy: bool,
 }
 
+/// Put Source Code Pro at the head of both font families, keeping egui's
+/// built-ins behind it as fallback (they carry the emoji/symbol glyphs a
+/// code face lacks — `⚙`/`⚠` must keep rendering). The *static* Regular
+/// instance is embedded (assets/, OFL-licensed): egui's rasterizer draws a
+/// variable font at its design origin — Source Code Pro's is ExtraLight,
+/// which reads as washed-out — so the machine's variable-font install is
+/// deliberately not used. Embedding also carries the face into the coming
+/// WASM client unchanged.
+fn install_fonts(ctx: &egui::Context) {
+    let bytes = include_bytes!("../assets/SourceCodePro-Regular.ttf");
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "source-code-pro".to_string(),
+        std::sync::Arc::new(egui::FontData::from_static(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "source-code-pro".to_string());
+    }
+    ctx.set_fonts(fonts);
+}
+
 impl GuiApp {
     fn new(cc: &eframe::CreationContext<'_>, cfg: HostConfig, whimsy: bool) -> GuiApp {
         let ctx = cc.egui_ctx.clone();
+        install_fonts(&ctx);
         // The host loads the model on its own thread; Ready (or Fatal) arrives
         // as the first event. A thread-spawn failure here is catastrophic and
         // unrecoverable — there is no engine to talk to.
@@ -291,6 +320,7 @@ impl GuiApp {
             in_flight_turn: None,
             ctx,
             splash_anim_start: None,
+            splash_retired: false,
             info: None,
             show_stats: false,
             input: String::new(),
@@ -609,13 +639,15 @@ impl GuiApp {
     }
 
     /// Clear the screen (Ctrl+L / `/cls`): drop the transcript and any in-flight
-    /// stream, dismiss the help, and replay the splash. The session/model stays.
+    /// stream, and dismiss the help. The session/model stays, and the pane goes
+    /// *empty* — the splash is a welcome, not a screensaver; it never returns
+    /// after the session has begun.
     fn clear(&mut self) {
         self.transcript.clear();
         self.streaming = None;
         self.streaming_reasoning.clear();
         self.help_open = false;
-        self.splash_anim_start = None;
+        self.splash_retired = true;
     }
 
     /// Fold host events into the UI mirror. `now` is the engine clock, used to
@@ -1122,6 +1154,32 @@ impl eframe::App for GuiApp {
                         }
                     }
                 }
+                // Emacs Ctrl+D — delete the character at point (or the
+                // selection). egui's TextEdit has no binding for it; the
+                // TUI's editor carries the full readline map, and fingers
+                // expect the two boxes to agree.
+                if edit.has_focus()
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::D))
+                {
+                    if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), edit.id) {
+                        if let Some(range) = st.cursor.char_range() {
+                            let [lo, hi] = range.sorted_cursors();
+                            let (lo, mut hi) = (lo.index.0, hi.index.0);
+                            if lo == hi {
+                                hi += 1; // no selection: the char at point
+                            }
+                            let mut chars: Vec<char> = self.input.chars().collect();
+                            if lo < chars.len() {
+                                chars.drain(lo..hi.min(chars.len()));
+                                self.input = chars.into_iter().collect();
+                                let cur = egui::text::CCursor::new(lo);
+                                st.cursor
+                                    .set_char_range(Some(egui::text::CCursorRange::one(cur)));
+                                st.store(ui.ctx(), edit.id);
+                            }
+                        }
+                    }
+                }
                 let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 // As a rule: whenever idle and ready, the input holds focus —
                 // unless the user has deliberately focused something else (e.g.
@@ -1150,8 +1208,9 @@ impl eframe::App for GuiApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Empty transcript (loading / pre-first-message): an animated splash.
-            if self.transcript.is_empty() && self.streaming.is_none() {
+            // Empty transcript (loading / pre-first-message): an animated
+            // splash — unless a clear retired it (a cleared pane stays empty).
+            if self.transcript.is_empty() && self.streaming.is_none() && !self.splash_retired {
                 self.show_splash(ui);
                 return;
             }
