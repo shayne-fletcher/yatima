@@ -13,7 +13,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-use yatima_lib::StopReason;
+use yatima_host::StopKind;
 use yatima_text::prettify_math;
 
 use crate::app::{scroll_y, App, Entry};
@@ -223,7 +223,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 // boldly (it's a deliberate act and should read as one); the
                 // automatic stops stay quiet and dim.
                 if let Some(note) = stop_note(*stop) {
-                    let style = if matches!(stop, Some(StopReason::Stopped)) {
+                    let style = if matches!(stop, Some(StopKind::Stopped)) {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
@@ -612,13 +612,13 @@ fn heading_text(line: &str) -> Option<String> {
     }
 }
 
-/// A short note for a non-`Eos` stop reason, or `None` for a clean finish.
-fn stop_note(stop: Option<StopReason>) -> Option<&'static str> {
+/// A short note for a non-`Eos` stop, or `None` for a clean finish.
+fn stop_note(stop: Option<StopKind>) -> Option<&'static str> {
     match stop {
-        Some(StopReason::MaxTokens) => Some("[stopped: hit max tokens]"),
-        Some(StopReason::Repetition) => Some("[stopped: repetition detected]"),
-        Some(StopReason::Stopped) => Some("⊘ interrupted"),
-        Some(StopReason::Eos) | None => None,
+        Some(StopKind::MaxTokens) => Some("[stopped: hit max tokens]"),
+        Some(StopKind::Repetition) => Some("[stopped: repetition detected]"),
+        Some(StopKind::Stopped) => Some("⊘ interrupted"),
+        Some(StopKind::Eos) | None => None,
     }
 }
 

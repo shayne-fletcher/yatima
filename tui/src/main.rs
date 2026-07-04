@@ -18,10 +18,10 @@ use crossterm::terminal::{
 use futures::stream::Stream;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use yatima_host::{init_file_logging, spawn, HostConfig};
 use yatima_lib::{GenOpts, ModelProfile, ModelSource, Sampling};
 
 use yatima_tui::app::{run_loop, App};
-use yatima_tui::engine_actor::{self, EngineConfig};
 
 /// Interactive terminal chat over a local model.
 #[derive(Parser)]
@@ -68,7 +68,10 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    init_file_logging()?;
+    // The terminal belongs to ratatui, so logs go to ~/.cache/yatima/tui.log;
+    // tui-markdown warns per animation frame about glyphs it can't render, so
+    // it stays quiet unless the filter names it.
+    init_file_logging("tui", &["tui_markdown"])?;
 
     // Resolve the profile (if any) → model dir + format + gen defaults. Done
     // before touching the terminal so an error prints normally.
@@ -108,7 +111,7 @@ async fn main() -> Result<()> {
     };
     let format = profile.as_ref().and_then(ModelProfile::format);
 
-    let config = EngineConfig {
+    let config = HostConfig {
         dir,
         cpu: args.cpu,
         opts,
@@ -118,57 +121,14 @@ async fn main() -> Result<()> {
     };
 
     eprintln!("loading model… (first run may fetch weights)");
-    let handle = engine_actor::spawn(config).await?;
+    let (handle, ready) = spawn(config).await?;
 
     let (mut terminal, enhanced) = enter_terminal()?;
-    let app = App::new(handle.req_tx, handle.ready);
+    let app = App::new(handle.req_tx, handle.cancel, ready);
     let key_events = key_event_stream();
     let result = run_loop(&mut terminal, app, handle.event_rx, key_events).await;
     restore_terminal(&mut terminal, enhanced)?;
     result
-}
-
-/// Install a file-writing tracing subscriber when `$YATIMA_LOG` is set (its
-/// value is the filter, e.g. `debug` or `yatima_lib=trace`) — OBS-1: the lib
-/// emits spans/events, the host decides where they go. The terminal belongs
-/// to ratatui, so logs append to `~/.cache/yatima/tui.log`; `debug` shows
-/// each tool call with its full args JSON and outcome, `trace` adds whole
-/// prompts and completions. No env var, no subscriber, no cost.
-fn init_file_logging() -> Result<()> {
-    if std::env::var_os("YATIMA_LOG").is_none() {
-        return Ok(());
-    }
-    let dir = std::env::home_dir()
-        .map(|home| home.join(".cache/yatima"))
-        .unwrap_or_else(std::env::temp_dir);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("tui.log");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    // A bare level ("debug") scopes to yatima: third-party internals
-    // (html5ever narrating every HTML token, hyper, wgpu) drown the log at
-    // debug, and the question the log answers is "what is yatima doing".
-    // A spec with '='/',' is honored verbatim for when those internals are
-    // exactly what's wanted. tui-markdown warns per animation frame about
-    // anything it can't render, so it stays quiet unless named.
-    let value = std::env::var("YATIMA_LOG").unwrap_or_default();
-    let mut spec = if value.contains('=') || value.contains(',') {
-        value
-    } else {
-        format!("warn,yatima_lib={value},yatima_tui={value},yatima_text={value}")
-    };
-    if !spec.contains("tui_markdown") {
-        spec.push_str(",tui_markdown=error");
-    }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(spec))
-        .with_writer(file)
-        .with_ansi(false)
-        .init();
-    eprintln!("logging to {}", path.display());
-    Ok(())
 }
 
 /// The crossterm key-event stream, dropping non-key/errored events upstream of

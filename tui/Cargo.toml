@@ -13,10 +13,15 @@ name = "yatima-tui"
 path = "src/main.rs"
 
 [features]
-metal = ["yatima-lib/metal"]
-fetch = ["yatima-lib/fetch"]
+metal = ["yatima-host/metal"]
+fetch = ["yatima-host/fetch"]
 
 [dependencies]
+# The engine-facing host (the actor, the protocol, file logging). The TUI is a
+# thin view over it (HOST-1).
+yatima-host = { path = "../host" }
+# Still used directly to build the HostConfig (GenOpts/profiles) and to parse
+# user-typed origins (origins_in); the engine itself is reached only via host.
 yatima-lib = { path = "../lib" }
 # Shared model-text prettification (LaTeX → Unicode); pure std, WASM-clean.
 yatima-text = { path = "../text" }
@@ -29,10 +34,6 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-# File logging behind $YATIMA_LOG (OBS-1: the lib emits tracing, the host
-# installs the subscriber). The terminal belongs to ratatui, so logs go to
-# ~/.cache/yatima/tui.log, never stderr.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Markdown → ratatui Text. default-features off drops the syntect code-highlight
 # stack (heavy); we render structure (headings, bold, lists, rules), not syntax.
 tui-markdown = { version = "0.3.8", default-features = false }

@@ -1,8 +1,8 @@
 //! UI state (a render *mirror*), input handling, and the async event loop.
 //!
-//! The engine thread owns the authoritative `ChatSession`; [`App`] holds only a
-//! mirror rebuilt from [`EngineEvent`]s, plus input/scroll/status. State changes
-//! flow through one of two places: a key [`Intent`] (`apply`) or an engine event
+//! The host thread owns the authoritative session; [`App`] holds only a mirror
+//! rebuilt from [`HostEvent`]s, plus input/scroll/status. State changes flow
+//! through one of two places: a key [`Intent`] (`apply`) or a host event
 //! (`on_engine_event`); the transcript grows only through [`App::push_entry`]
 //! (TUI-3). Rendering is a pure projection (`render::ui(&App)`, TUI-2).
 
@@ -18,9 +18,8 @@ use ratatui::style::Style;
 use ratatui::Terminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui_textarea::{CursorMove, Input, TextArea};
-use yatima_lib::{Cancel, Channel, StopReason};
+use yatima_host::{CancelGate, Channel, HostEvent, HostRequest, ModelInfo, StopKind, TurnId};
 
-use crate::engine_actor::{EngineEvent, EngineRequest, Ready, TurnId};
 use crate::render;
 
 /// One rendered transcript entry (the mirror; the actor's session is truth).
@@ -29,7 +28,7 @@ pub enum Entry {
     Assistant {
         reasoning: String,
         answer: String,
-        stop: Option<StopReason>,
+        stop: Option<StopKind>,
     },
     Error(String),
     /// A host notice (grant/revoke confirmations and the like) — visible
@@ -48,8 +47,6 @@ pub struct InFlight {
     /// Whether a cancel has been requested for this turn (the decode stops at the
     /// next token boundary; the indicator shows "cancelling…" until `Done`).
     pub cancelling: bool,
-    /// Control-plane handle: flip it to cancel this turn in flight (TUI-6).
-    pub control: Cancel,
 }
 
 /// Status-bar facts.
@@ -101,7 +98,9 @@ pub enum Intent {
 
 /// The UI render model.
 pub struct App {
-    pub req_tx: Sender<EngineRequest>,
+    pub req_tx: Sender<HostRequest>,
+    /// The host's cancel gate: Esc trips it for the in-flight turn (TUI-6).
+    pub cancel: CancelGate,
     pub transcript: Vec<Entry>,
     /// The input editor — a `tui-textarea` widget owning the prompt buffer,
     /// cursor, and edit history. The app feeds it [`Intent::Edit`] keys and
@@ -132,9 +131,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(req_tx: Sender<EngineRequest>, ready: Ready) -> App {
+    pub fn new(req_tx: Sender<HostRequest>, cancel: CancelGate, ready: ModelInfo) -> App {
         App {
             req_tx,
+            cancel,
             transcript: Vec::new(),
             input: fresh_input(),
             history: Vec::new(),
@@ -143,9 +143,9 @@ impl App {
             scroll_back: 0,
             in_flight: None,
             status: Status {
-                model_label: ready.model_label,
+                model_label: ready.label,
                 backend: ready.backend,
-                format: ready.format.to_string(),
+                format: ready.format,
                 context_length: ready.context_length,
                 prompt_tokens: None,
                 grants: Vec::new(),
@@ -240,7 +240,7 @@ impl App {
         // (clears the engine's authoritative history and the UI mirror). Granted
         // origins survive: capability state is not conversation state (CAP-3).
         if user == "/reset" {
-            let _ = self.req_tx.send(EngineRequest::Reset);
+            let _ = self.req_tx.send(HostRequest::Reset);
             self.transcript.clear();
             self.input = fresh_input();
             self.scroll_back = 0;
@@ -249,19 +249,19 @@ impl App {
         // Grant management (CAP-3: these, plus URLs typed in a message, are
         // the *only* sources of web authority).
         if user == "/grants" {
-            let _ = self.req_tx.send(EngineRequest::ListGrants);
+            let _ = self.req_tx.send(HostRequest::ListGrants);
             self.input = fresh_input();
             return;
         }
         if let Some(origin) = user.strip_prefix("/grant ") {
-            let _ = self.req_tx.send(EngineRequest::Grant {
+            let _ = self.req_tx.send(HostRequest::Grant {
                 origin: origin.trim().to_string(),
             });
             self.input = fresh_input();
             return;
         }
         if let Some(origin) = user.strip_prefix("/revoke ") {
-            let _ = self.req_tx.send(EngineRequest::Revoke {
+            let _ = self.req_tx.send(HostRequest::Revoke {
                 origin: origin.trim().to_string(),
             });
             self.input = fresh_input();
@@ -272,11 +272,10 @@ impl App {
         // act on it immediately. URLs from any other source never pass
         // through here.
         for origin in yatima_lib::origins_in(&user) {
-            let _ = self.req_tx.send(EngineRequest::Grant { origin });
+            let _ = self.req_tx.send(HostRequest::Grant { origin });
         }
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
-        let control = Cancel::new();
         self.push_entry(Entry::User(user.clone()));
         self.in_flight = Some(InFlight {
             turn_id,
@@ -284,12 +283,10 @@ impl App {
             frags: 0,
             answering: false,
             cancelling: false,
-            control: control.clone(),
         });
-        let _ = self.req_tx.send(EngineRequest::Submit {
+        let _ = self.req_tx.send(HostRequest::Submit {
             turn_id,
-            user,
-            control,
+            text: user,
         });
         self.input = fresh_input();
         self.scroll_back = 0; // jump to the latest
@@ -366,13 +363,14 @@ impl App {
         }
     }
 
-    /// Request cancellation of the in-flight turn (TUI-6): flip the shared
-    /// control flag the decode loop polls. The turn stops at the next token
-    /// boundary and arrives as a normal `Done` with `StopReason::Stopped`; until
-    /// then the indicator shows "cancelling…". A no-op when nothing is in flight.
+    /// Request cancellation of the in-flight turn (TUI-6): trip the host's
+    /// cancel gate for this turn, which flips the shared flag the decode loop
+    /// polls. The turn stops at the next token boundary and arrives as a normal
+    /// `Done` with `StopKind::Stopped`; until then the indicator shows
+    /// "cancelling…". A no-op when nothing is in flight.
     fn cancel_in_flight(&mut self) {
         if let Some(f) = self.in_flight.as_mut() {
-            f.control.cancel();
+            self.cancel.cancel(f.turn_id);
             f.cancelling = true;
         }
     }
@@ -388,17 +386,17 @@ impl App {
             .is_some_and(|f| f.turn_id == turn_id)
     }
 
-    /// Fold an engine event into the render mirror (the only event entry point).
-    pub fn on_engine_event(&mut self, event: EngineEvent) {
+    /// Fold a host event into the render mirror (the only event entry point).
+    pub fn on_engine_event(&mut self, event: HostEvent) {
         match event {
-            EngineEvent::Started { turn_id } if self.is_current(turn_id) => {
+            HostEvent::Started { turn_id } if self.is_current(turn_id) => {
                 self.push_entry(Entry::Assistant {
                     reasoning: String::new(),
                     answer: String::new(),
                     stop: None,
                 });
             }
-            EngineEvent::Fragment {
+            HostEvent::Fragment {
                 turn_id,
                 channel,
                 text,
@@ -411,23 +409,29 @@ impl App {
                 }
                 self.append_fragment(channel, &text);
             }
-            EngineEvent::Done {
-                turn_id,
-                answer: _, // the streamed Fragment channels are authoritative
-                stop,
-                prompt_tokens,
-            } if self.is_current(turn_id) => {
+            // Tool activity (⚙ lines, ok/failed outcomes, the budget warning)
+            // folds into the reasoning pane; a produced artifact carries the
+            // `wrote <path>` contract, which opens in the platform viewer.
+            HostEvent::ToolNote { turn_id, text } if self.is_current(turn_id) => {
+                self.append_fragment(Channel::Reasoning, &text);
+                open_artifact(&text);
+            }
+            // The most recent prompt's token count (the meter numerator); a
+            // status fact, set outside the turn guard (single-in-flight, TUI-7).
+            HostEvent::Context { prompt_tokens } => {
+                self.status.prompt_tokens = Some(prompt_tokens);
+            }
+            HostEvent::Done { turn_id, stop } if self.is_current(turn_id) => {
                 self.finish_assistant(stop);
-                self.status.prompt_tokens = prompt_tokens;
                 self.in_flight = None;
             }
-            EngineEvent::Error { turn_id, message } if self.is_current(turn_id) => {
+            HostEvent::Error { turn_id, message } if self.is_current(turn_id) => {
                 self.push_entry(Entry::Error(message));
                 self.in_flight = None;
             }
             // A step that became a tool call retracts its streamed narration
-            // from the answer (the actor replays it as reasoning) — AGENT-4.
-            EngineEvent::RetractAnswer { turn_id, chars } if self.is_current(turn_id) => {
+            // from the answer (the host replays it as reasoning) — AGENT-4.
+            HostEvent::RetractAnswer { turn_id, chars } if self.is_current(turn_id) => {
                 if let Some(Entry::Assistant { answer, .. }) = self.transcript.last_mut() {
                     let keep = answer.chars().count().saturating_sub(chars);
                     *answer = answer.chars().take(keep).collect();
@@ -435,10 +439,14 @@ impl App {
             }
             // Authority changes are always current (not tied to a turn): show
             // the notice and refresh the status rail's grant list (CAP-3).
-            EngineEvent::Grants { origins, message } => {
+            HostEvent::Grants { origins, message } => {
                 self.status.grants = origins;
                 self.push_entry(Entry::Notice(message));
             }
+            // The host reads artifact bytes and ships an Image for a texturing
+            // frontend; the terminal opens the file via the ToolNote path
+            // instead, so these bytes go unused here.
+            HostEvent::Image { .. } => {}
             _ => {} // stale event for a turn that is no longer current.
         }
     }
@@ -456,17 +464,37 @@ impl App {
         }
     }
 
-    /// Record the stop reason. The answer is NOT overwritten here: the streamed
-    /// Fragment channels (classified by the actor's splitter, seeded per format)
-    /// are the single source of truth. `Done.answer` comes from the lib's
-    /// *non-seeded* batch split, which disagrees for a pre-seeded model that
-    /// emitted no `</think>` (it would mislabel the whole reasoning as the
-    /// answer, duplicating it — the "no boundary" bug).
-    fn finish_assistant(&mut self, stop: StopReason) {
+    /// Record the stop reason on the completed assistant entry. The answer is
+    /// never overwritten from the host: the streamed Fragment channels
+    /// (classified by the host's splitter, seeded per format) are the single
+    /// source of truth — `Done` carries only why the turn stopped.
+    fn finish_assistant(&mut self, stop: StopKind) {
         if let Some(Entry::Assistant { stop: s, .. }) = self.transcript.last_mut() {
             *s = Some(stop);
         }
     }
+}
+
+/// Open a just-written image artifact (a plot render, a fetched image) in the
+/// platform viewer (macOS `open`), parsed from a tool outcome note carrying the
+/// `wrote <path> (…)` contract (PLOT-2 / IMG-1). Fire-and-forget: viewing is a
+/// courtesy, never an error — failures are ignored and a reaper thread waits the
+/// child so no zombies accrue. This only ever fires for an artifact the user
+/// just asked for.
+fn open_artifact(note: &str) {
+    #[cfg(target_os = "macos")]
+    if let Some((path, _)) = note
+        .split_once("wrote ")
+        .and_then(|(_, rest)| rest.rsplit_once(" ("))
+    {
+        if let Ok(mut child) = std::process::Command::new("open").arg(path).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = note;
 }
 
 /// A blank input editor configured for the prompt box: a "message" placeholder
@@ -491,7 +519,7 @@ pub fn scroll_y(total: usize, viewport: usize, scroll_back: usize) -> usize {
 pub async fn run_loop<B, S>(
     terminal: &mut Terminal<B>,
     mut app: App,
-    mut event_rx: UnboundedReceiver<EngineEvent>,
+    mut event_rx: UnboundedReceiver<HostEvent>,
     mut key_events: S,
 ) -> Result<()>
 where
@@ -542,7 +570,7 @@ where
             break;
         }
     }
-    let _ = app.req_tx.send(EngineRequest::Shutdown);
+    let _ = app.req_tx.send(HostRequest::Shutdown);
     Ok(())
 }
 
@@ -610,22 +638,24 @@ fn compose_in_editor(draft: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine_actor::Ready;
     use ratatui::backend::TestBackend;
     use std::time::Duration;
     use tokio::sync::mpsc::unbounded_channel;
-    use yatima_lib::{Arch, ChatFormat};
+    use yatima_lib::Cancel;
 
-    fn test_app() -> (App, std::sync::mpsc::Receiver<EngineRequest>) {
+    fn test_app() -> (App, std::sync::mpsc::Receiver<HostRequest>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let ready = Ready {
+        let ready = ModelInfo {
+            label: "test-model".into(),
+            arch: "Qwen2".into(),
             backend: "test".into(),
-            arch: Arch::Qwen2,
-            format: ChatFormat::Qwen,
+            device: "cpu".into(),
+            format: "Qwen".into(),
+            sampling: "greedy".into(),
+            max_tokens: 1024,
             context_length: Some(32768),
-            model_label: "test-model".into(),
         };
-        (App::new(tx, ready), rx)
+        (App::new(tx, CancelGate::new(), ready), rx)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -662,20 +692,21 @@ mod tests {
 
         app.set_input("hi");
         app.apply(Intent::Submit);
-        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
-        app.on_engine_event(EngineEvent::Done {
+        app.on_engine_event(HostEvent::Started { turn_id: 0 });
+        app.on_engine_event(HostEvent::Context {
+            prompt_tokens: 2048,
+        });
+        app.on_engine_event(HostEvent::Done {
             turn_id: 0,
-            answer: "ok".into(),
-            stop: StopReason::Eos,
-            prompt_tokens: Some(2048),
+            stop: StopKind::Eos,
         });
         assert_eq!(app.status.prompt_tokens, Some(2048));
     }
 
     #[test]
     fn esc_cancels_the_in_flight_turn() {
-        // upholds: TUI-6 — Esc flips the shared control flag the decode loop polls
-        // and marks the turn "cancelling"; a no-op when nothing is in flight.
+        // upholds: TUI-6 — Esc trips the host's cancel gate for the in-flight
+        // turn and marks it "cancelling"; a no-op when nothing is in flight.
         assert_eq!(App::classify(key(KeyCode::Esc)), Intent::Cancel);
         let (mut app, _rx) = test_app();
         app.apply(Intent::Cancel); // nothing in flight: harmless
@@ -683,10 +714,17 @@ mod tests {
 
         app.set_input("hi");
         app.apply(Intent::Submit);
-        let control = app.in_flight.as_ref().unwrap().control.clone();
-        assert!(!control.is_cancelled());
+        // The host arms the gate with the turn's cancel before it decodes;
+        // simulate that here, then check Esc flips it.
+        let turn_id = app.in_flight.as_ref().unwrap().turn_id;
+        let cancel = Cancel::new();
+        app.cancel.arm(turn_id, cancel.clone());
+        assert!(!cancel.is_cancelled());
         app.apply(Intent::Cancel);
-        assert!(control.is_cancelled(), "Esc must flip the control flag");
+        assert!(
+            cancel.is_cancelled(),
+            "Esc must trip the gate for the in-flight turn"
+        );
         assert!(
             app.in_flight.as_ref().unwrap().cancelling,
             "the turn is marked cancelling for the indicator"
@@ -717,44 +755,40 @@ mod tests {
         app.set_input("hi");
         app.apply(Intent::Submit);
         assert_eq!(app.transcript.len(), 1); // User
-        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
+        app.on_engine_event(HostEvent::Started { turn_id: 0 });
         assert_eq!(app.transcript.len(), 2); // + Assistant
         for _ in 0..5 {
-            app.on_engine_event(EngineEvent::Fragment {
+            app.on_engine_event(HostEvent::Fragment {
                 turn_id: 0,
                 channel: Channel::Answer,
                 text: "x".into(),
             });
         }
-        app.on_engine_event(EngineEvent::Done {
+        app.on_engine_event(HostEvent::Done {
             turn_id: 0,
-            answer: "xxxxx".into(),
-            stop: StopReason::Eos,
-            prompt_tokens: Some(123),
+            stop: StopKind::Eos,
         });
         assert_eq!(app.transcript.len(), 2, "fragments/done must not append");
     }
 
     #[test]
-    fn done_does_not_overwrite_the_streamed_answer() {
-        // Regression for the "no boundary" bug: a pre-seeded reasoning model that
-        // emits no </think> streams all Reasoning (answer stays empty); Done's
-        // non-seeded batch answer must NOT clobber the empty streamed answer
-        // (else reasoning and answer show the same text).
+    fn streamed_channels_are_the_answer_of_record() {
+        // A pre-seeded reasoning model that emits no </think> streams all
+        // Reasoning (the answer stays empty); the streamed Fragment channels are
+        // authoritative and Done — which carries no answer — leaves them intact
+        // (the old "no boundary" bug was Done clobbering the empty answer).
         let (mut app, _rx) = test_app();
         app.set_input("hi");
         app.apply(Intent::Submit);
-        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
-        app.on_engine_event(EngineEvent::Fragment {
+        app.on_engine_event(HostEvent::Started { turn_id: 0 });
+        app.on_engine_event(HostEvent::Fragment {
             turn_id: 0,
             channel: Channel::Reasoning,
             text: "deep thoughts".into(),
         });
-        app.on_engine_event(EngineEvent::Done {
+        app.on_engine_event(HostEvent::Done {
             turn_id: 0,
-            answer: "deep thoughts".into(), // the batch-split (mis)answer
-            stop: StopReason::MaxTokens,
-            prompt_tokens: Some(10),
+            stop: StopKind::MaxTokens,
         });
         let Entry::Assistant {
             reasoning, answer, ..
@@ -763,10 +797,7 @@ mod tests {
             panic!("expected an assistant entry");
         };
         assert_eq!(reasoning, "deep thoughts");
-        assert_eq!(
-            answer, "",
-            "Done.answer must not overwrite the streamed answer"
-        );
+        assert_eq!(answer, "", "the streamed (empty) answer stands");
     }
 
     #[test]
@@ -776,12 +807,10 @@ mod tests {
         let (mut app, rx) = test_app();
         app.set_input("hi");
         app.apply(Intent::Submit);
-        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
-        app.on_engine_event(EngineEvent::Done {
+        app.on_engine_event(HostEvent::Started { turn_id: 0 });
+        app.on_engine_event(HostEvent::Done {
             turn_id: 0,
-            answer: "ok".into(),
-            stop: StopReason::Eos,
-            prompt_tokens: Some(123),
+            stop: StopKind::Eos,
         });
         assert!(!app.transcript.is_empty());
         let _ = rx.try_recv(); // drain the Submit
@@ -790,7 +819,7 @@ mod tests {
         app.apply(Intent::Submit);
         assert!(app.transcript.is_empty(), "reset clears the mirror");
         assert!(app.in_flight.is_none(), "reset does not start a turn");
-        assert!(matches!(rx.try_recv(), Ok(EngineRequest::Reset)));
+        assert!(matches!(rx.try_recv(), Ok(HostRequest::Reset)));
     }
 
     #[test]
@@ -800,7 +829,7 @@ mod tests {
         app.set_input("first");
         app.apply(Intent::Submit);
         assert!(app.in_flight.is_some());
-        assert!(matches!(rx.try_recv(), Ok(EngineRequest::Submit { .. })));
+        assert!(matches!(rx.try_recv(), Ok(HostRequest::Submit { .. })));
 
         // A second submit while in flight is a no-op: no new request, input kept.
         app.set_input("second");
@@ -820,13 +849,13 @@ mod tests {
         );
         app.apply(Intent::Submit);
         match rx.try_recv() {
-            Ok(EngineRequest::Grant { origin }) => {
+            Ok(HostRequest::Grant { origin }) => {
                 assert_eq!(origin, "https://en.wikipedia.org")
             }
             other => panic!("expected Grant first, got {:?}", other.is_ok()),
         }
         assert!(
-            matches!(rx.try_recv(), Ok(EngineRequest::Submit { .. })),
+            matches!(rx.try_recv(), Ok(HostRequest::Submit { .. })),
             "Submit follows the grant"
         );
         assert!(rx.try_recv().is_err(), "one grant per distinct origin");
@@ -848,12 +877,12 @@ mod tests {
         }
         assert!(matches!(
             rx.try_recv(),
-            Ok(EngineRequest::Grant { origin }) if origin == "https://a.example"
+            Ok(HostRequest::Grant { origin }) if origin == "https://a.example"
         ));
-        assert!(matches!(rx.try_recv(), Ok(EngineRequest::ListGrants)));
+        assert!(matches!(rx.try_recv(), Ok(HostRequest::ListGrants)));
         assert!(matches!(
             rx.try_recv(),
-            Ok(EngineRequest::Revoke { origin }) if origin == "https://a.example"
+            Ok(HostRequest::Revoke { origin }) if origin == "https://a.example"
         ));
     }
 
@@ -862,7 +891,7 @@ mod tests {
         // upholds: CAP-3 — authority changes are visible: the status rail
         // mirrors the granted set and the transcript records the change.
         let (mut app, _rx) = test_app();
-        app.on_engine_event(EngineEvent::Grants {
+        app.on_engine_event(HostEvent::Grants {
             origins: vec!["https://a.example".into()],
             message: "granted read access to https://a.example".into(),
         });
@@ -881,15 +910,15 @@ mod tests {
         let (mut app, _rx) = test_app();
         app.set_input("go");
         app.apply(Intent::Submit);
-        app.on_engine_event(EngineEvent::Started { turn_id: 0 });
+        app.on_engine_event(HostEvent::Started { turn_id: 0 });
         for text in ["Let me ", "fetch that."] {
-            app.on_engine_event(EngineEvent::Fragment {
+            app.on_engine_event(HostEvent::Fragment {
                 turn_id: 0,
                 channel: Channel::Answer,
                 text: text.into(),
             });
         }
-        app.on_engine_event(EngineEvent::RetractAnswer {
+        app.on_engine_event(HostEvent::RetractAnswer {
             turn_id: 0,
             chars: "Let me fetch that.".chars().count(),
         });
@@ -912,7 +941,6 @@ mod tests {
             frags: 0,
             answering: false,
             cancelling: false,
-            control: Cancel::new(),
         });
 
         let (event_tx, event_rx) = unbounded_channel();
@@ -920,7 +948,7 @@ mod tests {
             for i in 0..5 {
                 std::thread::sleep(Duration::from_millis(100));
                 if event_tx
-                    .send(EngineEvent::Fragment {
+                    .send(HostEvent::Fragment {
                         turn_id: 0,
                         channel: Channel::Answer,
                         text: format!("t{i}"),
@@ -1006,11 +1034,9 @@ mod tests {
         assert_eq!(App::classify(key(KeyCode::Up)), Intent::Up);
         assert_eq!(App::classify(key(KeyCode::Down)), Intent::Down);
         let (mut app, _rx) = test_app();
-        let done = |id| EngineEvent::Done {
+        let done = |id| HostEvent::Done {
             turn_id: id,
-            answer: "ok".into(),
-            stop: StopReason::Eos,
-            prompt_tokens: None,
+            stop: StopKind::Eos,
         };
         app.set_input("first");
         app.apply(Intent::Submit);

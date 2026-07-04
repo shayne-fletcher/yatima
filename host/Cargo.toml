@@ -1,0 +1,36 @@
+[package]
+name = "yatima-host"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[lib]
+name = "yatima_host"
+path = "src/lib.rs"
+
+# The engine-facing host every yatima frontend shares: it owns the `!Send`
+# engine on a dedicated thread, serves chat and agent turns, and speaks the
+# yatima-protocol event/request planes. Native only (it drags yatima-lib /
+# candle); the WASM client consumes yatima-protocol directly and never depends
+# on this crate. It sits between yatima-lib and the frontends in the DAG
+# (LAYER-1: frontends → yatima-host → yatima-lib; never sideways, never up).
+[features]
+metal = ["yatima-lib/metal"]
+fetch = ["yatima-lib/fetch"]
+
+[dependencies]
+yatima-lib = { path = "../lib" }
+yatima-protocol = { path = "../protocol" }
+anyhow = "1"
+# The event plane is a tokio unbounded channel the async UI loop selects on;
+# `sync` is the only feature needed (decode is sync on a plain OS thread, not
+# a runtime worker — CMP-1 / RT-2).
+tokio = { version = "1", features = ["sync"] }
+# File logging behind $YATIMA_LOG (OBS-1: the lib emits tracing, the host
+# installs the subscriber). The frontend owns the screen, so logs go to a
+# per-host file under ~/.cache/yatima, never stdout/stderr.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+yatima-lib = { path = "../lib", features = ["fetch"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
