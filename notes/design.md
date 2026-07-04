@@ -746,6 +746,19 @@ Grouped by area; rough priority within each. Items marked *(lesson)* were tried
 and deliberately shelved — the note records why so we don't repeat them.
 
 ### Chat
+- **Markdown vs raw rendering, toggleable.** Both frontends render answers
+  through a presentation stack (TUI: `tui-markdown` + the `yatima-text`
+  prettify pass; GUI: `egui_commonmark` + prettify + image-link taming). A
+  toggle (`/raw`, and a `/stats` checkbox in the GUI) should show the
+  **verbatim** answer — no markdown, no LaTeX prettifying, no link taming —
+  because sometimes the reader needs what the model actually emitted:
+  debugging model behaviour (the `![](file://…)` and `\( 9\pi \)`
+  episodes were only diagnosable from raw text), copying exact characters,
+  or auditing the presentation layer itself. Doctrine fit: the transcript
+  mirror gains a second, unfiltered view of the same truth — rendering is a
+  *view* choice, never a mutation (the runner's session is already the
+  authority). Per-message would be a refinement; session-global toggle is
+  the slice.
 - **Context-length handling — a staged, robust progression.** The multi-turn
   REPL (and the agent loop sooner, via tool results) grows the transcript until
   it exceeds the model's window; today **nothing checks**, so the failure is
