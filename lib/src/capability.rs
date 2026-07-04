@@ -108,8 +108,11 @@ impl WebOrigin {
     pub fn resolve(&self, target: &str) -> Result<Url> {
         let url = Url::parse(target).or_else(|_| self.origin.join(target))?;
         if !same_origin(&self.origin, &url) {
+            // The reason leads, the URL trails: frontends clip long tool
+            // errors from the tail, and the URL is the long part — the
+            // actionable half must survive the clip.
             bail!(
-                "url {url} escapes web origin {}",
+                "url escapes web origin {}: {url}",
                 self.origin.as_str().trim_end_matches('/')
             );
         }
@@ -192,8 +195,9 @@ impl WebOrigins {
         }
         if let Ok(url) = Url::parse(target) {
             let Some(origin) = set.iter().find(|w| same_origin(w.origin(), &url)) else {
+                // Reason first, URL last (see WebOrigin::resolve on why).
                 bail!(
-                    "url {url} escapes the granted web origins [{}]",
+                    "url escapes the granted web origins [{}]: {url}",
                     set.iter()
                         .map(|w| w.origin().as_str().trim_end_matches('/'))
                         .collect::<Vec<_>>()

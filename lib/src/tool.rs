@@ -960,6 +960,19 @@ impl ReadPage {
                     out.push(')');
                 }
             }
+            // Wikipedia-shaped sites serve images from a sibling origin
+            // (upload.wikimedia.org vs en.wikipedia.org). Naming the missing
+            // grant turns a doomed read_image into a request to the user —
+            // who alone mints authority (CAP-3).
+            let ungranted = ungranted_image_origins(&page.images, &self.origins);
+            if !ungranted.is_empty() {
+                out.push_str("\n  not granted: ");
+                out.push_str(&ungranted.join(", "));
+                out.push_str(
+                    " — read_image will refuse these; ask the user \
+                              to /grant first",
+                );
+            }
             out.push(']');
         }
         out.push_str("\n\n");
@@ -1173,6 +1186,29 @@ fn attr_value(tag: &str, name: &str) -> Option<String> {
 
 /// The readable region's `<img>` sources with their alt text: resolved
 /// absolute against the page URL, deduped in document order, capped at
+/// The origins of listed images the held origin set cannot reach — deduped,
+/// render-ready (`scheme://host[:port]`), listing order. These are the
+/// grants a `read_image` on the listing would need but does not have.
+fn ungranted_image_origins(images: &[(String, String)], origins: &WebOrigins) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (src, _) in images {
+        if origins.resolve(src).is_ok() {
+            continue;
+        }
+        let Ok(url) = Url::parse(src) else {
+            continue;
+        };
+        let origin = url.origin().ascii_serialization();
+        if origin == "null" {
+            continue; // opaque (data:, blob:) — no origin to name
+        }
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    out
+}
+
 /// [`READ_PAGE_MAX_IMAGES`] — what `read_page` lists so the model can
 /// discover something worth a `read_image` call.
 fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
@@ -2468,6 +2504,16 @@ well known works of art depicting paradoxical architecture.</p>
             "srcset is not src: {}",
             first.content
         );
+        // The off-origin image's missing grant is named (CAP-3: the model
+        // must ask the user, not fail into a refusal it can't see coming);
+        // the on-origin image draws no note.
+        assert!(
+            first
+                .content
+                .contains("not granted: https://files.example — read_image will refuse"),
+            "{}",
+            first.content
+        );
 
         // Discovery rides window 0 only; continuations stay pure text.
         let next = next_offset(&first.content).expect("truncated at 80 chars");
@@ -2477,6 +2523,28 @@ well known works of art depicting paradoxical architecture.</p>
             !cont.content.contains("[images"),
             "listed once, in the first window: {}",
             cont.content
+        );
+    }
+
+    #[test]
+    fn ungranted_image_origins_name_the_missing_grants() {
+        // The origins a read_image on the listing would need but lacks:
+        // deduped, opaque schemes skipped, granted ones silent.
+        let origins = WebOrigins::one("https://en.wikipedia.org").unwrap();
+        let img = |src: &str| (src.to_string(), String::new());
+        let images = vec![
+            img("https://en.wikipedia.org/logo.png"),
+            img("https://upload.wikimedia.org/a.jpg"),
+            img("https://upload.wikimedia.org/b.jpg"),
+            img("data:image/png;base64,AAAA"),
+        ];
+        assert_eq!(
+            ungranted_image_origins(&images, &origins),
+            ["https://upload.wikimedia.org"]
+        );
+        assert!(
+            ungranted_image_origins(&images[..1], &origins).is_empty(),
+            "an all-granted listing draws no note"
         );
     }
 
