@@ -47,9 +47,9 @@ const METAL_KV_CLIFF: usize = 8_192;
 
 /// The deepest KV depth at which the workaround has been observed to hold
 /// (a coherent 15.5k-token prefill mid-marathon); ≥18k is known garbage.
-/// CTX-2 warns for the band and hard-warns past this. See
-/// `notes/metal-kv-cliff.md`.
-const METAL_KV_VALIDATED: usize = 15_000;
+/// CTX-2 warns for the band and hard-warns past this. Public so a host's
+/// user-facing warning can name the bound. See `notes/metal-kv-cliff.md`.
+pub const METAL_KV_VALIDATED: usize = 15_000;
 
 /// How the next token is chosen. Replaces the old `temperature <= 0` sentinel
 /// with an explicit choice — greedy carries no temperature, and seed is
@@ -568,14 +568,19 @@ fn context_length_from_config(config: &serde_json::Value) -> Option<usize> {
 /// CTX-2: how a Metal generation relates to the corruption depths — `None`
 /// under the cliff, `Mitigated` in the band the fork's sync workaround is
 /// validated for, `Unreliable` past the deepest depth it has been seen to
-/// hold. Pure so it is testable without a model.
+/// hold. Pure so it is testable without a model. Public so a host can put
+/// the risk in front of the user — the engine's own warning is a log line
+/// nothing surfaces (see `notes/metal-kv-cliff.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KvDepthRisk {
+pub enum KvDepthRisk {
     Mitigated,
     Unreliable,
 }
 
-fn metal_kv_depth_risk(prompt_tokens: usize, max_tokens: usize) -> Option<KvDepthRisk> {
+/// CTX-2's depth judgment for a Metal run of `prompt_tokens` plus up to
+/// `max_tokens` generated. The caller supplies device knowledge — this is
+/// pure arithmetic against the empirical depths ([`METAL_KV_VALIDATED`]).
+pub fn metal_kv_depth_risk(prompt_tokens: usize, max_tokens: usize) -> Option<KvDepthRisk> {
     let deepest = prompt_tokens.saturating_add(max_tokens);
     if deepest > METAL_KV_VALIDATED {
         Some(KvDepthRisk::Unreliable)

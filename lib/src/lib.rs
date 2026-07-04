@@ -122,7 +122,10 @@
 //! - **AGENT-3** across runs, an [`Agent`]'s session history carries only each
 //!   completed exchange's user turn and final answer — tool rounds and
 //!   reasoning are ephemeral to their run (the working-matter analogue of
-//!   REASON-1), and an interrupted run leaves history untouched.
+//!   REASON-1), and an interrupted run leaves history untouched. A Final
+//!   answer that looks like decode degeneration ([`looks_degenerate`], the
+//!   CHAT-2 judgment) also commits nothing (cited by
+//!   `a_degenerate_final_answer_commits_nothing`).
 //! - **AGENT-4** agent steps stream: each decode's text arrives live as
 //!   classified [`AgentEvent::Fragment`]s (reasoning vs answer — REASON-1
 //!   holds mid-stream), codec markup never reaches the answer channel (the
@@ -217,6 +220,10 @@
 //! - **CHAT-1** a [`ChatSession`] turn is atomic: if its completion errors, the
 //!   user turn is rolled back so the transcript is unchanged. A failed turn never
 //!   poisons the session — a later turn re-renders clean history and succeeds.
+//! - **CHAT-2** a final answer that looks like decode degeneration
+//!   ([`looks_degenerate`] — the Metal KV-cliff garbage modes) rolls the
+//!   exchange back the same way: the caller still sees the text, but it never
+//!   re-enters a prompt (cited by `a_degenerate_turn_is_not_committed`).
 
 mod agent;
 mod cancel;
@@ -236,13 +243,13 @@ mod transcript;
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
 pub use cancel::Cancel;
 pub use capability::{origins_in, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir};
-pub use chat::ChatSession;
+pub use chat::{looks_degenerate, ChatSession};
 pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
 pub use engine::ensure_model_blocking;
 pub use engine::{
-    device, is_model_present, Arch, Engine, GenOpts, Generation, PrefillLogits, PrefillProgress,
-    Sampling, StopReason, TokenLogit,
+    device, is_model_present, metal_kv_depth_risk, Arch, Engine, GenOpts, Generation, KvDepthRisk,
+    PrefillLogits, PrefillProgress, Sampling, StopReason, TokenLogit, METAL_KV_VALIDATED,
 };
 pub use host::{
     caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelProfile, ModelSource,

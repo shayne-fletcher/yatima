@@ -48,6 +48,9 @@ pub struct ChatSession<'a, C: Completer, T: PromptTemplate> {
     /// Tokens in the most recent rendered prompt (for a host's context meter),
     /// if the completer exposes a tokenizer; `None` otherwise.
     last_prompt_tokens: Option<usize>,
+    /// The most recent *degenerate* answer, held outside the transcript
+    /// (CHAT-2) so the turn can still hand its text back as `&str`.
+    uncommitted: String,
 }
 
 impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
@@ -63,6 +66,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             last_stop: None,
             last_reasoning: None,
             last_prompt_tokens: None,
+            uncommitted: String::new(),
         }
     }
 
@@ -113,6 +117,20 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         // `last_reasoning`, never re-fed into the next prompt (REASON-1).
         let Reasoned { reasoning, answer } = split_reasoning(&completion.text);
         self.last_reasoning = reasoning;
+        // A degenerate answer never enters history (CHAT-2): committed garbage
+        // re-renders into every later prompt and poisons the session. The
+        // exchange rolls back whole, as CHAT-1 does on error; the text is
+        // still handed back (stashed outside the transcript) so the caller
+        // can show what happened.
+        if looks_degenerate(&answer) {
+            tracing::warn!(
+                chars = answer.chars().count(),
+                "final answer looks degenerate; exchange not committed (CHAT-2)"
+            );
+            self.turns.pop();
+            self.uncommitted = answer;
+            return Ok(&self.uncommitted);
+        }
         self.turns.push(Turn {
             role: Role::Assistant,
             content: answer,
@@ -174,6 +192,18 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         // answer-only so history stays clean (REASON-1).
         let Reasoned { reasoning, answer } = split_reasoning(&completion.text);
         self.last_reasoning = reasoning;
+        // CHAT-2: a degenerate answer rolls the exchange back (see
+        // `turn_async`); the streamed tokens cannot be un-emitted, but the
+        // stored history stays clean.
+        if looks_degenerate(&answer) {
+            tracing::warn!(
+                chars = answer.chars().count(),
+                "final answer looks degenerate; exchange not committed (CHAT-2)"
+            );
+            self.turns.pop();
+            self.uncommitted = answer;
+            return Ok(&self.uncommitted);
+        }
         self.turns.push(Turn {
             role: Role::Assistant,
             content: answer,
@@ -228,6 +258,30 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
     pub fn history(&self) -> &[Turn] {
         &self.turns
     }
+}
+
+/// True when a final answer's tail looks like decode degeneration — the
+/// Metal KV-cliff garbage modes (ASCII punctuation soup `,,,,!0…`, digit
+/// runs; `notes/metal-kv-cliff.md`) rather than prose or code. This is the
+/// judgment CHAT-2 and AGENT-3's degenerate case gate history commits on,
+/// and a host uses to tell the user why an answer was not kept.
+///
+/// Deliberately conservative: only a *sustained* non-alphabetic tail
+/// convicts — prose and code both keep letters flowing, and an answer
+/// shorter than the window never convicts. Known tradeoffs: a long purely
+/// numeric table tail can false-positive (cost: the exchange is re-asked,
+/// not lost); the non-ASCII "wave" mode (`퓮퓮…`) is deliberately out of
+/// scope — those codepoints are alphabetic, and convicting on them would
+/// convict every CJK answer. That mode trips the repetition guard instead.
+pub fn looks_degenerate(answer: &str) -> bool {
+    const TAIL_CHARS: usize = 120;
+    const ALPHA_MIN_PERCENT: usize = 20;
+    let tail: Vec<char> = answer.chars().rev().take(TAIL_CHARS).collect();
+    if tail.len() < TAIL_CHARS {
+        return false;
+    }
+    let alpha = tail.iter().filter(|c| c.is_alphabetic()).count();
+    alpha * 100 < TAIL_CHARS * ALPHA_MIN_PERCENT
 }
 
 #[cfg(test)]
@@ -327,6 +381,59 @@ mod tests {
             !chat.completer.last_prompt.contains("poison me"),
             "the failed message must not reach the model's prompt"
         );
+    }
+
+    #[test]
+    fn degeneration_judgment_convicts_soup_spares_prose_and_code() {
+        // The KV-cliff garbage modes convict; real answer shapes do not.
+        let soup = format!(
+            "The Holy Sepulchre Bicycle] ({}!0 ... -lnd",
+            ",".repeat(120)
+        );
+        assert!(looks_degenerate(&soup), "punctuation soup convicts");
+        let digits = format!("answer: {}", "8, 0, 0, ".repeat(20));
+        assert!(looks_degenerate(&digits), "digit runs convict");
+
+        assert!(!looks_degenerate("short"), "short answers never convict");
+        let prose = "The road has historical significance as part of the \
+                     route used by soldiers traveling south during the \
+                     Invasion of Waikato in the 1860s, and later became a \
+                     center for brewers.";
+        assert!(!looks_degenerate(prose), "prose is spared");
+        let code = format!(
+            "fn scroll_y(total: usize, viewport: usize) -> usize {{\n    \
+             total.saturating_sub(viewport)\n}}\n{}",
+            "// the result is in [0, total - viewport]\n".repeat(3)
+        );
+        assert!(!looks_degenerate(&code), "code keeps letters flowing");
+    }
+
+    #[test]
+    fn a_degenerate_turn_is_not_committed() {
+        // upholds: CHAT-2 — a final answer that looks like decode
+        // degeneration rolls the exchange back (like CHAT-1 on error): the
+        // caller still sees the text, but the next prompt re-renders clean
+        // history, so one poisoned answer cannot poison the session.
+        let soup = format!("garbage{}", ",!0.".repeat(40));
+        let scripted = [soup.as_str(), "recovered"];
+        let mut model = Scripted::new(&scripted);
+        let mut chat = ChatSession::new(&mut model, PlainTemplate).with_system("sys");
+
+        let reply = chat.turn("first question").unwrap().to_string();
+        assert_eq!(reply, soup, "the degenerate text is still handed back");
+        assert_eq!(
+            chat.history().len(),
+            1,
+            "a degenerate exchange must leave history unchanged (CHAT-2)"
+        );
+
+        let reply = chat.turn("second question").unwrap().to_string();
+        assert_eq!(reply, "recovered");
+        assert!(
+            !chat.completer.last_prompt.contains("garbage"),
+            "the degenerate answer must never re-enter a prompt"
+        );
+        assert_eq!(chat.history().len(), 3); // sys, user, assistant
     }
 
     #[test]

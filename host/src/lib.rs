@@ -48,10 +48,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use yatima_lib::{
-    device, resolve_format, Agent, AgentEvent, AgentStop, Cancel, Channel as LibChannel,
-    ChatFormat, ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, PlainTemplate, Plot,
-    PlotSandbox, PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl, ReasoningSplitter,
-    Sampling, StopReason, ToolCallCodec, ToolOutcome, Tools, WebOrigins,
+    device, looks_degenerate, metal_kv_depth_risk, resolve_format, Agent, AgentEvent, AgentStop,
+    Cancel, Channel as LibChannel, ChatFormat, ChatMlTemplate, ChatSession, Engine, GenOpts,
+    JsonToolCall, KvDepthRisk, PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall,
+    ReadImage, ReadPage, ReadUrl, ReasoningSplitter, Sampling, StopReason, ToolCallCodec,
+    ToolOutcome, Tools, WebOrigins, METAL_KV_VALIDATED,
 };
 
 pub mod knobs;
@@ -187,6 +188,14 @@ fn actor_main(
         return; // the frontend gave up during load.
     }
 
+    // What the CTX-2 surface needs per turn: whether decode runs on Metal
+    // (mirrors ModelInfo's device judgment) and the per-turn budget the risk
+    // bound adds to the prompt depth.
+    let watch = DepthWatch {
+        metal: !config.cpu,
+        max_tokens: config.opts.max_tokens,
+    };
+
     // Tool-trained formats serve the sessionful agent from turn one: the web
     // tools hide themselves while the origin set is empty (CAP-3a), so pre-grant
     // the model sees exactly the no-authority tools (plot), and a grant simply
@@ -198,6 +207,7 @@ fn actor_main(
             format,
             config.system.clone(),
             config.opts.clone(),
+            watch,
             &req_rx,
             &event_tx,
             &gate,
@@ -215,6 +225,7 @@ fn actor_main(
             ChatMlTemplate,
             system,
             config.opts,
+            watch,
             &origins,
             &req_rx,
             &event_tx,
@@ -227,6 +238,7 @@ fn actor_main(
             PlainTemplate,
             system,
             config.opts,
+            watch,
             &origins,
             &req_rx,
             &event_tx,
@@ -267,6 +279,49 @@ fn sampling_summary(sampling: Sampling) -> String {
     }
 }
 
+/// Per-turn facts the CTX-2 surface needs: whether decode runs on Metal and
+/// the token budget the risk bound adds to the prompt depth.
+#[derive(Clone, Copy)]
+struct DepthWatch {
+    metal: bool,
+    max_tokens: usize,
+}
+
+/// CTX-2, surfaced: the engine logs the depth risk where no user looks
+/// (`tracing::warn!` behind `$YATIMA_LOG`); the frontends must *show* it, or
+/// a degenerate answer reads as a broken model rather than a known Metal
+/// cliff (`notes/metal-kv-cliff.md`). Quiet on CPU and in the mitigated
+/// band — only the unreliable depth speaks, as an always-visible app-plane
+/// [`HostEvent::Note`], never inside a foldable reasoning pane.
+fn warn_kv_depth(event_tx: &UnboundedSender<HostEvent>, watch: DepthWatch, prompt_tokens: usize) {
+    if !watch.metal {
+        return;
+    }
+    if metal_kv_depth_risk(prompt_tokens, watch.max_tokens) == Some(KvDepthRisk::Unreliable) {
+        let _ = event_tx.send(HostEvent::Note(format!(
+            "warning: this turn's context (~{prompt_tokens} tokens, up to \
+             ~{} with the reply) is past the ~{METAL_KV_VALIDATED} the Metal \
+             corruption workaround is validated to — output may degenerate; \
+             /reset starts clean (grants survive) [CTX-2]",
+            prompt_tokens.saturating_add(watch.max_tokens),
+        )));
+    }
+}
+
+/// Tell the user when a final answer looked degenerate and so was not kept
+/// (CHAT-2 / AGENT-3's degenerate case — the lib already withheld the
+/// commit; without this note the silent non-commit would be indistinguishable
+/// from normal memory).
+fn note_degenerate_answer(event_tx: &UnboundedSender<HostEvent>, answer: &str) {
+    if looks_degenerate(answer) {
+        let _ = event_tx.send(HostEvent::Note(
+            "the answer above looks degenerate (decode corruption), so it was \
+             not kept in session history — re-ask, or /reset if it recurs"
+                .to_string(),
+        ));
+    }
+}
+
 /// The chat serve loop for chat-only formats: the plain streaming
 /// [`ChatSession`]. Grants are always refused here (CAPS-1 — a chat-only format
 /// cannot enter the tool path); tool-trained formats never enter this loop.
@@ -276,6 +331,7 @@ fn serve_chat(
     format: ChatFormat,
     system: Option<String>,
     opts: GenOpts,
+    watch: DepthWatch,
     req_rx: &Receiver<HostRequest>,
     event_tx: &UnboundedSender<HostEvent>,
     gate: &CancelGate,
@@ -291,7 +347,15 @@ fn serve_chat(
             HostRequest::Submit { turn_id, text } => {
                 let cancel = Cancel::new();
                 gate.arm(turn_id, cancel.clone());
-                run_turn(&mut session, event_tx, format, turn_id, &text, &cancel);
+                run_turn(
+                    &mut session,
+                    event_tx,
+                    format,
+                    turn_id,
+                    &text,
+                    &cancel,
+                    watch,
+                );
                 gate.disarm();
             }
             HostRequest::Cancel { turn_id } => gate.cancel(turn_id),
@@ -316,6 +380,7 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
     template: T,
     system: String,
     opts: GenOpts,
+    watch: DepthWatch,
     origins: &WebOrigins,
     req_rx: &Receiver<HostRequest>,
     event_tx: &UnboundedSender<HostEvent>,
@@ -336,7 +401,7 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
             HostRequest::Submit { turn_id, text } => {
                 let cancel = Cancel::new();
                 gate.arm(turn_id, cancel.clone());
-                run_agent_turn(&mut agent, event_tx, turn_id, &text, &cancel);
+                run_agent_turn(&mut agent, event_tx, turn_id, &text, &cancel, watch);
                 gate.disarm();
             }
             HostRequest::Cancel { turn_id } => gate.cancel(turn_id),
@@ -482,6 +547,7 @@ fn read_artifact(content: &str) -> Result<(Vec<u8>, String)> {
 /// Run one chat turn: stream `turn_streaming`'s raw fragments through a
 /// [`ReasoningSplitter`] (so each emitted [`HostEvent::Fragment`] is already
 /// classified), report the prompt-token count for the meter, then `Done`/`Error`.
+#[allow(clippy::too_many_arguments)]
 fn run_turn(
     session: &mut ChatSession<'_, Engine, Box<dyn PromptTemplate>>,
     event_tx: &UnboundedSender<HostEvent>,
@@ -489,6 +555,7 @@ fn run_turn(
     turn_id: TurnId,
     user: &str,
     cancel: &Cancel,
+    watch: DepthWatch,
 ) {
     let _ = event_tx.send(HostEvent::Started { turn_id });
 
@@ -523,14 +590,16 @@ fn run_turn(
     });
 
     match outcome {
-        Ok(_answer) => {
+        Ok(answer) => {
             // The streamed Fragment channels are the answer's authoritative
             // form; Done carries only why it stopped.
             if let Some(used) = session.last_prompt_tokens() {
                 let _ = event_tx.send(HostEvent::Context {
                     prompt_tokens: used,
                 });
+                warn_kv_depth(event_tx, watch, used);
             }
+            note_degenerate_answer(event_tx, &answer);
             let stop = session.last_stop().unwrap_or(StopReason::Eos);
             let _ = event_tx.send(HostEvent::Done {
                 turn_id,
@@ -560,6 +629,7 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     turn_id: TurnId,
     user: &str,
     cancel: &Cancel,
+    watch: DepthWatch,
 ) {
     let _ = event_tx.send(HostEvent::Started { turn_id });
 
@@ -659,6 +729,18 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
 
     match result {
         Ok(((), run)) => {
+            // The run's deepest step prompt feeds the context meter (the
+            // agent path reported nothing before — precisely the mode that
+            // ran off the Metal cliff unmetered) and the CTX-2 warning.
+            if let Some(used) = agent.last_prompt_tokens() {
+                let _ = event_tx.send(HostEvent::Context {
+                    prompt_tokens: used,
+                });
+                warn_kv_depth(event_tx, watch, used);
+            }
+            if run.stop == AgentStop::Final {
+                note_degenerate_answer(event_tx, &run.answer);
+            }
             let stop = match run.stop {
                 AgentStop::Final => StopReason::Eos,
                 AgentStop::Stopped => StopReason::Stopped,
@@ -821,6 +903,30 @@ mod tests {
     fn clip_is_char_safe() {
         assert_eq!(clip("hello", 10), "hello");
         assert_eq!(clip("hello", 3), "hel…");
+    }
+
+    #[test]
+    fn kv_depth_warning_reaches_the_user_only_when_unreliable() {
+        // upholds: CTX-2 (surfaced) — the unreliable depth warns on the
+        // always-visible Note plane; the mitigated band and CPU runs stay
+        // quiet (the engine's debug log covers them).
+        let watch = |metal| DepthWatch {
+            metal,
+            max_tokens: 1024,
+        };
+        let (tx, mut rx) = unbounded_channel();
+        warn_kv_depth(&tx, watch(true), 16_000);
+        let Ok(HostEvent::Note(message)) = rx.try_recv() else {
+            panic!("expected a Note past the validated depth");
+        };
+        assert!(message.contains("~16000 tokens"), "{message}");
+        assert!(message.contains("may degenerate"), "{message}");
+        assert!(message.contains("/reset"), "{message}");
+
+        warn_kv_depth(&tx, watch(true), 9_000); // mitigated band: quiet
+        warn_kv_depth(&tx, watch(true), 2_000); // shallow: quiet
+        warn_kv_depth(&tx, watch(false), 16_000); // cpu: quiet
+        assert!(rx.try_recv().is_err(), "no other depth may warn");
     }
 
     #[test]

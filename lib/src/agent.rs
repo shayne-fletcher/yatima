@@ -92,6 +92,12 @@ pub struct Agent<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> {
     /// ephemeral to their run and never re-enter a later prompt; an
     /// interrupted or step-exhausted run leaves this untouched.
     history: Vec<Turn>,
+    /// Tokens in the most recently rendered step prompt — the deepest
+    /// context depth the latest run reached (each tool round grows the
+    /// step prompt, so the last step is the deepest). A host reads this
+    /// for its context meter and depth warnings (CTX-2). `None` before any
+    /// run, or when the completer cannot count.
+    last_prompt_tokens: Option<usize>,
 }
 
 impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
@@ -115,6 +121,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             max_steps,
             opts: GenOpts::default(),
             history: Vec::new(),
+            last_prompt_tokens: None,
         }
     }
 
@@ -128,6 +135,13 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
     /// answer, in order (AGENT-3). Empty until a run reaches a final answer.
     pub fn history(&self) -> &[Turn] {
         &self.history
+    }
+
+    /// Tokens in the latest run's deepest step prompt (the context-meter
+    /// numerator and CTX-2 depth input). `None` before any run, or when the
+    /// completer cannot count.
+    pub fn last_prompt_tokens(&self) -> Option<usize> {
+        self.last_prompt_tokens
     }
 
     /// Seed the session history (builder style) — the transplant a host uses
@@ -245,6 +259,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
 
         loop {
             let prompt = self.template.render(&transcript);
+            self.last_prompt_tokens = self.completer.count_tokens(&prompt);
             tracing::trace!(step = steps, prompt_chars = prompt.len(), prompt = %prompt,
                 "agent step prompt");
             // Stream the step's decode (AGENT-4): fragments are classified
@@ -470,8 +485,15 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         // Persist the exchange into session history only when it completed
         // (AGENT-3): the user turn and the final answer. Interrupted or
         // step-exhausted runs leave history untouched, so the caller can
-        // simply re-ask.
-        if stop == AgentStop::Final {
+        // simply re-ask. A Final answer that looks like decode degeneration
+        // (CHAT-2's judgment) also commits nothing — a poisoned answer
+        // re-rendered into every later prompt poisons the whole session.
+        if stop == AgentStop::Final && crate::chat::looks_degenerate(&answer) {
+            tracing::warn!(
+                chars = answer.chars().count(),
+                "final answer looks degenerate; exchange not committed (AGENT-3)"
+            );
+        } else if stop == AgentStop::Final {
             self.history.push(Turn {
                 role: Role::User,
                 content: user.to_string(),
@@ -694,6 +716,31 @@ mod tests {
             .transcript
             .iter()
             .any(|t| t.role == Role::Tool && t.content.contains("the sky is blue")));
+    }
+
+    #[test]
+    fn a_degenerate_final_answer_commits_nothing() {
+        // upholds: AGENT-3 (degenerate case) — a run that reaches Final with
+        // an answer that looks like decode degeneration leaves history
+        // untouched, like an interrupted run: one poisoned answer must not
+        // re-render into every later prompt.
+        let tools = Tools::new();
+        let soup = format!("garbage{}", ",!0.".repeat(40));
+        let scripted = [soup.as_str(), "a clean answer"];
+        let mut model = Scripted::new(&scripted);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5);
+
+        let run = agent.run("first question").unwrap();
+        assert_eq!(run.stop, AgentStop::Final, "the run itself completed");
+        assert_eq!(run.answer, soup, "the text still reaches the caller");
+        assert!(
+            agent.history().is_empty(),
+            "a degenerate exchange must not enter session history"
+        );
+
+        let run = agent.run("second question").unwrap();
+        assert_eq!(run.answer, "a clean answer");
+        assert_eq!(agent.history().len(), 2, "clean exchanges still commit");
     }
 
     #[test]

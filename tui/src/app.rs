@@ -468,6 +468,12 @@ impl App {
                 self.status.grants = origins;
                 self.push_entry(Entry::Notice(message));
             }
+            // App-plane messages (a depth warning, a host notice) are always
+            // current too — dropping one silently is how a known cliff reads
+            // as a broken model (CTX-2, surfaced).
+            HostEvent::Note(message) => {
+                self.push_entry(Entry::Notice(message));
+            }
             // The host reads artifact bytes and ships an Image for a texturing
             // frontend; the terminal opens the file via the ToolNote path
             // instead, so these bytes go unused here.
