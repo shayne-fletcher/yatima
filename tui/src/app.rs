@@ -889,16 +889,18 @@ mod tests {
     #[test]
     fn grants_events_update_status_and_leave_a_notice() {
         // upholds: CAP-3 — authority changes are visible: the status rail
-        // mirrors the granted set and the transcript records the change.
+        // mirrors the granted set and the transcript records the change. (The
+        // message is host-generated — HOST-2 — so this fixture uses a synthetic
+        // one; the wording itself is tested in yatima-host.)
         let (mut app, _rx) = test_app();
         app.on_engine_event(HostEvent::Grants {
             origins: vec!["https://a.example".into()],
-            message: "granted read access to https://a.example".into(),
+            message: "<a grant notice from the host>".into(),
         });
         assert_eq!(app.status.grants, ["https://a.example"]);
         assert!(matches!(
             app.transcript.last(),
-            Some(Entry::Notice(text)) if text.contains("granted read access")
+            Some(Entry::Notice(text)) if text.contains("grant notice")
         ));
     }
 

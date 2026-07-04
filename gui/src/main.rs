@@ -1,22 +1,21 @@
 //! `yatima-gui` — the GPU frontend: chat, agent turns, and image artifacts.
 //!
-//! An egui/eframe app (wgpu → Metal on macOS) that loads a local model,
-//! streams chat turns, and — on tool-trained formats, once the user grants a
-//! web origin (CAP-3) — runs real agent turns with the same toolset as the
-//! TUI (`read_url`, `read_page`, `plot`): the model cannot tell hosts apart.
-//! A successful plot ships its PNG over the event plane (`Ev::Image`) and
-//! renders inline as a GPU texture — the artifact plane this app spiked
-//! before the tool existed. No markdown, math, cancel, or live-tweak yet;
-//! those are later slices (see `plans/text-rendering.plan.md`).
+//! An egui/eframe app (wgpu → Metal on macOS) that is a thin view over
+//! [`yatima_host`]: it loads a local model, streams chat turns, and — on
+//! tool-trained formats, once the user grants a web origin (CAP-3) — runs real
+//! agent turns with the same toolset as the TUI (`read_url`, `read_page`,
+//! `plot`): the model cannot tell hosts apart, because there is one host. A
+//! successful plot's bytes arrive as a [`HostEvent::Image`] and render inline
+//! as a GPU texture (an SVG rasterizes on the way in — a view concern kept in
+//! this wasm-compilable half).
 //!
-//! The engine is `!Send`, so — exactly as `yatima-tui`'s actor does — it is
-//! created and owned on a dedicated background thread (`runner`), which
-//! serves requests over a channel and streams events back. The `Ev` plane is
-//! deliberately narrow: it is the seam a future `yatima-serve` puts a
-//! websocket through, so everything above it must already be viewer-shaped.
-//! Rendering is immediate mode: `update` is a pure projection of the
-//! accumulated state, redrawn each frame (the same discipline as the TUI's
-//! `ui(frame, &App)`).
+//! The engine lives in [`yatima_host`], on its own thread (HOST-3); this app
+//! drives it only through the [`HostRequest`]/[`HostEvent`] planes (HOST-1),
+//! which are exactly the seam a future `yatima-serve` puts a websocket through
+//! — so everything above them is already viewer-shaped. A small pump thread
+//! forwards host events to the UI and wakes egui per event. Rendering is
+//! immediate mode: `update` is a pure projection of the accumulated state,
+//! redrawn each frame (the same discipline as the TUI's `ui(frame, &App)`).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -26,12 +25,11 @@ use anyhow::Result;
 use clap::Parser;
 use eframe::egui;
 
-use yatima_lib::{
-    device, resolve_format, Agent, AgentEvent, AgentStop, Cancel, Channel, ChatFormat,
-    ChatMlTemplate, ChatSession, Engine, GenOpts, JsonToolCall, ModelProfile, ModelSource,
-    PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl,
-    ReasoningSplitter, Sampling, ToolCallCodec, ToolOutcome, Tools, WebOrigins,
+use yatima_host::{
+    init_file_logging, spawn_nonblocking, CancelGate, Channel, HostConfig, HostEvent, HostRequest,
+    ModelInfo,
 };
+use yatima_lib::{GenOpts, ModelProfile, ModelSource, Sampling};
 use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
 
 /// Interactive GUI chat over a local model.
@@ -79,18 +77,7 @@ struct Args {
     whimsy: bool,
 }
 
-/// Everything the background runner needs to load a model — all `Send`, so it
-/// crosses into the thread; the `!Send` `Engine` is then *created* inside it.
-struct RunConfig {
-    dir: PathBuf,
-    cpu: bool,
-    opts: GenOpts,
-    format: Option<ChatFormat>,
-    system: Option<String>,
-    label: String,
-}
-
-fn resolve(args: &Args) -> Result<RunConfig> {
+fn resolve(args: &Args) -> Result<HostConfig> {
     let profile = match &args.profile {
         Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -127,464 +114,14 @@ fn resolve(args: &Args) -> Result<RunConfig> {
     };
     let format = profile.as_ref().and_then(ModelProfile::format);
 
-    Ok(RunConfig {
+    Ok(HostConfig {
         dir,
         cpu: args.cpu,
         opts,
         format,
         system: args.system.clone(),
-        label,
+        model_label: label,
     })
-}
-
-/// What's running — surfaced in the status rail beside the receded mark. Built
-/// in the runner (where the engine and config live) and shipped to the UI on
-/// `Ready`. All fields are pre-formatted strings to keep the UI a pure view.
-#[derive(Clone)]
-struct ModelInfo {
-    label: String,
-    arch: String,
-    device: String,
-    format: String,
-    sampling: String,
-    max_tokens: usize,
-    /// The model's context window in tokens (the meter's denominator), if known.
-    context_length: Option<usize>,
-}
-
-/// UI → runner requests. Grants ride the same channel as prompts so the
-/// runner's phases see them in order (CAP-3: the UI sends `Grant` only for
-/// user utterances — a typed URL or an explicit `/grant`).
-enum Req {
-    /// A user turn; `cancel` is the UI's token-level stop handle for it.
-    Submit { prompt: String, cancel: Cancel },
-    /// Clear the conversation back to the system prompt (granted origins
-    /// survive — authority is the user's utterance, not the transcript's).
-    Reset,
-    /// Grant a web origin for the session; the first grant switches the
-    /// runner from the chat phase to the agent phase (tools live).
-    Grant(String),
-    /// Withdraw an origin.
-    Revoke(String),
-    /// Report the granted origins (a `Note` event answers).
-    ListGrants,
-}
-
-/// Runner → UI events (over `std::sync::mpsc`; the UI drains them each frame).
-enum Ev {
-    /// Model loaded and ready to chat (carries what's running).
-    Ready(ModelInfo),
-    /// A streamed slice of the surfaced answer.
-    Answer(String),
-    /// A streamed slice of the chain-of-thought (shown only when toggled on).
-    Reasoning(String),
-    /// Retract the last `chars` streamed answer chars: they were narration
-    /// ahead of a tool call, not answer — they replay on the reasoning
-    /// channel (AGENT-4's reclassification, mirrored from the TUI).
-    RetractAnswer(usize),
-    /// Context tokens used (the most recent rendered prompt) — for the meter.
-    Context(usize),
-    /// An image artifact (PNG bytes) produced by the turn — the artifact
-    /// plane: the plot tool's rendered chart, decoded and shown inline.
-    Image(Vec<u8>),
-    /// An app-plane message (grant reports and the like) — not model text.
-    Note(String),
-    /// The current turn finished.
-    Done,
-    /// The current turn failed.
-    Error(String),
-    /// The model could not be loaded; the session never starts.
-    Fatal(String),
-}
-
-/// Tool rounds per turn before the agent gives up (AGENT-1); mirrors the TUI.
-const AGENT_MAX_STEPS: usize = 6;
-
-/// The base system prompt for tool-enabled sessions when `--system` is absent.
-const DEFAULT_AGENT_SYSTEM: &str =
-    "You are a helpful assistant. Call a tool when it helps, then answer. \
-     Markdown image links do not render here: to show the user an image or \
-     chart, call read_image (or plot) — its result is displayed \
-     automatically.";
-
-/// `read_page` budgets for interactive use (see the TUI's rationale: the
-/// tool's own 40k default makes the next prefill take minutes on a local
-/// 32B; ~12k chars keeps a tool turn interactive).
-const READ_PAGE_MAX_CHARS: usize = 12_000;
-const READ_PAGE_MAX_INPUT_BYTES: usize = 4_000_000;
-
-/// A successful tool result at most this long (single-line) shows verbatim
-/// in the reasoning stream; longer ones summarize as a char count. Short
-/// results — a file path — *are* the deliverable.
-const TOOL_NOTE_MAX_CHARS: usize = 200;
-
-/// The web tools over a shared (growable) origin set — the same toolset, the
-/// same construction, as the TUI: the model cannot tell hosts apart. The
-/// plot tool rides along when a python-with-matplotlib is present (PLOT-1..3;
-/// output confined to `~/.cache/yatima/plots`) and quietly doesn't when it
-/// isn't.
-fn web_tools(origins: &WebOrigins) -> anyhow::Result<Tools> {
-    let mut tools = Tools::new()
-        .with(ReadUrl::new(origins.clone())?)
-        .with(ReadPage::with_limits(
-            origins.clone(),
-            READ_PAGE_MAX_INPUT_BYTES,
-            READ_PAGE_MAX_CHARS,
-        )?);
-    let cache = std::env::home_dir()
-        .map(|home| home.join(".cache/yatima"))
-        .unwrap_or_else(std::env::temp_dir);
-    tools = tools.with(ReadImage::new(origins.clone(), cache.join("images"))?);
-    match PlotSandbox::system(cache.join("plots")) {
-        Ok(sandbox) => tools = tools.with(Plot::new(sandbox)),
-        Err(e) => eprintln!("plot tool unavailable: {e}"),
-    }
-    Ok(tools)
-}
-
-/// The background engine thread: load the model, then serve requests. Owns
-/// the `!Send` `Engine` for its whole life (created here, never crossed over
-/// a thread boundary). Two phases, exactly the TUI's shape: streaming chat
-/// until the first origin grant, then a sessionful agent seeded with the
-/// chat history — a one-way switch; the seam is invisible (AGENT-3).
-fn runner(cfg: RunConfig, req_rx: Receiver<Req>, ev_tx: Sender<Ev>, ctx: egui::Context) {
-    let dev = match device(cfg.cpu) {
-        Ok(d) => d,
-        Err(e) => return fatal(&ev_tx, &ctx, e),
-    };
-    let mut engine = match Engine::load(&cfg.dir, dev) {
-        Ok(e) => e,
-        Err(e) => return fatal(&ev_tx, &ctx, e),
-    };
-    let (format, _mismatch) = resolve_format(engine.arch(), cfg.format);
-
-    // Snapshot what's running for the status rail before `cfg.opts` is moved.
-    let info = ModelInfo {
-        label: cfg.label.clone(),
-        arch: format!("{:?}", engine.arch()),
-        device: if cfg.cpu { "cpu" } else { "gpu" }.to_string(),
-        format: format!("{format:?}"),
-        sampling: match cfg.opts.sampling {
-            Sampling::Greedy => "greedy".to_string(),
-            Sampling::Sample {
-                temperature,
-                top_p,
-                seed,
-            } => match top_p {
-                Some(p) => format!("temp {temperature:.2} · top-p {p:.2} · seed {seed}"),
-                None => format!("temp {temperature:.2} · seed {seed}"),
-            },
-        },
-        max_tokens: cfg.opts.max_tokens,
-        context_length: engine.context_length(),
-    };
-
-    // Tool-trained formats carry the web tools from the start, initially with
-    // an empty origin set — hidden from the model (CAP-3a) and inert until a
-    // grant arrives (sandbox by omission; CAP-3: grants come only from the
-    // user, via the UI). Chat-only formats get none.
-    let tool_trained = matches!(format, ChatFormat::Qwen | ChatFormat::Plain);
-    let origins = WebOrigins::new();
-    let tools = tool_trained.then(|| web_tools(&origins).unwrap_or_default());
-
-    let _ = ev_tx.send(Ev::Ready(info));
-    ctx.request_repaint();
-
-    // Tool-trained formats serve the agent from turn one: web tools hide
-    // themselves while the origin set is empty (CAP-3a), so pre-grant the
-    // model sees exactly the no-authority tools (plot); a grant surfaces
-    // the web tools mid-session. Chat-only formats stay chat forever.
-    let Some(tools) = tools else {
-        serve_chat(
-            &mut engine,
-            format,
-            cfg.system.clone(),
-            cfg.opts.clone(),
-            &req_rx,
-            &ev_tx,
-            &ctx,
-        );
-        return;
-    };
-    let system = cfg
-        .system
-        .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
-    match format {
-        ChatFormat::Qwen => serve_agent(
-            &mut engine,
-            &tools,
-            QwenToolCall,
-            ChatMlTemplate,
-            system,
-            cfg.opts,
-            &origins,
-            req_rx,
-            ev_tx,
-            ctx,
-        ),
-        ChatFormat::Plain => serve_agent(
-            &mut engine,
-            &tools,
-            JsonToolCall,
-            PlainTemplate,
-            system,
-            cfg.opts,
-            &origins,
-            req_rx,
-            ev_tx,
-            ctx,
-        ),
-        _ => unreachable!("the switch is only offered on tool-trained formats"),
-    }
-}
-
-/// The chat serve loop for chat-only formats: the plain streaming
-/// [`ChatSession`]. Grants are always refused here (a chat-only format
-/// cannot enter the tool path); tool-trained formats never enter this loop
-/// (they serve the agent from turn one).
-fn serve_chat(
-    engine: &mut Engine,
-    format: ChatFormat,
-    system: Option<String>,
-    opts: GenOpts,
-    req_rx: &Receiver<Req>,
-    ev_tx: &Sender<Ev>,
-    ctx: &egui::Context,
-) {
-    let pre_seeds = format.pre_seeds_reasoning();
-    let template = format.template();
-    let mut session = ChatSession::new(engine, template).with_opts(opts);
-    if let Some(system) = system {
-        session = session.with_system(system);
-    }
-
-    while let Ok(req) = req_rx.recv() {
-        match req {
-            Req::Submit { prompt, cancel } => {
-                // Classify the stream into reasoning vs answer as it arrives,
-                // so the UI can fold the chain-of-thought away unless toggled.
-                let mut splitter = if pre_seeds {
-                    ReasoningSplitter::seeded()
-                } else {
-                    ReasoningSplitter::new()
-                };
-                let to_ev = |ch: Channel, text: &str| match ch {
-                    Channel::Reasoning => Ev::Reasoning(text.to_string()),
-                    Channel::Answer => Ev::Answer(text.to_string()),
-                };
-                let result = {
-                    let tx = ev_tx.clone();
-                    let ctx = ctx.clone();
-                    let mut on_token = |frag: &str| {
-                        splitter.push(frag, |ch, text| {
-                            let _ = tx.send(to_ev(ch, text));
-                        });
-                        ctx.request_repaint();
-                    };
-                    session
-                        .turn_streaming_cancellable(&prompt, &cancel, &mut on_token)
-                        .map(|answer| answer.to_string())
-                };
-                // Flush any tail buffered against a straddling marker.
-                splitter.finish(|ch, text| {
-                    let _ = ev_tx.send(to_ev(ch, text));
-                });
-                if let Some(used) = session.last_prompt_tokens() {
-                    let _ = ev_tx.send(Ev::Context(used));
-                }
-                let _ = ev_tx.send(match result {
-                    Ok(_) => Ev::Done,
-                    Err(e) => Ev::Error(e.to_string()),
-                });
-                ctx.request_repaint();
-            }
-            Req::Reset => session.reset(),
-            Req::Grant(origin) => {
-                let _ = ev_tx.send(Ev::Note(format!(
-                    "cannot grant {origin}: the {format} format is chat-only \
-                     (tool calling needs qwen or plain)"
-                )));
-                ctx.request_repaint();
-            }
-            Req::Revoke(_) => {
-                let _ = ev_tx.send(Ev::Note("nothing granted (chat-only format)".to_string()));
-                ctx.request_repaint();
-            }
-            Req::ListGrants => {
-                let _ = ev_tx.send(Ev::Note(grants_note(None)));
-                ctx.request_repaint();
-            }
-        }
-    }
-}
-
-/// The agent serve loop: one sessionful [`Agent`] (AGENT-3) serves every
-/// turn, seeded with the chat phase's history. Later grants/revokes mutate
-/// the shared origin set in place — the specs re-render each run (CAP-3a).
-#[allow(clippy::too_many_arguments)]
-fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
-    engine: &mut Engine,
-    tools: &Tools,
-    codec: K,
-    template: T,
-    system: String,
-    opts: GenOpts,
-    origins: &WebOrigins,
-    req_rx: Receiver<Req>,
-    ev_tx: Sender<Ev>,
-    ctx: egui::Context,
-) {
-    let mut agent =
-        Agent::new(engine, tools, codec, template, system, AGENT_MAX_STEPS).with_opts(opts);
-
-    while let Ok(req) = req_rx.recv() {
-        match req {
-            Req::Submit { prompt, cancel } => {
-                run_agent_turn(&mut agent, &prompt, &cancel, &ev_tx, &ctx)
-            }
-            Req::Reset => agent.reset(),
-            Req::Grant(origin) => {
-                let _ = ev_tx.send(Ev::Note(match origins.grant(&origin) {
-                    Ok(true) if origins.list().len() == 1 => {
-                        format!("granted read access to {origin} — web tools enabled")
-                    }
-                    Ok(true) => format!("granted read access to {origin}"),
-                    Ok(false) => format!("{origin} was already granted"),
-                    Err(e) => format!("grant failed: {e}"),
-                }));
-                ctx.request_repaint();
-            }
-            Req::Revoke(origin) => {
-                let _ = ev_tx.send(Ev::Note(match origins.revoke(&origin) {
-                    Ok(true) => format!("revoked {origin}"),
-                    Ok(false) => format!("{origin} was not granted"),
-                    Err(e) => format!("revoke failed: {e}"),
-                }));
-                ctx.request_repaint();
-            }
-            Req::ListGrants => {
-                let _ = ev_tx.send(Ev::Note(grants_note(Some(origins))));
-                ctx.request_repaint();
-            }
-        }
-    }
-}
-
-/// One agent turn, folding [`AgentEvent`]s onto the `Ev` plane (the TUI's
-/// `run_agent_turn`, on this host's events). Streamed answer prose that
-/// turns out to precede a tool call is retracted and replayed as reasoning
-/// (AGENT-4); tool activity renders as ⚙/ok lines on the reasoning
-/// channel (ASCII markers: egui's built-in fonts lack ✓/✗/⊘ — tofu);
-/// a successful plot's PNG is read back and shipped as an [`Ev::Image`].
-fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
-    agent: &mut Agent<'_, Engine, K, T>,
-    user: &str,
-    cancel: &Cancel,
-    ev_tx: &Sender<Ev>,
-    ctx: &egui::Context,
-) {
-    let send = |ev: Ev| {
-        let _ = ev_tx.send(ev);
-        ctx.request_repaint();
-    };
-
-    // Answer prose streamed during the *current* step; a ToolCall event means
-    // it was narration, not answer — retract and reclassify.
-    let mut step_answer = String::new();
-    // Name of the tool whose outcome we're awaiting (a plot success ships
-    // its PNG as an image artifact).
-    let mut pending_tool = String::new();
-
-    let result = agent.run_with_cancellable(user, cancel, (), |(), event| {
-        match event {
-            AgentEvent::Fragment { channel, text } => {
-                if channel == Channel::Answer {
-                    step_answer.push_str(&text);
-                    send(Ev::Answer(text));
-                } else {
-                    send(Ev::Reasoning(text));
-                }
-            }
-            // The per-step aggregate; already streamed via Fragment (AGENT-4).
-            AgentEvent::Reasoning(_) => {}
-            AgentEvent::ToolCall(call) => {
-                if !step_answer.is_empty() {
-                    let narration = std::mem::take(&mut step_answer);
-                    send(Ev::RetractAnswer(narration.chars().count()));
-                    send(Ev::Reasoning(format!("{}\n", narration.trim_end())));
-                }
-                pending_tool = call.name.clone();
-                send(Ev::Reasoning(format!(
-                    "\n⚙ {} {}\n",
-                    call.name,
-                    clip(&call.args.to_string(), 160)
-                )));
-            }
-            AgentEvent::ToolStarted(_) => {}
-            AgentEvent::ToolProgress(message) => {
-                send(Ev::Reasoning(format!("  {message}\n")));
-            }
-            AgentEvent::ToolOutcome(outcome) => {
-                let note = match &outcome {
-                    ToolOutcome::Success { content } => {
-                        let flat = content.trim();
-                        if flat.chars().count() <= TOOL_NOTE_MAX_CHARS && !flat.contains('\n') {
-                            format!("  ok {flat}\n")
-                        } else {
-                            format!("  ok {} chars\n", content.chars().count())
-                        }
-                    }
-                    other => format!(
-                        "  failed: {}\n",
-                        clip(&other.render_for_model("").content, 160)
-                    ),
-                };
-                send(Ev::Reasoning(note));
-                if matches!(pending_tool.as_str(), "plot" | "read_image") {
-                    if let ToolOutcome::Success { content } = &outcome {
-                        match artifact_bytes(content) {
-                            Ok(bytes) => send(Ev::Image(bytes)),
-                            Err(e) => send(Ev::Reasoning(format!("  failed: artifact: {e}\n"))),
-                        }
-                    }
-                }
-                step_answer.clear();
-            }
-            // Already streamed fragment-by-fragment; Done carries the answer.
-            AgentEvent::Final(_) => {}
-        }
-        Ok(std::ops::ControlFlow::Continue(()))
-    });
-
-    match result {
-        Ok(((), run)) => {
-            if matches!(run.stop, AgentStop::MaxSteps) {
-                send(Ev::Reasoning(format!(
-                    "\n⚠ tool-step budget exhausted ({AGENT_MAX_STEPS})\n"
-                )));
-            }
-            send(Ev::Done);
-        }
-        Err(e) => send(Ev::Error(e.to_string())),
-    }
-}
-
-/// Read back the image named by an artifact tool's `wrote <path> (…)`
-/// summary — the path always points inside the tool's own sandbox (PLOT-2 /
-/// IMG-1). Raster formats pass through for the texture decoder; an SVG is
-/// rasterized here (resvg → PNG bytes), so the display path stays one code
-/// path and — being pure Rust — serves unchanged in the WASM client.
-fn artifact_bytes(content: &str) -> Result<Vec<u8>> {
-    let path = content
-        .strip_prefix("wrote ")
-        .and_then(|rest| rest.rsplit_once(" ("))
-        .map(|(path, _)| path)
-        .ok_or_else(|| anyhow::anyhow!("unrecognized artifact summary: {content:?}"))?;
-    let bytes = std::fs::read(path)?;
-    if path.ends_with(".svg") {
-        return rasterize_svg(&bytes);
-    }
-    Ok(bytes)
 }
 
 /// Rasterize an SVG to PNG bytes at a display-friendly size: the intrinsic
@@ -610,37 +147,6 @@ fn rasterize_svg(data: &[u8]) -> Result<Vec<u8>> {
     pixmap
         .encode_png()
         .map_err(|e| anyhow::anyhow!("svg raster: {e}"))
-}
-
-/// The grants report, both phases.
-fn grants_note(origins: Option<&WebOrigins>) -> String {
-    match origins {
-        None => "no tools (chat-only format)".to_string(),
-        Some(origins) => {
-            let list = origins.list();
-            if list.is_empty() {
-                "no origins granted — type a URL or /grant <origin>".to_string()
-            } else {
-                format!("granted: {}", list.join(", "))
-            }
-        }
-    }
-}
-
-/// First `max` chars of `text` with an ellipsis when clipped (single line).
-fn clip(text: &str, max: usize) -> String {
-    let flat = text.replace('\n', " ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        let cut: String = flat.chars().take(max).collect();
-        format!("{cut}…")
-    }
-}
-
-fn fatal(ev_tx: &Sender<Ev>, ctx: &egui::Context, e: impl std::fmt::Display) {
-    let _ = ev_tx.send(Ev::Fatal(e.to_string()));
-    ctx.request_repaint();
 }
 
 /// The `/help` listing.
@@ -684,8 +190,16 @@ enum Status {
 }
 
 struct GuiApp {
-    req_tx: Sender<Req>,
-    ev_rx: Receiver<Ev>,
+    req_tx: Sender<HostRequest>,
+    /// The host's events, forwarded from its channel by a pump thread that also
+    /// wakes egui on each one (the host has no egui handle of its own).
+    ev_rx: Receiver<HostEvent>,
+    /// The host's cancel gate: Esc / the stop button trips it for the in-flight
+    /// turn (the mid-decode path, as in the TUI).
+    cancel: CancelGate,
+    /// The next turn's id, and the id of the turn in flight (for the gate).
+    next_turn_id: u64,
+    in_flight_turn: Option<u64>,
     /// A handle to the egui context, for uploading image artifacts as textures
     /// off the render path (in `drain_events`).
     ctx: egui::Context,
@@ -733,9 +247,6 @@ struct GuiApp {
     strawberry_start: Option<f32>,
     /// Parse/image cache for the markdown viewer (egui_commonmark).
     md_cache: egui_commonmark::CommonMarkCache,
-    /// The in-flight turn's stop handle (token-level, as in the TUI): Esc or
-    /// the stop button cancels; the runner returns the partial turn.
-    turn_cancel: Option<Cancel>,
     /// Everything submitted this session (prompts and commands alike —
     /// /grant is worth recalling), consecutive duplicates collapsed.
     prompt_history: Vec<String>,
@@ -752,15 +263,32 @@ struct GuiApp {
 }
 
 impl GuiApp {
-    fn new(cc: &eframe::CreationContext<'_>, cfg: RunConfig, whimsy: bool) -> GuiApp {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<Req>();
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Ev>();
+    fn new(cc: &eframe::CreationContext<'_>, cfg: HostConfig, whimsy: bool) -> GuiApp {
         let ctx = cc.egui_ctx.clone();
-        let runner_ctx = ctx.clone();
-        thread::spawn(move || runner(cfg, req_rx, ev_tx, runner_ctx));
+        // The host loads the model on its own thread; Ready (or Fatal) arrives
+        // as the first event. A thread-spawn failure here is catastrophic and
+        // unrecoverable — there is no engine to talk to.
+        let handle = spawn_nonblocking(cfg).expect("spawn engine host");
+        // The host's event channel is a tokio receiver with no egui handle; a
+        // pump thread forwards each event to the UI's std channel and wakes
+        // egui, reproducing the old runner's per-event repaint.
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel::<HostEvent>();
+        let pump_ctx = ctx.clone();
+        let mut host_events = handle.event_rx;
+        thread::spawn(move || {
+            while let Some(ev) = host_events.blocking_recv() {
+                if ev_tx.send(ev).is_err() {
+                    break; // the UI is gone.
+                }
+                pump_ctx.request_repaint();
+            }
+        });
         GuiApp {
-            req_tx,
+            req_tx: handle.req_tx,
             ev_rx,
+            cancel: handle.cancel,
+            next_turn_id: 0,
+            in_flight_turn: None,
             ctx,
             splash_anim_start: None,
             info: None,
@@ -783,7 +311,6 @@ impl GuiApp {
             roll_start: None,
             strawberry_start: None,
             md_cache: egui_commonmark::CommonMarkCache::default(),
-            turn_cancel: None,
             prompt_history: Vec::new(),
             history_nav: None,
             draft: String::new(),
@@ -1051,11 +578,12 @@ impl GuiApp {
         self.streaming.is_some()
     }
 
-    /// Stop the in-flight turn (token-level). The runner finishes with what
-    /// streamed so far; Done still arrives and commits the partial answer.
+    /// Stop the in-flight turn (token-level) by tripping the host's cancel gate.
+    /// The host finishes with what streamed so far; Done still arrives and
+    /// commits the partial answer. Taking the id makes a second Esc a no-op.
     fn cancel_turn(&mut self) {
-        if let Some(cancel) = self.turn_cancel.take() {
-            cancel.cancel();
+        if let Some(turn_id) = self.in_flight_turn.take() {
+            self.cancel.cancel(turn_id);
             self.transcript.push(Msg::Note("— interrupted".to_string()));
         }
     }
@@ -1090,17 +618,23 @@ impl GuiApp {
         self.splash_anim_start = None;
     }
 
-    /// Fold runner events into the UI mirror. `now` is the engine clock, used to
+    /// Fold host events into the UI mirror. `now` is the engine clock, used to
     /// stamp transient reactions (e.g. the avatar's surprise).
     fn drain_events(&mut self, now: f32) {
         while let Ok(ev) = self.ev_rx.try_recv() {
             match ev {
-                Ev::Ready(info) => {
+                HostEvent::Ready(info) => {
                     self.status = Status::Ready(info.label.clone());
                     self.info = Some(info);
                     self.focus_input = true; // activate the input on transition
                 }
-                Ev::Answer(text) => {
+                // The buffer is armed in `submit`; Started needs no action here.
+                HostEvent::Started { .. } => {}
+                HostEvent::Fragment {
+                    channel: Channel::Answer,
+                    text,
+                    ..
+                } => {
                     if self.turn_start.is_none() {
                         self.turn_start = Some(now);
                     }
@@ -1109,14 +643,26 @@ impl GuiApp {
                         buf.push_str(&text);
                     }
                 }
-                Ev::Reasoning(text) => {
+                HostEvent::Fragment {
+                    channel: Channel::Reasoning,
+                    text,
+                    ..
+                } => {
                     if self.turn_start.is_none() {
                         self.turn_start = Some(now);
                     }
                     self.gen_tokens += 1;
                     self.streaming_reasoning.push_str(&text);
                 }
-                Ev::RetractAnswer(chars) => {
+                // Tool activity (host text, not model tokens) folds into the
+                // reasoning pane without touching the token counter.
+                HostEvent::ToolNote { text, .. } => {
+                    if self.turn_start.is_none() {
+                        self.turn_start = Some(now);
+                    }
+                    self.streaming_reasoning.push_str(&text);
+                }
+                HostEvent::RetractAnswer { chars, .. } => {
                     // The streamed tail was narration ahead of a tool call —
                     // pull it back out of the answer; it replays as reasoning.
                     if let Some(buf) = self.streaming.as_mut() {
@@ -1125,25 +671,38 @@ impl GuiApp {
                         buf.truncate(cut);
                     }
                 }
-                Ev::Note(message) => self.transcript.push(Msg::Note(message)),
-                Ev::Context(used) => self.context_used = Some(used),
-                Ev::Image(bytes) => match decode_texture(&self.ctx, &bytes) {
-                    Ok(tex) => {
-                        self.transcript.push(Msg::Image(tex));
-                        self.surprise_until = now + 1.4; // an artifact! oh!
+                // Grant reports and app-plane messages both render as notes.
+                HostEvent::Note(message) | HostEvent::Grants { message, .. } => {
+                    self.transcript.push(Msg::Note(message))
+                }
+                HostEvent::Context { prompt_tokens } => self.context_used = Some(prompt_tokens),
+                // The host read the artifact's bytes; here they become a
+                // texture. An SVG rasterizes first (a view concern, kept in the
+                // wasm-compilable half); a raster format decodes directly.
+                HostEvent::Image { bytes, name, .. } => {
+                    let decoded = if name.ends_with(".svg") {
+                        rasterize_svg(&bytes).and_then(|png| decode_texture(&self.ctx, &png))
+                    } else {
+                        decode_texture(&self.ctx, &bytes)
+                    };
+                    match decoded {
+                        Ok(tex) => {
+                            self.transcript.push(Msg::Image(tex));
+                            self.surprise_until = now + 1.4; // an artifact! oh!
+                        }
+                        Err(e) => self
+                            .transcript
+                            .push(Msg::Error(format!("image decode: {e}"))),
                     }
-                    Err(e) => self
-                        .transcript
-                        .push(Msg::Error(format!("image decode: {e}"))),
-                },
-                Ev::Done => {
-                    self.turn_cancel = None;
+                }
+                HostEvent::Done { .. } => {
+                    self.in_flight_turn = None;
                     // Drop the streaming buffers; only commit a reply if the
                     // answer carried text (a fully-retracted turn streams none).
                     // Committed text is display-polished: local image links
                     // drop (the artifact is already inline as a texture) and
-                    // inline LaTeX prettifies. The runner's session is truth;
-                    // this is the UI mirror.
+                    // inline LaTeX prettifies. The host's session is truth; this
+                    // is the UI mirror.
                     let reasoning = std::mem::take(&mut self.streaming_reasoning);
                     if let Some(buf) = self.streaming.take() {
                         // Plain scripts: egui's fonts lack the Unicode
@@ -1156,17 +715,18 @@ impl GuiApp {
                         }
                     }
                 }
-                Ev::Error(message) => {
-                    self.turn_cancel = None;
+                HostEvent::Error { message, .. } => {
+                    self.in_flight_turn = None;
                     self.streaming = None;
                     self.streaming_reasoning.clear();
                     self.transcript.push(Msg::Error(message));
                 }
-                Ev::Fatal(message) => {
+                HostEvent::Fatal(message) => {
                     self.streaming = None;
                     self.streaming_reasoning.clear();
                     self.status = Status::Failed(message);
                 }
+                _ => {} // a future event variant this UI predates.
             }
         }
     }
@@ -1227,7 +787,7 @@ impl GuiApp {
             return;
         }
         if prompt == "/reset" {
-            let _ = self.req_tx.send(Req::Reset);
+            let _ = self.req_tx.send(HostRequest::Reset);
             self.clear();
             self.transcript
                 .push(Msg::Note("conversation reset".to_string()));
@@ -1237,17 +797,21 @@ impl GuiApp {
         // Grant management (CAP-3: these, plus URLs typed in a message, are
         // the *only* sources of web authority).
         if prompt == "/grants" {
-            let _ = self.req_tx.send(Req::ListGrants);
+            let _ = self.req_tx.send(HostRequest::ListGrants);
             self.input.clear();
             return;
         }
         if let Some(origin) = prompt.strip_prefix("/grant ") {
-            let _ = self.req_tx.send(Req::Grant(origin.trim().to_string()));
+            let _ = self.req_tx.send(HostRequest::Grant {
+                origin: origin.trim().to_string(),
+            });
             self.input.clear();
             return;
         }
         if let Some(origin) = prompt.strip_prefix("/revoke ") {
-            let _ = self.req_tx.send(Req::Revoke(origin.trim().to_string()));
+            let _ = self.req_tx.send(HostRequest::Revoke {
+                origin: origin.trim().to_string(),
+            });
             self.input.clear();
             return;
         }
@@ -1258,16 +822,20 @@ impl GuiApp {
         // its origin (CAP-3) — granted before the turn runs, so the model can
         // act on it immediately. URLs from any other source never pass here.
         for origin in yatima_lib::origins_in(&prompt) {
-            let _ = self.req_tx.send(Req::Grant(origin));
+            let _ = self.req_tx.send(HostRequest::Grant { origin });
         }
         self.transcript.push(Msg::User(prompt.clone()));
         self.streaming = Some(String::new());
         self.streaming_reasoning.clear();
         self.turn_start = None;
         self.gen_tokens = 0;
-        let cancel = Cancel::new();
-        self.turn_cancel = Some(cancel.clone());
-        let _ = self.req_tx.send(Req::Submit { prompt, cancel });
+        let turn_id = self.next_turn_id;
+        self.next_turn_id += 1;
+        self.in_flight_turn = Some(turn_id);
+        let _ = self.req_tx.send(HostRequest::Submit {
+            turn_id,
+            text: prompt,
+        });
         self.input.clear();
         self.splash_anim_start = None; // replay the draw-on if we return to it
     }
@@ -2186,50 +1754,14 @@ fn decode_texture(ctx: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHand
     Ok(ctx.load_texture("artifact", color, egui::TextureOptions::default()))
 }
 
-/// Install a file-writing tracing subscriber when `$YATIMA_LOG` is set (its
-/// value is the filter, e.g. `debug` or `yatima_lib=trace`) — OBS-1: the lib
-/// emits spans/events, the host decides where they go. Logs append to
-/// `~/.cache/yatima/gui.log`; `debug` shows each tool call with its full
-/// args JSON and outcome, `trace` adds whole prompts and completions. No env
-/// var, no subscriber, no cost. (The TUI's twin writes `tui.log` — separate
-/// files so two hosts never interleave.)
-fn init_file_logging() -> Result<()> {
-    if std::env::var_os("YATIMA_LOG").is_none() {
-        return Ok(());
-    }
-    let dir = std::env::home_dir()
-        .map(|home| home.join(".cache/yatima"))
-        .unwrap_or_else(std::env::temp_dir);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("gui.log");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    // A bare level ("debug") scopes to yatima: third-party internals
-    // (html5ever narrating every HTML token, wgpu, hyper) drown the log at
-    // debug, and the question the log answers is "what is yatima doing".
-    // A spec with '='/',' is honored verbatim.
-    let value = std::env::var("YATIMA_LOG").unwrap_or_default();
-    let spec = if value.contains('=') || value.contains(',') {
-        value
-    } else {
-        format!("warn,yatima_lib={value},yatima_gui={value},yatima_text={value}")
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(spec))
-        .with_writer(file)
-        .with_ansi(false)
-        .init();
-    eprintln!("logging to {}", path.display());
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
-    init_file_logging()?;
+    // Logs go to ~/.cache/yatima/gui.log (the window belongs to egui); no
+    // crate-specific quiets are needed here (the TUI's tui_markdown is not in
+    // this build).
+    init_file_logging("gui", &[])?;
     let cfg = resolve(&args)?;
-    let title = format!("yatima — {}", cfg.label);
+    let title = format!("yatima — {}", cfg.model_label);
 
     eprintln!("loading model… (first run may fetch weights)");
     let native = eframe::NativeOptions {
@@ -2254,20 +1786,15 @@ mod tests {
 
     #[test]
     fn svg_rasterizes_to_display_png() {
-        // upholds: IMG-1 (host half) — an SVG artifact becomes PNG bytes the
-        // texture decoder accepts, scaled to a display-friendly size.
+        // upholds: IMG-1 (view half) — an SVG artifact's bytes become PNG bytes
+        // the texture decoder accepts, scaled to a display-friendly size. (The
+        // host reads the artifact's bytes; rasterizing them stays a view
+        // concern, kept here so it compiles into the WASM client.)
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
             <rect width="20" height="10" fill="#3a7"/></svg>"##;
         let png = rasterize_svg(svg).unwrap();
         let img = image::load_from_memory(&png).unwrap();
         // 20x10 at the 4x upscale clamp → 80x40.
         assert_eq!((img.width(), img.height()), (80, 40));
-    }
-
-    #[test]
-    fn artifact_summaries_parse_and_teach() {
-        // The `wrote <path> (…)` contract shared by plot and read_image.
-        assert!(artifact_bytes("no such summary").is_err());
-        assert!(artifact_bytes("wrote /nonexistent/x.png (png, 5 bytes)").is_err());
     }
 }

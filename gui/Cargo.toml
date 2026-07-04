@@ -9,23 +9,24 @@ name = "yatima-gui"
 path = "src/main.rs"
 
 [features]
-metal = ["yatima-lib/metal"]
-fetch = ["yatima-lib/fetch"]
+metal = ["yatima-host/metal"]
+fetch = ["yatima-host/fetch"]
 
 [dependencies]
+# The engine-facing host (the actor, the protocol, file logging). The GUI is a
+# thin view over it (HOST-1); the runner half it used to carry now lives there.
+yatima-host = { path = "../host" }
+# Still used directly to build the HostConfig (GenOpts/profiles) and to parse
+# user-typed origins (origins_in); the engine itself is reached only via host.
 yatima-lib = { path = "../lib" }
 # Shared model-text prettification (LaTeX → Unicode); pure std, WASM-clean.
 yatima-text = { path = "../text" }
-# File logging behind $YATIMA_LOG (OBS-1: the lib emits tracing, the host
-# installs the subscriber). Logs go to ~/.cache/yatima/gui.log.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 # Immediate-mode GUI on wgpu (Metal on macOS). egui 0.35 shapes text via
 # harfrust + skrifa (kerning, ligatures, combining marks); bidi/RTL is the one
-# known gap. Slice 0 is a "hello, engine" window — the GPU frontend's first
-# pixels, reusing yatima-lib only (the engine-actor lives in yatima-tui for now;
-# this spike runs its own small background runner thread).
+# known gap. The engine lives in yatima-host; this crate is the view half, and
+# a pump thread wakes egui as host events arrive.
 eframe = { version = "0.35", default-features = false, features = [
   "wgpu",
   "default_fonts",
