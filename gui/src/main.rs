@@ -1202,11 +1202,51 @@ impl eframe::App for GuiApp {
         if self.in_flight() {
             ui.ctx().request_repaint();
         }
+
+        // Claim clicked local links before eframe sees them: its handler
+        // hands every OpenUrl to a *web browser* opener, which fails
+        // silently on a filesystem path — and the model links its artifacts
+        // by path. Local targets open in the platform viewer (the idiom the
+        // TUI uses at `wrote` time); web links keep the default path.
+        ui.ctx().output_mut(|o| {
+            o.commands.retain(|cmd| {
+                if let egui::OutputCommand::OpenUrl(open) = cmd {
+                    if let Some(path) = local_target(&open.url) {
+                        open_in_viewer(path);
+                        return false;
+                    }
+                }
+                true
+            });
+        });
     }
 }
 
 fn speaker(ui: &mut egui::Ui, who: &str, color: egui::Color32) {
     ui.label(egui::RichText::new(who).strong().color(color));
+}
+
+/// The filesystem path in a clicked link target, when it has one: a `file://`
+/// URL or a bare absolute path (how the model links artifacts). Web URLs are
+/// `None` — they stay on eframe's browser path.
+fn local_target(url: &str) -> Option<&str> {
+    url.strip_prefix("file://")
+        .or_else(|| url.starts_with('/').then_some(url))
+}
+
+/// Open a local artifact in the platform viewer (macOS `open`) — full-size
+/// Preview for the inline texture's source file. Fire-and-forget: viewing is
+/// a courtesy, never an error; a reaper thread waits the child so no zombies
+/// accrue. This only ever fires for a link the user just clicked.
+fn open_in_viewer(path: &str) {
+    #[cfg(target_os = "macos")]
+    if let Ok(mut child) = std::process::Command::new("open").arg(path).spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
 }
 
 /// Render a tool-note payload as a line in this view's marker vocabulary
@@ -1815,6 +1855,23 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap();
         // 20x10 at the 4x upscale clamp → 80x40.
         assert_eq!((img.width(), img.height()), (80, 40));
+    }
+
+    #[test]
+    fn local_targets_are_claimed_web_urls_are_not() {
+        // A clicked artifact link must reach the platform viewer, not
+        // eframe's browser opener (which fails silently on a path); web
+        // links must keep the default path.
+        assert_eq!(
+            local_target("file:///Users/s/.cache/yatima/images/img-1.jpg"),
+            Some("/Users/s/.cache/yatima/images/img-1.jpg")
+        );
+        assert_eq!(
+            local_target("/Users/s/.cache/yatima/images/img-1.jpg"),
+            Some("/Users/s/.cache/yatima/images/img-1.jpg")
+        );
+        assert_eq!(local_target("https://example.com/a.jpg"), None);
+        assert_eq!(local_target("mailto:a@b.example"), None);
     }
 
     #[test]
