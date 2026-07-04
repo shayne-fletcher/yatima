@@ -1264,6 +1264,12 @@ pub struct ReadImage {
     dir: WriteDir,
     client: Client,
     max_bytes: usize,
+    /// Fetch-once memo: resolved URL → the summary already returned. A
+    /// repeat call is served from here (zero network, like `read_page`'s
+    /// page cache) with a teaching tail: the user has already seen this
+    /// image, so a model padding "show me another" with a re-fetch learns
+    /// so instead of presenting a rerun as new. Session-lifetime only.
+    fetched: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl ReadImage {
@@ -1287,6 +1293,7 @@ impl ReadImage {
             dir: WriteDir::new(dir),
             client,
             max_bytes,
+            fetched: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -1348,6 +1355,22 @@ impl Tool for ReadImage {
     async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
         let target = required_string(&args, "read_image", "url")?;
         let url = self.origins.resolve(target)?; // CAP-2 before any network
+                                                 // Fetch-once: a repeat of a URL this session re-teaches, never
+                                                 // re-fetches — the artifact is already on disk and the user has
+                                                 // already seen it.
+        let memo = self
+            .fetched
+            .lock()
+            .expect("read_image memo poisoned")
+            .get(url.as_str())
+            .cloned();
+        if let Some(summary) = memo {
+            return Ok(format!(
+                "{summary} — already fetched and shown this session; pick a \
+                 different image from the read_page [images] list if the \
+                 user wants another"
+            ));
+        }
         let mut response = self.client.get(url.clone()).send().await?;
         let status = response.status();
         if !status.is_success() {
@@ -1398,11 +1421,12 @@ impl Tool for ReadImage {
         let name = format!("img-{:016x}.{ext}", fnv1a(&body));
         let out = self.dir.resolve(&name)?; // IMG-1 confinement
         tokio::fs::write(&out, &body).await?;
-        Ok(format!(
-            "wrote {} ({ext}, {} bytes)",
-            out.display(),
-            body.len()
-        ))
+        let summary = format!("wrote {} ({ext}, {} bytes)", out.display(), body.len());
+        self.fetched
+            .lock()
+            .expect("read_image memo poisoned")
+            .insert(url.to_string(), summary.clone());
+        Ok(summary)
     }
 }
 
@@ -2552,28 +2576,32 @@ well known works of art depicting paradoxical architecture.</p>
     async fn read_image_saves_typed_confined_and_content_hashed() {
         // upholds: IMG-1 — the artifact lands inside the tool's WriteDir at
         // a content-hash name with an honest extension; identical bytes
-        // share an artifact.
+        // (even via a different URL) share an artifact. A *repeat* of the
+        // same URL never touches the network again (expect(1) enforces) and
+        // teaches that the user has already seen the image.
         let server = MockServer::start().await;
         let png: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-image-bytes";
-        Mock::given(method("GET"))
-            .and(path("/tri.png"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "image/png")
-                    .set_body_bytes(png),
-            )
-            .expect(2)
-            .mount(&server)
-            .await;
+        for route in ["/tri.png", "/tri-copy.png"] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "image/png")
+                        .set_body_bytes(png),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let origins = WebOrigins::one(&server.uri()).unwrap();
         let tools = Tools::new().with(ReadImage::new(origins, dir.path().join("images")).unwrap());
-        let call = || ToolCall {
+        let call = |route: &str| ToolCall {
             name: "read_image".to_string(),
-            args: json(r#"{"url": "/tri.png"}"#),
+            args: json(&format!(r#"{{"url": "{route}"}}"#)),
         };
-        let first = tools.dispatch_async(&call()).await;
+        let first = tools.dispatch_async(&call("/tri.png")).await;
         let ToolOutcome::Success { content } = &first else {
             panic!("{first:?}");
         };
@@ -2586,10 +2614,30 @@ well known works of art depicting paradoxical architecture.</p>
         assert!(path.ends_with(".png"), "honest extension: {path}");
         assert_eq!(std::fs::read(path).unwrap(), png, "bytes saved verbatim");
 
-        let second = tools.dispatch_async(&call()).await;
+        // Same URL again: a memo hit (the mock's expect(1) proves zero
+        // network), same artifact, and the already-shown teaching tail.
+        let repeat = tools.dispatch_async(&call("/tri.png")).await;
+        let repeat = repeat.render_for_model("").content;
         assert!(
-            second.render_for_model("").content.contains(path),
-            "identical bytes share an artifact"
+            repeat.contains(path),
+            "the memo returns the artifact: {repeat}"
+        );
+        assert!(
+            repeat.contains("already fetched and shown this session"),
+            "a rerun teaches, not re-presents: {repeat}"
+        );
+
+        // A different URL with identical bytes fetches (its own expect(1))
+        // and lands on the same content-hash artifact, without the note.
+        let copy = tools.dispatch_async(&call("/tri-copy.png")).await;
+        let copy = copy.render_for_model("").content;
+        assert!(
+            copy.contains(path),
+            "identical bytes share an artifact: {copy}"
+        );
+        assert!(
+            !copy.contains("already fetched"),
+            "a fresh URL is not a rerun: {copy}"
         );
     }
 
