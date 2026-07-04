@@ -65,9 +65,9 @@
 //!   a BF16/F16 model never chunks its prefill (chunked prefill would hit a
 //!   Candle KV-cache `cat` dtype mismatch). Profiles and CLI flags only override
 //!   deliberately.
-//! - **HOST-1** an omitted chat format resolves to the architecture default
+//! - **FMT-1** an omitted chat format resolves to the architecture default
 //!   ([`ChatFormat::default_for`] / [`resolve_format`], from [`caps_for`]).
-//! - **HOST-2** a supplied format differing from the architecture default is
+//! - **FMT-2** a supplied format differing from the architecture default is
 //!   honored but surfaced as a [`FormatMismatch`] warning, never silently
 //!   mis-rendered.
 //! - **CAPS-1** the agent/tool path is gated by host capability

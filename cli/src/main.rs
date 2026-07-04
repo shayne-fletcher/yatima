@@ -270,8 +270,8 @@ async fn chat(args: ChatArgs) -> Result<()> {
     eprintln!("loaded {} [{}]", dir.display(), engine.backend());
 
     // Infer the chat format from the model's architecture unless overridden
-    // (HOST-1) — an explicit `--format` wins, else the profile's, else inference;
-    // warn on a contradicting override rather than mis-render (HOST-2).
+    // (FMT-1) — an explicit `--format` wins, else the profile's, else inference;
+    // warn on a contradicting override rather than mis-render (FMT-2).
     let explicit_format = args
         .format
         .or_else(|| profile.as_ref().and_then(ModelProfile::format));
@@ -443,7 +443,7 @@ async fn agent(args: AgentArgs) -> Result<()> {
         .system
         .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
 
-    // Infer the format from the model unless overridden (HOST-1/HOST-2), then
+    // Infer the format from the model unless overridden (FMT-1/FMT-2), then
     // pick the codec/template pair. Chat-only formats can't enter the tool loop
     // (CAPS-1): the match's fallthrough rejects them.
     let (format, mismatch) = resolve_format(engine.arch(), args.format);

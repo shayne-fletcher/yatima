@@ -95,7 +95,7 @@ impl ChatFormat {
     }
 
     /// The format a model of this architecture speaks natively — the default a
-    /// host uses when the user doesn't pass one (HOST-1). Delegates to the
+    /// host uses when the user doesn't pass one (FMT-1). Delegates to the
     /// capability table [`caps_for`].
     pub fn default_for(arch: Arch) -> ChatFormat {
         caps_for(arch).default_format
@@ -179,7 +179,7 @@ pub fn caps_for(arch: Arch) -> Caps {
 }
 
 /// An explicit `--format` that contradicts the model's architecture default —
-/// the basis for a host warning (HOST-2). Not an error: the user's choice is
+/// the basis for a host warning (FMT-2). Not an error: the user's choice is
 /// honored, but a mismatch is usually a mistake (a mis-rendered prompt → quiet
 /// garbage), so it is surfaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,9 +201,9 @@ impl std::fmt::Display for FormatMismatch {
 }
 
 /// Resolve the chat format for a loaded model: an explicit choice wins,
-/// otherwise the architecture default (HOST-1). When an explicit choice differs
+/// otherwise the architecture default (FMT-1). When an explicit choice differs
 /// from the architecture default, also return a [`FormatMismatch`] so the caller
-/// can warn (HOST-2). Pure, so both invariants are unit-testable without a GPU.
+/// can warn (FMT-2). Pure, so both invariants are unit-testable without a GPU.
 pub fn resolve_format(
     arch: Arch,
     explicit: Option<ChatFormat>,
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn default_format_is_inferred_per_arch() {
-        // upholds: HOST-1 — every arch maps to a native default format.
+        // upholds: FMT-1 — every arch maps to a native default format.
         assert_eq!(ChatFormat::default_for(Arch::Qwen2), ChatFormat::Qwen);
         assert_eq!(ChatFormat::default_for(Arch::Glm4), ChatFormat::Glm);
         assert_eq!(ChatFormat::default_for(Arch::Gemma2), ChatFormat::Gemma);
@@ -313,14 +313,14 @@ mod tests {
 
     #[test]
     fn resolve_format_infers_and_flags_mismatch() {
-        // upholds: HOST-1 — omitted format resolves to the arch default.
+        // upholds: FMT-1 — omitted format resolves to the arch default.
         assert_eq!(resolve_format(Arch::Glm4, None), (ChatFormat::Glm, None));
         // a matching explicit format is no mismatch.
         assert_eq!(
             resolve_format(Arch::Glm4, Some(ChatFormat::Glm)),
             (ChatFormat::Glm, None)
         );
-        // upholds: HOST-2 — a contradicting explicit format is honored but flagged.
+        // upholds: FMT-2 — a contradicting explicit format is honored but flagged.
         let (chosen, mismatch) = resolve_format(Arch::Qwen2, Some(ChatFormat::Glm));
         assert_eq!(chosen, ChatFormat::Glm);
         let m = mismatch.expect("mismatch should be reported");
