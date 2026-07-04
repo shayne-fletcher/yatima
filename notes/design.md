@@ -24,27 +24,49 @@ swappable dependency.
 - **`yatima-cli`** — a thin wrapper: `yatima generate`, `yatima chat`, `yatima
   agent`, and `yatima models-dir`, with model selection parsed into a
   `ModelSource` ADT at the edge.
-- **`yatima-tui`** — an interactive terminal UI (`ratatui`/`crossterm`), kept a
-  separate crate so its UI deps never touch the lean CLI. Its keystone: a
-  dedicated **engine thread** owns the `Engine` *and* `ChatSession` (the one
-  authoritative history) and calls the sync `turn_streaming` — because local
-  decode is `!Send` on the blocking island (CMP-1/RT-2) it cannot run in a
-  `tokio::spawn`. Three planes connect it to the async UI: a `std::sync::mpsc`
-  **request** plane, a `tokio::sync::mpsc` **event** plane (the UI's only
-  transcript truth; rendered as a *mirror*), and an out-of-band **control** plane
-  (a shared `Cancel` per turn — the lib's cooperative cancellation flag) so a
-  cancel is reachable while the actor is mid-decode: the decode loop polls it per
-  token and stops at the next boundary (`StopReason::Stopped`, partial output
-  kept). Its own `TUI-N` invariant registry (cursor-bounds, pure-render,
-  single-append, ui-liveness, reasoning-foldable, prompt-cancel, single-in-flight)
-  is in the crate doc. Built in slices: Slice 1 chat + streaming + reasoning
-  split, Slice 2 foldable reasoning + context meter, Slice 3 Esc cancellation.
-- **`yatima-gui`** — the GPU frontend (egui/eframe, wgpu → Metal): the same
-  runner (the agent from turn one, as the TUI), the same toolset and CAP-3
-  grant rules as the TUI — the model cannot tell hosts apart — plus inline
-  image artifacts (plot PNGs as textures on the `Ev` event plane, the seam a
-  future `yatima-serve` puts a websocket through). Markdown via
-  `egui_commonmark`; decorative animation behind `--whimsy` (off by default).
+- **`yatima-protocol`** — the frontend wire plane, spelled once: `HostEvent`
+  and `HostRequest`, plus `ModelInfo` and the `Channel`/`StopKind` mirrors of
+  their `yatima-lib` namesakes. Serde-only and WASM-clean by construction —
+  serve's browser client deserializes these, so nothing here may drag candle;
+  `yatima-lib` is deliberately absent (the lib↔wire conversions live in
+  `yatima-host`). Its `PROTO-2` law: every variant round-trips losslessly, the
+  enums are externally tagged and `#[non_exhaustive]`, and no variant is
+  `untagged` (which would make wire evolution ambiguous).
+- **`yatima-host`** — the engine-facing host every frontend shares. A dedicated
+  **engine thread** owns the `Engine` *and* the `ChatSession`/`Agent` (the one
+  authoritative history) for its whole life (`HOST-3`) and calls the sync
+  decode shims — local decode is `!Send` on the blocking island (CMP-1/RT-2), so
+  it cannot run in a `tokio::spawn`. It serves chat-only formats as a plain
+  streaming session and tool-trained formats as a sessionful agent from turn
+  one, with the web toolset, the CAP-3 grant wording, the budget knobs
+  (`knobs.rs`), and file logging (`init_file_logging`) all single-sourced here.
+  Two planes connect it to a frontend — a `std::sync::mpsc` **request** plane
+  (`HostRequest`) and a `tokio::sync::mpsc` **event** plane (`HostEvent`, the
+  frontend's only transcript truth, rendered as a *mirror*) — plus an
+  out-of-band **`CancelGate`**: the host owns each turn's `Cancel` and arms the
+  gate with it before decoding, so a frontend trips it mid-decode (the request
+  queue is unserviced while decoding; the decode loop polls per token and stops
+  at the next boundary — `StopKind::Stopped`, partial output kept). Its laws:
+  `HOST-1` frontends drive turns only through the protocol (none constructs an
+  `Agent`/`ChatSession`), `HOST-2` the grant/refusal wording lives only here,
+  `HOST-3` one thread owns the `!Send` engine. Native only — it drags
+  `yatima-lib`; the WASM client consumes only `yatima-protocol`.
+- **`yatima-tui`** — an interactive terminal UI (`ratatui`/`crossterm`), a thin
+  view over `yatima-host` kept a separate crate so its UI deps never touch the
+  lean CLI. It holds only a render *mirror* rebuilt from `HostEvent`s plus
+  input/scroll/status; Esc trips the host's `CancelGate` for the in-flight turn.
+  Its own `TUI-N` invariant registry (cursor-bounds, pure-render, single-append,
+  ui-liveness, reasoning-foldable, prompt-cancel, single-in-flight) is in the
+  crate doc. Built in slices: Slice 1 chat + streaming + reasoning split, Slice 2
+  foldable reasoning + context meter, Slice 3 Esc cancellation.
+- **`yatima-gui`** — the GPU frontend (egui/eframe, wgpu → Metal): the same thin
+  view over `yatima-host`, so the model cannot tell hosts apart because there is
+  one host. It renders the `HostEvent` stream as a markdown/texture transcript
+  (`egui_commonmark`), with inline image artifacts — the host reads a plot/image
+  artifact's bytes and ships them as `HostEvent::Image`, textured on receipt (an
+  SVG rasterizes first, the one view concern kept here so it compiles into the
+  coming WASM client). A pump thread wakes egui as host events arrive.
+  Decorative animation is behind `--whimsy` (off by default).
 - **`yatima-text`** — host-neutral prettification of model output (the LaTeX
   → Unicode pipeline, fence-aware). Deliberately dependency-free, pure std,
   WASM-clean: every frontend — TUI, GUI, serve's browser client — runs the
@@ -590,11 +612,11 @@ is the join/watch/cancel surface, while the agent normally awaits each typed
 `ToolOutcome`, projects it to a model-facing `ToolResult`, and then proceeds to
 the next model turn.
 
-**Deferred**: the durable engine-side shape is an **engine actor** owning the
-`Engine` and serving `(prompt, opts, reply)` requests over a channel — also the
-home for conversation/KV-cache reuse and cross-request scheduling. That actor can
-compose with the async tool runtime, but it is not required to make tools
-awaitable/watchable today.
+**Realized as `yatima-host`**: the durable engine-side shape is an **engine
+actor** owning the `Engine` and serving requests over a channel — now the shared
+host every frontend drives (see Crates), and the home for conversation/KV-cache
+reuse and cross-request scheduling. It composes with the async tool runtime but
+is not required to make tools awaitable/watchable.
 
 ### Runtime ownership & the sync↔async bridge (RT-1)
 
@@ -688,7 +710,9 @@ return-type-notation or `trait_variant` — not before.
 ## Registries
 
 The **canonical** invariant & law registry lives in the crate docs — see the
-`yatima-lib` crate doc and the `yatima-cli` `main.rs` doc. Each is protected by
+`yatima-lib` crate doc and the `yatima-cli` `main.rs` doc, and, for the frontend
+stack, the `yatima-protocol` doc (**PROTO-2**), the `yatima-host` doc
+(**HOST-1/2/3**), and the `yatima-tui` doc (**TUI-1..7**). Each is protected by
 a test that cites its id in an `// upholds: <id>` comment (`grep -r
 'upholds:'`).
 
@@ -696,7 +720,8 @@ In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
 **GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1/2**, **CAP-1/2**,
 **PROTO-1**); observability (**OBS-1/2/3/4**); chat templates
-(**TMPL-1/2**, **REASON-1**); CLI (**CLI-1/2/3**).
+(**TMPL-1/2**, **REASON-1**); CLI (**CLI-1/2/3**); the frontend host and its
+wire plane (**HOST-1/2/3**, **PROTO-2**) and the terminal UI (**TUI-1..7**).
 
 ## State machines
 
@@ -756,7 +781,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   episodes were only diagnosable from raw text), copying exact characters,
   or auditing the presentation layer itself. Doctrine fit: the transcript
   mirror gains a second, unfiltered view of the same truth — rendering is a
-  *view* choice, never a mutation (the runner's session is already the
+  *view* choice, never a mutation (the host's session is already the
   authority). Per-message would be a refinement; session-global toggle is
   the slice.
 - **Context-length handling — a staged, robust progression.** The multi-turn
@@ -902,8 +927,9 @@ and deliberately shelved — the note records why so we don't repeat them.
   slice: advisory, not patch-writing. Git is host-side evidence gathering here;
   a future interactive agent should get explicit `GitStatus`/`GitDiff`
   capabilities rather than ambient shell access.
-- **Async engine-actor** owning the `Engine` and wrapping `run_with_async` — the
-  home for cross-request concurrency and KV-cache reuse (see Concurrency).
+- **Async `yatima-host`** — the current host owns the `Engine` on one thread and
+  serves one session synchronously; the evolution wraps `run_with_async` for
+  cross-request concurrency and KV-cache reuse (see Concurrency).
 - **Structured-message `Completer` boundary** — `complete` takes a *rendered prompt
   string* today, which suits a local model fed one prompt but loses role
   structure for a hosted chat API (Anthropic/OpenAI take `messages[]`, not a
@@ -917,21 +943,23 @@ and deliberately shelved — the note records why so we don't repeat them.
   module).** `yatima-lib` is the in-process **leaf**; serving concerns must not
   leak into it (no auth/tenancy/routing in `Engine`/`ChatSession`/`Agent`). The
   map, by where each concern lives:
-  - *Node concurrency* (many clients, one model) → the **engine-actor** above
-    (owns the `Engine`, serves requests over a channel; home of KV reuse). A
-    request queue gives modest concurrency cheaply; real throughput needs
-    continuous batching — a large engine build, probably **rented** (see fork).
+  - *Node concurrency* (many clients, one model) → **`yatima-host`** (owns the
+    `Engine`, serves requests over a channel; home of KV reuse). A request queue
+    gives modest concurrency cheaply; real throughput needs continuous batching —
+    a large engine build, probably **rented** (see fork).
   - *Tenancy / auth / quotas / multi-client API* → a separate **service tier**
     (e.g. `yatima-serve`) mapping tenant → capabilities → budget → model. Builds
     on the capability primitive (`Dir`/`WriteDir`/`WebOrigin`/`NtfyTopic` —
     bounded effects are exactly what isolation needs); never enters the library.
     **Live trigger (2026-07): remote collaboration on sieve** — serving yatima
-    to a second user. The client plane is the GUI's event stream: everything
-    above `Ev` (decode, textures, egui rendering) compiles to WASM; everything
-    below (engine, tools, python) stays native — serve is "the `Ev` plane over
-    a websocket," artifacts (plot PNGs) crossing as bytes. Stepping stone:
-    wire real agent turns + the shared toolset into the GUI, hardening that
-    seam in-process first.
+    to a second user. The seam is now built: `yatima-host` owns the engine and
+    speaks `yatima-protocol`, so serve is a socket speaking that protocol.
+    Everything below (engine, tools, python) stays native; the client plane is
+    the GUI's view half (decode, textures, egui) compiled to WASM over
+    `yatima-protocol`, with artifacts (plot PNGs) crossing as `HostEvent::Image`
+    bytes. The in-process hardening — real agent turns, the shared toolset, and
+    the protocol/host extraction that made "consistent by parallel implementation"
+    into "consistent by construction" — is done; serve is the remaining edge.
   - *Clusters / routing / model placement* → a **control-plane** tier above the
     service; the library is the leaf and knows nothing of it.
   - *Model sharding* → engine-internal, **rented from candle/backend**, surfaced
@@ -942,10 +970,10 @@ and deliberately shelved — the note records why so we don't repeat them.
   `Completer`s — vLLM / TGI / llama.cpp-server / cloud) **vs** yatima as *serving
   engine* (continuous batching — far larger, lower-level). The remote `Completer`
   is the escape hatch: front a real serving engine and let yatima orchestrate.
-  The async runtime (RT-1/RT-2), `Send`-per-impl `Completer` (CMP-1), the
-  engine-actor, and capability scoping are the substrate the service tier
-  consumes — the serving tier is the first consumer that would pull the
-  engine-actor off this list.
+  The async runtime (RT-1/RT-2), `Send`-per-impl `Completer` (CMP-1),
+  `yatima-host` (the extracted engine host) with `yatima-protocol` (its wire
+  plane), and capability scoping are the concrete substrate the service tier
+  builds on.
 - **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the
   `<root>/<org>/<name>` layout, extracted once there's a real trigger (possum
   validating its own ids, or a second consumer).
@@ -958,8 +986,8 @@ and deliberately shelved — the note records why so we don't repeat them.
   wrote yatima's own name in Arabic, يَتِيمَة, which a TTY cannot shape — it
   briefly signed the idle TUI title before being dropped as clutter.) The answer is a
   **separate** frontend, not a TTY upgrade: a sibling edge (`yatima-gui`) over
-  `yatima-lib`, reusing the engine-actor's three planes unchanged (the actor is
-  already frontend-agnostic — preserve that as an invariant). Rust build path,
+  `yatima-host`, sharing the protocol planes with the TUI (the host is
+  frontend-agnostic by construction now — HOST-1). Rust build path,
   not a Haskell port: `wgpu` + `cosmic-text`/`glyphon` for shaped/bidi text,
   `egui`/`makepad` for imgui-style controls, MSDF for crisp scaling. Beyond
   rendering, the deeper bet is **live-tweak / incremental recomputation** — a
