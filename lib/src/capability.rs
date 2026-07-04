@@ -103,10 +103,13 @@ impl WebOrigin {
     }
 
     /// Resolve `target` under this origin. Absolute targets must have the same
-    /// scheme/host/port. Fragments are rejected because they are client-side only
-    /// and should not affect a fetched document.
+    /// scheme/host/port. A fragment is stripped, not refused: it is client-side
+    /// only and cannot affect the fetched document, and a user-pasted
+    /// `…/Article#Section` URL used to burn a whole agent step teaching the
+    /// model to do the same strip. Stripping also makes the fragment-bearing
+    /// URL a cache hit for the same page.
     pub fn resolve(&self, target: &str) -> Result<Url> {
-        let url = Url::parse(target).or_else(|_| self.origin.join(target))?;
+        let mut url = Url::parse(target).or_else(|_| self.origin.join(target))?;
         if !same_origin(&self.origin, &url) {
             // The reason leads, the URL trails: frontends clip long tool
             // errors from the tail, and the URL is the long part — the
@@ -116,9 +119,7 @@ impl WebOrigin {
                 self.origin.as_str().trim_end_matches('/')
             );
         }
-        if url.fragment().is_some() {
-            bail!("url fragments are not fetchable");
-        }
+        url.set_fragment(None);
         Ok(url)
     }
 }
@@ -518,7 +519,15 @@ mod tests {
         assert!(web.resolve("https://example.com/ok").is_ok());
         assert!(web.resolve("http://example.com/no").is_err());
         assert!(web.resolve("https://evil.example/no").is_err());
-        assert!(web.resolve("https://example.com/page#frag").is_err());
+        // A fragment strips rather than refuses: it is client-side only, and
+        // a user-pasted `…#Section` URL must not cost an agent step. The
+        // stripped form also caches as the same page.
+        assert_eq!(
+            web.resolve("https://example.com/page#frag")
+                .unwrap()
+                .as_str(),
+            "https://example.com/page"
+        );
     }
 
     #[test]
