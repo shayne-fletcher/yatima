@@ -129,6 +129,9 @@ pub struct App {
     /// choreography the compose needs.
     compose_requested: bool,
     pub should_quit: bool,
+    /// A first Ctrl+C/Ctrl+D armed the quit; the next confirms, any other key
+    /// stands down. Render shows the confirm hint while armed.
+    pub quit_armed: bool,
     next_turn_id: TurnId,
 }
 
@@ -155,6 +158,7 @@ impl App {
             reasoning_expanded: false,
             compose_requested: false,
             should_quit: false,
+            quit_armed: false,
             next_turn_id: 0,
         }
     }
@@ -196,9 +200,21 @@ impl App {
 
     /// Apply an intent's effect.
     pub fn apply(&mut self, intent: Intent) {
+        // Quitting takes a confirmation: the first Ctrl+C/Ctrl+D arms it (the
+        // input box shows the hint), the next confirms, and any other key
+        // stands down — a stray reflex never tears the session down.
+        if !matches!(intent, Intent::Quit) {
+            self.quit_armed = false;
+        }
         match intent {
             Intent::None => {}
-            Intent::Quit => self.should_quit = true,
+            Intent::Quit => {
+                if self.quit_armed {
+                    self.should_quit = true;
+                } else {
+                    self.quit_armed = true;
+                }
+            }
             Intent::Submit => self.start_turn(),
             Intent::Cancel => self.cancel_in_flight(),
             Intent::Edit(input) => {
@@ -725,6 +741,29 @@ mod tests {
             stop: StopKind::Eos,
         });
         assert_eq!(app.status.prompt_tokens, Some(2048));
+    }
+
+    #[test]
+    fn quit_takes_two_presses() {
+        // A stray Ctrl+C/Ctrl+D must not tear the session down: the first
+        // press arms (render shows the confirm hint), the second confirms,
+        // and any other key stands down.
+        let (mut app, _rx) = test_app();
+        app.apply(Intent::Quit);
+        assert!(!app.should_quit, "one press must not quit");
+        assert!(app.quit_armed, "the first press arms");
+        app.apply(Intent::Quit);
+        assert!(app.should_quit, "the second press confirms");
+
+        let (mut app, _rx) = test_app();
+        app.apply(Intent::Quit);
+        app.apply(Intent::ToggleReasoning);
+        assert!(!app.quit_armed, "any other key stands down");
+        app.apply(Intent::Quit);
+        assert!(
+            !app.should_quit,
+            "after standing down, a press only re-arms"
+        );
     }
 
     #[test]

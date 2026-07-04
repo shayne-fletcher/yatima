@@ -634,15 +634,23 @@ fn push_wrapped<'a>(lines: &mut Vec<Line<'a>>, text: &str, style: Style) {
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     // While a turn is in flight, the input box title carries the live activity
     // indicator (a breathing colored glyph + stats) — unmistakably working,
-    // never apparently hung.
-    let title: Line = match &app.in_flight {
-        Some(f) => Line::from(activity_spans(
-            f.answering,
-            f.cancelling,
-            f.started.elapsed(),
-            f.frags,
-        )),
-        None => Line::from("message"),
+    // never apparently hung. An armed quit outranks it: the confirm hint must
+    // be seen for the second Ctrl+C/Ctrl+D to mean anything.
+    let title: Line = if app.quit_armed {
+        Line::from(Span::styled(
+            "press ^C or ^D again to quit",
+            Style::default().fg(Color::Yellow),
+        ))
+    } else {
+        match &app.in_flight {
+            Some(f) => Line::from(activity_spans(
+                f.answering,
+                f.cancelling,
+                f.started.elapsed(),
+                f.frags,
+            )),
+            None => Line::from("message"),
+        }
     };
     // The input editor (`tui-textarea`) renders itself — cursor at the point,
     // horizontal scroll, placeholder. We draw the bordered block (its title is
@@ -655,9 +663,9 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.in_flight.is_some() {
-        "Esc cancel · ^C quit"
+        "Esc cancel · ^C^C quit"
     } else {
-        "^C quit · /reset · ^R reasoning · ^G editor · PgUp/PgDn"
+        "^C^C quit · /reset · ^R reasoning · ^G editor · PgUp/PgDn"
     };
     let mut parts = vec![
         app.status.model_label.clone(),
