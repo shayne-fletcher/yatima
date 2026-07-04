@@ -1,0 +1,17 @@
+[package]
+name = "yatima-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+# The frontend wire protocol: the event/request plane the TUI, GUI, and the
+# future yatima-serve WASM client all speak. Deliberately serde-only and
+# wasm-clean — yatima-serve deserializes these types in a browser, so this
+# crate must compile to wasm32 and therefore must NOT depend on yatima-lib
+# (which drags candle and never targets a browser). The actor that produces
+# these events lives in yatima-host; this crate is only their shape.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

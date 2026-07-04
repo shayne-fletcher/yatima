@@ -6,4 +6,5 @@ members = [
   "tui",
   "gui",
   "text",
+  "protocol",
 ]
