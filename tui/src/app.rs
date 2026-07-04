@@ -89,6 +89,10 @@ pub enum Intent {
     Up,
     /// ↓: recall the next prompt (or the live draft), or move down a line.
     Down,
+    /// Ctrl+G: compose the prompt in `$VISUAL`/`$EDITOR` (the TUI suspends,
+    /// the editor gets the draft, the result lands back in the input box —
+    /// reviewed, never auto-submitted).
+    Compose,
     ScrollUp,
     ScrollDown,
     /// Expand/collapse the reasoning regions of completed turns (TUI-5).
@@ -120,6 +124,9 @@ pub struct App {
     /// Whether completed turns' reasoning is expanded (TUI-5). The in-flight
     /// turn always streams its reasoning live regardless.
     pub reasoning_expanded: bool,
+    /// Set by Ctrl+G; consumed by the run loop, which owns the terminal
+    /// choreography the compose needs.
+    compose_requested: bool,
     pub should_quit: bool,
     next_turn_id: TurnId,
 }
@@ -144,6 +151,7 @@ impl App {
                 grants: Vec::new(),
             },
             reasoning_expanded: false,
+            compose_requested: false,
             should_quit: false,
             next_turn_id: 0,
         }
@@ -160,6 +168,7 @@ impl App {
             KeyCode::Char('c') if ctrl => Intent::Quit,
             KeyCode::Char('d') if ctrl => Intent::Quit,
             KeyCode::Char('r') if ctrl => Intent::ToggleReasoning,
+            KeyCode::Char('g') if ctrl => Intent::Compose,
             KeyCode::Esc => Intent::Cancel,
             KeyCode::PageUp => Intent::ScrollUp,
             KeyCode::PageDown => Intent::ScrollDown,
@@ -211,6 +220,7 @@ impl App {
                     self.input.move_cursor(CursorMove::Down);
                 }
             }
+            Intent::Compose => self.compose_requested = true,
             Intent::ScrollUp => self.scroll_back = self.scroll_back.saturating_add(3),
             Intent::ScrollDown => self.scroll_back = self.scroll_back.saturating_sub(3),
             Intent::ToggleReasoning => self.reasoning_expanded = !self.reasoning_expanded,
@@ -289,6 +299,17 @@ impl App {
     /// reaching the editor, so this is normally a single line.
     pub fn input_text(&self) -> String {
         self.input.lines().join("\n")
+    }
+
+    /// Consume a pending Ctrl+G compose request (run-loop side).
+    pub fn take_compose_request(&mut self) -> bool {
+        std::mem::take(&mut self.compose_requested)
+    }
+
+    /// Surface an app-plane notice in the transcript (compose failures land
+    /// here — audible, never fatal).
+    pub fn notice(&mut self, message: String) {
+        self.push_entry(Entry::Notice(message));
     }
 
     /// Replace the prompt text (cursor lands at the end).
@@ -504,12 +525,86 @@ where
                 }
             }
         }
+        if app.take_compose_request() {
+            // Ctrl+G: hand the draft to $VISUAL/$EDITOR. The engine keeps
+            // running (events buffer in the channel and land on return);
+            // the terminal is suspended for exactly the editor's lifetime.
+            match tokio::task::block_in_place(|| compose_in_editor(&app.input_text())) {
+                Ok(Some(text)) => app.set_input(&text),
+                Ok(None) => {} // unchanged or emptied: the draft stands
+                Err(e) => app.notice(format!("compose: {e}")),
+            }
+            // External writes trashed the alternate screen; repaint from
+            // scratch on the next draw.
+            terminal.clear()?;
+        }
         if app.should_quit {
             break;
         }
     }
     let _ = app.req_tx.send(EngineRequest::Shutdown);
     Ok(())
+}
+
+/// Suspend the TUI, run `$VISUAL`/`$EDITOR` on a temp file seeded with the
+/// draft, and return the edited text — `None` when the user left it
+/// unchanged or emptied it (their draft stands either way). The terminal is
+/// restored before any error propagates, whatever the editor did.
+fn compose_in_editor(draft: &str) -> Result<Option<String>> {
+    use crossterm::event::{
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    };
+
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .map_err(|_| anyhow::anyhow!("set $VISUAL or $EDITOR"))?;
+    let mut words = editor.split_whitespace();
+    let program = words
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("$VISUAL/$EDITOR is empty"))?
+        .to_string();
+    let args: Vec<String> = words.map(str::to_string).collect();
+
+    let path = std::env::temp_dir().join(format!("yatima-compose-{}.md", std::process::id()));
+    std::fs::write(&path, draft)?;
+
+    // Suspend: mirror enter_terminal/restore_terminal in main.rs (the
+    // enhancement query answers the same for the same terminal).
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
+    }
+    crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .arg(&path)
+        .status();
+
+    // Resume unconditionally — the terminal must come back even if the
+    // editor never started.
+    enable_raw_mode()?;
+    crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+    if enhanced {
+        crossterm::execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+
+    let status = status.map_err(|e| anyhow::anyhow!("could not run {program}: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("{program} exited with {status}; draft kept");
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let _ = std::fs::remove_file(&path);
+    let text = text.trim_end();
+    Ok((!text.is_empty() && text != draft).then(|| text.to_string()))
 }
 
 #[cfg(test)]
@@ -535,6 +630,19 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn ctrl_g_requests_compose_once() {
+        // Ctrl+G classifies to Compose and raises the flag; the run loop
+        // consumes it exactly once (classify stays pure, apply is the only
+        // writer).
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(App::classify(key), Intent::Compose));
+        let (mut app, _rx) = test_app();
+        app.apply(Intent::Compose);
+        assert!(app.take_compose_request());
+        assert!(!app.take_compose_request(), "consumed, not sticky");
     }
 
     #[test]

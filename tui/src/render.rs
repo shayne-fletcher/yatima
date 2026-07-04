@@ -657,7 +657,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.in_flight.is_some() {
         "Esc cancel · ^C quit"
     } else {
-        "^C quit · /reset · ^R reasoning · PgUp/PgDn"
+        "^C quit · /reset · ^R reasoning · ^G editor · PgUp/PgDn"
     };
     let mut parts = vec![
         app.status.model_label.clone(),
