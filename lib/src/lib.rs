@@ -203,6 +203,15 @@
 //!   confines output to its [`WriteDir`] at a content-hash name: the model
 //!   never chooses the path, identical bytes share an artifact, and each
 //!   host displays it in its medium's idiom.
+//! - **IMG-2** display authority is the typed artifact event
+//!   ([`ToolCtx::emit_artifact`] → `ToolEvent::Artifact` →
+//!   `AgentEvent::ToolArtifact`), never a parse of result prose — and a
+//!   tool emits it exactly when the artifact is new to the user this
+//!   session. `read_image` keeps a fetch-once memo by URL *and* by content
+//!   hash (the artifact name), so a repeat URL and a different URL serving
+//!   byte-identical content both teach the model the user has already seen
+//!   the picture, emit nothing, and can never re-show it. Cited by the
+//!   repeat/duplicate tests on `read_image` and the artifact-event tests.
 //! - **PROTO-1** a malformed/unknown tool call becomes a typed non-success
 //!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
 //!   from, never a silent mis-execution.

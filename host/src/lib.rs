@@ -618,20 +618,16 @@ fn load_engine(config: &HostConfig) -> Result<Engine> {
     Engine::load(&config.dir, dev)
 }
 
-/// Read back the image an artifact tool just wrote (a plot render, a fetched
-/// image), returning its bytes and filename. The path is parsed from the tool's
-/// `wrote <path> (…)` summary and so always points inside the tool's own
-/// sandbox (PLOT-2 / IMG-1); this only ever fires for an artifact the user just
-/// asked for. Format-agnostic — an SVG's raw bytes pass through; a view that
-/// cannot show SVG rasterizes on receipt (that stays a view concern).
-fn read_artifact(content: &str) -> Result<(Vec<u8>, String)> {
-    let path = content
-        .strip_prefix("wrote ")
-        .and_then(|rest| rest.rsplit_once(" ("))
-        .map(|(path, _)| path)
-        .ok_or_else(|| anyhow::anyhow!("unrecognized artifact summary: {content:?}"))?;
+/// Read back the image an artifact tool just announced (a plot render, a
+/// fetched image), returning its bytes and filename. The path arrives on the
+/// typed artifact event (IMG-2) — the tool emitted it, so it always points
+/// inside the tool's own sandbox (PLOT-2 / IMG-1) and only ever names an
+/// artifact the user has not seen this session. Format-agnostic — an SVG's
+/// raw bytes pass through; a view that cannot show SVG rasterizes on receipt
+/// (that stays a view concern).
+fn read_artifact(path: &std::path::Path) -> Result<(Vec<u8>, String)> {
     let bytes = std::fs::read(path)?;
-    let name = std::path::Path::new(path)
+    let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("artifact")
@@ -746,9 +742,6 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
     // Answer prose streamed during the *current* step; a ToolCall event means it
     // was narration, not answer — retract and reclassify.
     let mut step_answer = String::new();
-    // Name of the tool whose outcome we're awaiting, so the outcome handler
-    // knows who produced it (a plot/read_image success ships its bytes).
-    let mut pending_tool = String::new();
 
     let result = agent.run_with_cancellable(user, cancel, (), |(), event| {
         match event {
@@ -769,7 +762,6 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     });
                     fragment(LibChannel::Reasoning, format!("{}\n", narration.trim_end()));
                 }
-                pending_tool = call.name.clone();
                 note(
                     ToolNoteKind::Call,
                     format!("{} {}", call.name, clip(&call.args.to_string(), 160)),
@@ -800,21 +792,23 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     ),
                 };
                 note(kind, text);
-                if matches!(pending_tool.as_str(), "plot" | "read_image") {
-                    if let ToolOutcome::Success { content } = &outcome {
-                        match read_artifact(content) {
-                            Ok((bytes, name)) => {
-                                let _ = event_tx.send(HostEvent::Image {
-                                    turn_id,
-                                    bytes,
-                                    name,
-                                });
-                            }
-                            Err(e) => note(ToolNoteKind::Failure, format!("artifact: {e}")),
-                        }
-                    }
-                }
                 step_answer.clear();
+            }
+            AgentEvent::ToolArtifact(path) => {
+                // IMG-2: the typed artifact event is the display license —
+                // result prose is model-facing only, so a memo-served repeat
+                // (which mentions the file but emits no event) never
+                // re-shows the image.
+                match read_artifact(&path) {
+                    Ok((bytes, name)) => {
+                        let _ = event_tx.send(HostEvent::Image {
+                            turn_id,
+                            bytes,
+                            name,
+                        });
+                    }
+                    Err(e) => note(ToolNoteKind::Failure, format!("artifact: {e}")),
+                }
             }
             // Already streamed fragment-by-fragment; Done carries the stop.
             AgentEvent::Final(_) => {}
@@ -961,17 +955,16 @@ mod tests {
     }
 
     #[test]
-    fn artifact_summary_parses_the_wrote_contract() {
-        // The `wrote <path> (…)` contract shared by plot and read_image: an
-        // unrecognized summary and a missing file both error; a real file
-        // yields its bytes and bare filename (the wire's Image.name).
-        assert!(read_artifact("no such summary").is_err());
-        assert!(read_artifact("wrote /nonexistent/x.png (png, 5 bytes)").is_err());
+    fn artifact_read_takes_the_event_path() {
+        // upholds: IMG-2 — the display path starts from the typed artifact
+        // event's path, never from parsing result prose: a missing file
+        // errors; a real file yields its bytes and bare filename (the wire's
+        // Image.name).
+        assert!(read_artifact(std::path::Path::new("/nonexistent/x.png")).is_err());
 
         let path = std::env::temp_dir().join("yatima-host-artifact-test.png");
         std::fs::write(&path, b"PNGDATA").unwrap();
-        let content = format!("wrote {} (png, 7 bytes)", path.display());
-        let (bytes, name) = read_artifact(&content).unwrap();
+        let (bytes, name) = read_artifact(&path).unwrap();
         assert_eq!(bytes, b"PNGDATA");
         assert_eq!(name, "yatima-host-artifact-test.png");
         let _ = std::fs::remove_file(&path);

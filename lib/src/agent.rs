@@ -28,6 +28,11 @@ pub enum AgentEvent {
     ToolCall(ToolCall),
     ToolStarted(ToolCall),
     ToolProgress(String),
+    /// A tool announced a freshly produced artifact the user should be shown
+    /// (IMG-2): the display license is this typed event, never a parse of the
+    /// outcome's prose. Memo-served repeats produce an outcome but no
+    /// artifact event.
+    ToolArtifact(std::path::PathBuf),
     ToolOutcome(ToolOutcome),
     /// A live slice of the current step's decode (AGENT-4), classified as it
     /// streams: chain-of-thought on [`Channel::Reasoning`], prose on
@@ -454,6 +459,29 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                 match task.recv().await {
                                     Some(ToolEvent::Started { call, .. }) => {
                                         match step(acc, AgentEvent::ToolStarted(call))? {
+                                            ControlFlow::Continue(a) => acc = a,
+                                            ControlFlow::Break(a) => {
+                                                task.cancel();
+                                                let _ = task.join().await;
+                                                tracing::info!(
+                                                    steps,
+                                                    stop = ?AgentStop::Stopped,
+                                                    "agent run finished"
+                                                );
+                                                return Ok((
+                                                    a,
+                                                    Run {
+                                                        answer,
+                                                        transcript,
+                                                        steps,
+                                                        stop: AgentStop::Stopped,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Some(ToolEvent::Artifact { path, .. }) => {
+                                        match step(acc, AgentEvent::ToolArtifact(path))? {
                                             ControlFlow::Continue(a) => acc = a,
                                             ControlFlow::Break(a) => {
                                                 task.cancel();
@@ -908,6 +936,54 @@ mod tests {
             })
             .collect();
         assert_eq!(streamed.trim(), run_folded.answer);
+    }
+
+    #[test]
+    fn tool_artifact_announcements_are_forwarded() {
+        // upholds: IMG-2 — a tool's typed artifact announcement reaches the
+        // run_with fold as ToolArtifact, after Started and before Outcome,
+        // carrying the tool's own path: display authority is this event,
+        // never a parse of the outcome's prose.
+        use crate::tool::{Tool, ToolCtx, ToolSpec};
+        struct Announces;
+        #[async_trait::async_trait]
+        impl Tool for Announces {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "announce".to_string(),
+                    description: "test artifact announcement".to_string(),
+                    params: serde_json::json!({ "type": "object" }),
+                }
+            }
+            async fn call(&self, _args: serde_json::Value, ctx: ToolCtx) -> Result<String> {
+                ctx.emit_artifact("/sandbox/announced.png");
+                Ok("wrote /sandbox/announced.png (png, 3 bytes)".to_string())
+            }
+        }
+
+        let script = [call("announce", "unused"), "Final.".to_string()];
+        let texts: Vec<&str> = script.iter().map(String::as_str).collect();
+        let tools = Tools::new().with(Announces);
+        let mut model = Scripted::new(&texts);
+        let (events, _run) = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "sys", 5)
+            .run_with("q", Vec::new(), |mut acc, event| {
+                acc.push(event);
+                Ok(ControlFlow::Continue(acc))
+            })
+            .unwrap();
+
+        let marks: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| !matches!(e, AgentEvent::Fragment { .. }))
+            .collect();
+        assert!(matches!(marks[0], AgentEvent::ToolCall(_)));
+        assert!(matches!(marks[1], AgentEvent::ToolStarted(_)));
+        let AgentEvent::ToolArtifact(path) = marks[2] else {
+            panic!("expected ToolArtifact, got {:?}", marks[2]);
+        };
+        assert_eq!(path, std::path::Path::new("/sandbox/announced.png"));
+        assert!(matches!(marks[3], AgentEvent::ToolOutcome(_)));
+        assert!(matches!(marks[4], AgentEvent::Final(_)));
     }
 
     #[test]

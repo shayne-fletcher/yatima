@@ -199,6 +199,19 @@ impl ToolCtx {
             message: message.into(),
         });
     }
+
+    /// Announce a freshly produced artifact the user should be shown (IMG-2).
+    /// This event — not the result prose — is what licenses a host to display
+    /// the file, so a tool emits it exactly when the artifact is new to the
+    /// user this session: a memo-served repeat mentions the file in its result
+    /// text but does not emit. `path` must lie inside the tool's own write
+    /// sandbox (PLOT-2 / IMG-1).
+    pub fn emit_artifact(&self, path: impl Into<PathBuf>) {
+        let _ = self.events.send(ToolEvent::Artifact {
+            call_id: self.call_id,
+            path: path.into(),
+        });
+    }
 }
 
 /// Observable lifecycle events for a tool call.
@@ -211,6 +224,13 @@ pub enum ToolEvent {
     Progress {
         call_id: ToolCallId,
         message: String,
+    },
+    /// A new artifact the user should be shown, announced by the tool itself
+    /// via [`ToolCtx::emit_artifact`] (IMG-2): display authority is this
+    /// typed event, never a host's parse of result prose.
+    Artifact {
+        call_id: ToolCallId,
+        path: PathBuf,
     },
     Finished {
         call_id: ToolCallId,
@@ -974,6 +994,17 @@ impl ReadPage {
                 );
             }
             out.push(']');
+        } else if offset > 0 && !page.images.is_empty() {
+            // Deeper windows carry no image URLs by design, and a model
+            // hunting for "more images" past the first window will
+            // otherwise invent thumbnail URLs (which encode unguessable
+            // content hashes — every constructed one 400s). Say where the
+            // list lives instead.
+            out.push_str(
+                "\n[images: already listed in the offset-0 window — that \
+                 list covers the whole page; copy URLs from it exactly, \
+                 never construct them]",
+            );
         }
         out.push_str("\n\n");
         out.push_str(&body);
@@ -1209,8 +1240,18 @@ fn ungranted_image_origins(images: &[(String, String)], origins: &WebOrigins) ->
     out
 }
 
+/// Imgs with a declared width or height under this are page furniture
+/// (logos, bullets, vote symbols, UI icons), not content — skipped by
+/// [`article_images`].
+const READ_PAGE_ICON_MAX_PX: u32 = 64;
+
 /// [`READ_PAGE_MAX_IMAGES`] — what `read_page` lists so the model can
-/// discover something worth a `read_image` call.
+/// discover something worth a `read_image` call. Listing is *content*
+/// discovery, so page furniture never spends a slot (nor the model's
+/// attention): `data:` URLs (nothing to fetch), icon-sized imgs
+/// ([`READ_PAGE_ICON_MAX_PX`]), and MediaWiki's math fallback renders
+/// (`mwe-math` classes — formulas, not pictures; a Wikipedia-shaped
+/// special case like the sibling-origin note).
 fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut rest = content_html;
@@ -1222,6 +1263,20 @@ fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
         let Some(src) = attr_value(tag, "src") else {
             continue;
         };
+        if src.trim_start().starts_with("data:") {
+            continue;
+        }
+        let icon_sized = ["width", "height"].iter().any(|dim| {
+            attr_value(tag, dim)
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .is_some_and(|px| px < READ_PAGE_ICON_MAX_PX)
+        });
+        if icon_sized {
+            continue;
+        }
+        if attr_value(tag, "class").is_some_and(|c| c.contains("mwe-math")) {
+            continue;
+        }
         let Ok(resolved) = base.join(&src) else {
             continue;
         };
@@ -1264,12 +1319,35 @@ pub struct ReadImage {
     dir: WriteDir,
     client: Client,
     max_bytes: usize,
-    /// Fetch-once memo: resolved URL → the summary already returned. A
-    /// repeat call is served from here (zero network, like `read_page`'s
-    /// page cache) with a teaching tail: the user has already seen this
-    /// image, so a model padding "show me another" with a re-fetch learns
-    /// so instead of presenting a rerun as new. Session-lifetime only.
-    fetched: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Fetch-once memo (session-lifetime, IMG-2). `by_url`: resolved URL →
+    /// the summary already returned; a repeat call is served from here (zero
+    /// network, like `read_page`'s page cache) with a teaching tail: the
+    /// user has already seen this image, so a model padding "show me
+    /// another" with a re-fetch learns so instead of presenting a rerun as
+    /// new. `shown`: artifact names already displayed — the name *is* the
+    /// content hash, so a different URL serving byte-identical content is
+    /// caught after its (unavoidable) fetch and teaches the same lesson
+    /// instead of being presented as a new picture. Repeats of either kind
+    /// emit no artifact event: the user is never shown the same bytes twice.
+    fetched: std::sync::Mutex<ImageMemo>,
+}
+
+/// See [`ReadImage::fetched`].
+#[derive(Default)]
+struct ImageMemo {
+    by_url: std::collections::HashMap<String, String>,
+    shown: std::collections::HashSet<String>,
+}
+
+/// The memo's URLs as one deterministic, comma-joined line — the concrete
+/// avoid-list a teaching tail hands the model (IMG-2). The [images] list a
+/// prior run saw is gone from context (tool results are ephemeral across
+/// runs), so "pick a different one" only works if the tail says different
+/// from *what*.
+fn sorted_urls(by_url: &std::collections::HashMap<String, String>) -> String {
+    let mut urls: Vec<&str> = by_url.keys().map(String::as_str).collect();
+    urls.sort_unstable();
+    urls.join(", ")
 }
 
 impl ReadImage {
@@ -1293,7 +1371,7 @@ impl ReadImage {
             dir: WriteDir::new(dir),
             client,
             max_bytes,
-            fetched: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fetched: std::sync::Mutex::new(ImageMemo::default()),
         })
     }
 }
@@ -1352,23 +1430,26 @@ impl Tool for ReadImage {
         !self.origins.is_empty()
     }
 
-    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+    async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String> {
         let target = required_string(&args, "read_image", "url")?;
         let url = self.origins.resolve(target)?; // CAP-2 before any network
                                                  // Fetch-once: a repeat of a URL this session re-teaches, never
                                                  // re-fetches — the artifact is already on disk and the user has
-                                                 // already seen it.
-        let memo = self
-            .fetched
-            .lock()
-            .expect("read_image memo poisoned")
-            .get(url.as_str())
-            .cloned();
-        if let Some(summary) = memo {
+                                                 // already seen it (IMG-2: no artifact event, so no re-display).
+        let (memo_hit, shown_urls) = {
+            let memo = self.fetched.lock().expect("read_image memo poisoned");
+            (
+                memo.by_url.get(url.as_str()).cloned(),
+                sorted_urls(&memo.by_url),
+            )
+        };
+        if let Some(summary) = memo_hit {
             return Ok(format!(
-                "{summary} — already fetched and shown this session; pick a \
-                 different image from the read_page [images] list if the \
-                 user wants another"
+                "{summary} — already fetched and shown this session; do not \
+                 present it as new. Shown so far: {shown_urls}. If the user \
+                 wants another, pick a file name from the read_page [images] \
+                 list that is not among these (call read_page again if you \
+                 no longer have the list)"
             ));
         }
         let mut response = self.client.get(url.clone()).send().await?;
@@ -1422,10 +1503,25 @@ impl Tool for ReadImage {
         let out = self.dir.resolve(&name)?; // IMG-1 confinement
         tokio::fs::write(&out, &body).await?;
         let summary = format!("wrote {} ({ext}, {} bytes)", out.display(), body.len());
-        self.fetched
-            .lock()
-            .expect("read_image memo poisoned")
-            .insert(url.to_string(), summary.clone());
+        {
+            let mut memo = self.fetched.lock().expect("read_image memo poisoned");
+            // Same bytes under a different URL (the artifact name is the
+            // content hash): teach, don't re-show (IMG-2). The URL is
+            // memoized too, so its own repeats short-circuit the fetch.
+            if !memo.shown.insert(name.clone()) {
+                memo.by_url.insert(url.to_string(), summary.clone());
+                let shown_urls = sorted_urls(&memo.by_url);
+                return Ok(format!(
+                    "{summary} — byte-identical to an image already shown \
+                     this session under a different URL; do not present it \
+                     as new. Shown so far: {shown_urls}. If the user wants \
+                     another, pick a file name from the read_page [images] \
+                     list that is not among these"
+                ));
+            }
+            memo.by_url.insert(url.to_string(), summary.clone());
+        }
+        ctx.emit_artifact(&out); // IMG-2: display authority, first showing only
         Ok(summary)
     }
 }
@@ -1744,7 +1840,7 @@ impl Tool for Plot {
         }
     }
 
-    async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
+    async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String> {
         // PLOT-1: the closed schema is the whole authority story — unknown
         // fields (e.g. anything code-shaped) fail deserialization, and the
         // rejection teaches the legal channel for symbolic intent.
@@ -1826,6 +1922,10 @@ impl Tool for Plot {
         let bytes = tokio::fs::read(&out).await?;
         let (w, h) = png_dims(&bytes)
             .ok_or_else(|| anyhow!("plot: generator produced an unreadable PNG"))?;
+        // IMG-2: every successful render is a fresh deliverable the user
+        // asked for — announce it (a re-render of the same spec re-shows by
+        // design; the *user* requested the plot, unlike a padding re-fetch).
+        ctx.emit_artifact(&out);
         Ok(format!(
             "wrote {} ({w}x{h}, {} bytes)",
             out.display(),
@@ -2539,15 +2639,52 @@ well known works of art depicting paradoxical architecture.</p>
             first.content
         );
 
-        // Discovery rides window 0 only; continuations stay pure text.
+        // Discovery rides window 0 only; a continuation carries a pointer
+        // back to it — never the list (a model hunting "more images" in
+        // deeper windows would otherwise construct URLs, which always 400).
         let next = next_offset(&first.content).expect("truncated at 80 chars");
         let cont = read_window(&tools, "/objects", next).await;
         assert!(!cont.is_error);
         assert!(
-            !cont.content.contains("[images"),
+            cont.content
+                .contains("already listed in the offset-0 window"),
+            "the pointer names where discovery lives: {}",
+            cont.content
+        );
+        assert!(
+            !cont.content.contains("tri.svg"),
             "listed once, in the first window: {}",
             cont.content
         );
+    }
+
+    #[test]
+    fn article_images_lists_content_not_furniture() {
+        // The discovery listing carries *content* images only: data: URLs,
+        // icon-sized imgs (declared width or height under 64px), and
+        // MediaWiki math-fallback renders are page furniture that would
+        // otherwise spend the capped slots (and the model's attention)
+        // before the first real picture.
+        let base = Url::parse("https://en.wikipedia.org/wiki/X").unwrap();
+        let html = concat!(
+            r#"<img src="/static/icons/enwiki-25.svg" width="25" height="25">"#,
+            r#"<img src="data:image/png;base64,AAAA">"#,
+            r#"<img class="mwe-math-fallback-image-inline mw-invert" "#,
+            r#"src="https://wikimedia.org/api/rest_v1/media/math/render/svg/abc" alt="x^2">"#,
+            r#"<img src="//upload.wikimedia.org/thumb/Real.png/250px-Real.png" alt="a real picture">"#,
+            r#"<img src="/tiny-bullet.png" height="20">"#,
+            r#"<img src="/diagram.png" width="480" height="360">"#,
+        );
+        let images = article_images(html, &base);
+        let srcs: Vec<&str> = images.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(
+            srcs,
+            [
+                "https://upload.wikimedia.org/thumb/Real.png/250px-Real.png",
+                "https://en.wikipedia.org/diagram.png",
+            ]
+        );
+        assert_eq!(images[0].1, "a real picture");
     }
 
     #[test]
@@ -2627,8 +2764,10 @@ well known works of art depicting paradoxical architecture.</p>
             "a rerun teaches, not re-presents: {repeat}"
         );
 
-        // A different URL with identical bytes fetches (its own expect(1))
-        // and lands on the same content-hash artifact, without the note.
+        // A different URL with identical bytes fetches (its own expect(1)),
+        // lands on the same content-hash artifact — and teaches that the
+        // picture has already been shown (IMG-2): a URL is not an identity,
+        // the bytes are.
         let copy = tools.dispatch_async(&call("/tri-copy.png")).await;
         let copy = copy.render_for_model("").content;
         assert!(
@@ -2636,8 +2775,72 @@ well known works of art depicting paradoxical architecture.</p>
             "identical bytes share an artifact: {copy}"
         );
         assert!(
-            !copy.contains("already fetched"),
-            "a fresh URL is not a rerun: {copy}"
+            copy.contains("byte-identical to an image already shown"),
+            "same bytes at a new URL teach, not re-present: {copy}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_image_emits_the_artifact_event_only_on_first_showing() {
+        // upholds: IMG-2 — the typed artifact event is the display license,
+        // and it fires exactly once per content per session: the first fetch
+        // emits it; a repeat of the same URL emits nothing (memo hit); a
+        // different URL serving byte-identical content emits nothing either.
+        let server = MockServer::start().await;
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-image-bytes";
+        for route in ["/tri.png", "/tri-copy.png"] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "image/png")
+                        .set_body_bytes(png),
+                )
+                .mount(&server)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadImage::new(origins, dir.path().join("images")).unwrap());
+
+        // Drive one call to completion, collecting its artifact events.
+        let run = |route: &'static str| {
+            let tools = &tools;
+            async move {
+                let mut task = tools.spawn(ToolCall {
+                    name: "read_image".to_string(),
+                    args: json(&format!(r#"{{"url": "{route}"}}"#)),
+                });
+                let mut artifacts = Vec::new();
+                loop {
+                    match task.recv().await {
+                        Some(ToolEvent::Artifact { path, .. }) => artifacts.push(path),
+                        Some(ToolEvent::Finished { outcome, .. }) => break (outcome, artifacts),
+                        Some(_) => {}
+                        None => break (task.join().await, artifacts),
+                    }
+                }
+            }
+        };
+
+        let (first, artifacts) = run("/tri.png").await;
+        assert!(first.is_success(), "{first:?}");
+        assert_eq!(artifacts.len(), 1, "first showing announces the artifact");
+        assert!(
+            artifacts[0].starts_with(dir.path().join("images")),
+            "the event names the sandboxed artifact: {:?}",
+            artifacts[0]
+        );
+
+        let (repeat, artifacts) = run("/tri.png").await;
+        assert!(repeat.is_success(), "{repeat:?}");
+        assert!(artifacts.is_empty(), "a URL rerun never re-shows (IMG-2)");
+
+        let (dup, artifacts) = run("/tri-copy.png").await;
+        assert!(dup.is_success(), "{dup:?}");
+        assert!(
+            artifacts.is_empty(),
+            "byte-identical content under a new URL never re-shows (IMG-2)"
         );
     }
 
