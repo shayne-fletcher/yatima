@@ -934,6 +934,17 @@ impl ImageListing {
             .map(|(url, _)| url.clone())
             .ok_or(listing.len())
     }
+
+    /// Every listed URL — what `read_image` checks the shown-set against to
+    /// state exhaustion as a fact rather than let the model guess it.
+    fn urls(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .expect("image listing poisoned")
+            .iter()
+            .map(|(url, _)| url.clone())
+            .collect()
+    }
 }
 
 impl ReadPage {
@@ -1010,7 +1021,12 @@ impl ReadPage {
                 "\n[images — display one with read_image {\"image\": N}; \
                  markdown image links do not render:",
             );
-            for (n, (src, alt)) in page.images.iter().enumerate() {
+            for (n, (src, alt)) in page
+                .images
+                .iter()
+                .take(READ_PAGE_MAX_IMAGES_SHOWN)
+                .enumerate()
+            {
                 out.push_str(&format!("\n  {}. ", n + 1));
                 out.push_str(src);
                 if !alt.is_empty() {
@@ -1018,6 +1034,16 @@ impl ReadPage {
                     out.push_str(alt);
                     out.push(')');
                 }
+            }
+            // The head is printed; the whole list is selectable. Say what is
+            // not shown — silent truncation once cost a session its ability
+            // to tell "out of images" from "out of listed images".
+            if page.images.len() > READ_PAGE_MAX_IMAGES_SHOWN {
+                out.push_str(&format!(
+                    "\n  …plus {}.–{}., not shown but selectable by number",
+                    READ_PAGE_MAX_IMAGES_SHOWN + 1,
+                    page.images.len()
+                ));
             }
             // Wikipedia-shaped sites serve images from a sibling origin
             // (upload.wikimedia.org vs en.wikipedia.org). Naming the missing
@@ -1048,9 +1074,14 @@ impl ReadPage {
         out.push_str("\n\n");
         out.push_str(&body);
         if end < total {
+            // State the unread fraction and target the satisficing failure
+            // directly: models conclude from the first window unless the
+            // marker names the moment they go wrong.
+            let unread_pct = (total - end) * 100 / total;
             out.push_str(&format!(
-                "\n\n[chars {offset}..{end} of {total}; call read_page again \
-                 with offset={end} for the rest]"
+                "\n\n[chars {offset}..{end} of {total} — {unread_pct}% of \
+                 this page is unread; if the answer is not above, call \
+                 read_page again with offset={end} before concluding]"
             ));
         } else if offset > 0 {
             out.push_str(&format!("\n\n[chars {offset}..{end} of {total}; end]"));
@@ -1170,6 +1201,11 @@ impl Tool for ReadPage {
         let base = url.clone();
         let (title, text, images) = tokio::task::spawn_blocking(
             move || -> Result<(String, String, Vec<(String, String)>)> {
+            // Scan the whole fetched page before the extractor consumes it:
+            // the readable region misses infobox tails, galleries, and
+            // navboxes — real pictures a reader will ask for. The listing
+            // must cover the page, not the extraction (IMG-3).
+            let page_wide = article_images(&html, &base);
             let cfg = dom_smoothie::Config {
                 max_elements_to_parse: READ_PAGE_MAX_ELEMENTS,
                 ..Default::default()
@@ -1183,7 +1219,14 @@ impl Tool for ReadPage {
             let article = readability.parse().map_err(|e| {
                 anyhow!("read_page: no readable article at {url_string}: {e}; use read_url for raw content")
             })?;
-            let images = article_images(&article.content, &base);
+            // Article-region images keep the low numbers; the rest of the
+            // page follows, deduped.
+            let mut images = article_images(&article.content, &base);
+            for (url, alt) in page_wide {
+                if !images.iter().any(|(u, _)| *u == url) {
+                    images.push((url, alt));
+                }
+            }
             Ok((
                 article.title.to_string(),
                 article.text_content.to_string(),
@@ -1212,8 +1255,12 @@ impl Tool for ReadPage {
     }
 }
 
-/// Cap on the images listed per page — discovery metadata, not a sitemap.
-const READ_PAGE_MAX_IMAGES: usize = 12;
+/// Cap on the image entries *printed* in window 0's header — the full list
+/// is published to the shared [`ImageListing`] and every entry stays
+/// selectable by number; past the cap the header says exactly what it is
+/// not showing (no silent truncation — "out of images" and "out of listed
+/// images" must never diverge again).
+const READ_PAGE_MAX_IMAGES_SHOWN: usize = 24;
 
 /// Cap on a fetched image's size — real diagrams and photos fit; a
 /// pathological body can't buffer unbounded (the guard streams).
@@ -1284,13 +1331,14 @@ fn ungranted_image_origins(images: &[(String, String)], origins: &WebOrigins) ->
 /// [`article_images`].
 const READ_PAGE_ICON_MAX_PX: u32 = 64;
 
-/// [`READ_PAGE_MAX_IMAGES`] — what `read_page` lists so the model can
-/// discover something worth a `read_image` call. Listing is *content*
-/// discovery, so page furniture never spends a slot (nor the model's
-/// attention): `data:` URLs (nothing to fetch), icon-sized imgs
-/// ([`READ_PAGE_ICON_MAX_PX`]), and MediaWiki's math fallback renders
-/// (`mwe-math` classes — formulas, not pictures; a Wikipedia-shaped
-/// special case like the sibling-origin note).
+/// Every content image in `content_html` — what `read_page` publishes so
+/// the model can discover something worth a `read_image` call. Uncapped:
+/// completeness is the point (the display cap lives at render,
+/// [`READ_PAGE_MAX_IMAGES_SHOWN`]). Page furniture never spends a slot
+/// (nor the model's attention): `data:` URLs (nothing to fetch),
+/// icon-sized imgs ([`READ_PAGE_ICON_MAX_PX`]), and MediaWiki's math
+/// fallback renders (`mwe-math` classes — formulas, not pictures; a
+/// Wikipedia-shaped special case like the sibling-origin note).
 fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut rest = content_html;
@@ -1325,9 +1373,6 @@ fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
         }
         let alt = attr_value(tag, "alt").unwrap_or_default();
         out.push((url, alt));
-        if out.len() >= READ_PAGE_MAX_IMAGES {
-            break;
-        }
     }
     out
 }
@@ -1375,10 +1420,12 @@ pub struct ReadImage {
     listing: ImageListing,
 }
 
-/// See [`ReadImage::fetched`].
+/// See [`ReadImage::fetched`]. `by_url` keeps the artifact *path* as data
+/// alongside the summary so an `"again": true` re-show emits the typed
+/// artifact event without parsing its own prose.
 #[derive(Default)]
 struct ImageMemo {
-    by_url: std::collections::HashMap<String, String>,
+    by_url: std::collections::HashMap<String, (String, PathBuf)>,
     shown: std::collections::HashSet<String>,
 }
 
@@ -1387,7 +1434,7 @@ struct ImageMemo {
 /// prior run saw is gone from context (tool results are ephemeral across
 /// runs), so "pick a different one" only works if the tail says different
 /// from *what*.
-fn sorted_urls(by_url: &std::collections::HashMap<String, String>) -> String {
+fn sorted_urls<V>(by_url: &std::collections::HashMap<String, V>) -> String {
     let mut urls: Vec<&str> = by_url.keys().map(String::as_str).collect();
     urls.sort_unstable();
     urls.join(", ")
@@ -1475,6 +1522,10 @@ impl Tool for ReadImage {
                     "url": {
                         "type": "string",
                         "description": "absolute image URL on a granted origin, copied exactly from a read_page [images] list"
+                    },
+                    "again": {
+                        "type": "boolean",
+                        "description": "true only when the user asked to see an already-shown image again — re-displays it"
                     }
                 }
             }),
@@ -1521,24 +1572,51 @@ impl Tool for ReadImage {
                 selected.as_str()
             }
         };
+        let again = args
+            .get("again")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let url = self.origins.resolve(target)?; // CAP-2 before any network
                                                  // Fetch-once: a repeat of a URL this session re-teaches, never
                                                  // re-fetches — the artifact is already on disk and the user has
-                                                 // already seen it (IMG-2: no artifact event, so no re-display).
-        let (memo_hit, shown_urls) = {
+                                                 // already seen it (IMG-2: no artifact event, so no re-display —
+                                                 // unless the user asked, which is what "again" asserts).
+        let (memo_hit, shown_urls, exhausted) = {
             let memo = self.fetched.lock().expect("read_image memo poisoned");
+            let listed = self.listing.urls();
             (
                 memo.by_url.get(url.as_str()).cloned(),
                 sorted_urls(&memo.by_url),
+                !listed.is_empty() && listed.iter().all(|u| memo.by_url.contains_key(u)),
             )
         };
-        if let Some(summary) = memo_hit {
+        if let Some((summary, path)) = memo_hit {
+            if again {
+                // A deliberate re-show at the user's request (IMG-2's one
+                // sanctioned repeat): same artifact, spelled out as a rerun.
+                ctx.emit_artifact(&path);
+                return Ok(format!("{summary} — re-shown at the user's request"));
+            }
+            if exhausted {
+                // Not the model's guess: computed against a listing that
+                // covers the whole page. Name the productive next move.
+                return Ok(format!(
+                    "{summary} — already shown, and every image in the \
+                     current [images] list has now been shown this session. \
+                     Reading deeper windows of this page will not reveal new \
+                     images (the list covers the whole page); if the user \
+                     wants more, ask them for a different page or origin. To \
+                     re-show one the user asked to see again, repeat the \
+                     call with \"again\": true"
+                ));
+            }
             return Ok(format!(
                 "{summary} — already fetched and shown this session; do not \
                  present it as new. Shown so far: {shown_urls}. If the user \
-                 wants another, pick a file name from the read_page [images] \
-                 list that is not among these (call read_page again if you \
-                 no longer have the list)"
+                 wants another, pick a different number from the read_page \
+                 [images] list (call read_page again if you no longer have \
+                 the list). If the user asked to see this one again, repeat \
+                 the call with \"again\": true"
             ));
         }
         let mut response = self.client.get(url.clone()).send().await?;
@@ -1598,17 +1676,25 @@ impl Tool for ReadImage {
             // content hash): teach, don't re-show (IMG-2). The URL is
             // memoized too, so its own repeats short-circuit the fetch.
             if !memo.shown.insert(name.clone()) {
-                memo.by_url.insert(url.to_string(), summary.clone());
+                memo.by_url
+                    .insert(url.to_string(), (summary.clone(), out.clone()));
+                if again {
+                    drop(memo);
+                    ctx.emit_artifact(&out);
+                    return Ok(format!("{summary} — re-shown at the user's request"));
+                }
                 let shown_urls = sorted_urls(&memo.by_url);
                 return Ok(format!(
                     "{summary} — byte-identical to an image already shown \
                      this session under a different URL; do not present it \
                      as new. Shown so far: {shown_urls}. If the user wants \
-                     another, pick a file name from the read_page [images] \
-                     list that is not among these"
+                     another, pick a different number from the read_page \
+                     [images] list. If the user asked to see this one again, \
+                     repeat the call with \"again\": true"
                 ));
             }
-            memo.by_url.insert(url.to_string(), summary.clone());
+            memo.by_url
+                .insert(url.to_string(), (summary.clone(), out.clone()));
         }
         ctx.emit_artifact(&out); // IMG-2: display authority, first showing only
         Ok(summary)
@@ -2756,6 +2842,100 @@ well known works of art depicting paradoxical architecture.</p>
         );
     }
 
+    #[tokio::test]
+    async fn read_page_images_cover_the_page_and_speak_truncation() {
+        // upholds: IMG-3 — the listing covers the whole fetched page, not
+        // just the extracted article (footers/galleries/navboxes hold real
+        // pictures a reader will ask for); article-region entries keep the
+        // low numbers; the header prints only the head and *says* what it
+        // is not printing; and every entry stays selectable by number.
+        let footer_imgs: String = (1..=28)
+            .map(|i| format!(r#"<img src="/pics/f.png?i={i}" alt="related {i}">"#))
+            .collect();
+        let html = format!(
+            r#"<html><body><article><h1>T</h1>
+<img src="/pics/a.png" alt="the article picture">
+<p>Some readable article prose long enough to extract cleanly and render
+as the first window of the page without tripping any extraction guard.</p>
+</article><footer>{footer_imgs}</footer></body></html>"#
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/article"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pics/f.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"\x89PNG\r\n\x1a\nfooter-bytes".as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let listing = ImageListing::default();
+        let tools = Tools::new()
+            .with(
+                ReadPage::with_limits(origins.clone(), 1_000_000, 4_000)
+                    .unwrap()
+                    .with_listing(listing.clone()),
+            )
+            .with(
+                ReadImage::new(origins, dir.path().join("images"))
+                    .unwrap()
+                    .with_listing(listing),
+            );
+
+        let first = read_window(&tools, "/article", 0).await;
+        assert!(!first.is_error, "{}", first.content);
+        // The article's own image leads the numbering…
+        assert!(
+            first.content.contains(&format!(
+                "\n  1. {}/pics/a.png (the article picture)",
+                server.uri()
+            )),
+            "{}",
+            first.content
+        );
+        // …the footer images (invisible to the extraction) are listed after…
+        assert!(
+            first.content.contains("/pics/f.png?i=1"),
+            "page-wide coverage: {}",
+            first.content
+        );
+        // …the head stops at the cap, and the tail is spoken, not silent.
+        assert!(
+            !first.content.contains("\n  25. "),
+            "the head stops at the display cap: {}",
+            first.content
+        );
+        assert!(
+            first
+                .content
+                .contains("…plus 25.–29., not shown but selectable by number"),
+            "{}",
+            first.content
+        );
+        // An entry past the printed head is still an index copy away.
+        let picked = tools
+            .dispatch_async(&ToolCall {
+                name: "read_image".to_string(),
+                args: json(r#"{"image": 29}"#),
+            })
+            .await;
+        let ToolOutcome::Success { content } = &picked else {
+            panic!("{picked:?}");
+        };
+        assert!(content.starts_with("wrote "), "{content}");
+    }
+
     #[test]
     fn article_images_lists_content_not_furniture() {
         // The discovery listing carries *content* images only: data: URLs,
@@ -2949,6 +3129,16 @@ as the first window of the page without tripping any extraction guard.</p>
         };
         assert!(content.starts_with("wrote "), "{content}");
 
+        // With the page's whole (one-image) listing shown, a bare repeat
+        // states exhaustion as a computed fact and names the next move.
+        let spent = tools.dispatch_async(&image_call(r#"{"image": 1}"#)).await;
+        let spent = spent.render_for_model("").content;
+        assert!(
+            spent.contains("every image in the current [images] list has now been shown"),
+            "{spent}"
+        );
+        assert!(spent.contains("different page or origin"), "{spent}");
+
         // Misses teach with the live range / the conflicting args.
         let range = tools.dispatch_async(&image_call(r#"{"image": 5}"#)).await;
         let range = range.render_for_model("").content;
@@ -3019,13 +3209,40 @@ as the first window of the page without tripping any extraction guard.</p>
 
         let (repeat, artifacts) = run("/tri.png").await;
         assert!(repeat.is_success(), "{repeat:?}");
-        assert!(artifacts.is_empty(), "a URL rerun never re-shows (IMG-2)");
+        assert!(
+            artifacts.is_empty(),
+            "a URL rerun never re-shows unrequested (IMG-2)"
+        );
 
         let (dup, artifacts) = run("/tri-copy.png").await;
         assert!(dup.is_success(), "{dup:?}");
         assert!(
             artifacts.is_empty(),
             "byte-identical content under a new URL never re-shows (IMG-2)"
+        );
+
+        // The one sanctioned repeat: "again" asserts the user asked, and the
+        // re-show is emitted and spelled out as a rerun.
+        let mut task = tools.spawn(ToolCall {
+            name: "read_image".to_string(),
+            args: json(r#"{"url": "/tri.png", "again": true}"#),
+        });
+        let mut artifacts = Vec::new();
+        let outcome = loop {
+            match task.recv().await {
+                Some(ToolEvent::Artifact { path, .. }) => artifacts.push(path),
+                Some(ToolEvent::Finished { outcome, .. }) => break outcome,
+                Some(_) => {}
+                None => break task.join().await,
+            }
+        };
+        let ToolOutcome::Success { content } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(artifacts.len(), 1, "again re-shows, deliberately (IMG-2)");
+        assert!(
+            content.contains("re-shown at the user's request"),
+            "{content}"
         );
     }
 

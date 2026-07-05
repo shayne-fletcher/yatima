@@ -885,6 +885,20 @@ and deliberately shelved — the note records why so we don't repeat them.
   Follows the night of 2026-07-04: IMG-2 (typed artifact events,
   content-hash fetch-once) fixed re-display; this is the remaining
   discovery half.
+- **`read_page` find-in-page — promoted; sieve's reasons, not chat's.**
+  `{"url": …, "find": "going concern"}` returning the window(s) around
+  matches plus where the other matches live. The memo pipeline's model job
+  is reading long filings (the 8-K before the buy, offering language)
+  under a 12k-char window and the Metal depth ceiling; sequential paging
+  demands planning initiative a local model lacks, while *asking for what
+  it needs* is the one initiative-shaped thing instruct models do
+  reliably — the same move as `{"image": N}`: delete the job the model
+  fails at. Own design pass first: multi-match shape, case folding, cache
+  and budget interaction.
+- **`read_page` link discovery.** List the page's outbound article links
+  the way images are listed (numbered, filtered, capped-with-a-spoken-
+  tail), so "find me more on X" has a structural next hop instead of a
+  constructed URL. Secondary to find-in-page.
 - **Richer capabilities** — process capabilities and tools, plus multi-tool-per
   turn / planning. `WriteDir`, `WebOrigin`, and `NtfyTopic` are now present as
   first slices of the broader capability model.

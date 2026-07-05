@@ -210,15 +210,22 @@
 //!   session. `read_image` keeps a fetch-once memo by URL *and* by content
 //!   hash (the artifact name), so a repeat URL and a different URL serving
 //!   byte-identical content both teach the model the user has already seen
-//!   the picture, emit nothing, and can never re-show it. Cited by the
-//!   repeat/duplicate tests on `read_image` and the artifact-event tests.
+//!   the picture, emit nothing, and can never re-show it *unrequested* — an
+//!   explicit `{"again": true}` re-shows deliberately, spelled out as a
+//!   rerun. When every listed image has been shown, the teach states that
+//!   exhaustion as a computed fact. Cited by the repeat/duplicate, re-show,
+//!   and exhaustion tests on `read_image` and the artifact-event tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL
 //!   transcription: `read_page`'s first window publishes its numbered
 //!   `[images]` list into a session-shared [`ImageListing`], and
 //!   `read_image {"image": N}` selects from it (the exact-url form remains
-//!   for user-supplied targets). No listing yet and out-of-range numbers
-//!   teach rather than fail opaquely. Cited by the numbered-listing and
-//!   select-by-number tests.
+//!   for user-supplied targets). The listing covers the whole fetched page
+//!   (article-region images first, the rest deduped after — the extraction
+//!   alone misses galleries and navboxes), every entry is selectable even
+//!   past the printed head, and truncation is always spoken, never silent.
+//!   No listing yet and out-of-range numbers teach rather than fail
+//!   opaquely. Cited by the numbered-listing, page-wide-coverage,
+//!   spoken-truncation, and select-by-number tests.
 //! - **PROTO-1** a malformed/unknown tool call becomes a typed non-success
 //!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
 //!   from, never a silent mis-execution.
