@@ -209,10 +209,17 @@ impl WebOrigins {
         }
         match set.as_slice() {
             [only] => only.resolve(target),
+            // Name the candidates (CAP-3's teaching style): the retry should
+            // be a copy, not a reconstruction.
             _ => bail!(
                 "relative url {target:?} is ambiguous with {} origins granted; \
-                 use an absolute url",
-                set.len()
+                 use an absolute url — one of: {}",
+                set.len(),
+                set.iter()
+                    .filter_map(|w| w.origin().join(target).ok())
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -424,6 +431,10 @@ mod tests {
         set.grant("https://b.example").unwrap();
         let err = set.resolve("/wiki/x").unwrap_err().to_string();
         assert!(err.contains("ambiguous"), "{err}");
+        // The refusal names the candidates so the retry is a copy, not a
+        // reconstruction.
+        assert!(err.contains("https://a.example/wiki/x"), "{err}");
+        assert!(err.contains("https://b.example/wiki/x"), "{err}");
     }
 
     #[test]
