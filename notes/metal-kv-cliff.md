@@ -171,9 +171,22 @@ the more conservative of the two in the band that does work).
   answer poisons every later turn).
 - The TUI's 12k-char `read_page` budget stays on latency grounds alone
   (a 40k-char tool result cost ~2.5 min of prefill per agent step).
-- Upstream: candle issue to be filed with this diagnosis; the pin already
-  contains all recent Metal sync fixes (#3532, #3595, #3394), so the defect
-  is live on their main.
+- Upstream: **filed 2026-07-04 as huggingface/candle#3705**
+  (notes/candle-metal-kv-issue.md is the body), with a field-verified
+  repro: the stock `quantized-qwen2-instruct` example, `--split-prompt`,
+  8,414 templated tokens → garbage from the first sampled token on their
+  main at 31f35b1. The pin already contains all recent Metal sync fixes
+  (#3532, #3595, #3394), so the defect is live on their main. Watch the
+  issue; an upstream fix plus a candle bump is also the path to i-quant
+  GGUF support. Related but distinct upstream reports (do not let triage
+  fold ours into them): #3520 / #3698 are safetensors-path bugs (BF16 RoPE
+  tables; phi3's ignored `sliding_window`) — graded or window-shaped
+  degradation, partly CPU-reproducible; ours is quantized-path, f32-RoPE,
+  CPU-clean, sync-rescued, a byte-exact cliff at 8,192. Repro caution for
+  48 GB machines: never run the example unsplit at this length (~30 GB of
+  transient O(n²) attention buffers → unrecoverable swap spiral), and even
+  split-prompt peaks ~52 GB (the pool's power-of-two buckets never shrink;
+  it completes).
 
 ## Reproducing
 

@@ -811,11 +811,23 @@ and deliberately shelved — the note records why so we don't repeat them.
      host trims between turns (never mid-run) back under a low-water mark
      (`depth_ceiling − max_tokens − TOOL_HEADROOM`, the ceiling tightened to the
      Metal KV validated depth), always announcing the drop on the Note plane.
+     *Live validation still owed*: unit-proven, but no real session has yet
+     crossed the low-water mark — an ordinary tool session can't (tool tokens
+     are ephemeral across runs, AGENT-3; a 10-turn read_page/image session
+     committed ~2k tokens against an ~8k mark). Smoke it by temporarily
+     lowering `METAL_KV_VALIDATED`, then one long-prose marathon at the real
+     ceiling. That session's trim-frequency/dropped-size data also settles
+     rung 4's summary budget and knob default.
   4. **Summarize (compaction)** — fold the evicted prefix into one synthetic turn
      *via the `Completer` itself* (the local analog of server-side compaction);
      heaviest and lossiest, gated on real long-session use. *On trigger* — rung 2
      of `plans/context-compaction.plan.md`, layered on the returned dropped turns
-     of rung 3; not yet built.
+     of rung 3; not yet built, and not before rung 3's live validation (above).
+     Hard requirements already specced in the plan: the summary passes the same
+     degeneracy gate as any answer (it is the only model text that enters
+     history without streaming past the user), its source prompt is
+     budget-checked, Submit/Cancel during compaction is defined in code, and
+     the knob starts OFF everywhere.
   - Agent-specific rung: **elide old tool-result payloads** (keep "called
     `read_file` → ok", drop the body) — the analog of context-editing, cheaper
     than summarizing prose, since tool output is the actual bloat. *On trigger*
@@ -832,6 +844,14 @@ and deliberately shelved — the note records why so we don't repeat them.
   to what budget, and telling the user) is in the host. Rung 4 (summarize) layers
   on top, on trigger. (`generate` one-shot and short chats rarely hit this; the
   `embed` classify loop `reset()`s per item, so it never grows.)
+- **Build stamp in both frontends.** Embed `git describe --always --dirty`
+  at build time (a `build.rs`, no new deps) and surface it in the GUI
+  title/`/stats` and the TUI status line. Parallel sessions across two
+  frontends plus uncommitted working trees made "does the window I'm
+  testing contain the fix?" the single most re-asked question of
+  2026-07-04 — a glanceable stamp answers it. Pairs with a habit: a fix
+  that lands in one frontend either rides shared code (`yatima-text`'s
+  `user_label` is the pattern) or gets a parity line here.
 - **Readline niceties** — line editing + history (e.g. `rustyline`); the loop is
   plain `stdin` today.
 - **Conversation persistence** — save/load a session transcript.
@@ -852,6 +872,19 @@ and deliberately shelved — the note records why so we don't repeat them.
   quality.
 - **Native Mistral tool codec** (`[TOOL_CALLS]` / `[AVAILABLE_TOOLS]`) — a second
   tool-trained family in the agent; complex (special-token detok, 9-char IDs).
+- **Index-based `read_image` — take URL fidelity away from the model.** One
+  live session produced the whole failure taxonomy: mis-copied thumbnail
+  URLs (HTTP 400), *constructed* thumbnail URLs with invented hash
+  directories (HTTP 400 — the paths are unguessable by design), and
+  re-fetches of already-shown files. The listing should number its entries
+  and `read_image` should accept `{"image": 3}` against the session's last
+  `[images]` list, with the URL form kept for direct user-supplied targets.
+  Kills the class by construction instead of by teaching text. Design
+  question to settle first: how `ReadPage` and `ReadImage` share the
+  listing (they are separate `Tool`s today; the seam is deliberate).
+  Follows the night of 2026-07-04: IMG-2 (typed artifact events,
+  content-hash fetch-once) fixed re-display; this is the remaining
+  discovery half.
 - **Richer capabilities** — process capabilities and tools, plus multi-tool-per
   turn / planning. `WriteDir`, `WebOrigin`, and `NtfyTopic` are now present as
   first slices of the broader capability model.
