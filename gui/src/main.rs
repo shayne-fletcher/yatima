@@ -250,6 +250,12 @@ struct GuiApp {
     strawberry_start: Option<f32>,
     /// Parse/image cache for the markdown viewer (egui_commonmark).
     md_cache: egui_commonmark::CommonMarkCache,
+    /// Artifacts received this session, by wire name (`img-<hash>.png`),
+    /// re-persisted to a GUI-owned cache so a clicked *relative*
+    /// self-reference (`./img-…` — how the model tends to cite the file its
+    /// tool result named) can open in the platform viewer. Content-hash
+    /// names make the write idempotent.
+    artifact_paths: std::collections::HashMap<String, std::path::PathBuf>,
     /// Everything submitted this session (prompts and commands alike —
     /// /grant is worth recalling), consecutive duplicates collapsed.
     prompt_history: Vec<String>,
@@ -341,6 +347,7 @@ impl GuiApp {
             roll_start: None,
             strawberry_start: None,
             md_cache: egui_commonmark::CommonMarkCache::default(),
+            artifact_paths: std::collections::HashMap::new(),
             prompt_history: Vec::new(),
             history_nav: None,
             draft: String::new(),
@@ -714,6 +721,12 @@ impl GuiApp {
                 // texture. An SVG rasterizes first (a view concern, kept in the
                 // wasm-compilable half); a raster format decodes directly.
                 HostEvent::Image { bytes, name, .. } => {
+                    // Keep the bytes reachable for a later clicked
+                    // self-reference: the platform viewer needs a file, and
+                    // the wire (deliberately) carries no host-side path.
+                    if let Some(path) = persist_artifact(&name, &bytes) {
+                        self.artifact_paths.insert(name.clone(), path);
+                    }
                     let decoded = if name.ends_with(".svg") {
                         rasterize_svg(&bytes).and_then(|png| decode_texture(&self.ctx, &png))
                     } else {
@@ -1268,12 +1281,42 @@ impl eframe::App for GuiApp {
         // by path. Local targets open in the platform viewer (the idiom the
         // TUI uses at `wrote` time); web links keep the default path.
         ui.ctx().output_mut(|o| {
+            for cmd in &mut o.commands {
+                if let egui::OutputCommand::OpenUrl(open) = cmd {
+                    // A protocol-relative link has no scheme to open under;
+                    // give it the web's default, as a browser would.
+                    if open.url.starts_with("//") {
+                        open.url = format!("https:{}", open.url);
+                    }
+                }
+            }
             o.commands.retain(|cmd| {
                 if let egui::OutputCommand::OpenUrl(open) = cmd {
+                    // A relative target (no scheme, no leading slash) can't
+                    // resolve in a chat window — unless it names an artifact
+                    // this session received (`./img-…`, the model citing the
+                    // file its tool result wrote); that opens the persisted
+                    // copy in the platform viewer.
+                    if !open.url.contains(':') && !open.url.starts_with('/') {
+                        let named = std::path::Path::new(open.url.as_str())
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .and_then(|n| self.artifact_paths.get(n));
+                        if let Some(path) = named {
+                            eprintln!("link click → artifact viewer: {}", path.display());
+                            open_in_viewer(&path.to_string_lossy());
+                            return false;
+                        }
+                    }
                     if let Some(path) = local_target(&open.url) {
+                        eprintln!("link click → platform viewer: {path}");
                         open_in_viewer(path);
                         return false;
                     }
+                    // Kept for eframe's browser opener; the log line is the
+                    // ground truth when "the click did nothing" — it shows
+                    // the exact target the model wrote.
+                    eprintln!("link click → browser: {}", open.url);
                 }
                 true
             });
@@ -1287,10 +1330,31 @@ fn speaker(ui: &mut egui::Ui, who: &str, color: egui::Color32) {
 
 /// The filesystem path in a clicked link target, when it has one: a `file://`
 /// URL or a bare absolute path (how the model links artifacts). Web URLs are
-/// `None` — they stay on eframe's browser path.
+/// `None` — they stay on eframe's browser path. A protocol-relative URL
+/// (`//host/…` — Wikipedia-shaped HTML is full of them, and models copy
+/// them verbatim) starts with `/` but is *not* a path: handing it to the
+/// platform viewer dies silently, so it stays on the browser path too.
 fn local_target(url: &str) -> Option<&str> {
     url.strip_prefix("file://")
-        .or_else(|| url.starts_with('/').then_some(url))
+        .or_else(|| (url.starts_with('/') && !url.starts_with("//")).then_some(url))
+}
+
+/// Persist a received artifact into a GUI-owned cache directory, returning
+/// its path — the file a clicked self-reference opens. Content-hash names
+/// make this idempotent; failures return `None` (viewing is a courtesy).
+fn persist_artifact(name: &str, bytes: &[u8]) -> Option<std::path::PathBuf> {
+    // The wire name is host-chosen (content hash + extension), but never
+    // trust a name with path structure to escape the cache dir.
+    if name.contains('/') || name.contains("..") {
+        return None;
+    }
+    let dir = std::env::temp_dir().join("yatima-gui-artifacts");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(name);
+    if !path.exists() {
+        std::fs::write(&path, bytes).ok()?;
+    }
+    Some(path)
 }
 
 /// Open a local artifact in the platform viewer (macOS `open`) — full-size
@@ -1827,7 +1891,7 @@ fn render_msg(
 ) {
     match msg {
         Msg::User(text) => {
-            speaker(ui, "you", egui::Color32::LIGHT_BLUE);
+            speaker(ui, yatima_text::user_label(), egui::Color32::LIGHT_BLUE);
             ui.label(text);
         }
         Msg::Assistant { answer, reasoning } => {
@@ -1931,6 +1995,28 @@ mod tests {
         );
         assert_eq!(local_target("https://example.com/a.jpg"), None);
         assert_eq!(local_target("mailto:a@b.example"), None);
+        // Protocol-relative URLs start with `/` but are web targets — feeding
+        // them to the platform viewer dies silently (the regression where
+        // clicked wiki links opened nothing).
+        assert_eq!(local_target("//upload.wikimedia.org/a/b.png"), None);
+    }
+
+    #[test]
+    fn persisted_artifacts_roundtrip_and_never_escape_the_cache() {
+        // A received artifact persists under its wire name so a clicked
+        // relative self-reference (`./img-…`) can open it; a name with path
+        // structure is refused rather than allowed to escape the cache dir.
+        let path = persist_artifact("img-cafef00d.png", b"PNGDATA").unwrap();
+        assert!(path.ends_with("img-cafef00d.png"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"PNGDATA");
+        // Idempotent: same content-hash name, no rewrite needed, same path.
+        assert_eq!(
+            persist_artifact("img-cafef00d.png", b"PNGDATA").unwrap(),
+            path
+        );
+        assert!(persist_artifact("../escape.png", b"x").is_none());
+        assert!(persist_artifact("a/b.png", b"x").is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
