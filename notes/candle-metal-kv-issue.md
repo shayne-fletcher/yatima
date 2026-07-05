@@ -44,10 +44,12 @@ model.
 
 ```bash
 MODEL=/path/to/Qwen2.5-32B-Instruct-Q4_K_M.gguf
-# 8,414 tokens after the example's chat template — past the 8,192 cliff
-PROMPT=$(python3 -c 'print("Summarize this: " + "lorem ipsum " * 4200)')
+# 8,414 tokens after the example's chat template — past the 8,192 cliff.
+# (Not named PROMPT: in an interactive zsh that variable is the shell
+# prompt itself, and themes rewrite it under you.)
+TEXT=$(python3 -c 'print("Summarize this: " + "lorem ipsum " * 4200)')
 cargo run --release --features metal --example quantized-qwen2-instruct -- \
-  --model "$MODEL" --prompt "$PROMPT" --split-prompt \
+  --model "$MODEL" --prompt "$TEXT" --split-prompt \
   --sample-len 60 --temperature 0
 ```
 
