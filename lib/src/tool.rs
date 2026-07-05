@@ -873,6 +873,9 @@ pub struct ReadPage {
     /// spend). FIFO-evicted at [`READ_PAGE_CACHE_PAGES`]; session-lifetime
     /// only. A std `Mutex` — never held across an `.await`.
     cache: std::sync::Mutex<PageCache>,
+    /// Where window 0 publishes its numbered `[images]` list (IMG-3);
+    /// `read_image` holds the same handle and selects by number.
+    listing: ImageListing,
 }
 
 /// The extracted article a continuation call re-reads.
@@ -907,6 +910,32 @@ impl PageCache {
     }
 }
 
+/// The most recent `[images]` listing `read_page` published, shared with
+/// `read_image` so the model selects a picture by its list number instead
+/// of transcribing a thumbnail URL (IMG-3 — one live session produced the
+/// full failure taxonomy of the URL form: mis-copies, constructions with
+/// invented hash directories, re-fetches). One cell per session, wired
+/// into both tools at construction; a later page's listing replaces an
+/// earlier one, so a number always means "from the most recent listing".
+#[derive(Clone, Default)]
+pub struct ImageListing(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+impl ImageListing {
+    fn publish(&self, images: &[(String, String)]) {
+        *self.0.lock().expect("image listing poisoned") = images.to_vec();
+    }
+
+    /// The URL at 1-based `n`, or the listing's current length for the
+    /// teaching message when `n` misses.
+    fn select(&self, n: usize) -> std::result::Result<String, usize> {
+        let listing = self.0.lock().expect("image listing poisoned");
+        n.checked_sub(1)
+            .and_then(|i| listing.get(i))
+            .map(|(url, _)| url.clone())
+            .ok_or(listing.len())
+    }
+}
+
 impl ReadPage {
     /// A capability-scoped page reader with default budgets.
     pub fn new(origins: WebOrigins) -> Result<ReadPage> {
@@ -933,7 +962,16 @@ impl ReadPage {
             max_input_bytes,
             max_output_chars,
             cache: std::sync::Mutex::new(PageCache::default()),
+            listing: ImageListing::default(),
         })
+    }
+
+    /// Share the `[images]` listing with a `read_image` holding the same
+    /// handle (IMG-3): window 0 publishes into it; `{"image": N}` selects
+    /// from it.
+    pub fn with_listing(mut self, listing: ImageListing) -> ReadPage {
+        self.listing = listing;
+        self
     }
 
     /// Render one `max_output_chars` window of a cached page, starting at
@@ -967,12 +1005,13 @@ impl ReadPage {
         // header/body/marker window structure is untouched — WIN-1), once,
         // in the first window.
         if offset == 0 && !page.images.is_empty() {
+            self.listing.publish(&page.images); // IMG-3: what {"image": N} selects from
             out.push_str(
-                "\n[images — call read_image to display one; markdown image \
-                 links do not render:",
+                "\n[images — display one with read_image {\"image\": N}; \
+                 markdown image links do not render:",
             );
-            for (src, alt) in &page.images {
-                out.push_str("\n  ");
+            for (n, (src, alt)) in page.images.iter().enumerate() {
+                out.push_str(&format!("\n  {}. ", n + 1));
                 out.push_str(src);
                 if !alt.is_empty() {
                     out.push_str(" (");
@@ -1002,8 +1041,8 @@ impl ReadPage {
             // list lives instead.
             out.push_str(
                 "\n[images: already listed in the offset-0 window — that \
-                 list covers the whole page; copy URLs from it exactly, \
-                 never construct them]",
+                 list covers the whole page; display one with read_image \
+                 {\"image\": N} against it, never a constructed URL]",
             );
         }
         out.push_str("\n\n");
@@ -1330,6 +1369,10 @@ pub struct ReadImage {
     /// instead of being presented as a new picture. Repeats of either kind
     /// emit no artifact event: the user is never shown the same bytes twice.
     fetched: std::sync::Mutex<ImageMemo>,
+    /// The numbered listing the sibling `read_page` last published (IMG-3);
+    /// `{"image": N}` selects from it, so picking a picture is an index
+    /// copy, never a URL transcription.
+    listing: ImageListing,
 }
 
 /// See [`ReadImage::fetched`].
@@ -1372,7 +1415,15 @@ impl ReadImage {
             client,
             max_bytes,
             fetched: std::sync::Mutex::new(ImageMemo::default()),
+            listing: ImageListing::default(),
         })
+    }
+
+    /// Share the `[images]` listing with the `read_page` holding the same
+    /// handle (IMG-3): `{"image": N}` selects from what it last published.
+    pub fn with_listing(mut self, listing: ImageListing) -> ReadImage {
+        self.listing = listing;
+        self
     }
 }
 
@@ -1408,20 +1459,24 @@ impl Tool for ReadImage {
             // The spec states the tool's live authority (CAP-3a).
             description: format!(
                 "Fetch an image (SVG/PNG/JPEG) and save it for the user to \
-                 view. Use an exact URL from a read_page [images] list — do \
-                 not construct URLs. May read only these origins: {}. \
-                 Returns the file path.",
+                 view. Prefer {{\"image\": N}} — the entry's number in the \
+                 most recent read_page [images] list. A url must be copied \
+                 exactly from that list, never constructed. May read only \
+                 these origins: {}. Returns the file path.",
                 self.origins.list().join(", ")
             ),
             params: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "image": {
+                        "type": "integer",
+                        "description": "1-based number of an entry in the most recent read_page [images] list (preferred)"
+                    },
                     "url": {
                         "type": "string",
-                        "description": "absolute image URL on a granted origin"
+                        "description": "absolute image URL on a granted origin, copied exactly from a read_page [images] list"
                     }
-                },
-                "required": ["url"]
+                }
             }),
         }
     }
@@ -1431,7 +1486,41 @@ impl Tool for ReadImage {
     }
 
     async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String> {
-        let target = required_string(&args, "read_image", "url")?;
+        // IMG-3: selection by list number is the preferred path — an index
+        // copy where the url form invites transcription errors and invented
+        // thumbnail paths. Every miss teaches (PROTO-1).
+        let selected;
+        let target = match (args.get("url"), args.get("image")) {
+            (Some(_), Some(_)) => bail!(
+                "read_image: pass either \"image\" (a number from the last \
+                 read_page [images] list) or \"url\", not both"
+            ),
+            (None, None) => bail!(
+                "read_image: pass {{\"image\": N}} — the entry's number in \
+                 the most recent read_page [images] list (or an exact \"url\" \
+                 from it)"
+            ),
+            (Some(url), None) => url
+                .as_str()
+                .ok_or_else(|| anyhow!("read_image: `url` must be a string, got {url}"))?,
+            (None, Some(n)) => {
+                let n = n.as_u64().ok_or_else(|| {
+                    anyhow!("read_image: `image` must be a positive integer, got {n}")
+                })?;
+                selected = self.listing.select(n as usize).map_err(|len| match len {
+                    0 => anyhow!(
+                        "read_image: no [images] list yet this session — \
+                         call read_page first; its first window lists the \
+                         page's images by number"
+                    ),
+                    len => anyhow!(
+                        "read_image: image {n} is out of range — the most \
+                         recent read_page listed {len} images (1..={len})"
+                    ),
+                })?;
+                selected.as_str()
+            }
+        };
         let url = self.origins.resolve(target)?; // CAP-2 before any network
                                                  // Fetch-once: a repeat of a URL this session re-teaches, never
                                                  // re-fetches — the artifact is already on disk and the user has
@@ -2605,8 +2694,17 @@ well known works of art depicting paradoxical architecture.</p>
         assert!(
             first
                 .content
-                .contains("[images — call read_image to display one"),
+                .contains("[images — display one with read_image {\"image\": N}"),
             "{}",
+            first.content
+        );
+        // Entries are numbered (IMG-3): the number is what read_image selects
+        // by, so it must be printed next to each URL.
+        assert!(
+            first
+                .content
+                .contains(&format!("\n  1. {}/img/tri.svg", server.uri())),
+            "numbered entries: {}",
             first.content
         );
         assert!(
@@ -2778,6 +2876,93 @@ well known works of art depicting paradoxical architecture.</p>
             copy.contains("byte-identical to an image already shown"),
             "same bytes at a new URL teach, not re-present: {copy}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_image_selects_by_number_from_the_shared_listing() {
+        // upholds: IMG-3 — read_page's first window publishes its numbered
+        // [images] list into the shared ImageListing and read_image
+        // {"image": N} selects from it: picking a picture is an index copy,
+        // never a URL transcription. Every miss teaches: no listing yet,
+        // out-of-range, both args, neither arg.
+        let server = MockServer::start().await;
+        let html = r#"<html><body><article><h1>T</h1>
+<img src="/pic.png" alt="a picture">
+<p>Some readable article prose long enough to extract cleanly and render
+as the first window of the page without tripping any extraction guard.</p>
+</article></body></html>"#;
+        Mock::given(method("GET"))
+            .and(path("/article"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pic.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"\x89PNG\r\n\x1a\nbytes".as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let listing = ImageListing::default();
+        let tools = Tools::new()
+            .with(
+                ReadPage::with_limits(origins.clone(), 1_000_000, 4_000)
+                    .unwrap()
+                    .with_listing(listing.clone()),
+            )
+            .with(
+                ReadImage::new(origins, dir.path().join("images"))
+                    .unwrap()
+                    .with_listing(listing),
+            );
+        let image_call = |args: &str| ToolCall {
+            name: "read_image".to_string(),
+            args: json(args),
+        };
+
+        // Before any read_page: a number teaches "call read_page first".
+        let early = tools.dispatch_async(&image_call(r#"{"image": 1}"#)).await;
+        let early = early.render_for_model("").content;
+        assert!(early.contains("no [images] list yet"), "{early}");
+
+        // read_page publishes the numbered listing…
+        let page = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".to_string(),
+                args: json(&format!(r#"{{"url": "{}/article"}}"#, server.uri())),
+            })
+            .await;
+        assert!(page.is_success(), "{page:?}");
+
+        // …and {"image": 1} fetches exactly that entry.
+        let picked = tools.dispatch_async(&image_call(r#"{"image": 1}"#)).await;
+        let ToolOutcome::Success { content } = &picked else {
+            panic!("{picked:?}");
+        };
+        assert!(content.starts_with("wrote "), "{content}");
+
+        // Misses teach with the live range / the conflicting args.
+        let range = tools.dispatch_async(&image_call(r#"{"image": 5}"#)).await;
+        let range = range.render_for_model("").content;
+        assert!(range.contains("listed 1 images (1..=1)"), "{range}");
+        let both = tools
+            .dispatch_async(&image_call(
+                r#"{"image": 1, "url": "https://x.example/a.png"}"#,
+            ))
+            .await;
+        let both = both.render_for_model("").content;
+        assert!(both.contains("not both"), "{both}");
+        let neither = tools.dispatch_async(&image_call("{}")).await;
+        let neither = neither.render_for_model("").content;
+        assert!(neither.contains(r#"pass {"image": N}"#), "{neither}");
     }
 
     #[tokio::test]

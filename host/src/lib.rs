@@ -57,9 +57,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use yatima_lib::{
     device, looks_degenerate, metal_kv_depth_risk, resolve_format, Agent, AgentEvent, AgentStop,
     Cancel, Channel as LibChannel, ChatFormat, ChatMlTemplate, ChatSession, Engine, GenOpts,
-    JsonToolCall, KvDepthRisk, PlainTemplate, Plot, PlotSandbox, PromptTemplate, QwenToolCall,
-    ReadImage, ReadPage, ReadUrl, ReasoningSplitter, Sampling, StopReason, ToolCallCodec,
-    ToolOutcome, Tools, WebOrigins, METAL_KV_VALIDATED,
+    ImageListing, JsonToolCall, KvDepthRisk, PlainTemplate, Plot, PlotSandbox, PromptTemplate,
+    QwenToolCall, ReadImage, ReadPage, ReadUrl, ReasoningSplitter, Sampling, StopReason,
+    ToolCallCodec, ToolOutcome, Tools, WebOrigins, METAL_KV_VALIDATED,
 };
 
 pub mod knobs;
@@ -595,17 +595,22 @@ fn report_grants(event_tx: &UnboundedSender<HostEvent>, origins: Option<&WebOrig
 /// and content-hash named so re-renders are idempotent) — and quietly doesn't
 /// when it isn't; the model never sees a tool it cannot use.
 fn web_tools(origins: &WebOrigins) -> Result<Tools> {
-    let mut tools = Tools::new()
-        .with(ReadUrl::new(origins.clone())?)
-        .with(ReadPage::with_limits(
+    // One listing cell per session (IMG-3): read_page publishes its numbered
+    // [images] list into it, read_image selects from it by number.
+    let listing = ImageListing::default();
+    let mut tools = Tools::new().with(ReadUrl::new(origins.clone())?).with(
+        ReadPage::with_limits(
             origins.clone(),
             knobs::READ_PAGE_MAX_INPUT_BYTES,
             knobs::READ_PAGE_MAX_CHARS,
-        )?);
+        )?
+        .with_listing(listing.clone()),
+    );
     let cache = std::env::home_dir()
         .map(|home| home.join(".cache/yatima"))
         .unwrap_or_else(std::env::temp_dir);
-    tools = tools.with(ReadImage::new(origins.clone(), cache.join("images"))?);
+    tools =
+        tools.with(ReadImage::new(origins.clone(), cache.join("images"))?.with_listing(listing));
     match PlotSandbox::system(cache.join("plots")) {
         Ok(sandbox) => tools = tools.with(Plot::new(sandbox)),
         Err(e) => eprintln!("plot tool unavailable: {e}"),
