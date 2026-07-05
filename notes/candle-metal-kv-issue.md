@@ -37,10 +37,13 @@ single forward, and each layer then materializes a full f32
 attention-scores tensor (`[1, 40, n, n]` ≈ 10 GB at n ≈ 8,400, with
 masked and softmaxed copies alive alongside it) — transiently tens of
 GB on top of ~19 GB of weights, enough to force a 48 GB machine into
-an unrecoverable swap spiral. Single-token prefill is memory-flat and
-still crosses the cliff (chunk size is immaterial — see below), at the
-cost of prompt processing taking on the order of ten minutes for this
-model.
+an unrecoverable swap spiral. Single-token prefill avoids the O(n²)
+attention buffers and still crosses the cliff (chunk size is
+immaterial — see below), though it is not cheap either: the Metal
+buffer pool's power-of-two buckets never shrink, so the process still
+peaked near 52 GB here (much of it long-idle outgrown buckets that
+compress well — the run completes on a 48 GB machine). Measured
+prompt processing: 5.44 token/s, ~26 minutes for this prompt.
 
 ```bash
 MODEL=/path/to/Qwen2.5-32B-Instruct-Q4_K_M.gguf
@@ -52,6 +55,11 @@ cargo run --release --features metal --example quantized-qwen2-instruct -- \
   --model "$MODEL" --prompt "$TEXT" --split-prompt \
   --sample-len 60 --temperature 0
 ```
+
+Verified with exactly this command on main at 31f35b1: all 60 sampled
+tokens are garbage from the first one — unrelated Chinese word-salad
+("基础教育阶段不加标点符号 …") decaying into a repeated "正在显示..."
+loop, with the example's default repeat penalty 1.1.
 
 (For the decode-side crossing instead, `* 4000` — 8,014 tokens after
 the template — with `--sample-len 400` derails partway through
