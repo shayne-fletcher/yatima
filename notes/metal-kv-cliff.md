@@ -160,6 +160,11 @@ the more conservative of the two in the band that does work).
 - CTX-2 (reinstated after briefly being retired on over-optimism) flags
   Metal runs entering the band: debug-level through the validated depth
   (~15k), a hard warning past it — output there is likely garbage.
+- Hosts now **compact under the validated depth** (COMPACT-1 / HOST-5):
+  between turns the host trims the oldest committed exchanges back under a
+  low-water mark (the Metal KV validated depth, less the reply budget and one
+  run's within-run tool growth), announcing each drop on the Note plane — so a
+  long session stays under the reliable depth instead of running off the cliff.
 - Follow-on for hosts: an exchange whose final answer looks degenerate
   should not be committed to session history (AGENT-3 already skips
   non-Final stops; "Final but degenerate" is the missing case — a poisoned

@@ -254,6 +254,45 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         self.turns.truncate(self.system_len);
     }
 
+    /// Drop the oldest committed exchanges until the rendered prompt of the
+    /// remaining transcript fits `budget` tokens, keeping the newest
+    /// `keep_last` exchanges (COMPACT-1). Returns the dropped turns, oldest
+    /// first (a host may summarize them; rung 2). The seeded system prompt
+    /// (`system_len` leading turns) is never dropped, and exchanges are
+    /// dropped as indivisible user+assistant pairs, so template alternation is
+    /// never broken. If the system prompt alone exceeds `budget` only the
+    /// protected turns remain.
+    pub fn trim_history_to(&mut self, budget: usize, keep_last: usize) -> Vec<Turn> {
+        let protected_tail = keep_last.saturating_mul(2);
+        let mut dropped = Vec::new();
+        loop {
+            let droppable = self
+                .turns
+                .len()
+                .saturating_sub(self.system_len)
+                .saturating_sub(protected_tail);
+            if droppable < 2 {
+                break;
+            }
+            let rendered = self.template.render(&self.turns);
+            if self.count_prompt_tokens(&rendered) <= budget {
+                break;
+            }
+            // Oldest exchange = the two turns just after the system prefix.
+            dropped.push(self.turns.remove(self.system_len));
+            dropped.push(self.turns.remove(self.system_len));
+        }
+        dropped
+    }
+
+    /// Token count of `rendered` under the completer's tokenizer, falling back
+    /// to `chars/4` when it exposes none (COMPACT-1's deterministic fallback).
+    fn count_prompt_tokens(&self, rendered: &str) -> usize {
+        self.completer
+            .count_tokens(rendered)
+            .unwrap_or_else(|| rendered.chars().count() / 4)
+    }
+
     /// The transcript so far (system / user / assistant turns, in order).
     pub fn history(&self) -> &[Turn] {
         &self.turns
@@ -486,6 +525,95 @@ mod tests {
         assert_eq!(assistant.role, Role::Assistant);
         assert_eq!(assistant.content, "Your name is Ada.");
         assert!(!assistant.content.contains("<think>"));
+    }
+
+    #[test]
+    fn trim_protects_system_and_newest_and_drops_oldest_pairs() {
+        // upholds: COMPACT-1 — on a session with a seeded system prompt,
+        // trimming drops the oldest user/assistant pairs *after* the system
+        // turn, oldest first, and never the system prompt nor the newest
+        // keep_last exchanges. The `chars/4` fallback (the scripted completer
+        // counts no tokens) makes the drop deterministic.
+        let replies: Vec<String> = (0..6)
+            .map(|i| format!("answer {i} {}", "y".repeat(100)))
+            .collect();
+        let reply_refs: Vec<&str> = replies.iter().map(String::as_str).collect();
+        let mut model = Scripted::new(&reply_refs);
+        let mut chat = ChatSession::new(&mut model, PlainTemplate).with_system("SYSTEM PROMPT");
+        for i in 0..6 {
+            chat.turn(&format!("question {i} {}", "x".repeat(100)))
+                .unwrap();
+        }
+        assert_eq!(chat.history().len(), 13); // system + 6 exchanges
+
+        let dropped = chat.trim_history_to(200, 2);
+        assert!(!dropped.is_empty(), "a too-deep session must be trimmed");
+        assert_eq!(dropped.len() % 2, 0, "exchanges drop as whole pairs");
+        assert_eq!(dropped[0].role, Role::User, "oldest turn first");
+        assert!(dropped[0].content.contains("question 0"));
+        // The system prompt is never dropped and stays at the front.
+        assert_eq!(chat.history()[0].role, Role::System);
+        assert_eq!(chat.history()[0].content, "SYSTEM PROMPT");
+        // Alternation intact: the turn right after the system prefix is a user.
+        assert_eq!(chat.history()[1].role, Role::User);
+        // The newest two exchanges (4 turns) survive alongside the system turn.
+        assert!(chat.history().len() >= 5 && chat.history().len() < 13);
+        assert!(chat.history().last().unwrap().content.contains("answer 5"));
+    }
+
+    #[test]
+    fn a_long_scripted_session_stays_bounded_under_repeated_trims() {
+        // upholds: COMPACT-1 (with the host's HOST-5 policy simulated here) —
+        // over a 30-turn scripted run, trimming to a fixed small budget after
+        // every turn keeps history bounded, drops whole pairs oldest-first
+        // (each dropped exchange exactly once, in order), and never touches the
+        // system prompt.
+        let replies: Vec<String> = (0..30)
+            .map(|i| format!("reply {i} {}", "z".repeat(60)))
+            .collect();
+        let reply_refs: Vec<&str> = replies.iter().map(String::as_str).collect();
+        let mut model = Scripted::new(&reply_refs);
+        let mut chat = ChatSession::new(&mut model, PlainTemplate).with_system("SYS");
+
+        let budget = 200; // chars/4 fallback: only a handful of exchanges fit
+        let mut next_oldest = 0usize; // the exchange index we expect to drop next
+        let mut total_dropped = 0usize;
+        for i in 0..30 {
+            chat.turn(&format!("ask {i} {}", "q".repeat(60))).unwrap();
+            let dropped = chat.trim_history_to(budget, 2);
+            assert_eq!(dropped.len() % 2, 0, "whole pairs only");
+            for pair in dropped.chunks(2) {
+                assert_eq!(pair[0].role, Role::User);
+                assert!(
+                    pair[0].content.starts_with(&format!("ask {next_oldest} ")),
+                    "dropped out of order: {:?}",
+                    pair[0].content
+                );
+                assert_eq!(pair[1].role, Role::Assistant);
+                next_oldest += 1;
+            }
+            total_dropped += dropped.len();
+            assert_eq!(chat.history()[0].content, "SYS", "system prompt survives");
+        }
+        assert!(total_dropped > 0, "a 30-turn run must trigger drops");
+        assert!(
+            (5..=15).contains(&chat.history().len()),
+            "history stayed bounded: {}",
+            chat.history().len()
+        );
+    }
+
+    #[test]
+    fn trim_leaves_a_fitting_session_untouched() {
+        // upholds: COMPACT-1 — a session already under budget is returned
+        // whole; nothing is dropped.
+        let mut model = Scripted::new(&["ok"]);
+        let mut chat = ChatSession::new(&mut model, PlainTemplate).with_system("sys");
+        chat.turn("hi").unwrap();
+        let before = chat.history().len();
+        let dropped = chat.trim_history_to(100_000, 0);
+        assert!(dropped.is_empty());
+        assert_eq!(chat.history().len(), before);
     }
 
     #[test]

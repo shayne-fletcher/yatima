@@ -803,22 +803,35 @@ and deliberately shelved — the note records why so we don't repeat them.
      feature. **Done** (CTX-1): `generate_with` refuses an over-budget prompt
      before decode via the `within_context` guard.
   3. **Trim (evict oldest)** — keep the system turn + the most-recent turns that
-     fit. Deterministic and lossy; covers most chat pain. *On trigger.*
+     fit. Deterministic and lossy; covers most chat pain. **Done** (COMPACT-1 /
+     HOST-5): `ChatSession::trim_history_to` / `Agent::trim_history_to` drop
+     whole committed exchanges (user+assistant pairs) oldest-first until the
+     remaining history fits a token budget — the seeded system prompt and the
+     newest `keep_last` exchanges protected, alternation never broken — and the
+     host trims between turns (never mid-run) back under a low-water mark
+     (`depth_ceiling − max_tokens − TOOL_HEADROOM`, the ceiling tightened to the
+     Metal KV validated depth), always announcing the drop on the Note plane.
   4. **Summarize (compaction)** — fold the evicted prefix into one synthetic turn
      *via the `Completer` itself* (the local analog of server-side compaction);
-     heaviest and lossiest, gated on real long-session use. *On trigger.*
+     heaviest and lossiest, gated on real long-session use. *On trigger* — rung 2
+     of `plans/context-compaction.plan.md`, layered on the returned dropped turns
+     of rung 3; not yet built.
   - Agent-specific rung: **elide old tool-result payloads** (keep "called
     `read_file` → ok", drop the body) — the analog of context-editing, cheaper
-    than summarizing prose, since tool output is the actual bloat. *On trigger.*
+    than summarizing prose, since tool output is the actual bloat. *On trigger*
+    (already ephemeral across runs — AGENT-3 — so this rung only matters
+    within one deep run).
 
   Layering (LAYER-1): the *budget* is an engine fact (`context_length`); the
-  *policy* lives in `ChatSession`/`Agent` — the engine never decides what to
-  drop. **CTX-1** (rungs 1–2, built): the context window is discovered from
-  config and a turn never sends more than `context_length` tokens — over-budget
-  is rejected before decode, never silently truncated by the backend. Rungs 3–4
-  (trim/compact) layer the *policy* on top, on trigger. (`generate` one-shot and
-  short chats rarely hit this; the `embed` classify loop `reset()`s per item, so
-  it never grows.)
+  *policy* lives in `ChatSession`/`Agent` and the host — the engine never
+  decides what to drop. **CTX-1** (rungs 1–2, built): the context window is
+  discovered from config and a turn never sends more than `context_length`
+  tokens — over-budget is rejected before decode, never silently truncated by
+  the backend. **COMPACT-1 / HOST-5** (rung 3, built): the *mechanism* (which
+  turns to drop, deterministically) is in the lib; the *policy* (when to trim,
+  to what budget, and telling the user) is in the host. Rung 4 (summarize) layers
+  on top, on trigger. (`generate` one-shot and short chats rarely hit this; the
+  `embed` classify loop `reset()`s per item, so it never grows.)
 - **Readline niceties** — line editing + history (e.g. `rustyline`); the loop is
   plain `stdin` today.
 - **Conversation persistence** — save/load a session transcript.

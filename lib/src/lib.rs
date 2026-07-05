@@ -82,8 +82,19 @@
 //!   `<arch>.context_length`) and enforced: a prompt plus `max_tokens` that
 //!   would exceed it is refused before decode, rather than silently overflowing.
 //!   An undeclared window imposes no constraint. (Hosts use the same budget to
-//!   trim/compact a transcript — the higher rungs of the ladder in
+//!   trim/compact a transcript — the trim rung is built: COMPACT-1 below, with
+//!   the host policy at HOST-5; the higher rungs of the ladder in
 //!   `notes/design.md`.)
+//! - **COMPACT-1** [`ChatSession::trim_history_to`] / [`Agent::trim_history_to`]
+//!   drop whole committed exchanges (user+assistant pairs), oldest first, until
+//!   the remaining history's rendered prompt fits the caller's token budget —
+//!   never touching the seeded system prompt or the newest `keep_last`
+//!   exchanges, so template alternation is never broken and only the protected
+//!   turns can remain. Token counting uses the completer's tokenizer, falling
+//!   back to a deterministic `chars/4` when it exposes none. This is the trim
+//!   rung of the context ladder (`notes/design.md`); the *policy* (when to
+//!   trim, to what budget) lives in a host (HOST-5). Cited by unit tests on
+//!   both session types.
 //! - **CTX-2** stock candle's Metal backend deterministically corrupts the
 //!   KV state from depth 8,192 (`notes/metal-kv-cliff.md`). The pinned candle
 //!   fork's sync workaround restores correctness at moderate depths

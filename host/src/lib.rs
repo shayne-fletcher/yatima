@@ -39,6 +39,13 @@
 //!   [`ToolNoteKind`] carries the semantics, and this crate emits no marker
 //!   glyphs or note indentation; the vocabulary a note renders under is view
 //!   policy (cited by `notes_carry_kind_not_typography`).
+//! - **HOST-5** the host keeps every rendered prompt under the depth budget:
+//!   between turns it trims the committed history (COMPACT-1) back under a
+//!   low-water mark ([`compaction_low_water`] = the depth ceiling less the
+//!   reply and one run's within-run tool growth), and compaction is always
+//!   visible — history is never edited silently. The ceiling tightens to the
+//!   Metal KV validated depth on a Metal run (CTX-2). Wording single-sourced
+//!   in [`compaction_note`]; cited by the arithmetic/wording/trigger tests.
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -194,6 +201,7 @@ fn actor_main(
     let watch = DepthWatch {
         metal: !config.cpu,
         max_tokens: config.opts.max_tokens,
+        context_length: engine.context_length(),
     };
 
     // Tool-trained formats serve the sessionful agent from turn one: the web
@@ -279,12 +287,15 @@ fn sampling_summary(sampling: Sampling) -> String {
     }
 }
 
-/// Per-turn facts the CTX-2 surface needs: whether decode runs on Metal and
-/// the token budget the risk bound adds to the prompt depth.
+/// Per-turn facts the CTX-2 / HOST-5 surface needs: whether decode runs on
+/// Metal, the token budget the risk bound adds to the prompt depth, and the
+/// model's declared context window (the compaction ceiling when it is tighter
+/// than the Metal KV depth, or the only ceiling off Metal).
 #[derive(Clone, Copy)]
 struct DepthWatch {
     metal: bool,
     max_tokens: usize,
+    context_length: Option<usize>,
 }
 
 /// CTX-2, surfaced: the engine logs the depth risk where no user looks
@@ -305,6 +316,76 @@ fn warn_kv_depth(event_tx: &UnboundedSender<HostEvent>, watch: DepthWatch, promp
              /reset starts clean (grants survive) [CTX-2]",
             prompt_tokens.saturating_add(watch.max_tokens),
         )));
+    }
+}
+
+/// The depth ceiling every rendered prompt must stay under (HOST-5): the
+/// model's declared context window, tightened to the Metal KV validated depth
+/// on a Metal run. `None` off Metal with no declared window — nothing bounds
+/// depth, so compaction never fires.
+fn depth_ceiling(watch: DepthWatch) -> Option<usize> {
+    match (watch.metal, watch.context_length) {
+        (true, Some(c)) => Some(c.min(METAL_KV_VALIDATED)),
+        (true, None) => Some(METAL_KV_VALIDATED),
+        (false, c) => c,
+    }
+}
+
+/// The token budget compaction trims the committed history down to (HOST-5):
+/// the depth ceiling less the reply budget (`max_tokens`) and one run's
+/// within-run tool growth ([`knobs::TOOL_HEADROOM`]), so the deepest step of
+/// the next turn stays under the ceiling. `None` when no ceiling applies.
+fn compaction_low_water(watch: DepthWatch) -> Option<usize> {
+    let ceiling = depth_ceiling(watch)?;
+    Some(
+        ceiling
+            .saturating_sub(watch.max_tokens)
+            .saturating_sub(knobs::TOOL_HEADROOM),
+    )
+}
+
+/// The always-visible compaction notice (HOST-5). Wording single-sourced here
+/// like the grant wording (HOST-2); unit-tested. Names the depth budget so the
+/// drop reads as a known limit, not lost memory by accident.
+fn compaction_note(exchanges: usize, watch: DepthWatch) -> String {
+    let ceiling = depth_ceiling(watch).unwrap_or(METAL_KV_VALIDATED);
+    let plural = if exchanges == 1 {
+        "exchange"
+    } else {
+        "exchanges"
+    };
+    format!(
+        "compacted: dropped the {exchanges} oldest {plural} to stay under the \
+         reliable context depth (~{ceiling} tokens on this backend) — older \
+         turns are gone from memory; /reset clears everything"
+    )
+}
+
+/// COMPACT-1's *policy* (HOST-5): between turns, if the run just served
+/// reached deeper than the low-water mark, trim the committed history back
+/// under it via `trim` (which returns how many turns it dropped) and tell the
+/// user, always visibly. A no-op when no depth ceiling applies, when the run
+/// stayed under the mark, or when nothing needed dropping (a deep run whose
+/// depth was all within-run tool growth leaves history untouched and stays
+/// silent). Never mid-run: the serve loop calls this only after a turn ends.
+fn compact_after_turn(
+    event_tx: &UnboundedSender<HostEvent>,
+    watch: DepthWatch,
+    last_prompt_tokens: Option<usize>,
+    trim: impl FnOnce(usize) -> usize,
+) {
+    let Some(low_water) = compaction_low_water(watch) else {
+        return;
+    };
+    let Some(depth) = last_prompt_tokens else {
+        return;
+    };
+    if depth <= low_water {
+        return;
+    }
+    let dropped_turns = trim(low_water);
+    if dropped_turns >= 2 {
+        let _ = event_tx.send(HostEvent::Note(compaction_note(dropped_turns / 2, watch)));
     }
 }
 
@@ -357,6 +438,13 @@ fn serve_chat(
                     watch,
                 );
                 gate.disarm();
+                // Between turns, keep the next prompt under the depth budget
+                // (HOST-5) — never mid-run.
+                compact_after_turn(event_tx, watch, session.last_prompt_tokens(), |budget| {
+                    session
+                        .trim_history_to(budget, knobs::COMPACTION_KEEP_LAST)
+                        .len()
+                });
             }
             HostRequest::Cancel { turn_id } => gate.cancel(turn_id),
             HostRequest::Reset => session.reset(),
@@ -403,6 +491,13 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
                 gate.arm(turn_id, cancel.clone());
                 run_agent_turn(&mut agent, event_tx, turn_id, &text, &cancel, watch);
                 gate.disarm();
+                // Between turns, keep the next prompt under the depth budget
+                // (HOST-5) — never mid-run.
+                compact_after_turn(event_tx, watch, agent.last_prompt_tokens(), |budget| {
+                    agent
+                        .trim_history_to(budget, knobs::COMPACTION_KEEP_LAST)
+                        .len()
+                });
             }
             HostRequest::Cancel { turn_id } => gate.cancel(turn_id),
             HostRequest::Reset => agent.reset(),
@@ -913,6 +1008,7 @@ mod tests {
         let watch = |metal| DepthWatch {
             metal,
             max_tokens: 1024,
+            context_length: None,
         };
         let (tx, mut rx) = unbounded_channel();
         warn_kv_depth(&tx, watch(true), 16_000);
@@ -927,6 +1023,109 @@ mod tests {
         warn_kv_depth(&tx, watch(true), 2_000); // shallow: quiet
         warn_kv_depth(&tx, watch(false), 16_000); // cpu: quiet
         assert!(rx.try_recv().is_err(), "no other depth may warn");
+    }
+
+    #[test]
+    fn compaction_budget_reserves_reply_and_tool_headroom() {
+        // upholds: HOST-5 — the low-water mark is the depth ceiling less the
+        // reply budget and one run's within-run tool growth; on Metal the
+        // ceiling is tightened to the validated KV depth, off Metal it is the
+        // model's declared window (or none, so nothing is trimmed).
+        let metal = |ctx| DepthWatch {
+            metal: true,
+            max_tokens: 1024,
+            context_length: ctx,
+        };
+        let cpu = |ctx| DepthWatch {
+            metal: false,
+            max_tokens: 1024,
+            context_length: ctx,
+        };
+        let headroom = knobs::TOOL_HEADROOM;
+        // Metal, no declared window: the validated depth is the ceiling.
+        assert_eq!(
+            compaction_low_water(metal(None)),
+            Some(METAL_KV_VALIDATED - 1024 - headroom)
+        );
+        // A larger declared window is still capped at the validated depth…
+        assert_eq!(
+            compaction_low_water(metal(Some(128_000))),
+            Some(METAL_KV_VALIDATED - 1024 - headroom)
+        );
+        // …a smaller one binds instead.
+        assert_eq!(
+            compaction_low_water(metal(Some(8_000))),
+            Some(8_000 - 1024 - headroom)
+        );
+        // Off Metal the declared window is the ceiling; none means no trimming.
+        assert_eq!(
+            compaction_low_water(cpu(Some(32_000))),
+            Some(32_000 - 1024 - headroom)
+        );
+        assert_eq!(compaction_low_water(cpu(None)), None);
+    }
+
+    #[test]
+    fn compaction_note_is_single_sourced_and_names_the_depth() {
+        // upholds: HOST-5 — the compaction wording lives only here, names the
+        // depth budget, pluralizes, and points at /reset (like the grant
+        // wording, HOST-2).
+        let watch = DepthWatch {
+            metal: true,
+            max_tokens: 1024,
+            context_length: None,
+        };
+        let one = compaction_note(1, watch);
+        assert!(one.contains("dropped the 1 oldest exchange "), "{one}");
+        assert!(
+            one.contains(&format!("~{METAL_KV_VALIDATED} tokens")),
+            "{one}"
+        );
+        assert!(one.contains("/reset"), "{one}");
+        let many = compaction_note(3, watch);
+        assert!(many.contains("dropped the 3 oldest exchanges"), "{many}");
+    }
+
+    #[test]
+    fn compaction_only_notes_when_history_is_actually_dropped() {
+        // upholds: HOST-5 — compaction is retrospective and always visible: it
+        // fires only when the run went past the low-water mark AND trimming
+        // dropped committed exchanges. A run at/under the mark never even
+        // attempts a trim; a deep run whose depth was all within-run tool
+        // growth (history already fits) drops nothing and stays silent.
+        let watch = DepthWatch {
+            metal: true,
+            max_tokens: 1024,
+            context_length: None,
+        };
+        let low_water = compaction_low_water(watch).unwrap();
+
+        // At/under the mark: trimming is not even attempted, no note.
+        let (tx, mut rx) = unbounded_channel();
+        let mut attempted = false;
+        compact_after_turn(&tx, watch, Some(low_water), |_| {
+            attempted = true;
+            0
+        });
+        assert!(!attempted, "at/under the mark, no trim is attempted");
+        assert!(rx.try_recv().is_err());
+
+        // Past the mark but nothing droppable (history already fits): silent,
+        // and the trim was asked for exactly the low-water budget.
+        let (tx, mut rx) = unbounded_channel();
+        compact_after_turn(&tx, watch, Some(low_water + 1), |budget| {
+            assert_eq!(budget, low_water);
+            0
+        });
+        assert!(rx.try_recv().is_err(), "no exchanges dropped → no note");
+
+        // Past the mark and two turns dropped: one visible note, one exchange.
+        let (tx, mut rx) = unbounded_channel();
+        compact_after_turn(&tx, watch, Some(low_water + 1), |_| 2);
+        let Ok(HostEvent::Note(msg)) = rx.try_recv() else {
+            panic!("expected a compaction note");
+        };
+        assert!(msg.contains("dropped the 1 oldest exchange"), "{msg}");
     }
 
     #[test]

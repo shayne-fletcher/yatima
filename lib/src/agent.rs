@@ -158,6 +158,61 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         self.history.clear();
     }
 
+    /// Drop the oldest committed exchanges until the rendered prompt of the
+    /// remaining history fits `budget` tokens, keeping the newest `keep_last`
+    /// exchanges (COMPACT-1). Returns the dropped turns, oldest first (a host
+    /// may summarize them; rung 2). Exchanges are dropped as indivisible
+    /// user+assistant pairs, so ChatML alternation is never broken. The base
+    /// system prompt is not part of [`history`](Agent::history) but *is*
+    /// counted toward `budget`: it is re-rendered into every prompt and can
+    /// never be dropped, so if it alone exceeds `budget` only the protected
+    /// exchanges remain.
+    pub fn trim_history_to(&mut self, budget: usize, keep_last: usize) -> Vec<Turn> {
+        let protected = keep_last.saturating_mul(2);
+        let mut dropped = Vec::new();
+        loop {
+            if self.history.len().saturating_sub(protected) < 2 {
+                break;
+            }
+            let rendered = self.render_history_prompt();
+            if self.count_prompt_tokens(&rendered) <= budget {
+                break;
+            }
+            // Oldest exchange = the two leading turns (user then answer).
+            dropped.push(self.history.remove(0));
+            dropped.push(self.history.remove(0));
+        }
+        dropped
+    }
+
+    /// Render the system prompt plus the current session history the way a run
+    /// does (minus the pending user turn) — the compactable depth that
+    /// [`trim_history_to`](Agent::trim_history_to) measures against `budget`.
+    fn render_history_prompt(&self) -> String {
+        let rendered_tools = self.codec.render_system(&self.tools.specs());
+        let system = if rendered_tools.is_empty() {
+            self.system.clone()
+        } else {
+            format!("{}\n\n{rendered_tools}", self.system)
+        };
+        let mut transcript = Vec::with_capacity(self.history.len() + 1);
+        transcript.push(Turn {
+            role: Role::System,
+            content: system,
+        });
+        transcript.extend(self.history.iter().cloned());
+        self.template.render(&transcript)
+    }
+
+    /// Token count of `rendered` under the completer's tokenizer, falling back
+    /// to `chars/4` when it exposes none (COMPACT-1's deterministic fallback,
+    /// the path a scripted or remote completer takes).
+    fn count_prompt_tokens(&self, rendered: &str) -> usize {
+        self.completer
+            .count_tokens(rendered)
+            .unwrap_or_else(|| rendered.chars().count() / 4)
+    }
+
     /// Run to a final answer (or `max_steps`), discarding per-step events.
     pub fn run(&mut self, user: &str) -> Result<Run> {
         let ((), run) = self.run_with(user, (), |(), _event| Ok(ControlFlow::Continue(())))?;
@@ -1261,6 +1316,91 @@ mod tests {
             .unwrap();
         assert_eq!(assistant.content, "The answer is 4.");
         assert!(!assistant.content.contains("<think>"));
+    }
+
+    /// Build an even history of `n` exchanges whose turns are long enough that
+    /// a small budget forces drops under the `chars/4` fallback.
+    fn long_history(n: usize) -> Vec<Turn> {
+        (0..n)
+            .flat_map(|i| {
+                [
+                    Turn {
+                        role: Role::User,
+                        content: format!("question number {i} {}", "x".repeat(100)),
+                    },
+                    Turn {
+                        role: Role::Assistant,
+                        content: format!("answer number {i} {}", "y".repeat(100)),
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trim_drops_oldest_pairs_and_protects_the_newest() {
+        // upholds: COMPACT-1 — trimming drops whole exchanges oldest-first
+        // until the rendered history fits budget, keeping the newest keep_last
+        // exchanges; the `chars/4` fallback (a scripted completer counts no
+        // tokens) makes the drop deterministic.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&[]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "sys", 5)
+            .with_history(long_history(6));
+
+        let dropped = agent.trim_history_to(200, 2);
+        assert!(!dropped.is_empty(), "a too-deep history must be trimmed");
+        assert_eq!(dropped.len() % 2, 0, "exchanges drop as whole pairs");
+        assert_eq!(dropped[0].role, Role::User, "oldest turn first");
+        assert_eq!(
+            dropped[0].content,
+            format!("question number 0 {}", "x".repeat(100))
+        );
+        // The newest two exchanges (4 turns) survive, alternation intact.
+        assert!(agent.history().len() >= 4);
+        assert_eq!(agent.history()[0].role, Role::User);
+        assert_eq!(
+            agent.history().last().unwrap().content,
+            format!("answer number 5 {}", "y".repeat(100)),
+            "the newest exchange is never dropped"
+        );
+        // Trimming again to the same budget is a no-op (it already fits, or
+        // only the protected exchanges remain).
+        assert!(agent.trim_history_to(200, 2).is_empty());
+    }
+
+    #[test]
+    fn trim_leaves_a_fitting_history_untouched() {
+        // upholds: COMPACT-1 — a history already under budget is returned
+        // whole; nothing is dropped.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&[]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "sys", 5)
+            .with_history(long_history(2));
+        let dropped = agent.trim_history_to(100_000, 0);
+        assert!(dropped.is_empty());
+        assert_eq!(agent.history().len(), 4);
+    }
+
+    #[test]
+    fn trim_never_splits_a_pair_on_an_odd_history() {
+        // upholds: COMPACT-1 — a malformed (odd) transplanted history is never
+        // made worse: whole pairs drop oldest-first, and the lone trailing
+        // turn is left in place rather than paired with a partner it lacks.
+        let tools = Tools::new();
+        let mut model = Scripted::new(&[]);
+        let mut history = long_history(2); // [u0, a0, u1, a1]
+        history.push(Turn {
+            role: Role::User,
+            content: "stray trailing user turn".to_string(),
+        });
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "sys", 5)
+            .with_history(history);
+        let dropped = agent.trim_history_to(1, 0); // force maximum dropping
+        assert_eq!(dropped.len(), 4, "both clean pairs drop, oldest first");
+        assert_eq!(dropped.len() % 2, 0);
+        assert_eq!(agent.history().len(), 1, "only the unpaired stray remains");
+        assert_eq!(agent.history()[0].content, "stray trailing user turn");
     }
 
     // End-to-end agent runs over a real, tool-trained model (Qwen2.5-Instruct,
