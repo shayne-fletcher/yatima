@@ -423,6 +423,22 @@ fn sub_superscripts(s: &str, style: ScriptStyle) -> String {
     out
 }
 
+/// The user's speaker label: their login name (`$USER`), falling back to
+/// "you". Resolved once — it cannot change mid-session. Every frontend
+/// labels the user's turns with it (one policy, each view's own
+/// typography).
+pub fn user_label() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| label_from(std::env::var("USER").ok()))
+}
+
+/// The pure half of [`user_label`], testable without touching the process
+/// environment.
+fn label_from(user: Option<String>) -> String {
+    user.filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "you".to_string())
+}
+
 /// Rewrite markdown image tags in a model answer for hosts that cannot (or
 /// deliberately will not) load them. `![alt](file://…)` — a model echoing an
 /// artifact the host already displays inline — is dropped. Any other
@@ -467,6 +483,15 @@ mod tests {
         assert_eq!(prettify_math_plain_scripts("\\( e^{-x} \\)"), " e^(-x) ");
         assert_eq!(prettify_math_plain_scripts("x^2"), "x^2");
         assert_eq!(prettify_math("\\( e^{-x} \\)"), " e⁻ˣ ");
+    }
+
+    #[test]
+    fn user_label_is_the_login_name_or_you() {
+        // The label policy shared by every frontend: $USER when it carries a
+        // name, "you" when unset or blank.
+        assert_eq!(label_from(Some("shayne".to_string())), "shayne");
+        assert_eq!(label_from(Some("  ".to_string())), "you");
+        assert_eq!(label_from(None), "you");
     }
 
     #[test]

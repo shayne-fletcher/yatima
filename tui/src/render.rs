@@ -14,7 +14,7 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 use yatima_host::StopKind;
-use yatima_text::prettify_math;
+use yatima_text::{prettify_math, user_label};
 
 use crate::app::{scroll_y, App, Entry};
 
@@ -147,18 +147,6 @@ pub fn ui(frame: &mut Frame, app: &App) {
     render_transcript(frame, chunks[0], app);
     render_input(frame, chunks[1], app);
     render_status(frame, chunks[2], app);
-}
-
-/// The user's speaker label: their login name (`$USER`), falling back to
-/// "you". Resolved once — it cannot change mid-session.
-fn user_label() -> &'static str {
-    static LABEL: OnceLock<String> = OnceLock::new();
-    LABEL.get_or_init(|| {
-        std::env::var("USER")
-            .ok()
-            .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| "you".to_string())
-    })
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
