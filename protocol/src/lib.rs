@@ -28,6 +28,11 @@
 //!   would silently make wire evolution ambiguous (and does not compose with
 //!   `deny_unknown_fields`). Cited by `host_events_round_trip` /
 //!   `host_requests_round_trip`.
+//! - **WASM-1** this crate compiles for `wasm32-unknown-unknown` — the
+//!   "serde-only, WASM-clean" paragraph above is enforced, not aspirational.
+//!   Checked by `scripts/check-wasm.sh` locally and by the CI "wasm check"
+//!   step on every push; a dependency added to this crate that cannot reach
+//!   wasm32 fails the build, not the browser.
 
 use serde::{Deserialize, Serialize};
 
