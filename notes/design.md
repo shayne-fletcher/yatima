@@ -70,6 +70,18 @@ swappable dependency.
   SVG rasterizes first, the one view concern kept here so it compiles into the
   coming WASM client). A pump thread wakes egui as host events arrive.
   Decorative animation is behind `--whimsy` (off by default).
+- **`yatima-serve`** — the native bridge that draws nothing: it owns a
+  `yatima-host` `HostHandle` exactly as the GUI does and carries the two planes
+  to a browser over one WebSocket (the vision's rung 2). Its laws: `SRV-1`
+  binds only an explicit, specific address — the unspecified forms, including
+  the IPv4-mapped wildcard, are refused so nobody exposes a session beyond the
+  tailnet by accident; `SRV-2` the wire is exactly the `yatima-protocol` enums
+  as externally-tagged JSON, so serve defines no message types of its own;
+  `SRV-3` one client at a time (a second is refused 409), the event stream
+  survives disconnect and resumes on reconnect with at-least-once delivery at
+  the seam, and a session always ends (send cap + keepalive) so the one stream
+  always comes back. Native only (it drags `yatima-host`/candle); the browser
+  client depends on `yatima-protocol` alone.
 - **`yatima-text`** — host-neutral prettification of model output (the LaTeX
   → Unicode pipeline, fence-aware). Deliberately dependency-free, pure std,
   WASM-clean: every frontend — TUI, GUI, serve's browser client — runs the
@@ -714,8 +726,9 @@ return-type-notation or `trait_variant` — not before.
 
 The **canonical** invariant & law registry lives in the crate docs — see the
 `yatima-lib` crate doc and the `yatima-cli` `main.rs` doc, and, for the frontend
-stack, the `yatima-protocol` doc (**PROTO-2**), the `yatima-host` doc
-(**HOST-1/2/3**), and the `yatima-tui` doc (**TUI-1..7**). Each is protected by
+stack, the `yatima-protocol` doc (**PROTO-2**, and **WASM-1**: it compiles for
+`wasm32`), the `yatima-host` doc (**HOST-1/2/3**), the `yatima-tui` doc
+(**TUI-1..7**), and the `yatima-serve` doc (**SRV-1/2/3**). Each is protected by
 a test that cites its id in an `// upholds: <id>` comment (`grep -r
 'upholds:'`).
 
@@ -724,7 +737,8 @@ In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1/2**, **CAP-1/2**,
 **PROTO-1**); observability (**OBS-1/2/3/4**); chat templates
 (**TMPL-1/2**, **REASON-1**); CLI (**CLI-1/2/3**); the frontend host and its
-wire plane (**HOST-1/2/3**, **PROTO-2**) and the terminal UI (**TUI-1..7**).
+wire plane (**HOST-1/2/3**, **PROTO-2**, **WASM-1**), the terminal UI
+(**TUI-1..7**), and the WebSocket bridge (**SRV-1/2/3**).
 
 ## State machines
 

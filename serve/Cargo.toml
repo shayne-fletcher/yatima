@@ -1,0 +1,40 @@
+[package]
+name = "yatima-serve"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+# Rung 2's bridge: the yatima-host event/request planes over a WebSocket,
+# plus static serving for the browser client's bundle. The wire is exactly
+# the yatima-protocol enums as externally-tagged JSON (SRV-2) — serve
+# defines no message types of its own, so any client that speaks the
+# protocol crate speaks serve. Native only (it drags yatima-host / candle);
+# the browser client depends on yatima-protocol alone.
+
+[[bin]]
+name = "yatima-serve"
+path = "src/main.rs"
+
+[lib]
+name = "yatima_serve"
+path = "src/lib.rs"
+
+[features]
+metal = ["yatima-host/metal"]
+fetch = ["yatima-host/fetch"]
+
+[dependencies]
+yatima-host = { path = "../host" }
+yatima-lib = { path = "../lib" }
+yatima-protocol = { path = "../protocol" }
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "time"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

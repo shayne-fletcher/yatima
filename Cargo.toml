@@ -8,4 +8,5 @@ members = [
   "text",
   "protocol",
   "host",
+  "serve",
 ]

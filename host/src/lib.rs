@@ -47,6 +47,7 @@
 //!   Metal KV validated depth on a Metal run (CTX-2). Wording single-sourced
 //!   in [`compaction_note`]; cited by the arithmetic/wording/trigger tests.
 
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -71,12 +72,28 @@ pub use yatima_protocol::{Channel, HostEvent, HostRequest, ModelInfo, StopKind, 
 /// A turn identifier, monotonic per session. Lets a frontend ignore stale events.
 pub type TurnId = u64;
 
+/// The gate's interior: the turn currently in flight (armed before it
+/// decodes), and the turns whose cancel arrived before they armed.
+#[derive(Default)]
+struct GateState {
+    armed: Option<(TurnId, Cancel)>,
+    early: BTreeSet<TurnId>,
+}
+
 /// The out-of-band cancel handle: the actor arms it with the in-flight turn's
-/// [`Cancel`] before decoding; a frontend flips it mid-decode. Cloneable and
-/// cheap (an `Arc`); [`spawn`] hands one to the frontend and keeps one for the
-/// actor.
+/// [`Cancel`] before decoding; a frontend flips it mid-decode. A cancel that
+/// arrives before its turn is armed — the wire ordering `Submit{n}` then
+/// `Cancel{n}` for a turn still queued behind a running one — is remembered
+/// and applied the instant that turn arms, so a queued turn a user asked to
+/// stop never runs anyway. Cloneable and cheap (an `Arc`); [`spawn`] hands one
+/// to the frontend and keeps one for the actor.
 #[derive(Clone, Default)]
-pub struct CancelGate(Arc<Mutex<Option<(TurnId, Cancel)>>>);
+pub struct CancelGate(Arc<Mutex<GateState>>);
+
+/// The most early cancels the gate remembers at once. Turn ids are monotonic
+/// and spent ids are pruned as turns arm, so this is only reached by a client
+/// spraying cancels for turns it never submits — then the oldest is evicted.
+const EARLY_CANCEL_CAP: usize = 1024;
 
 impl CancelGate {
     /// A fresh, disarmed gate.
@@ -85,26 +102,42 @@ impl CancelGate {
     }
 
     /// Arm the gate with the turn about to decode (the host's job, per turn).
+    /// A cancel that arrived early for this turn fires now; ids at or below it
+    /// are spent (monotonic turns) and pruned.
     pub fn arm(&self, turn_id: TurnId, cancel: Cancel) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = Some((turn_id, cancel));
+        if let Ok(mut state) = self.0.lock() {
+            let fire = state.early.remove(&turn_id);
+            state.early = state.early.split_off(&turn_id);
+            state.armed = Some((turn_id, cancel.clone()));
+            if fire {
+                cancel.cancel();
+            }
         }
     }
 
     /// Disarm after a turn finishes (a stale `cancel(turn_id)` then no-ops).
+    /// Early cancels for turns not yet armed survive — they are the point.
     pub fn disarm(&self) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = None;
+        if let Ok(mut state) = self.0.lock() {
+            state.armed = None;
         }
     }
 
-    /// Cancel `turn_id` if it is the one in flight; otherwise a no-op (nothing
-    /// armed, or a different turn — a late Esc never touches the wrong turn).
+    /// Cancel `turn_id`. If it is the one in flight, flip it now. Otherwise it
+    /// is either a queued turn not yet armed (remember it — [`arm`] applies it
+    /// when the turn starts) or a stale id for a finished turn (harmless: a
+    /// monotonic turn id never arms again, and the next arm prunes it).
     pub fn cancel(&self, turn_id: TurnId) {
-        if let Ok(slot) = self.0.lock() {
-            if let Some((id, cancel)) = slot.as_ref() {
-                if *id == turn_id {
-                    cancel.cancel();
+        if let Ok(mut state) = self.0.lock() {
+            match state.armed.as_ref() {
+                Some((id, cancel)) if *id == turn_id => cancel.cancel(),
+                _ => {
+                    if state.early.len() >= EARLY_CANCEL_CAP {
+                        if let Some(&oldest) = state.early.iter().next() {
+                            state.early.remove(&oldest);
+                        }
+                    }
+                    state.early.insert(turn_id);
                 }
             }
         }
@@ -977,19 +1010,45 @@ mod tests {
 
     #[test]
     fn cancel_gate_flips_only_the_armed_turn() {
-        // The gate cancels the in-flight turn and ignores a stale id — a late
-        // Esc for a finished turn never touches a newer one.
+        // The armed turn cancels; a cancel for a different turn never touches
+        // the in-flight one (it is remembered for that turn, not applied here).
         let gate = CancelGate::new();
         let cancel = Cancel::new();
-        gate.arm(0, cancel.clone());
-        gate.cancel(1); // wrong turn: no-op
+        gate.arm(5, cancel.clone());
+        gate.cancel(6); // a different (queued) turn: must not touch turn 5
         assert!(!cancel.is_cancelled());
-        gate.cancel(0);
+        gate.cancel(5);
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_gate_remembers_a_cancel_that_beats_its_turn() {
+        // A Submit{n}/Cancel{n} for a turn still queued behind a running one:
+        // the cancel arrives before the turn arms and must apply the instant it
+        // does, so the queued turn a user stopped never runs.
+        let gate = CancelGate::new();
+        let running = Cancel::new();
+        gate.arm(7, running.clone());
+        gate.cancel(8); // turn 8 not armed yet: remembered
+        assert!(!running.is_cancelled(), "cancel for 8 must not touch 7");
         gate.disarm();
-        let stale = Cancel::new();
-        gate.cancel(0); // disarmed: no-op
-        assert!(!stale.is_cancelled());
+        let queued = Cancel::new();
+        gate.arm(8, queued.clone());
+        assert!(queued.is_cancelled(), "early cancel must fire when 8 arms");
+    }
+
+    #[test]
+    fn cancel_gate_prunes_spent_early_cancels() {
+        // A cancel for a turn that never arms is pruned by a later arm
+        // (monotonic ids), so it can never leak onto a newer turn.
+        let gate = CancelGate::new();
+        gate.cancel(1); // never submitted; remembered
+        let later = Cancel::new();
+        gate.arm(2, later.clone()); // arming 2 prunes ids <= 2, incl. stale 1
+        assert!(
+            !later.is_cancelled(),
+            "turn 2 must not inherit a stale cancel"
+        );
     }
 
     #[test]
