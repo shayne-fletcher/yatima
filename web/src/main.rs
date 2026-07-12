@@ -25,12 +25,30 @@ mod app {
         format!("{scheme}://{host}/ws")
     }
 
+    /// Open the socket, waking egui on every socket event — without the
+    /// wakeup an idle frame never notices an arriving fragment.
+    fn connect(ctx: &egui::Context) -> (ewebsock::WsSender, ewebsock::WsReceiver) {
+        let ctx = ctx.clone();
+        ewebsock::connect_with_wakeup(ws_url(), ewebsock::Options::default(), move || {
+            ctx.request_repaint()
+        })
+        .expect("websocket connect")
+    }
+
     pub struct WebApp {
         transcript: Transcript,
         ws_tx: ewebsock::WsSender,
         ws_rx: ewebsock::WsReceiver,
+        /// The egui context, kept so a reconnect can wire its wakeup.
+        ctx: egui::Context,
         /// Socket state, for the status line ("connecting…" until Opened).
         connected: bool,
+        /// The socket died (idle phone, network blip): offer the reconnect
+        /// button. A reconnect here — no page reload — keeps this app
+        /// instance, so the transcript and its textures stay on screen and
+        /// the resumed stream (SRV-3) appends to them; a browser refresh
+        /// would wipe the mirror and replay only what queued while away.
+        dropped: bool,
         input: String,
         /// Client-local turn counter (the id space is this client's own;
         /// serve relays, the host arms its gate per turn).
@@ -44,24 +62,32 @@ mod app {
 
     impl WebApp {
         pub fn new(ctx: &egui::Context) -> Self {
-            let ctx2 = ctx.clone();
-            // The wakeup closure repaints on every socket event — without it
-            // an idle egui frame never notices an arriving fragment.
-            let (ws_tx, ws_rx) =
-                ewebsock::connect_with_wakeup(ws_url(), ewebsock::Options::default(), move || {
-                    ctx2.request_repaint()
-                })
-                .expect("websocket connect");
+            let (ws_tx, ws_rx) = connect(ctx);
             WebApp {
                 transcript: Transcript::default(),
                 ws_tx,
                 ws_rx,
+                ctx: ctx.clone(),
                 connected: false,
+                dropped: false,
                 input: String::new(),
                 next_turn_id: 0,
                 show_reasoning: false,
                 textures: HashMap::new(),
             }
+        }
+
+        /// Replace the dead socket with a fresh one; serve returns the same
+        /// event stream to the next connection, so the session continues
+        /// where it left off (`in_flight` is deliberately not cleared: if a
+        /// turn was running, its remaining events — or its Done — arrive on
+        /// the resumed stream and settle it).
+        fn reconnect(&mut self) {
+            let (ws_tx, ws_rx) = connect(&self.ctx);
+            self.ws_tx = ws_tx;
+            self.ws_rx = ws_rx;
+            self.connected = false;
+            self.dropped = false;
         }
 
         fn send(&mut self, request: &HostRequest) {
@@ -84,11 +110,13 @@ mod app {
                     ewebsock::WsEvent::Message(_) => {} // ping/pong/binary: not this wire
                     ewebsock::WsEvent::Error(e) => {
                         self.connected = false;
+                        self.dropped = true;
                         self.transcript
                             .apply(HostEvent::Note(format!("[socket error: {e}]")));
                     }
                     ewebsock::WsEvent::Closed => {
                         self.connected = false;
+                        self.dropped = true;
                         self.transcript
                             .apply(HostEvent::Note("[connection closed]".into()));
                     }
@@ -111,6 +139,9 @@ mod app {
         fn status_line(&self) -> String {
             if let Some(fatal) = &self.transcript.fatal {
                 return format!("failed: {fatal}");
+            }
+            if self.dropped {
+                return "disconnected".into();
             }
             let mut parts = Vec::new();
             parts.push(match (&self.transcript.model, self.connected) {
@@ -153,6 +184,9 @@ mod app {
                         ui.spinner();
                     }
                     ui.checkbox(&mut self.show_reasoning, "show reasoning");
+                    if self.dropped && ui.button("reconnect").clicked() {
+                        self.reconnect();
+                    }
                 });
             });
 
