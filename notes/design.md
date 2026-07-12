@@ -77,11 +77,27 @@ swappable dependency.
   the IPv4-mapped wildcard, are refused so nobody exposes a session beyond the
   tailnet by accident; `SRV-2` the wire is exactly the `yatima-protocol` enums
   as externally-tagged JSON, so serve defines no message types of its own;
-  `SRV-3` one client at a time (a second is refused 409), the event stream
-  survives disconnect and resumes on reconnect with at-least-once delivery at
-  the seam, and a session always ends (send cap + keepalive) so the one stream
-  always comes back. Native only (it drags `yatima-host`/candle); the browser
-  client depends on `yatima-protocol` alone.
+  `SRV-3` one stream holder at a time, and the newest connection is it — a
+  second connection preempts the live session (refusing would protect a
+  stale holder, e.g. a phone's zombie socket, over a live human; 409 remains
+  only as the takeover-deadline fallback); the event stream survives
+  disconnect and resumes on reconnect with at-least-once delivery at the
+  seam, and a session always ends (send cap + keepalive) so the one stream
+  always comes back. Native only (it drags `yatima-host`/candle); the
+  browser client depends on `yatima-protocol` alone.
+- **`yatima-web`** — that browser client (the vision's rung 2): an
+  eframe/egui app that speaks `yatima-protocol` JSON over one WebSocket back
+  to the serve session it was loaded from. Excluded from the workspace and
+  built with `trunk` (wasm32-only; its own lockfile). The crate splits along
+  the browser line so the subtle half stays testable off-browser: `lib.rs` is
+  a plain-Rust `Transcript` — the `HostEvent` mirror (char-boundary
+  retraction, the PNG/JPEG decode path, the commit-on-`Done` rules, and the
+  reconnect-seam arming that shows a taken-over turn live), unit-tested
+  natively; `main.rs` is the thin egui view over it, compiled only for
+  wasm32. A deliberate miniature of the GUI's transcript — its *semantics*
+  copied, not its code — with the spike's cuts named (plain text, no
+  markdown; PNG/JPEG only, other formats a named placeholder; grant reports
+  as notes). Depends on `yatima-protocol` alone, WASM-clean by construction.
 - **`yatima-text`** — host-neutral prettification of model output (the LaTeX
   → Unicode pipeline, fence-aware). Deliberately dependency-free, pure std,
   WASM-clean: every frontend — TUI, GUI, serve's browser client — runs the
@@ -726,9 +742,11 @@ return-type-notation or `trait_variant` — not before.
 
 The **canonical** invariant & law registry lives in the crate docs — see the
 `yatima-lib` crate doc and the `yatima-cli` `main.rs` doc, and, for the frontend
-stack, the `yatima-protocol` doc (**PROTO-2**, and **WASM-1**: it compiles for
-`wasm32`), the `yatima-host` doc (**HOST-1/2/3**), the `yatima-tui` doc
-(**TUI-1..7**), and the `yatima-serve` doc (**SRV-1/2/3**). Each is protected by
+stack, the `yatima-protocol` doc (**PROTO-2**, and **WASM-1**: it — and the
+other libraries the browser client stands on, `yatima-text` — compile for
+`wasm32`, so `yatima-web` can build on them), the `yatima-host` doc
+(**HOST-1/2/3**), the `yatima-tui` doc (**TUI-1..7**), and the `yatima-serve`
+doc (**SRV-1/2/3**). Each is protected by
 a test that cites its id in an `// upholds: <id>` comment (`grep -r
 'upholds:'`).
 

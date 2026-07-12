@@ -9,6 +9,25 @@
 
 use anyhow::Result;
 
+/// Turn a `$YATIMA_LOG` value into a tracing filter spec. A bare level
+/// ("debug") scopes to the yatima crates: third-party internals (html5ever
+/// narrating every HTML token, hyper, wgpu) drown the log at debug, and the
+/// question the log answers is "what is yatima doing". A spec that already
+/// carries a target (`=`) or several directives (`,`) is honored verbatim,
+/// for when those internals are exactly what's wanted. Both logging
+/// destinations scope identically — the only difference is where the bytes
+/// go and what the unset default is.
+fn scoped_spec(file_stem: &str, value: &str) -> String {
+    if value.contains('=') || value.contains(',') {
+        value.to_string()
+    } else {
+        format!(
+            "warn,yatima_lib={value},yatima_host={value},\
+             yatima_{file_stem}={value},yatima_text={value}"
+        )
+    }
+}
+
 /// Install a file-writing tracing subscriber when `$YATIMA_LOG` is set (its
 /// value is the filter, e.g. `debug` or `yatima_lib=trace`). Logs append to
 /// `~/.cache/yatima/{file_stem}.log` — separate files so two frontends never
@@ -33,20 +52,8 @@ pub fn init_file_logging(file_stem: &str, default_quiets: &[&str]) -> Result<()>
         .create(true)
         .append(true)
         .open(&path)?;
-    // A bare level ("debug") scopes to yatima: third-party internals
-    // (html5ever narrating every HTML token, hyper, wgpu) drown the log at
-    // debug, and the question the log answers is "what is yatima doing". A
-    // spec with '='/',' is honored verbatim for when those internals are
-    // exactly what's wanted.
     let value = std::env::var("YATIMA_LOG").unwrap_or_default();
-    let mut spec = if value.contains('=') || value.contains(',') {
-        value
-    } else {
-        format!(
-            "warn,yatima_lib={value},yatima_host={value},\
-             yatima_{file_stem}={value},yatima_text={value}"
-        )
-    };
+    let mut spec = scoped_spec(file_stem, &value);
     for quiet in default_quiets {
         if !spec.contains(quiet) {
             spec.push_str(&format!(",{quiet}=error"));
@@ -70,17 +77,37 @@ pub fn init_file_logging(file_stem: &str, default_quiets: &[&str]) -> Result<()>
 /// yatima doing", not hyper's inner life.
 pub fn init_stderr_logging(file_stem: &str) -> Result<()> {
     let value = std::env::var("YATIMA_LOG").unwrap_or_else(|_| "info".into());
-    let spec = if value.contains('=') || value.contains(',') {
-        value
-    } else {
-        format!(
-            "warn,yatima_lib={value},yatima_host={value},\
-             yatima_{file_stem}={value},yatima_text={value}"
-        )
-    };
+    let spec = scoped_spec(file_stem, &value);
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(spec))
         .with_writer(std::io::stderr)
         .init();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scoped_spec;
+
+    #[test]
+    fn bare_level_scopes_to_yatima_crates() {
+        // upholds: OBS-1 — the host owns log config; a bare level is scoped.
+        // A bare level fans out to the yatima crates (plus a warn floor for
+        // everything else) and interpolates the frontend's own crate.
+        let spec = scoped_spec("serve", "debug");
+        assert_eq!(
+            spec,
+            "warn,yatima_lib=debug,yatima_host=debug,\
+             yatima_serve=debug,yatima_text=debug"
+        );
+    }
+
+    #[test]
+    fn a_targeted_or_multi_directive_spec_is_verbatim() {
+        // upholds: OBS-1 — the operator can override the host's scoping.
+        // The escape hatch: once the caller names a target (`=`) or lists
+        // several directives (`,`), we honor it untouched.
+        assert_eq!(scoped_spec("serve", "hyper=trace"), "hyper=trace");
+        assert_eq!(scoped_spec("serve", "info,wgpu=off"), "info,wgpu=off");
+    }
 }

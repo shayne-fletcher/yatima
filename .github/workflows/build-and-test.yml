@@ -28,6 +28,12 @@ jobs:
       run: cargo fmt --all --check
     - name: clippy check
       run: cargo clippy --all-targets
+    # web is excluded from the workspace (wasm32-only crate), so the checks
+    # above skip it; run its native lints explicitly on the transcript model.
+    - name: web format check
+      run: cargo fmt --manifest-path web/Cargo.toml --all --check
+    - name: web clippy check
+      run: cargo clippy --manifest-path web/Cargo.toml --all-targets
     - name: build
       run: cargo build
     - name: wasm check (WASM-1)
@@ -53,6 +59,10 @@ jobs:
         cache-all-crates: true
     - name: run tests
       run: cargo test
+    # web is excluded from the workspace; its transcript model is unit-tested
+    # natively (the wasm view is compile-checked in the build job).
+    - name: run web tests
+      run: cargo test --manifest-path web/Cargo.toml
   publish-docs:
     runs-on: ubuntu-latest
     permissions:

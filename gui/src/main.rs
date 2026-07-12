@@ -751,13 +751,14 @@ impl GuiApp {
                     // inline LaTeX prettifies. The host's session is truth; this
                     // is the UI mirror.
                     let reasoning = std::mem::take(&mut self.streaming_reasoning);
+                    let reasoning = reasoning.trim();
                     if let Some(buf) = self.streaming.take() {
                         // Plain scripts: egui's fonts lack the Unicode
                         // super/subscript blocks (e⁻ˣ would be tofu).
                         let answer = prettify_math_plain_scripts(&tame_markdown_images(&buf));
                         if !answer.trim().is_empty() {
-                            let reasoning = (!reasoning.trim().is_empty())
-                                .then(|| prettify_math_plain_scripts(reasoning.trim()));
+                            let reasoning = (!reasoning.is_empty())
+                                .then(|| prettify_math_plain_scripts(reasoning));
                             self.transcript.push(Msg::Assistant { answer, reasoning });
                         }
                     }

@@ -22,27 +22,37 @@
 //!   externally-tagged JSON — serve defines no message types of its own,
 //!   and a client that speaks the protocol crate speaks serve. Cited by
 //!   `wire_is_the_protocol_round_tripped`.
-//! - **SRV-3** one client at a time: the host emits one event stream, and
-//!   splitting it across sockets would silently corrupt both readers. A
-//!   second concurrent connection is refused (409); when a client
-//!   disconnects, the stream is returned intact and the next connection
-//!   resumes it. Nothing is dropped. Events emitted while nobody is
-//!   connected wait in the channel; the one event a session had already
-//!   pulled and attempted to send rides the carry slot
-//!   ([`EventStream::pending`]) to the next session. Delivery at the seam
-//!   is *at-least-once*, not exactly-once: a successful `socket.send` means
-//!   only that the frame was buffered locally, never that the peer read it,
-//!   so a client that closes right after we send may never have seen that
-//!   frame. Rather than guess, a session carries its last-attempted event
-//!   forward and the next client receives it first — a viewer tolerates a
-//!   repeated final fragment far better than a hole. Cited by
-//!   `second_client_refused_and_stream_survives_reconnect` and
+//! - **SRV-3** one stream holder at a time, and the newest connection is
+//!   it: the host emits one event stream, and splitting it across sockets
+//!   would silently corrupt both readers — but *refusing* a second
+//!   connection protects a stale holder over a live human (a phone's
+//!   zombie socket answers protocol pings for a frozen tab and would
+//!   squat the slot indefinitely). So a second connection preempts: the
+//!   live session is signaled, yields at its next await (bounded — every
+//!   session await is capped or cancels with the peer), and the stream
+//!   passes to the newcomer, carry slot intact. One holder at every
+//!   instant; the handoff is atomic through the lease. Refusal (409)
+//!   survives only as the takeover-deadline fallback, the wedge guard for
+//!   a session that cannot yield in time. When a client disconnects, the
+//!   stream is returned intact and the next connection resumes it.
+//!   Nothing is dropped. Events emitted while nobody is connected wait in
+//!   the channel; the one event a session had already pulled and
+//!   attempted to send rides the carry slot ([`EventStream::pending`]) to
+//!   the next session. Delivery at the seam is *at-least-once*, not
+//!   exactly-once: a successful `socket.send` means only that the frame
+//!   was buffered locally, never that the peer read it, so a client that
+//!   closes right after we send may never have seen that frame. Rather
+//!   than guess, a session carries its last-attempted event forward and
+//!   the next client receives it first — a viewer tolerates a repeated
+//!   final fragment far better than a hole. Cited by
+//!   `second_client_takes_over_and_the_stream_survives` and
 //!   `carry_slot_redelivers_the_last_attempted_event`.
 //!
 //!   The stream always comes back: a session hands it over through a
 //!   [`StreamLease`] whose `Drop` restores it, so a WebSocket upgrade that
 //!   fails after the stream is claimed, or a session that panics, cannot
-//!   strand it and wedge serve at 409. And a session is always able to end:
+//!   strand it — which would leave nothing to preempt and force every later
+//!   connection to the 409 fallback. And a session is always able to end:
 //!   the outbound send is capped ([`SEND_STALL_CAP`]) and the peer is pinged
 //!   on an idle timer ([`KEEPALIVE_INTERVAL`]) so a half-open client that
 //!   stopped answering — even while the host is idle and no send is
@@ -117,6 +127,10 @@ pub struct Bridge {
     req_tx: Sender<HostRequest>,
     cancel: CancelGate,
     event_rx: Mutex<Option<EventStream>>,
+    /// The takeover signal (SRV-3): a new connection bumps it; the live
+    /// session watches it and yields the stream. A counter, not a flag, so
+    /// every bump is an edge no matter when the session subscribed.
+    preempt: tokio::sync::watch::Sender<u64>,
     send_stall_cap: Duration,
     keepalive_interval: Duration,
 }
@@ -138,9 +152,19 @@ impl Bridge {
                 rx: handle.event_rx,
                 pending: None,
             })),
+            preempt: tokio::sync::watch::channel(0).0,
             send_stall_cap,
             keepalive_interval,
         })
+    }
+
+    /// How long a takeover may wait for the live session to yield before
+    /// falling back to refusal. The session reacts to the signal at its
+    /// next select wake — instantly when parked, and at worst after one
+    /// full outbound send to a stalled peer — so the deadline is the send
+    /// cap plus slack.
+    fn takeover_deadline(&self) -> Duration {
+        self.send_stall_cap + TAKEOVER_SLACK
     }
 
     /// The serve router: the WebSocket route plus, when a client bundle
@@ -159,14 +183,14 @@ impl Bridge {
 }
 
 /// A session's borrow of the one event stream, with return guaranteed
-/// (SRV-3). The stream is taken *before* the upgrade so a second client is
-/// refused at the handshake — but that split means the caller that takes it
-/// (the HTTP handler) is not the code that hands it back (the upgraded
-/// session), and axum runs the `on_upgrade` callback only on a *successful*
-/// upgrade. A lease closes the gap: whoever holds it restores the stream on
-/// `Drop`, so a failed upgrade (axum drops the callback with the lease
-/// inside) or a panicking session returns the stream instead of stranding it
-/// and wedging serve at 409 forever.
+/// (SRV-3). The stream is taken *before* the upgrade — the takeover
+/// handshake completes only once it holds the lease — but that split means
+/// the caller that takes it (the HTTP handler) is not the code that hands
+/// it back (the upgraded session), and axum runs the `on_upgrade` callback
+/// only on a *successful* upgrade. A lease closes the gap: whoever holds it
+/// restores the stream on `Drop`, so a failed upgrade (axum drops the
+/// callback with the lease inside) or a panicking session returns the
+/// stream instead of stranding it and wedging serve forever.
 struct StreamLease {
     bridge: Arc<Bridge>,
     stream: Option<EventStream>,
@@ -202,17 +226,31 @@ async fn ws_upgrade(
     State(bridge): State<Arc<Bridge>>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // SRV-3: lease the event stream before upgrading; a second concurrent
-    // client finds it borrowed and is refused at the handshake. The lease
-    // rides into the callback and returns the stream on Drop even if the
-    // upgrade never completes.
-    let Some(lease) = StreamLease::acquire(bridge) else {
-        tracing::info!("second concurrent client refused 409 (SRV-3)");
-        return (
-            StatusCode::CONFLICT,
-            "another client is connected (serve is single-client — SRV-3)",
-        )
-            .into_response();
+    // SRV-3: lease the event stream before upgrading. If a session holds
+    // it, preempt: signal, then poll for the yield — bumping the signal
+    // each round, because a session mid-send subscribes to edges and a
+    // single early bump could land before it listens. The lease rides into
+    // the callback and returns the stream on Drop even if the upgrade
+    // never completes.
+    let deadline = tokio::time::Instant::now() + bridge.takeover_deadline();
+    let lease = loop {
+        if let Some(lease) = StreamLease::acquire(Arc::clone(&bridge)) {
+            break lease;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // The wedge guard: a holder that cannot yield in time (it
+            // should not exist — every session await is bounded) must not
+            // hang every future handshake too.
+            tracing::warn!("takeover deadline passed; refusing 409 (SRV-3 fallback)");
+            return (
+                StatusCode::CONFLICT,
+                "another client held the stream past the takeover deadline (SRV-3)",
+            )
+                .into_response();
+        }
+        tracing::info!("takeover: signaling the live session to yield (SRV-3)");
+        bridge.preempt.send_modify(|generation| *generation += 1);
+        tokio::time::sleep(TAKEOVER_POLL).await;
     };
     tracing::info!("client connected; session begins");
     upgrade
@@ -237,6 +275,17 @@ const SEND_STALL_CAP: Duration = Duration::from_secs(30);
 /// WebSocket stack answers automatically, so only a gone one fails to.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
+/// How long a takeover waits between re-bumping the preempt signal and
+/// re-checking whether the live session has yielded the stream. Short enough
+/// that a parked session hands off imperceptibly, long enough not to spin.
+const TAKEOVER_POLL: Duration = Duration::from_millis(25);
+
+/// Headroom added to the send cap for [`Bridge::takeover_deadline`]: the extra
+/// time a takeover allows beyond one worst-case stalled send before it gives
+/// up and falls back to a 409. Covers scheduling jitter between the signal and
+/// the session's next wake; the send cap is the substantive term.
+const TAKEOVER_SLACK: Duration = Duration::from_secs(5);
+
 /// Serve one connected client until it hangs up (or a send/keepalive marks it
 /// gone), then return the event stream — including the last event this session
 /// attempted to send — for the next one (SRV-3, via [`StreamLease`]'s Drop).
@@ -246,6 +295,11 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// stream can always come back.
 async fn client_session(mut lease: StreamLease, mut socket: WebSocket) {
     let bridge = Arc::clone(&lease.bridge);
+    // Subscribe to the takeover signal before serving: bumps from before
+    // this session's tenure are marked seen (they targeted a predecessor);
+    // a newcomer re-bumps every poll round, so none are missed for long.
+    let mut preempt = bridge.preempt.subscribe();
+    preempt.borrow_and_update();
     let stream = lease.stream();
     // The event the previous session last attempted goes out before the
     // channel resumes: its send may have been buffered to a peer that then
@@ -273,13 +327,18 @@ async fn client_session(mut lease: StreamLease, mut socket: WebSocket) {
     keepalive.tick().await; // the first tick is immediate; spend it now
     let mut awaiting_pong = false;
     loop {
-        // `biased` with the socket arm first so a waiting Close/Pong/request is
-        // handled before another event is pulled — the sooner a dead peer is
-        // seen, the sooner the stream returns. Correctness does not hinge on
-        // it: whichever event this session last pulled is carried forward
-        // regardless of who wins the race, so nothing is lost either way.
+        // `biased`, takeover first — the newest connection is authoritative
+        // (SRV-3), so a pending preempt outranks even a waiting Close. Then
+        // the socket arm, so a Close/Pong/request is handled before another
+        // event is pulled: the sooner a dead peer is seen, the sooner the
+        // stream returns. Correctness does not hinge on the order — the
+        // last-pulled event is carried forward regardless of who wins.
         tokio::select! {
             biased;
+            _ = preempt.changed() => {
+                tracing::info!("preempted by a new client; yielding the stream (SRV-3)");
+                return;
+            }
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(frame))) => match decode_request(&frame) {
                     // Mid-decode cancel must bypass the (unserviced) request
@@ -578,10 +637,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn second_client_refused_and_stream_survives_reconnect() {
-        // upholds: SRV-3 — a concurrent second client is refused at the
-        // handshake; after the first disconnects, a new client resumes the
-        // same stream and events queued while disconnected arrive.
+    async fn second_client_takes_over_and_the_stream_survives() {
+        // upholds: SRV-3 — a second connection is not refused: it preempts.
+        // The live session is signaled and yields, the newcomer's handshake
+        // completes holding the same stream, and the old socket is closed.
+        // Events then flow to the new holder; a clean disconnect afterwards
+        // still returns the stream for the next connection.
         let (bridge, event_tx, _req_rx, _gate) = fake_host();
         let addr = serve_on_ephemeral(bridge).await;
 
@@ -591,35 +652,28 @@ mod tests {
         )
         .await
         .unwrap();
-        // upholds: SRV-3 — the refusal is specifically HTTP 409, not any
-        // stray non-101 (a regression to 500/reset would still "err").
-        let refused = within(
-            "second (refused) handshake",
+        // The takeover: one connect attempt succeeds while the first client
+        // is still connected — the handshake itself waits for the yield.
+        let (mut second, _) = within(
+            "takeover handshake",
             tokio_tungstenite::connect_async(ws_url(addr)),
         )
-        .await;
-        match refused {
-            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
-                assert_eq!(resp.status(), 409, "second client must be refused 409");
-            }
-            other => panic!("expected a 409 Http error, got {other:?}"),
-        }
-
-        within("first close", first.close(None)).await.unwrap();
-        // Events sent while nobody is connected wait in the channel.
-        event_tx.send(HostEvent::Note("queued".into())).unwrap();
-        // The stream is returned on disconnect; poll the handshake (bounded)
-        // until the returning session releases it.
-        let mut second = within("reconnect after disconnect", async {
+        .await
+        .expect("second client must take over, not be refused (SRV-3)");
+        // The preempted session ends: the first socket observes EOF/close.
+        within("first client sees its session end", async {
             loop {
-                match tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await {
-                    Ok((ws, _)) => break ws,
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                match first.next().await {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => break,
+                    Some(Ok(_)) => {} // drain anything in flight
                 }
             }
         })
         .await;
-        let frame = within("queued event arrives", second.next())
+        // Events flow to the new holder.
+        event_tx.send(HostEvent::Note("taken over".into())).unwrap();
+        let frame = within("event arrives at the takeover client", second.next())
             .await
             .unwrap()
             .unwrap()
@@ -627,7 +681,48 @@ mod tests {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<HostEvent>(&frame).unwrap(),
-            HostEvent::Note("queued".into())
+            HostEvent::Note("taken over".into())
+        );
+
+        // The clean-disconnect half: close, queue an event while nobody is
+        // connected, reconnect. At-least-once at the seam fixes the *tail*,
+        // not the duplicates: whichever event the old session last sent
+        // unacknowledged rides the carry slot, so the next client sees
+        // either ["taken over", "queued"] (Close processed before the
+        // queued pull) or just ["queued"] (the queued event was sent to the
+        // closing socket, superseding the carry) — and "queued" arrives
+        // last either way. Nothing is dropped; order among duplicates is
+        // the race's to pick.
+        within("takeover client close", second.close(None))
+            .await
+            .unwrap();
+        event_tx.send(HostEvent::Note("queued".into())).unwrap();
+        let mut third = within("reconnect after disconnect", async {
+            loop {
+                match tokio_tungstenite::connect_async(ws_url(addr)).await {
+                    Ok((ws, _)) => break ws,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await;
+        let mut seen = Vec::new();
+        while seen.last() != Some(&"queued".to_string()) {
+            let frame = within("events reach the reconnected client", third.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            match serde_json::from_str::<HostEvent>(&frame).unwrap() {
+                HostEvent::Note(n) => seen.push(n),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(
+            seen == ["queued"] || seen == ["taken over", "queued"],
+            "the queued event must arrive, preceded at most by the carried \
+             duplicate; got {seen:?}"
         );
     }
 
@@ -751,13 +846,22 @@ mod tests {
         );
     }
 
+    /// The takeover generation the bridge has issued (0 = none). The
+    /// freed-stream tests assert on it: with preemption in the handshake, a
+    /// bare "reconnect succeeded" would pass even if the mechanism under
+    /// test (keepalive reap, host-gone exit) never freed the stream — the
+    /// connect would just have preempted. Generation 0 proves it did not.
+    fn preempt_generation(bridge: &Bridge) -> u64 {
+        *bridge.preempt.subscribe().borrow()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn host_gone_ends_the_session_and_frees_the_stream() {
-        // When the host drops its event sender, the session's rx.recv() returns
-        // None, the session ends, and the stream is freed for the next client
-        // rather than stranded.
+        // When the host drops its event sender, the session's rx.recv()
+        // returns None, the session ends, and the stream is freed — no
+        // takeover needed (asserted via the preempt generation).
         let (bridge, event_tx, _req_rx, _gate) = fake_host();
-        let addr = serve_on_ephemeral(bridge).await;
+        let addr = serve_on_ephemeral(Arc::clone(&bridge)).await;
         let (_first, _) = within(
             "first handshake",
             tokio_tungstenite::connect_async(ws_url(addr)),
@@ -765,26 +869,37 @@ mod tests {
         .await
         .unwrap();
         drop(event_tx); // host thread gone: the event channel closes
-        let _second = within("reconnect after host gone", async {
-            loop {
-                match tokio_tungstenite::connect_async(ws_url(addr)).await {
-                    Ok((ws, _)) => break ws,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-                }
+                        // Wait for the session to notice (bounded), then a single connect
+                        // must succeed without preempting.
+        within("stream returns after host gone", async {
+            while StreamLease::acquire(Arc::clone(&bridge)).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
+        let _second = within(
+            "reconnect after host gone",
+            tokio_tungstenite::connect_async(ws_url(addr)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            preempt_generation(&bridge),
+            0,
+            "the stream must be freed by the session ending, not by takeover"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn idle_unresponsive_peer_is_reaped_by_keepalive() {
-        // upholds: SRV-3 liveness — a peer that stops answering while the host
-        // is idle (no event to send, so the send cap never fires) is pinged and,
-        // on a missed pong, dropped, freeing the stream. Without the keepalive
-        // this session would hold the one stream until the OS TCP keepalive.
+        // upholds: SRV-3 liveness — a peer that stops answering while the
+        // host is idle (no event to send, so the send cap never fires) is
+        // pinged and, on a missed pong, dropped, freeing the stream. The
+        // preempt generation stays 0: the keepalive freed it, not a
+        // takeover.
         let (bridge, _event_tx, _req_rx, _gate) =
             fake_host_timed(Duration::from_secs(30), Duration::from_millis(50));
-        let addr = serve_on_ephemeral(bridge).await;
+        let addr = serve_on_ephemeral(Arc::clone(&bridge)).await;
         // Connect but never poll: tungstenite answers pings only on read, so
         // this client never pongs — a half-open peer by construction.
         let _silent = within(
@@ -793,15 +908,25 @@ mod tests {
         )
         .await
         .unwrap();
-        let _second = within("reconnect after keepalive reap", async {
-            loop {
-                match tokio_tungstenite::connect_async(ws_url(addr)).await {
-                    Ok((ws, _)) => break ws,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-                }
+        // The reap fires after a missed pong deadline (~2 intervals); wait
+        // for the freed stream (bounded), then connect once, no takeover.
+        within("stream returns after the reap", async {
+            while StreamLease::acquire(Arc::clone(&bridge)).is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await;
+        let _second = within(
+            "reconnect after keepalive reap",
+            tokio_tungstenite::connect_async(ws_url(addr)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            preempt_generation(&bridge),
+            0,
+            "the stream must be freed by the reap, not by takeover"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

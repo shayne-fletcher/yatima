@@ -79,9 +79,11 @@ mod app {
 
         /// Replace the dead socket with a fresh one; serve returns the same
         /// event stream to the next connection, so the session continues
-        /// where it left off (`in_flight` is deliberately not cleared: if a
-        /// turn was running, its remaining events — or its Done — arrive on
-        /// the resumed stream and settle it).
+        /// where it left off. `in_flight` is deliberately kept: if a turn was
+        /// running, its remaining events re-arm the mirror (the Fragment arms
+        /// arm on demand) and its Done settles it. Should that Done be dropped
+        /// at the seam, the spinner stays lit but the stop button — shown
+        /// whenever `in_flight` is set — settles the turn locally.
         fn reconnect(&mut self) {
             let (ws_tx, ws_rx) = connect(&self.ctx);
             self.ws_tx = ws_tx;
@@ -103,7 +105,7 @@ mod app {
                     ewebsock::WsEvent::Opened => self.connected = true,
                     ewebsock::WsEvent::Message(ewebsock::WsMessage::Text(frame)) => {
                         match serde_json::from_str::<HostEvent>(&frame) {
-                            Ok(ev) => self.transcript.apply(ev),
+                            Ok(ev) => self.transcript.fold(ev),
                             Err(e) => log::warn!("unintelligible frame dropped: {e}"),
                         }
                     }
@@ -112,19 +114,20 @@ mod app {
                         self.connected = false;
                         self.dropped = true;
                         self.transcript
-                            .apply(HostEvent::Note(format!("[socket error: {e}]")));
+                            .fold(HostEvent::Note(format!("[socket error: {e}]")));
                     }
                     ewebsock::WsEvent::Closed => {
                         self.connected = false;
                         self.dropped = true;
                         self.transcript
-                            .apply(HostEvent::Note("[connection closed]".into()));
+                            .fold(HostEvent::Note("[connection closed]".into()));
                     }
                 }
             }
         }
 
         fn submit(&mut self) {
+            // upholds: WEB-2 — a submit is refused while a turn is in flight.
             let text = self.input.trim().to_string();
             if text.is_empty() || self.transcript.in_flight.is_some() {
                 return; // single-in-flight, as in the GUI/TUI
@@ -214,7 +217,12 @@ mod app {
                     }
                     if let Some(turn_id) = self.transcript.in_flight {
                         if ui.button("stop").clicked() {
+                            // Tell the host to cancel, and settle the mirror
+                            // locally now — don't wait for a Done that the
+                            // reconnect seam may have dropped. This is also the
+                            // escape hatch out of a wedged spinner.
                             self.send(&HostRequest::Cancel { turn_id });
+                            self.transcript.abort();
                         }
                     }
                 });
