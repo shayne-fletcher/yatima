@@ -34,12 +34,14 @@ on the serve seam. The spike's first external dividend: the surface
 invited a collaborator to design *with* it, which is what a surface is
 for.
 
-What the day taught, spike-style (details land in the serve roadmap
-entry at the W3 flip): reconnect semantics are the first thing a phone
-tests — idle tabs drop, zombie sockets answer keepalives on behalf of
-frozen pages, and SRV-3's single-client refusal reads as "server
-confused" from the outside (preemption — newest connection wins — is
-the proposed amendment). A reconnect button that preserves the
-in-memory mirror closed the daily case. Model temperament is a real
-variable: QwQ tutorializes where qwen32b calls the tool. And a debug
-wasm bundle is 21 MB — release builds before anyone else is invited.
+What the day taught, spike-style (the findings are recorded in the
+serve roadmap entry, design.md): reconnect semantics are the first
+thing a phone tests — idle tabs drop, zombie sockets answer keepalives
+on behalf of frozen pages, and SRV-3's single-client refusal read as
+"server confused" from the outside. Preemption — newest connection
+wins — shipped as the amendment the same day, and the daily case closed
+as a pair: a reconnect button that preserves the in-memory mirror, plus
+a stop that settles the turn locally (the escape hatch a dropped Done
+would otherwise wedge). Model temperament is a real variable: QwQ
+tutorializes where qwen32b calls the tool. And a debug wasm bundle is
+21 MB — release builds before anyone else is invited.

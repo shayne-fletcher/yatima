@@ -745,10 +745,11 @@ The **canonical** invariant & law registry lives in the crate docs — see the
 stack, the `yatima-protocol` doc (**PROTO-2**, and **WASM-1**: it — and the
 other libraries the browser client stands on, `yatima-text` — compile for
 `wasm32`, so `yatima-web` can build on them), the `yatima-host` doc
-(**HOST-1/2/3**), the `yatima-tui` doc (**TUI-1..7**), and the `yatima-serve`
-doc (**SRV-1/2/3**). Each is protected by
-a test that cites its id in an `// upholds: <id>` comment (`grep -r
-'upholds:'`).
+(**HOST-1/2/3**), the `yatima-tui` doc (**TUI-1..7**), the `yatima-serve`
+doc (**SRV-1/2/3**), and the `yatima-web` doc (**WEB-1..6**). Each is
+protected by a test that cites its id in an `// upholds: <id>` comment
+(`grep -r 'upholds:'`) — except **WASM-1**, which is a *compile-time* law:
+its guard is `scripts/check-wasm.sh` (run in CI), not a citing test.
 
 In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
@@ -756,7 +757,8 @@ In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **PROTO-1**); observability (**OBS-1/2/3/4**); chat templates
 (**TMPL-1/2**, **REASON-1**); CLI (**CLI-1/2/3**); the frontend host and its
 wire plane (**HOST-1/2/3**, **PROTO-2**, **WASM-1**), the terminal UI
-(**TUI-1..7**), and the WebSocket bridge (**SRV-1/2/3**).
+(**TUI-1..7**), the WebSocket bridge (**SRV-1/2/3**), and the browser client
+(**WEB-1..6**).
 
 ## State machines
 
@@ -1034,27 +1036,36 @@ and deliberately shelved — the note records why so we don't repeat them.
   above — until then the flat string is fine. **Prerequisite done:** `Role`/`Turn`
   now live in a neutral `transcript` module (were in `agent`), so the boundary would
   not make the model layer depend upward into the agent layer.
-- **Serving & scale (deferred — mostly a different *process/tier*, not a
-  module).** `yatima-lib` is the in-process **leaf**; serving concerns must not
-  leak into it (no auth/tenancy/routing in `Engine`/`ChatSession`/`Agent`). The
-  map, by where each concern lives:
+- **Serving & scale (the tailnet bridge is built; the *tiers* stay deferred —
+  a different *process/tier*, not a module).** `yatima-lib` is the in-process
+  **leaf**; serving concerns must not leak into it (no auth/tenancy/routing in
+  `Engine`/`ChatSession`/`Agent`). The map, by where each concern lives:
   - *Node concurrency* (many clients, one model) → **`yatima-host`** (owns the
     `Engine`, serves requests over a channel; home of KV reuse). A request queue
     gives modest concurrency cheaply; real throughput needs continuous batching —
     a large engine build, probably **rented** (see fork).
   - *Tenancy / auth / quotas / multi-client API* → a separate **service tier**
-    (e.g. `yatima-serve`) mapping tenant → capabilities → budget → model. Builds
-    on the capability primitive (`Dir`/`WriteDir`/`WebOrigin`/`NtfyTopic` —
-    bounded effects are exactly what isolation needs); never enters the library.
-    **Live trigger (2026-07): remote collaboration on sieve** — serving yatima
-    to a second user. The seam is now built: `yatima-host` owns the engine and
-    speaks `yatima-protocol`, so serve is a socket speaking that protocol.
-    Everything below (engine, tools, python) stays native; the client plane is
-    the GUI's view half (decode, textures, egui) compiled to WASM over
-    `yatima-protocol`, with artifacts (plot PNGs) crossing as `HostEvent::Image`
-    bytes. The in-process hardening — real agent turns, the shared toolset, and
-    the protocol/host extraction that made "consistent by parallel implementation"
-    into "consistent by construction" — is done; serve is the remaining edge.
+    mapping tenant → capabilities → budget → model. Builds on the capability
+    primitive (`Dir`/`WriteDir`/`WebOrigin`/`NtfyTopic` — bounded effects are
+    exactly what isolation needs); never enters the library.
+    **Rung 2 built and demoed (2026-07-12):** `yatima-serve` bridges the host's
+    two planes over one WebSocket (SRV-1/2/3) and `yatima-web` — a purpose-
+    built miniature of the GUI's transcript semantics over `yatima-protocol`
+    alone, *not* the GUI's view half compiled to wasm as once sketched — ran a
+    live qwen32b turn with a tool-rendered chart on a phone over the tailnet
+    (provenance: `notes/vision.md`, 2026-07-12; the walk-through:
+    `articles/browser-viewer.md`). What the demo taught, spike-style:
+    reconnect is the first thing a phone tests (idle tabs drop; a frozen tab's
+    zombie socket answers keepalives), which forced SRV-3 from refusal to
+    preemption — newest connection wins — plus the client-side seam laws
+    (WEB-3/4/5). Still open from the demo notes: the `π`-in-plot-title
+    rendering bug, committed answers leaking `![](./plots/…)` artifact links
+    the browser can't resolve, a 21 MB debug wasm bundle (release builds
+    before anyone else is invited), and model temperament as a real variable
+    (QwQ tutorializes where qwen32b calls the tool). What remains *deferred*
+    here is the multi-tenant service tier itself — auth, quotas, tenant
+    isolation; the personal tailnet bridge deliberately has none (`/ws` is
+    unauthenticated by posture).
   - *Clusters / routing / model placement* → a **control-plane** tier above the
     service; the library is the leaf and knows nothing of it.
   - *Model sharding* → engine-internal, **rented from candle/backend**, surfaced

@@ -12,6 +12,13 @@ wrappers. The TUI runs decode on a dedicated engine thread behind a three-plane
 protocol (request / event / control), so the UI loop never blocks on decode and a
 turn is cancellable in flight.
 
+Every frontend is a viewer over the same host: `yatima-host` owns the engine
+thread and speaks `yatima-protocol` (events out, requests in), so the TUI, the
+GUI, and — over one WebSocket via `yatima-serve` — a browser running the
+`yatima-web` wasm client all render the same event stream. The serve/web data
+path, from a submit on a phone to a textured chart, is walked through in
+[the browser viewer](browser-viewer.md).
+
 ## Streaming agent steps (AGENT-4)
 
 Each agent step drives the completer's streaming path. Fragments are
@@ -50,6 +57,8 @@ events later.
 
 ## Further reading
 
+- The serve/web browser viewer — components, the wire, and the reconnect
+  seam: [articles/browser-viewer.md](browser-viewer.md).
 - The full invariant registry, state machines, model-loading contract,
   concurrency discussion, and deferred work: [notes/design.md](../notes/design.md).
 - The Metal KV-depth corruption investigation, workaround, and upgrade canary:

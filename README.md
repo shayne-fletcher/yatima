@@ -90,6 +90,9 @@ canary test used to retire the fork on each candle upgrade are documented in
 
 - [The TUI](articles/tui.md) — the interactive session: runtime origin grants,
   live streaming, pagination, the keys and commands.
+- [The browser viewer](articles/browser-viewer.md) — serve as the event plane
+  over one WebSocket, the wasm client as a viewer; one turn's bytes across
+  the seam.
 - [Models & quantization](articles/models.md) — the support matrix, the `‡`
   caveat, GGUF i-quant limits, and the candle fork.
 - [Reasoning models](articles/reasoning-models.md) — think-block splitting,
