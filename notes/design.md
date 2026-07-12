@@ -1051,22 +1051,20 @@ and deliberately shelved — the note records why so we don't repeat them.
   `yatima-host` (the extracted engine host) with `yatima-protocol` (its wire
   plane), and capability scoping are the concrete substrate the service tier
   builds on.
-- **Speculative decoding over the wire (idea, 2026-07-12).** Provenance: the
-  wasm spike's first remote demo — a phone on the tailnet streaming a live
-  qwen32b turn with a tool-rendered chart — was shared with a compilers/PL
-  friend, whose reaction ("text UIs are fun but so fundamentally limiting")
-  endorsed the graphics-UI direction, and who then proposed the next wire:
-  run a featherweight drafter locally (EAGLE-2-style single-layer models —
-  little storage, lives on modest GPUs) speculating for a remote big model;
-  the remote side takes *batched* confirmation queries, verifies up to token
-  N, and returns the corrected token N+1. His observation: no current
-  protocol supports local generation with remote confirmation. Compounding
-  move: grammar filtering — a lexer masking tokens that cannot extend a
-  valid program — stacked on speculation for serious codegen speedups.
-  Where it sits here: this is the *dual* of the remote-`Completer` identity
-  fork above. There, yatima orchestrates a rented engine (prompts up, tokens
-  down); here, yatima's local model becomes the drafter and the wire carries
-  token proposals up / verifications down — a second protocol plane beside
+- **Speculative decoding over the wire (idea, 2026-07-12).** Provenance in
+  the vision log (`notes/vision.md`, 2026-07-12): proposed by a compilers/PL
+  friend after the spike's phone demo. The idea: run a featherweight drafter
+  locally (EAGLE-2-style single-layer models — little storage, lives on
+  modest GPUs) speculating for a remote big model; the remote side takes
+  *batched* confirmation queries, verifies up to token N, and returns the
+  corrected token N+1 — no current protocol supports local generation with
+  remote confirmation. Compounding move: grammar filtering — a lexer masking
+  tokens that cannot extend a valid program — stacked on speculation for
+  serious codegen speedups. Where it sits here: this is the *dual* of the
+  remote-`Completer` identity fork above. There, yatima orchestrates a
+  rented engine (prompts up, tokens down); here, yatima's local model
+  becomes the drafter and the wire carries token proposals up /
+  verifications down — a second protocol plane beside
   `HostEvent`/`HostRequest`, and a verify-batch shape on the `Completer`
   boundary. Caveat known upfront: EAGLE-style drafters train against the
   target model's hidden states (awkward against rented remotes); vanilla
