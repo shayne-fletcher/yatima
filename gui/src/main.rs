@@ -182,6 +182,23 @@ enum Msg {
     Error(String),
 }
 
+/// The turn in flight, if any. One sum where three parallel fields (an answer
+/// buffer, a reasoning buffer, an in-flight id) used to drift apart by hand:
+/// `Idle`/`Live` make "a streaming buffer without a live turn" unrepresentable
+/// — the same shape as the web client's `Turn`, for the same reason.
+#[derive(Default)]
+enum Turn {
+    #[default]
+    Idle,
+    Live {
+        id: u64,
+        /// The answer streaming in (armed in `submit`).
+        answer: String,
+        /// The chain-of-thought (and tool notes) streaming in alongside it.
+        reasoning: String,
+    },
+}
+
 /// Where the session is in its lifecycle (drives the status line / input gating).
 enum Status {
     Loading,
@@ -197,9 +214,8 @@ struct GuiApp {
     /// The host's cancel gate: Esc / the stop button trips it for the in-flight
     /// turn (the mid-decode path, as in the TUI).
     cancel: CancelGate,
-    /// The next turn's id, and the id of the turn in flight (for the gate).
+    /// The next turn's id (the id space is this frontend's own).
     next_turn_id: u64,
-    in_flight_turn: Option<u64>,
     /// A handle to the egui context, for uploading image artifacts as textures
     /// off the render path (in `drain_events`).
     ctx: egui::Context,
@@ -215,10 +231,9 @@ struct GuiApp {
     show_stats: bool,
     input: String,
     transcript: Vec<Msg>,
-    /// The answer currently streaming in, if a turn is in flight.
-    streaming: Option<String>,
-    /// The chain-of-thought streaming in alongside it (this turn).
-    streaming_reasoning: String,
+    /// The turn in flight with its streaming buffers — drives the gate, the
+    /// stop path, the avatar, and the live render (via `in_flight`).
+    turn: Turn,
     /// Whether to surface reasoning. Off by default — the answer is what matters;
     /// the chain-of-thought is opt-in via `/stats`.
     show_reasoning: bool,
@@ -323,7 +338,6 @@ impl GuiApp {
             ev_rx,
             cancel: handle.cancel,
             next_turn_id: 0,
-            in_flight_turn: None,
             ctx,
             splash_anim_start: None,
             splash_retired: false,
@@ -331,8 +345,7 @@ impl GuiApp {
             show_stats: false,
             input: String::new(),
             transcript: Vec::new(),
-            streaming: None,
-            streaming_reasoning: String::new(),
+            turn: Turn::Idle,
             show_reasoning: false,
             status: Status::Loading,
             opacity: 0.85,
@@ -612,16 +625,43 @@ impl GuiApp {
     }
 
     fn in_flight(&self) -> bool {
-        self.streaming.is_some()
+        matches!(self.turn, Turn::Live { .. })
     }
 
-    /// Stop the in-flight turn (token-level) by tripping the host's cancel gate.
-    /// The host finishes with what streamed so far; Done still arrives and
-    /// commits the partial answer. Taking the id makes a second Esc a no-op.
+    /// Settle the streaming turn: commit its answer (display-polished) if it
+    /// carried text, then disarm — the one `Live → Idle` edge, shared by a
+    /// clean `Done` and by `cancel_turn`. Committed text is display-polished:
+    /// local image links drop (the artifact is already inline as a texture)
+    /// and inline LaTeX prettifies. The host's session is truth; this is the
+    /// UI mirror.
+    fn settle(&mut self) {
+        if let Turn::Live {
+            answer, reasoning, ..
+        } = std::mem::take(&mut self.turn)
+        {
+            let reasoning = reasoning.trim();
+            // Plain scripts: egui's fonts lack the Unicode super/subscript
+            // blocks (e⁻ˣ would be tofu).
+            let answer = prettify_math_plain_scripts(&tame_markdown_images(&answer));
+            if !answer.trim().is_empty() {
+                let reasoning =
+                    (!reasoning.is_empty()).then(|| prettify_math_plain_scripts(reasoning));
+                self.transcript.push(Msg::Assistant { answer, reasoning });
+            }
+        }
+    }
+
+    /// Stop the in-flight turn (token-level) by tripping the host's cancel
+    /// gate, and settle the mirror at once — commit what streamed, disarm —
+    /// rather than wait on the host's round trip (the web client's stop does
+    /// exactly this, WEB-5). The host still finishes and sends a Done, which
+    /// lands on an already-idle mirror as a no-op. Matching `Idle` makes a
+    /// second Esc a no-op.
     fn cancel_turn(&mut self) {
-        if let Some(turn_id) = self.in_flight_turn.take() {
-            self.cancel.cancel(turn_id);
+        if let Turn::Live { id, .. } = self.turn {
+            self.cancel.cancel(id);
             self.transcript.push(Msg::Note("— interrupted".to_string()));
+            self.settle();
         }
     }
 
@@ -651,8 +691,7 @@ impl GuiApp {
     /// after the session has begun.
     fn clear(&mut self) {
         self.transcript.clear();
-        self.streaming = None;
-        self.streaming_reasoning.clear();
+        self.turn = Turn::Idle;
         self.help_open = false;
         self.splash_retired = true;
     }
@@ -678,8 +717,8 @@ impl GuiApp {
                         self.turn_start = Some(now);
                     }
                     self.gen_tokens += 1;
-                    if let Some(buf) = self.streaming.as_mut() {
-                        buf.push_str(&text);
+                    if let Turn::Live { answer, .. } = &mut self.turn {
+                        answer.push_str(&text);
                     }
                 }
                 HostEvent::Fragment {
@@ -691,7 +730,9 @@ impl GuiApp {
                         self.turn_start = Some(now);
                     }
                     self.gen_tokens += 1;
-                    self.streaming_reasoning.push_str(&text);
+                    if let Turn::Live { reasoning, .. } = &mut self.turn {
+                        reasoning.push_str(&text);
+                    }
                 }
                 // Tool activity (host events, not model tokens) folds into
                 // the reasoning pane without touching the token counter,
@@ -700,16 +741,20 @@ impl GuiApp {
                     if self.turn_start.is_none() {
                         self.turn_start = Some(now);
                     }
-                    self.streaming_reasoning
-                        .push_str(&tool_note_line(kind, &text));
+                    if let Turn::Live { reasoning, .. } = &mut self.turn {
+                        reasoning.push_str(&tool_note_line(kind, &text));
+                    }
                 }
                 HostEvent::RetractAnswer { chars, .. } => {
                     // The streamed tail was narration ahead of a tool call —
                     // pull it back out of the answer; it replays as reasoning.
-                    if let Some(buf) = self.streaming.as_mut() {
-                        let keep = buf.chars().count().saturating_sub(chars);
-                        let cut = buf.char_indices().nth(keep).map_or(buf.len(), |(i, _)| i);
-                        buf.truncate(cut);
+                    if let Turn::Live { answer, .. } = &mut self.turn {
+                        let keep = answer.chars().count().saturating_sub(chars);
+                        let cut = answer
+                            .char_indices()
+                            .nth(keep)
+                            .map_or(answer.len(), |(i, _)| i);
+                        answer.truncate(cut);
                     }
                 }
                 // Grant reports and app-plane messages both render as notes.
@@ -742,36 +787,20 @@ impl GuiApp {
                             .push(Msg::Error(format!("image decode: {e}"))),
                     }
                 }
-                HostEvent::Done { .. } => {
-                    self.in_flight_turn = None;
-                    // Drop the streaming buffers; only commit a reply if the
-                    // answer carried text (a fully-retracted turn streams none).
-                    // Committed text is display-polished: local image links
-                    // drop (the artifact is already inline as a texture) and
-                    // inline LaTeX prettifies. The host's session is truth; this
-                    // is the UI mirror.
-                    let reasoning = std::mem::take(&mut self.streaming_reasoning);
-                    let reasoning = reasoning.trim();
-                    if let Some(buf) = self.streaming.take() {
-                        // Plain scripts: egui's fonts lack the Unicode
-                        // super/subscript blocks (e⁻ˣ would be tofu).
-                        let answer = prettify_math_plain_scripts(&tame_markdown_images(&buf));
-                        if !answer.trim().is_empty() {
-                            let reasoning = (!reasoning.is_empty())
-                                .then(|| prettify_math_plain_scripts(reasoning));
-                            self.transcript.push(Msg::Assistant { answer, reasoning });
-                        }
-                    }
-                }
+                // Only commit a reply if the answer carried text (a fully-
+                // retracted turn streams none) — `settle`, the one
+                // `Live → Idle` edge. A Done after a local stop lands on an
+                // idle mirror and is a no-op.
+                HostEvent::Done { .. } => self.settle(),
                 HostEvent::Error { message, .. } => {
-                    self.in_flight_turn = None;
-                    self.streaming = None;
-                    self.streaming_reasoning.clear();
+                    self.turn = Turn::Idle;
                     self.transcript.push(Msg::Error(message));
                 }
                 HostEvent::Fatal(message) => {
-                    self.streaming = None;
-                    self.streaming_reasoning.clear();
+                    // The turn disarms whole. (The old three-field shape
+                    // cleared the buffers here but left the in-flight id
+                    // set — drift the sum type cannot express.)
+                    self.turn = Turn::Idle;
                     self.status = Status::Failed(message);
                 }
                 _ => {} // a future event variant this UI predates.
@@ -873,13 +902,15 @@ impl GuiApp {
             let _ = self.req_tx.send(HostRequest::Grant { origin });
         }
         self.transcript.push(Msg::User(prompt.clone()));
-        self.streaming = Some(String::new());
-        self.streaming_reasoning.clear();
         self.turn_start = None;
         self.gen_tokens = 0;
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
-        self.in_flight_turn = Some(turn_id);
+        self.turn = Turn::Live {
+            id: turn_id,
+            answer: String::new(),
+            reasoning: String::new(),
+        };
         let _ = self.req_tx.send(HostRequest::Submit {
             turn_id,
             text: prompt,
@@ -917,7 +948,7 @@ impl eframe::App for GuiApp {
             // yatima's mood follows her state: surprised when an artifact just
             // landed, asleep while loading, sad on failure; mid-turn she thinks
             // hard while reasoning and talks once the answer flows; else calm.
-            let answering = self.streaming.as_deref().is_some_and(|s| !s.is_empty());
+            let answering = matches!(&self.turn, Turn::Live { answer, .. } if !answer.is_empty());
             let expr = if t < self.surprise_until {
                 Face::Surprised
             } else if matches!(self.status, Status::Loading) {
@@ -950,7 +981,8 @@ impl eframe::App for GuiApp {
                     let text = if self.in_flight() {
                         let elapsed = self.turn_start.map(|s| now - s).unwrap_or(0.0);
                         let clock = fmt_clock(elapsed);
-                        let answering = self.streaming.as_deref().is_some_and(|s| !s.is_empty());
+                        let answering =
+                            matches!(&self.turn, Turn::Live { answer, .. } if !answer.is_empty());
                         if answering {
                             let tps = if elapsed > 0.1 {
                                 self.gen_tokens as f32 / elapsed
@@ -1224,7 +1256,7 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ui, |ui| {
             // Empty transcript (loading / pre-first-message): an animated
             // splash — unless a clear retired it (a cleared pane stays empty).
-            if self.transcript.is_empty() && self.streaming.is_none() && !self.splash_retired {
+            if self.transcript.is_empty() && !self.in_flight() && !self.splash_retired {
                 self.show_splash(ui);
                 return;
             }
@@ -1235,17 +1267,18 @@ impl eframe::App for GuiApp {
                     for msg in &self.transcript {
                         render_msg(ui, msg, tint, self.show_reasoning, &mut self.md_cache);
                     }
-                    if let Some(buf) = &self.streaming {
+                    if let Turn::Live {
+                        answer: buf,
+                        reasoning,
+                        ..
+                    } = &self.turn
+                    {
                         speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
-                        if self.show_reasoning && !self.streaming_reasoning.is_empty() {
-                            ui.label(
-                                egui::RichText::new(&self.streaming_reasoning)
-                                    .weak()
-                                    .italics(),
-                            );
+                        if self.show_reasoning && !reasoning.is_empty() {
+                            ui.label(egui::RichText::new(reasoning).weak().italics());
                             ui.add_space(4.0);
                         }
-                        if buf.is_empty() && !self.streaming_reasoning.is_empty() {
+                        if buf.is_empty() && !reasoning.is_empty() {
                             // Reasoning is flowing but the answer hasn't begun.
                             ui.label(egui::RichText::new("thinking…").weak());
                         } else {

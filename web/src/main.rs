@@ -129,7 +129,7 @@ mod app {
         fn submit(&mut self) {
             // upholds: WEB-2 — a submit is refused while a turn is in flight.
             let text = self.input.trim().to_string();
-            if text.is_empty() || self.transcript.in_flight.is_some() {
+            if text.is_empty() || self.transcript.in_flight().is_some() {
                 return; // single-in-flight, as in the GUI/TUI
             }
             let turn_id = self.next_turn_id;
@@ -183,7 +183,7 @@ mod app {
             egui::Panel::top("status").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(self.status_line());
-                    if self.transcript.in_flight.is_some() {
+                    if self.transcript.in_flight().is_some() {
                         ui.spinner();
                     }
                     ui.checkbox(&mut self.show_reasoning, "show reasoning");
@@ -206,7 +206,7 @@ mod app {
                         edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui
                         .add_enabled(
-                            can_submit && self.transcript.in_flight.is_none(),
+                            can_submit && self.transcript.in_flight().is_none(),
                             egui::Button::new("send"),
                         )
                         .clicked()
@@ -215,7 +215,7 @@ mod app {
                         self.submit();
                         edit.request_focus();
                     }
-                    if let Some(turn_id) = self.transcript.in_flight {
+                    if let Some(turn_id) = self.transcript.in_flight() {
                         if ui.button("stop").clicked() {
                             // Tell the host to cancel, and settle the mirror
                             // locally now — don't wait for a Done that the

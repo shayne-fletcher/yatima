@@ -22,17 +22,23 @@
 //! - **WEB-2** single in flight: at most one turn runs at a time; a submit is
 //!   refused while one is in flight (enforced at the view's send gate).
 //! - **WEB-3** a live turn always shows live: any turn activity — `Started`,
-//!   an answer or reasoning fragment, or a tool-note — arms the in-flight
-//!   marker on demand, so a client that resumes or preempts (SRV-3) into a
-//!   turn it never saw begin still renders it running (spinner, stop,
-//!   submit-gate).
+//!   an answer or reasoning fragment, or a tool-note — arms the turn on
+//!   demand, so a client that resumes or preempts (SRV-3) into a turn it
+//!   never saw begin still renders it running (spinner, stop, submit-gate).
+//!   Structural: the id and the buffers are one [`Turn::Live`] value, so a
+//!   streaming buffer without a live turn — the drift behind the
+//!   wedged-spinner bug — cannot be constructed.
 //! - **WEB-4** a settle names its turn: only a `Done`/`Error` for the turn
 //!   believed live settles it, so a stale settle redelivered at the reconnect
-//!   seam cannot clear a newer turn.
+//!   seam cannot clear a newer turn. Structural: disarming is the one
+//!   `Turn::Idle` assignment — a half-settled turn (id cleared, buffers
+//!   kept, or the reverse) cannot exist.
 //! - **WEB-5** a turn is always locally endable: stop settles the mirror at
 //!   once (commit what streamed, disarm) without waiting on a host round trip
 //!   the one-deep carry slot can drop — the client-side dual of SRV-3's "a
-//!   session can always end".
+//!   session can always end". `settle` is the one `Live → Idle` edge; every
+//!   ending (`Done`, stop, `Fatal`) passes through it or assigns `Idle`
+//!   whole.
 //! - **WEB-6** commit only real output: on settle an answer commits iff it
 //!   carried non-whitespace text (a fully-retracted turn commits nothing,
 //!   never a blank bubble); retraction counts characters, never bytes; an
@@ -44,7 +50,7 @@
 
 use yatima_protocol::{Channel, HostEvent, ModelInfo, ToolNoteKind};
 
-/// One committed transcript entry (the streaming turn lives in the buffers
+/// One committed transcript entry (the streaming turn lives in [`Turn::Live`]
 /// until `Done`/`Error` commits or discards it).
 pub enum Entry {
     User(String),
@@ -96,19 +102,33 @@ pub fn tool_note_line(kind: ToolNoteKind, text: &str) -> String {
     }
 }
 
+/// The turn in flight, if any. One sum where three parallel fields (an answer
+/// buffer, a reasoning buffer, an in-flight id) used to drift apart by hand:
+/// `Idle`/`Live` make "a streaming buffer without a live turn" — the state
+/// behind the wedged-spinner bug — unrepresentable.
+#[derive(Default)]
+pub enum Turn {
+    #[default]
+    Idle,
+    Live {
+        id: u64,
+        /// The answer streaming in (armed on submit, or on demand — see
+        /// `fold`'s Fragment arms).
+        answer: String,
+        /// The chain-of-thought (and tool notes) streaming in alongside it.
+        reasoning: String,
+    },
+}
+
 /// The UI mirror the app renders: committed entries plus the turn in flight.
 /// Fold every [`HostEvent`] through [`Transcript::fold`]; the host's session
 /// is truth, this is a view of it.
 #[derive(Default)]
 pub struct Transcript {
     pub entries: Vec<Entry>,
-    /// The answer streaming in, if a turn is in flight (armed on submit, or
-    /// on demand — see `fold`'s Fragment arm).
-    streaming: Option<String>,
-    /// The chain-of-thought (and tool notes) streaming in alongside it.
-    streaming_reasoning: String,
-    /// The turn in flight, if any — drives the spinner and the stop button.
-    pub in_flight: Option<u64>,
+    /// The turn in flight with its streaming buffers — drives the spinner,
+    /// the stop button, and the submit gate (via [`Transcript::in_flight`]).
+    turn: Turn,
     /// What's running (set by `Ready`; the status line shows the label).
     pub model: Option<ModelInfo>,
     /// The most recent prompt token count (`Context`), for the status line.
@@ -118,40 +138,58 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// Record the user's submit and arm the streaming buffers (the mirror of
-    /// the GUI's `submit`).
+    /// Record the user's submit and arm the turn (the mirror of the GUI's
+    /// `submit`).
     pub fn push_user(&mut self, turn_id: u64, text: &str) {
         self.entries.push(Entry::User(text.to_string()));
-        self.streaming = Some(String::new());
-        self.streaming_reasoning.clear();
-        self.in_flight = Some(turn_id);
+        self.turn = Turn::Live {
+            id: turn_id,
+            answer: String::new(),
+            reasoning: String::new(),
+        };
+    }
+
+    /// The turn in flight, if any — drives the spinner, the stop button, and
+    /// the submit gate. A projection of [`Turn`]: it cannot disagree with the
+    /// streaming buffers, because they are the same value.
+    pub fn in_flight(&self) -> Option<u64> {
+        match self.turn {
+            Turn::Live { id, .. } => Some(id),
+            Turn::Idle => None,
+        }
     }
 
     /// The live answer, if a turn is streaming (for the view).
     pub fn streaming_answer(&self) -> Option<&str> {
-        self.streaming.as_deref()
+        match &self.turn {
+            Turn::Live { answer, .. } => Some(answer),
+            Turn::Idle => None,
+        }
     }
 
     /// The live reasoning fold (empty when nothing streamed).
     pub fn streaming_reasoning(&self) -> &str {
-        &self.streaming_reasoning
+        match &self.turn {
+            Turn::Live { reasoning, .. } => reasoning,
+            Turn::Idle => "",
+        }
     }
 
     /// Settle the streaming turn locally: commit its answer (with the
     /// reasoning fold) if it carried text, then disarm. A fully-retracted
     /// turn commits nothing — an empty answer would render a blank bubble.
-    /// Shared by a clean `Done` and by `abort` (the stop button).
+    /// Shared by a clean `Done` and by `abort` (the stop button). Taking the
+    /// whole turn is the point: commit and disarm are one `Live → Idle` edge,
+    /// so a half-settled turn cannot exist.
     fn settle(&mut self) {
-        self.in_flight = None;
-        let reasoning = std::mem::take(&mut self.streaming_reasoning);
-        let reasoning = reasoning.trim();
-        if let Some(buf) = self.streaming.take() {
-            if !buf.trim().is_empty() {
+        if let Turn::Live {
+            answer, reasoning, ..
+        } = std::mem::take(&mut self.turn)
+        {
+            if !answer.trim().is_empty() {
+                let reasoning = reasoning.trim();
                 let reasoning = (!reasoning.is_empty()).then(|| reasoning.to_string());
-                self.entries.push(Entry::Assistant {
-                    answer: buf,
-                    reasoning,
-                });
+                self.entries.push(Entry::Assistant { answer, reasoning });
             }
         }
     }
@@ -175,57 +213,86 @@ impl Transcript {
     pub fn fold(&mut self, ev: HostEvent) {
         match ev {
             HostEvent::Ready(info) => self.model = Some(info),
-            HostEvent::Started { turn_id } => {
-                self.in_flight = Some(turn_id);
+            HostEvent::Started { turn_id } => match &mut self.turn {
                 // Usually armed by push_user; arm here too so a client that
                 // attaches mid-turn (serve's reconnect resumes the stream)
                 // still renders the rest of the turn.
-                if self.streaming.is_none() {
-                    self.streaming = Some(String::new());
+                Turn::Idle => {
+                    self.turn = Turn::Live {
+                        id: turn_id,
+                        answer: String::new(),
+                        reasoning: String::new(),
+                    }
                 }
-            }
+                // A Started onto an already-live turn re-names it but keeps
+                // what streamed: the carry slot can deliver a mid-turn
+                // fragment first, and wiping it here would lose that text.
+                Turn::Live { id, .. } => *id = turn_id,
+            },
             HostEvent::Fragment {
                 turn_id,
                 channel: Channel::Answer,
                 text,
-            } => {
+            } => match &mut self.turn {
                 // Arm on demand rather than drop: after a reconnect the carry
                 // slot can redeliver a mid-turn fragment before any Started,
                 // and a client that takes over a live turn (SRV-3 preemption)
                 // must show it in flight — spinner, stop, submit-gate — though
-                // it never saw Started. `get_or_insert` so a stale fragment
-                // can't hijack a different live turn's id.
-                self.in_flight.get_or_insert(turn_id);
-                self.streaming
-                    .get_or_insert_with(String::new)
-                    .push_str(&text);
-            }
+                // it never saw Started.
+                Turn::Idle => {
+                    self.turn = Turn::Live {
+                        id: turn_id,
+                        answer: text,
+                        reasoning: String::new(),
+                    }
+                }
+                // Already live: append, and keep the live id — a stale
+                // fragment can't hijack a different live turn's id.
+                Turn::Live { answer, .. } => answer.push_str(&text),
+            },
             HostEvent::Fragment {
                 turn_id,
                 channel: Channel::Reasoning,
                 text,
-            } => {
-                self.in_flight.get_or_insert(turn_id);
-                self.streaming_reasoning.push_str(&text);
-            }
+            } => match &mut self.turn {
+                Turn::Idle => {
+                    self.turn = Turn::Live {
+                        id: turn_id,
+                        answer: String::new(),
+                        reasoning: text,
+                    }
+                }
+                Turn::Live { reasoning, .. } => reasoning.push_str(&text),
+            },
             HostEvent::ToolNote {
                 turn_id,
                 kind,
                 text,
             } => {
-                self.in_flight.get_or_insert(turn_id);
-                self.streaming_reasoning
-                    .push_str(&tool_note_line(kind, &text));
+                let line = tool_note_line(kind, &text);
+                match &mut self.turn {
+                    Turn::Idle => {
+                        self.turn = Turn::Live {
+                            id: turn_id,
+                            answer: String::new(),
+                            reasoning: line,
+                        }
+                    }
+                    Turn::Live { reasoning, .. } => reasoning.push_str(&line),
+                }
             }
             HostEvent::RetractAnswer { chars, .. } => {
                 // The streamed tail was narration ahead of a tool call — pull
                 // it back out of the answer; it replays as reasoning. The
                 // GUI's exact arithmetic: chars, never bytes (a multibyte
                 // fragment truncated by bytes would panic or shear a char).
-                if let Some(buf) = self.streaming.as_mut() {
-                    let keep = buf.chars().count().saturating_sub(chars);
-                    let cut = buf.char_indices().nth(keep).map_or(buf.len(), |(i, _)| i);
-                    buf.truncate(cut);
+                if let Turn::Live { answer, .. } = &mut self.turn {
+                    let keep = answer.chars().count().saturating_sub(chars);
+                    let cut = answer
+                        .char_indices()
+                        .nth(keep)
+                        .map_or(answer.len(), |(i, _)| i);
+                    answer.truncate(cut);
                 }
             }
             HostEvent::Image { bytes, name, .. } => match decode_rgba(&bytes) {
@@ -247,22 +314,24 @@ impl Transcript {
                 // Settle unless this Done is for a turn we've already moved
                 // past: at the reconnect seam a stale Done can be redelivered,
                 // and it must not clear a newer turn's in-flight state.
-                if self.in_flight.is_none_or(|live| live == turn_id) {
+                if self.in_flight().is_none_or(|live| live == turn_id) {
                     self.settle();
                 }
             }
             HostEvent::Error { turn_id, message } => {
-                // Same guard as Done: a stale Error can't disarm a newer turn.
-                if self.in_flight.is_none_or(|live| live == turn_id) {
-                    self.in_flight = None;
-                    self.streaming = None;
-                    self.streaming_reasoning.clear();
+                // Same guard as Done: a stale Error can't disarm a newer
+                // turn. The message itself is always shown.
+                if self.in_flight().is_none_or(|live| live == turn_id) {
+                    self.turn = Turn::Idle;
                 }
                 self.entries.push(Entry::Error(message));
             }
             HostEvent::Fatal(message) => {
-                self.streaming = None;
-                self.streaming_reasoning.clear();
+                // The session is over: the turn disarms whole. (Under the
+                // old three-field shape this arm cleared the buffers but
+                // left the in-flight id set — the drift WEB-4 exists to
+                // guard against, latent here until the fields became one.)
+                self.turn = Turn::Idle;
                 self.fatal = Some(message);
             }
             _ => {} // a future event variant this view predates
@@ -339,7 +408,7 @@ mod tests {
             chars: 15,
         });
         t.fold(done());
-        assert!(t.in_flight.is_none());
+        assert!(t.in_flight().is_none());
         assert!(
             !t.entries
                 .iter()
@@ -388,7 +457,11 @@ mod tests {
         let mut t = Transcript::default();
         t.fold(fragment("resumed mid-turn"));
         assert_eq!(t.streaming_answer(), Some("resumed mid-turn"));
-        assert_eq!(t.in_flight, Some(1), "a bare fragment marks the turn live");
+        assert_eq!(
+            t.in_flight(),
+            Some(1),
+            "a bare fragment marks the turn live"
+        );
     }
 
     #[test]
@@ -402,7 +475,7 @@ mod tests {
             channel: Channel::Reasoning,
             text: "thinking…".into(),
         });
-        assert_eq!(t.in_flight, Some(7));
+        assert_eq!(t.in_flight(), Some(7));
 
         let mut t = Transcript::default();
         t.fold(HostEvent::ToolNote {
@@ -410,7 +483,7 @@ mod tests {
             kind: ToolNoteKind::Call,
             text: "plot(...)".into(),
         });
-        assert_eq!(t.in_flight, Some(7));
+        assert_eq!(t.in_flight(), Some(7));
     }
 
     #[test]
@@ -423,7 +496,7 @@ mod tests {
         t.push_user(1, "go");
         t.fold(fragment("partial answer"));
         t.abort();
-        assert!(t.in_flight.is_none(), "stop clears the spinner");
+        assert!(t.in_flight().is_none(), "stop clears the spinner");
         assert!(
             matches!(t.entries.last(), Some(Entry::Assistant { answer, .. }) if answer == "partial answer"),
             "stop keeps what streamed"
@@ -445,7 +518,7 @@ mod tests {
         let mut t = Transcript::default();
         t.push_user(1, "go");
         t.abort();
-        assert!(t.in_flight.is_none());
+        assert!(t.in_flight().is_none());
         assert!(
             !t.entries
                 .iter()
@@ -467,12 +540,57 @@ mod tests {
             turn_id: 1, // a stale Done from the previous turn
             stop: StopKind::Eos,
         });
-        assert_eq!(t.in_flight, Some(5), "the live turn stays armed");
+        assert_eq!(t.in_flight(), Some(5), "the live turn stays armed");
         assert_eq!(
             t.streaming_answer(),
             Some("streaming"),
             "its buffer survives"
         );
+    }
+
+    #[test]
+    fn stale_fragment_appends_but_keeps_the_live_id() {
+        // upholds: WEB-3/WEB-4 — a fragment naming another turn cannot
+        // hijack the live turn's id: at the seam its text still shows (a
+        // repeated tail beats a hole), but stop/settle keep answering to
+        // the turn the mirror believes is live.
+        let mut t = Transcript::default();
+        t.push_user(5, "go");
+        t.fold(HostEvent::Fragment {
+            turn_id: 9, // a stale id from before the seam
+            channel: Channel::Answer,
+            text: "tail".into(),
+        });
+        assert_eq!(t.in_flight(), Some(5), "the live id survives");
+        assert_eq!(t.streaming_answer(), Some("tail"), "the text is kept");
+    }
+
+    #[test]
+    fn started_after_a_carried_fragment_keeps_the_text() {
+        // upholds: WEB-3 — the carry slot can deliver a mid-turn fragment
+        // before Started; the late Started re-names the turn, never wipes
+        // what already streamed.
+        let mut t = Transcript::default();
+        t.fold(fragment("resumed "));
+        t.fold(HostEvent::Started { turn_id: 1 });
+        t.fold(fragment("tail"));
+        assert_eq!(t.streaming_answer(), Some("resumed tail"));
+        assert_eq!(t.in_flight(), Some(1));
+    }
+
+    #[test]
+    fn fatal_disarms_the_turn_whole() {
+        // upholds: WEB-3 (its dual) — a turn that cannot continue stops
+        // showing live: Fatal disarms the whole turn, so no spinner spins
+        // over a dead session. (The old three-field shape cleared the
+        // buffers but left the id set — drift the sum type cannot express.)
+        let mut t = Transcript::default();
+        t.push_user(1, "go");
+        t.fold(fragment("partial"));
+        t.fold(HostEvent::Fatal("engine lost".into()));
+        assert!(t.in_flight().is_none(), "no spinner over a dead session");
+        assert!(t.streaming_answer().is_none(), "no live buffer either");
+        assert_eq!(t.fatal.as_deref(), Some("engine lost"));
     }
 
     #[test]
@@ -571,14 +689,14 @@ mod tests {
         // for the live turn disarms it.
         let mut t = Transcript::default();
         t.fold(HostEvent::Started { turn_id: 4 });
-        assert_eq!(t.in_flight, Some(4));
+        assert_eq!(t.in_flight(), Some(4));
         t.fold(HostEvent::Context { prompt_tokens: 777 });
         assert_eq!(t.prompt_tokens, Some(777));
         t.fold(HostEvent::Error {
             turn_id: 4,
             message: "boom".into(),
         });
-        assert!(t.in_flight.is_none());
+        assert!(t.in_flight().is_none());
         assert!(matches!(t.entries.last(), Some(Entry::Error(m)) if m == "boom"));
         t.fold(HostEvent::Fatal("no model".into()));
         assert_eq!(t.fatal.as_deref(), Some("no model"));
