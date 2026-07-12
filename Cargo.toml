@@ -10,3 +10,8 @@ members = [
   "host",
   "serve",
 ]
+# The browser client is deliberately NOT a member: it targets wasm32 and
+# depends on yatima-protocol alone, and the native `cargo test --workspace`
+# must never try to build wasm-targeted code. Its checks run explicitly
+# (scripts/check-wasm.sh, `trunk build` in web/).
+exclude = ["web"]

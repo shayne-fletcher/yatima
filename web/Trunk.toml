@@ -1,0 +1,6 @@
+# Trunk pins the build's conventions in-repo (the plan: commit Trunk.toml
+# and index.html; gitignore dist/). `trunk build` emits the bundle serve's
+# --static-dir hands to a browser.
+[build]
+target = "index.html"
+dist = "dist"
