@@ -63,6 +63,13 @@
 //! exactly as the host crate's module doc specifies for serve — the
 //! request channel is unserviced while the actor decodes, so a queued
 //! cancel would arrive after the turn it meant to stop.
+//!
+//! CAP-3's frontend half also lives here: a URL in an inbound submit
+//! grants its origin before the turn is forwarded. The TUI and GUI scan
+//! in their own submit paths, but the browser client is protocol-only
+//! (`origins_in` is yatima-lib, which never compiles to wasm), so the
+//! bridge — the browser's native edge — owns the scan. Cited by
+//! `a_url_in_a_submit_grants_its_origin_before_the_turn`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -348,10 +355,25 @@ async fn client_session(mut lease: StreamLease, mut socket: WebSocket) {
                         bridge.cancel.cancel(turn_id);
                     }
                     Ok(request) => {
-                        if let HostRequest::Submit { turn_id, .. } = &request {
+                        if let HostRequest::Submit { turn_id, text } = &request {
                             // The id only: prompt text is the user's, and the
                             // console is not the transcript.
                             tracing::info!("Submit for turn {turn_id}");
+                            // CAP-3's frontend half, homed at the bridge: a
+                            // URL in the user's own message grants its origin,
+                            // before the turn runs. The TUI/GUI scan in their
+                            // submit paths; the browser client cannot (it is
+                            // protocol-only, and `origins_in` lives in
+                            // yatima-lib, which never compiles to wasm), so
+                            // serve — the browser's native edge — owns the
+                            // scan. Without this, a serve session has no path
+                            // to web authority at all.
+                            for origin in yatima_lib::origins_in(text) {
+                                tracing::info!("auto-grant for {origin} (CAP-3)");
+                                if bridge.req_tx.send(HostRequest::Grant { origin }).is_err() {
+                                    return; // host gone
+                                }
+                            }
                         }
                         if bridge.req_tx.send(request).is_err() {
                             return; // host gone
@@ -634,6 +656,65 @@ mod tests {
         })
         .await;
         assert!(in_flight.is_cancelled(), "wire Cancel must reach the gate");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_url_in_a_submit_grants_its_origin_before_the_turn() {
+        // upholds: CAP-3 — a URL in the user's own message is authorization
+        // for its origin. The browser client is protocol-only, so the bridge
+        // owns the law's frontend half: the Grant must reach the host plane
+        // *before* the Submit it authorizes (the turn can then act on it),
+        // and a plain submit grants nothing.
+        let (bridge, _event_tx, req_rx, _gate) = fake_host();
+        let addr = serve_on_ephemeral(bridge).await;
+        let (mut ws, _) = within(
+            "client handshake",
+            tokio_tungstenite::connect_async(ws_url(addr)),
+        )
+        .await
+        .unwrap();
+
+        for text in [
+            "summarize https://en.wikipedia.org/wiki/Roger_Penrose",
+            "no urls in this one",
+        ] {
+            within(
+                "submit send",
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(&HostRequest::Submit {
+                        turn_id: 1,
+                        text: text.into(),
+                    })
+                    .unwrap(),
+                )),
+            )
+            .await
+            .unwrap();
+        }
+        // The request plane is a std (blocking) receiver; park the waits on
+        // the blocking pool, never a runtime worker.
+        let received = within(
+            "grant then both submits reach the host plane",
+            tokio::task::spawn_blocking(move || {
+                (0..3)
+                    .map(|_| req_rx.recv_timeout(TEST_CAP).unwrap())
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&received[0], HostRequest::Grant { origin }
+                if origin == "https://en.wikipedia.org"),
+            "the origin is granted first, path stripped: {:?}",
+            received[0]
+        );
+        assert!(matches!(&received[1], HostRequest::Submit { .. }));
+        assert!(
+            matches!(&received[2], HostRequest::Submit { .. }),
+            "a submit without URLs grants nothing: {:?}",
+            received[2]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

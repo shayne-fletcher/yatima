@@ -129,6 +129,13 @@ mod app {
         fn submit(&mut self) {
             // upholds: WEB-2 — a submit is refused while a turn is in flight.
             let text = self.input.trim().to_string();
+            // Grant commands work any time, even mid-turn (the GUI's rule):
+            // they are requests, not turns. The reports come back as notes.
+            if let Some(request) = yatima_web::parse_grant_command(&text) {
+                self.send(&request);
+                self.input.clear();
+                return;
+            }
             if text.is_empty() || self.transcript.in_flight().is_some() {
                 return; // single-in-flight, as in the GUI/TUI
             }

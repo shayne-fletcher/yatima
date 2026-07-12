@@ -472,9 +472,59 @@ pub fn tame_markdown_images(text: &str) -> String {
     out
 }
 
+/// Drop markdown image tags entirely, keeping only their alt text — for
+/// hosts that render *no* markdown. Where [`tame_markdown_images`] rewrites
+/// `![alt](url)` into a clickable link for markdown-rendering hosts, a
+/// plain-text view can make nothing of the URL: the artifact the model is
+/// citing already arrived inline as bytes, and a link it cannot click is
+/// noise. Observed live on the browser client: a model hallucinating a
+/// signed CDN URL for its own plot committed four hundred characters of
+/// signature into the transcript — under this pass it reduces to the alt
+/// text, or to nothing when the alt is empty.
+pub fn strip_markdown_images(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(bang) = rest.find("![") {
+        let Some(mid) = rest[bang..].find("](") else {
+            break;
+        };
+        let Some(close) = rest[bang + mid..].find(')') else {
+            break;
+        };
+        out.push_str(&rest[..bang]);
+        out.push_str(rest[bang + 2..bang + mid].trim());
+        rest = &rest[bang + mid + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripped_images_reduce_to_their_alt_or_nothing() {
+        // The plain-text twin of `tame_markdown_images`: the tag vanishes,
+        // alt text survives, prose around it is untouched — including the
+        // observed live case, an empty-alt image with a signed-URL target.
+        assert_eq!(
+            strip_markdown_images(
+                "![](http://localhost:11111/plot.png?Expires=1&Signature=XfF) Here is the plot."
+            ),
+            " Here is the plot."
+        );
+        assert_eq!(
+            strip_markdown_images("see ![the chart](./plots/img-1.png), above"),
+            "see the chart, above"
+        );
+        assert_eq!(strip_markdown_images("no images here"), "no images here");
+        // A malformed tag (no closing paren) passes through untouched.
+        assert_eq!(
+            strip_markdown_images("dangling ![alt](oops"),
+            "dangling ![alt](oops"
+        );
+    }
 
     #[test]
     fn plain_scripts_never_emit_script_glyphs() {

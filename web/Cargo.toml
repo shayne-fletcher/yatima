@@ -6,11 +6,12 @@ license = "BSD-3-Clause"
 
 # Rung 2's viewer: an eframe app compiled to wasm32 via trunk, served from
 # yatima-serve's static route, speaking the wire over one WebSocket. The
-# dependency line IS the design: yatima-protocol only — never yatima-lib or
-# yatima-host (that separation is the entire point of the protocol crate) —
-# and no tokio (ewebsock drives the socket on both wasm and native). The
-# model half (src/lib.rs) is plain Rust so its tests run natively; the egui
-# app compiles only for wasm32.
+# dependency line IS the design: the wasm-clean set only (WASM-1) —
+# yatima-protocol for the wire, yatima-text for commit-time polish — never
+# yatima-lib or yatima-host (that separation is the entire point of the
+# protocol crate), and no tokio (ewebsock drives the socket on both wasm
+# and native). The model half (src/lib.rs) is plain Rust so its tests run
+# natively; the egui app compiles only for wasm32.
 
 # Deliberately its own workspace: the repo root's native
 # `cargo test --workspace` must never build wasm-targeted code.
@@ -18,6 +19,9 @@ license = "BSD-3-Clause"
 
 [dependencies]
 yatima-protocol = { path = "../protocol" }
+# Commit-time polish, shared with the GUI: LaTeX → readable text, plus the
+# plain-text image-link strip. Dependency-free, wasm-clean (WASM-1).
+yatima-text = { path = "../text" }
 # Decode image artifacts (PNG/JPEG only, per the spike's cuts); wasm-clean.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde_json = "1"

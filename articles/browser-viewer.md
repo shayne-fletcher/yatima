@@ -6,8 +6,9 @@ the vision's rung 2: the event plane over a WebSocket, every client a
 viewer.
 
 ```bash
-# build the client bundle once (web/ is wasm32-only, its own workspace)
-cd web && trunk build
+# build the client bundle once (web/ is wasm32-only, its own workspace;
+# release is the one to hand a phone — 4.8 MB against 21 MB debug)
+cd web && trunk build --release
 # serve a model on the tailnet, handing out the bundle at /
 cargo run -p yatima-serve --release --features metal -- \
   --profile qwen32b --bind 100.x.y.z:8787 --static-dir web/dist
@@ -109,6 +110,19 @@ sequenceDiagram
     B->>S: Cancel {turn_id} — stop
     S->>H: CancelGate.cancel(turn_id) — trips the gate mid-decode
 ```
+
+## Web authority from a browser (CAP-3)
+
+Grants work exactly as in the TUI and GUI — authority derives only from
+*your* utterances — with one relocation: the browser client is
+protocol-only and cannot scan for origins itself (`origins_in` lives in
+`yatima-lib`, which never compiles to wasm), so **serve, the browser's
+native edge, owns the auto-grant**. Type a URL in your message and the
+bridge grants its origin before the turn runs; `/grant <origin>`,
+`/grants`, and `/revoke <origin>` are the explicit forms, parsed
+client-side into the protocol's requests. Grant reports come back as
+muted notes in the transcript. A URL the model encounters still grants
+nothing — there is no code path from content to authority.
 
 ## The seam: what a phone actually tests
 

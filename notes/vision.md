@@ -44,4 +44,5 @@ as a pair: a reconnect button that preserves the in-memory mirror, plus
 a stop that settles the turn locally (the escape hatch a dropped Done
 would otherwise wedge). Model temperament is a real variable: QwQ
 tutorializes where qwen32b calls the tool. And a debug wasm bundle is
-21 MB — release builds before anyone else is invited.
+21 MB — release builds before anyone else is invited (measured since:
+4.8 MB with wasm-opt).

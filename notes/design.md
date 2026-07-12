@@ -96,8 +96,12 @@ swappable dependency.
   natively; `main.rs` is the thin egui view over it, compiled only for
   wasm32. A deliberate miniature of the GUI's transcript — its *semantics*
   copied, not its code — with the spike's cuts named (plain text, no
-  markdown; PNG/JPEG only, other formats a named placeholder; grant reports
-  as notes). Depends on `yatima-protocol` alone, WASM-clean by construction.
+  markdown — image links strip and LaTeX prettifies at commit, but structure
+  never renders; PNG/JPEG only, other formats a named placeholder; grant
+  management by command, `/grant`/`/grants`/`/revoke`, with URLs in a message
+  auto-granted at the serve edge — CAP-3 — and reports rendered as notes).
+  Depends on `yatima-protocol` + `yatima-text` alone, WASM-clean by
+  construction.
 - **`yatima-text`** — host-neutral prettification of model output (the LaTeX
   → Unicode pipeline, fence-aware). Deliberately dependency-free, pure std,
   WASM-clean: every frontend — TUI, GUI, serve's browser client — runs the
@@ -1058,14 +1062,24 @@ and deliberately shelved — the note records why so we don't repeat them.
     reconnect is the first thing a phone tests (idle tabs drop; a frozen tab's
     zombie socket answers keepalives), which forced SRV-3 from refusal to
     preemption — newest connection wins — plus the client-side seam laws
-    (WEB-3/4/5). Still open from the demo notes: the `π`-in-plot-title
-    rendering bug, committed answers leaking `![](./plots/…)` artifact links
-    the browser can't resolve, a 21 MB debug wasm bundle (release builds
-    before anyone else is invited), and model temperament as a real variable
-    (QwQ tutorializes where qwen32b calls the tool). What remains *deferred*
-    here is the multi-tenant service tier itself — auth, quotas, tenant
-    isolation; the personal tailnet bridge deliberately has none (`/ws` is
-    unauthenticated by posture).
+    (WEB-3/4/5). The first *web-tool* attempt from the phone found the next
+    gap: the browser client is protocol-only, so nothing scanned its messages
+    for CAP-3 auto-grants and a serve session had no path to web authority at
+    all — fixed at the bridge (serve scans inbound submits and grants before
+    forwarding; the client gained the GUI's `/grant`/`/grants`/`/revoke`
+    command set). The leaked-artifact-link finding — a hallucinated *signed*
+    URL committed as a wall of text, worse than the relative links first
+    recorded — fixed at the client's commit edge (`strip_markdown_images` +
+    LaTeX prettify, the GUI's polish pair adapted to a plain-text view).
+    Bundle size, measured: 21 MB debug, 4.8 MB release (wasm-opt). Still
+    open: the `π`-in-plot-title rendering bug; model temperament as a real
+    variable (QwQ tutorializes where qwen32b calls the tool). Follow-ons
+    recorded for later: binary image frames (image bytes ride as JSON number
+    arrays today), SVG in the browser client, multiple sessions, and the
+    shared frontend view-model (the `yatima-mirror` bullet below). What
+    remains *deferred* here is the multi-tenant service tier itself — auth,
+    quotas, tenant isolation; the personal tailnet bridge deliberately has
+    none (`/ws` is unauthenticated by posture).
   - *Clusters / routing / model placement* → a **control-plane** tier above the
     service; the library is the leaf and knows nothing of it.
   - *Model sharding* → engine-internal, **rented from candle/backend**, surfaced
@@ -1103,6 +1117,21 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **`lexicon` crate** — a shared, dependency-light home for `ModelId` + the
   `<root>/<org>/<name>` layout, extracted once there's a real trigger (possum
   validating its own ids, or a second consumer).
+- **`yatima-mirror` crate (deferred)** — one home for the `HostEvent → mirror`
+  fold that web, GUI, and TUI each reimplement: the event transitions, the
+  char-retraction arithmetic (the most-duplicated, most-subtle piece), channel
+  routing, commit-on-`Done`, and the reconnect-seam guards. The `Turn` sum
+  type (web + GUI, 2026-07-12) made the shared shape explicit; extraction
+  waits on the three reconciliations the crate would force: the **image type**
+  (web decodes to raw RGBA, the GUI holds `egui::TextureHandle`, the TUI opens
+  a file — wants a per-frontend artifact hook), **commit-time polish** (now
+  converging — web and GUI both polish at commit via `yatima-text`, tame vs
+  strip being each view's own vocabulary), and the **storage model** (web/GUI
+  buffer the live turn apart from committed history; the TUI streams into the
+  last entry in place, TUI-3 — unify by converging one side or by making the
+  core generic over storage). Discipline per the `yatima-text` precedent:
+  `yatima-protocol` + pure std only, wasm-clean (WASM-1). Named `mirror`, not
+  `transcript` — that name is the `Role`/`Turn` primitives module's.
 - **The Haskell study** — formalize the `generate` and agent contracts
   (GE/STOP/AGENT/CAP/PROTO/TMPL as propositions); the planned home for the
   recursion-scheme reading and `axiom`.

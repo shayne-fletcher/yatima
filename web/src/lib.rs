@@ -1,15 +1,20 @@
 //! The browser client's transcript model: a deliberately small miniature of
 //! the GUI's `Msg` list — its *semantics* copied, not its code. The model is
-//! plain Rust over `yatima-protocol` types (plus the `image` crate for
-//! artifact decode), so everything subtle here — char-boundary retraction,
-//! the image path, the commit-on-Done rules — is unit-tested natively,
-//! without a browser in the loop. The egui app in `main.rs` is a thin view
-//! over [`Transcript`] and compiles only for wasm32.
+//! plain Rust over `yatima-protocol` types (plus `yatima-text` for the
+//! commit-time polish and the `image` crate for artifact decode — the
+//! wasm-clean set, WASM-1), so everything subtle here — char-boundary
+//! retraction, the image path, the commit-on-Done rules — is unit-tested
+//! natively, without a browser in the loop. The egui app in `main.rs` is a
+//! thin view over [`Transcript`] and compiles only for wasm32.
 //!
 //! Spike cuts (chosen, not discovered — see plans/wasm-spike.plan.md): plain
-//! text only (no markdown), PNG/JPEG only (an SVG or other format renders as
-//! a named placeholder line, never an error), no grants UI (grant reports
-//! render as notes), no context meter beyond a token count.
+//! text only (no markdown — model-written image links strip at commit and
+//! LaTeX prettifies, but structure never renders), PNG/JPEG only (an SVG or
+//! other format renders as a named placeholder line, never an error), grant
+//! management by command only (`/grant`, `/grants`, `/revoke`; a URL typed
+//! in a message auto-grants at the serve edge — CAP-3 — since this client is
+//! protocol-only and cannot scan origins itself) with reports rendered as
+//! notes, no context meter beyond a token count.
 //!
 //! # Invariant & law registry
 //!
@@ -48,7 +53,8 @@
 //! wire's (**HOST-4**): egui's fonts lack `✓`/`✗`, so `tool_note_line` spells
 //! `ok`/`failed:` and keeps `⚙`/`⚠`.
 
-use yatima_protocol::{Channel, HostEvent, ModelInfo, ToolNoteKind};
+use yatima_protocol::{Channel, HostEvent, HostRequest, ModelInfo, ToolNoteKind};
+use yatima_text::{prettify_math_plain_scripts, strip_markdown_images};
 
 /// One committed transcript entry (the streaming turn lives in [`Turn::Live`]
 /// until `Done`/`Error` commits or discards it).
@@ -100,6 +106,29 @@ pub fn tool_note_line(kind: ToolNoteKind, text: &str) -> String {
         ToolNoteKind::Warning => format!("\n⚠ {text}\n"),
         _ => format!("  {text}\n"),
     }
+}
+
+/// Parse an utterance that is a grant-management command into the request it
+/// maps to; `None` means an ordinary prompt. The GUI's exact command set —
+/// `/grant <origin>`, `/grants`, `/revoke <origin>` — because CAP-3 makes
+/// these, plus URLs typed in a message (auto-granted at the serve edge), the
+/// only sources of web authority. String-only on purpose: the protocol-only
+/// client gets grant management without yatima-lib.
+pub fn parse_grant_command(text: &str) -> Option<HostRequest> {
+    if text == "/grants" {
+        return Some(HostRequest::ListGrants);
+    }
+    if let Some(origin) = text.strip_prefix("/grant ") {
+        return Some(HostRequest::Grant {
+            origin: origin.trim().to_string(),
+        });
+    }
+    if let Some(origin) = text.strip_prefix("/revoke ") {
+        return Some(HostRequest::Revoke {
+            origin: origin.trim().to_string(),
+        });
+    }
+    None
 }
 
 /// The turn in flight, if any. One sum where three parallel fields (an answer
@@ -186,9 +215,18 @@ impl Transcript {
             answer, reasoning, ..
         } = std::mem::take(&mut self.turn)
         {
+            // Commit-time polish, the GUI's pair adapted to a plain-text
+            // view: model-written image links strip entirely (the artifact
+            // already arrived inline as a texture; an unclickable URL is
+            // noise — the GUI, which renders markdown, link-ifies instead)
+            // and LaTeX prettifies to readable text (same egui fonts, same
+            // tofu). Polish precedes the guard, so a link-only answer
+            // commits nothing.
+            let answer = prettify_math_plain_scripts(&strip_markdown_images(&answer));
             if !answer.trim().is_empty() {
                 let reasoning = reasoning.trim();
-                let reasoning = (!reasoning.is_empty()).then(|| reasoning.to_string());
+                let reasoning =
+                    (!reasoning.is_empty()).then(|| prettify_math_plain_scripts(reasoning));
                 self.entries.push(Entry::Assistant { answer, reasoning });
             }
         }
@@ -591,6 +629,76 @@ mod tests {
         assert!(t.in_flight().is_none(), "no spinner over a dead session");
         assert!(t.streaming_answer().is_none(), "no live buffer either");
         assert_eq!(t.fatal.as_deref(), Some("engine lost"));
+    }
+
+    #[test]
+    fn committed_answers_strip_image_links_and_prettify_latex() {
+        // upholds: WEB-6 — commit only real output, polished for this view.
+        // The leak observed live on the phone: a hallucinated signed URL
+        // committed as a wall of text; and raw \( … \) LaTeX where the GUI
+        // shows readable math. Both clean up at the commit edge.
+        let mut t = Transcript::default();
+        t.push_user(1, "plot it");
+        t.fold(fragment(
+            "![](http://localhost:11111/plot.png?Expires=1&Signature=XfFyvL) \
+             Here is the plot of \\( e^{-x} \\).",
+        ));
+        t.fold(done());
+        match t.entries.last() {
+            Some(Entry::Assistant { answer, .. }) => {
+                assert!(!answer.contains("Signature"), "{answer}");
+                assert!(!answer.contains("!["), "{answer}");
+                assert!(answer.contains("e^(-x)"), "{answer}");
+                assert!(!answer.contains("\\("), "{answer}");
+            }
+            _ => panic!("expected a committed Assistant entry"),
+        }
+    }
+
+    #[test]
+    fn a_link_only_answer_commits_nothing() {
+        // upholds: WEB-6 — polish precedes the guard: an answer that was
+        // nothing but a model-written image link is an empty answer, never
+        // a blank bubble.
+        let mut t = Transcript::default();
+        t.push_user(1, "go");
+        t.fold(fragment("![](./plots/img-1.png)"));
+        t.fold(done());
+        assert!(
+            !t.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Assistant { .. })),
+            "a stripped-empty answer must not commit"
+        );
+    }
+
+    #[test]
+    fn grant_commands_parse_to_their_requests() {
+        // upholds: CAP-3 — the command surface is exactly the GUI's; an
+        // ordinary prompt (even one naming a URL — the serve edge owns the
+        // auto-grant) is not a command.
+        assert_eq!(
+            parse_grant_command("/grants"),
+            Some(HostRequest::ListGrants)
+        );
+        assert_eq!(
+            parse_grant_command("/grant https://en.wikipedia.org "),
+            Some(HostRequest::Grant {
+                origin: "https://en.wikipedia.org".into()
+            })
+        );
+        assert_eq!(
+            parse_grant_command("/revoke https://en.wikipedia.org"),
+            Some(HostRequest::Revoke {
+                origin: "https://en.wikipedia.org".into()
+            })
+        );
+        assert_eq!(parse_grant_command("summarize https://x.org/page"), None);
+        assert_eq!(
+            parse_grant_command("/grant"),
+            None,
+            "bare /grant is not a command"
+        );
     }
 
     #[test]
