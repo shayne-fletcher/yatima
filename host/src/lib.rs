@@ -66,7 +66,7 @@ use yatima_lib::{
 pub mod knobs;
 mod logging;
 
-pub use logging::init_file_logging;
+pub use logging::{init_file_logging, init_stderr_logging};
 pub use yatima_protocol::{Channel, HostEvent, HostRequest, ModelInfo, StopKind, ToolNoteKind};
 
 /// A turn identifier, monotonic per session. Lets a frontend ignore stale events.

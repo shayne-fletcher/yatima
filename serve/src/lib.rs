@@ -193,6 +193,7 @@ impl Drop for StreamLease {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
             *self.bridge.event_rx.lock().expect("event stream lock") = Some(stream);
+            tracing::info!("client session ended; event stream returned");
         }
     }
 }
@@ -206,12 +207,14 @@ async fn ws_upgrade(
     // rides into the callback and returns the stream on Drop even if the
     // upgrade never completes.
     let Some(lease) = StreamLease::acquire(bridge) else {
+        tracing::info!("second concurrent client refused 409 (SRV-3)");
         return (
             StatusCode::CONFLICT,
             "another client is connected (serve is single-client — SRV-3)",
         )
             .into_response();
     };
+    tracing::info!("client connected; session begins");
     upgrade
         .on_upgrade(move |socket| client_session(lease, socket))
         .into_response()
@@ -281,8 +284,16 @@ async fn client_session(mut lease: StreamLease, mut socket: WebSocket) {
                 Some(Ok(Message::Text(frame))) => match decode_request(&frame) {
                     // Mid-decode cancel must bypass the (unserviced) request
                     // queue and flip the out-of-band gate.
-                    Ok(HostRequest::Cancel { turn_id }) => bridge.cancel.cancel(turn_id),
+                    Ok(HostRequest::Cancel { turn_id }) => {
+                        tracing::info!("wire Cancel for turn {turn_id} — flipping the gate");
+                        bridge.cancel.cancel(turn_id);
+                    }
                     Ok(request) => {
+                        if let HostRequest::Submit { turn_id, .. } = &request {
+                            // The id only: prompt text is the user's, and the
+                            // console is not the transcript.
+                            tracing::info!("Submit for turn {turn_id}");
+                        }
                         if bridge.req_tx.send(request).is_err() {
                             return; // host gone
                         }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use yatima_host::{init_file_logging, spawn_nonblocking, HostConfig};
+use yatima_host::{init_stderr_logging, spawn_nonblocking, HostConfig};
 use yatima_lib::{GenOpts, ModelProfile, ModelSource, Sampling};
 use yatima_serve::{validate_bind, Bridge};
 
@@ -113,7 +113,10 @@ fn resolve(args: &Args) -> Result<HostConfig> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    init_file_logging("serve", &[])?;
+    // serve owns no screen: the console is the operator's view, so logs go
+    // to stderr, always ($YATIMA_LOG raises the level — `debug` shows tool
+    // calls with args, `trace` adds whole prompts).
+    init_stderr_logging("serve")?;
     let bind = validate_bind(&args.bind)?; // SRV-1 before any model load
     let config = resolve(&args)?;
 
