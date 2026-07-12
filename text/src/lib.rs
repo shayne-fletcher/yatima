@@ -484,6 +484,7 @@ pub fn tame_markdown_images(text: &str) -> String {
 pub fn strip_markdown_images(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
+    let mut stripped = false;
     while let Some(bang) = rest.find("![") {
         let Some(mid) = rest[bang..].find("](") else {
             break;
@@ -493,10 +494,35 @@ pub fn strip_markdown_images(text: &str) -> String {
         };
         out.push_str(&rest[..bang]);
         out.push_str(rest[bang + 2..bang + mid].trim());
+        stripped = true;
         rest = &rest[bang + mid + close + 1..];
     }
     out.push_str(rest);
-    out
+    if !stripped {
+        return out;
+    }
+    // A tag that sat alone on its line leaves a blank hole where the image
+    // "was" (observed live: an empty gap mid-answer) — collapse runs of
+    // blank lines down to one, a paragraph break. Only a stripped answer is
+    // reflowed; untouched text passes through byte-identical above.
+    let mut result = String::with_capacity(out.len());
+    let mut blanks = 0;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    if !out.ends_with('\n') {
+        result.pop();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -523,6 +549,12 @@ mod tests {
         assert_eq!(
             strip_markdown_images("dangling ![alt](oops"),
             "dangling ![alt](oops"
+        );
+        // A tag alone on its line takes its blank hole with it (observed
+        // live as an empty gap mid-answer); a paragraph break survives.
+        assert_eq!(
+            strip_markdown_images("Here is the plot:\n\n![](./img/f.png)\n\nThe x-axis is n."),
+            "Here is the plot:\n\nThe x-axis is n."
         );
     }
 

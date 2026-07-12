@@ -422,8 +422,14 @@ impl Tools {
 fn classify_tool_error(error: anyhow::Error) -> ToolOutcome {
     match error.downcast::<ToolRejection>() {
         Ok(rejection) => ToolOutcome::Rejected(rejection),
+        // The whole chain (`:#`), not the top message: a wrapped error's
+        // teaching lives in its *source* — a refused redirect, for one, is
+        // reqwest's "error following redirect" wrapping the policy's
+        // "escapes the granted web origins […]" — and the model can only
+        // act on what it is shown. `bail!`-born errors have no chain and
+        // render exactly as before.
         Err(error) => ToolOutcome::Failed(ToolFailure {
-            message: error.to_string(),
+            message: format!("{error:#}"),
         }),
     }
 }
@@ -768,7 +774,6 @@ impl Tool for WriteFile {
     }
 }
 
-/// Read a text response from a URL under a [`WebOrigins`] capability.
 /// The `User-Agent` for every web-touching tool. Many origins (Wikipedia's bot
 /// policy, SEC EDGAR) reject or throttle anonymous clients — a descriptive UA
 /// with a contact URL is required politeness, and reqwest sends none by
@@ -779,6 +784,39 @@ const WEB_USER_AGENT: &str = concat!(
     " (+https://github.com/shayne-fletcher/yatima)"
 );
 
+/// The one-sentence grant protocol every origin-gated tool spec teaches. A
+/// refusal mid-run arrives after the model has committed to a plan, and the
+/// smaller models don't change course on an error string alone (observed
+/// live: the remedy in the refusal text was read and ignored). The legal
+/// move — stop, ask the user — has to be in the layer the model plans
+/// from: the spec. The model cannot mint authority (CAP-3).
+const GRANT_PROTOCOL: &str = "If a fetch is refused because an origin is \
+    not granted, do not retry and do not construct alternative URLs: end \
+    your answer by asking the user to grant that origin (the user types \
+    /grant <origin>); only the user can grant origins.";
+
+/// A redirect policy under CAP-2: each hop is checked against the granted
+/// set exactly like a fresh request, and a hop that leaves it is refused
+/// with the escaping URL named (grant its origin and retry — the teaching
+/// path). reqwest's default policy follows up to ten redirects sight-unseen,
+/// which would let any granted origin carry the request anywhere — observed
+/// live when a granted `http://` origin 301'd to its `https://` twin:
+/// authority must be *exactly* the granted set, by construction. The handle
+/// is live (`WebOrigins` is shared): an origin granted mid-session is
+/// followable on the next hop.
+fn granted_redirects(origins: WebOrigins) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many redirects");
+        }
+        match origins.resolve(attempt.url().as_str()) {
+            Ok(_) => attempt.follow(),
+            Err(e) => attempt.error(format!("redirect refused: {e}")),
+        }
+    })
+}
+
+/// Read a text response from a URL under a [`WebOrigins`] capability.
 pub struct ReadUrl {
     origins: WebOrigins,
     client: Client,
@@ -793,6 +831,7 @@ impl ReadUrl {
     pub fn with_max_bytes(origins: WebOrigins, max_bytes: usize) -> Result<ReadUrl> {
         let client = Client::builder()
             .user_agent(WEB_USER_AGENT)
+            .redirect(granted_redirects(origins.clone()))
             .timeout(Duration::from_secs(10))
             .build()?;
         Ok(ReadUrl {
@@ -810,7 +849,8 @@ impl Tool for ReadUrl {
             name: "read_url".to_string(),
             // The spec states the tool's live authority (CAP-3a).
             description: format!(
-                "Read a UTF-8/text web URL. May read only these origins: {}.",
+                "Read a UTF-8/text web URL. May read only these origins: {}. \
+                 {GRANT_PROTOCOL}",
                 self.origins.list().join(", ")
             ),
             params: serde_json::json!({
@@ -965,6 +1005,7 @@ impl ReadPage {
     ) -> Result<ReadPage> {
         let client = Client::builder()
             .user_agent(WEB_USER_AGENT)
+            .redirect(granted_redirects(origins.clone()))
             .timeout(Duration::from_secs(15))
             .build()?;
         Ok(ReadPage {
@@ -1104,7 +1145,7 @@ impl Tool for ReadPage {
                  next window (continuations are served from cache — no refetch). For \
                  raw or non-HTML responses (JSON, plaintext, APIs) use read_url \
                  instead. Server-rendered HTML only — no JavaScript, paywalls, or \
-                 cross-origin links.",
+                 cross-origin links. {GRANT_PROTOCOL}",
                 self.origins.list().join(", ")
             ),
             params: serde_json::json!({
@@ -1154,6 +1195,13 @@ impl Tool for ReadPage {
         if !status.is_success() {
             bail!("read_page failed with HTTP {status} for {url}");
         }
+        // The document base for resolving the page's relative/protocol-
+        // relative URLs is where the page actually came *from* — the final,
+        // post-redirect URL — not where we asked. Observed live: a page
+        // requested over a granted http:// origin redirected to https, and
+        // its protocol-relative image srcs, resolved against the *requested*
+        // scheme, escaped the https grant they should have matched.
+        let base = response.url().clone();
 
         // Content-type gate (case-insensitive): reject obvious non-HTML before
         // reading or extracting. A missing/blank type is allowed (servers are
@@ -1197,8 +1245,10 @@ impl Tool for ReadPage {
         // Extract off the async worker — also required because the extractor's
         // types are `!Send`, so they are created and consumed entirely here and
         // only owned `String`s escape.
-        let url_string = url.to_string();
-        let base = url.clone();
+        // The extractor's document URL is `base` too: readability absolutizes
+        // in-article srcs against it, and a requested-URL base would resurrect
+        // the split this fix removes (one copy per scheme/host).
+        let url_string = base.to_string();
         let (title, text, images) = tokio::task::spawn_blocking(
             move || -> Result<(String, String, Vec<(String, String)>)> {
             // Scan the whole fetched page before the extractor consumes it:
@@ -1454,6 +1504,7 @@ impl ReadImage {
         std::fs::create_dir_all(&dir)?;
         let client = Client::builder()
             .user_agent(WEB_USER_AGENT)
+            .redirect(granted_redirects(origins.clone()))
             .timeout(Duration::from_secs(10))
             .build()?;
         Ok(ReadImage {
@@ -1509,7 +1560,7 @@ impl Tool for ReadImage {
                  view. Prefer {{\"image\": N}} — the entry's number in the \
                  most recent read_page [images] list. A url must be copied \
                  exactly from that list, never constructed. May read only \
-                 these origins: {}. Returns the file path.",
+                 these origins: {}. Returns the file path. {GRANT_PROTOCOL}",
                 self.origins.list().join(", ")
             ),
             params: serde_json::json!({
@@ -2209,6 +2260,10 @@ impl NtfyPublisher {
     fn new(topic: NtfyTopic) -> Result<NtfyPublisher> {
         let client = Client::builder()
             .user_agent(WEB_USER_AGENT)
+            // CAP-2: the capability names one endpoint; a redirect would
+            // move the publish elsewhere. Don't follow — a 3xx surfaces as
+            // the HTTP failure it is.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
             .build()?;
         Ok(NtfyPublisher { topic, client })
@@ -2742,6 +2797,161 @@ mod tests {
         });
         assert!(result.is_error);
         assert!(result.content.contains("escapes the granted web origins"));
+    }
+
+    #[test]
+    fn web_tool_specs_teach_the_grant_protocol() {
+        // upholds: CAP-3 (teaching) — the legal move on a refused origin
+        // (stop; ask the user; /grant) lives in the spec the model plans
+        // from, not only in the refusal it may ignore mid-run.
+        let origins = WebOrigins::one("https://a.example").unwrap();
+        for spec in [
+            ReadUrl::new(origins.clone()).unwrap().spec(),
+            ReadPage::new(origins.clone()).unwrap().spec(),
+            ReadImage::new(origins, std::env::temp_dir().join("yatima-spec-test"))
+                .unwrap()
+                .spec(),
+        ] {
+            assert!(
+                spec.description.contains("asking the user to grant"),
+                "{}: {}",
+                spec.name,
+                spec.description
+            );
+            assert!(spec.description.contains("/grant"), "{}", spec.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_within_the_granted_set_is_followed() {
+        // upholds: CAP-2 — each redirect hop is checked like a fresh
+        // request; a hop that stays inside the granted set follows.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/b"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let origin = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_url".to_string(),
+                args: json(r#"{"url": "/a"}"#),
+            })
+            .await;
+        assert_eq!(
+            result,
+            ToolOutcome::Success {
+                content: "hello".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_escaping_the_granted_set_is_refused() {
+        // upholds: CAP-2 — the network must not carry a granted request to
+        // an ungranted origin. The phone found the doctrine hole live: with
+        // reqwest's default policy, a granted origin's 3xx goes anywhere
+        // sight-unseen. The refusal names the escaping URL, and the escape
+        // target is never contacted.
+        let granted = MockServer::start().await;
+        let ungranted = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/secret", ungranted.uri()).as_str()),
+            )
+            .mount(&granted)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("leaked"))
+            .expect(0) // the whole point: no request ever arrives
+            .mount(&ungranted)
+            .await;
+
+        let origin = WebOrigins::one(&granted.uri()).unwrap();
+        let tools = Tools::new().with(ReadUrl::new(origin).unwrap());
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_url".to_string(),
+                args: json(r#"{"url": "/a"}"#),
+            })
+            .await
+            .render_for_model("read_url");
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("escapes the granted web origins"),
+            "the teaching text must survive the error chain: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn read_page_resolves_images_against_the_final_url() {
+        // upholds: IMG-3 — the listing's URLs resolve against where the page
+        // actually came *from* (the post-redirect URL), not where it was
+        // requested. The phone found the gap live: a page requested via a
+        // granted http:// origin redirected to https, and its relative image
+        // srcs, resolved against the requested scheme, escaped the https
+        // grant they should have matched.
+        let html = r#"<html><body><article><h1>Impossible objects</h1>
+<p>The Penrose triangle is an impossible object: a two dimensional drawing
+that the eye reads as a solid three dimensional triangle which cannot
+exist, because its beams twist through inconsistent depth relations.</p>
+<img src="/img/tri.png" alt="Penrose triangle">
+<p>The related Penrose stairs construction loops a staircase back onto
+itself, ascending forever within a closed circuit, and features in several
+well known works of art depicting paradoxical architecture.</p>
+</article></body></html>"#;
+        let front = MockServer::start().await;
+        let host = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("location", format!("{}/page", host.uri()).as_str()),
+            )
+            .mount(&front)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&host)
+            .await;
+
+        let origins = WebOrigins::one(&front.uri()).unwrap();
+        origins.grant(&host.uri()).unwrap();
+        let tools = Tools::new().with(ReadPage::with_limits(origins, 1_000_000, 80).unwrap());
+        // Absolute: a relative target is ambiguous with two origins granted.
+        let result = read_window(&tools, &format!("{}/page", front.uri()), 0).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains(&format!("{}/img/tri.png", host.uri())),
+            "images resolve against the final host: {}",
+            result.content
+        );
+        assert!(
+            !result
+                .content
+                .contains(&format!("{}/img/tri.png", front.uri())),
+            "never against the requested one: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

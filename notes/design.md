@@ -1071,6 +1071,26 @@ and deliberately shelved — the note records why so we don't repeat them.
     URL committed as a wall of text, worse than the relative links first
     recorded — fixed at the client's commit edge (`strip_markdown_images` +
     LaTeX prettify, the GUI's polish pair adapted to a plain-text view).
+    The first `read_page` turn from the phone (granted `http://`, Wikipedia
+    301'd to https) then exposed two lib-side holes: reqwest's default
+    policy followed redirects sight-unseen — a granted origin could carry
+    the request *anywhere*, against CAP-2's letter — now every hop is
+    re-checked like a fresh request (`granted_redirects`); and the page's
+    image URLs resolved against the *requested* URL rather than the final
+    post-redirect one, so protocol-relative srcs escaped the https grant
+    they should have matched — the document base is now `response.url()`.
+    Live testing then showed the strict twin of the redirect fix punishing
+    the user: scheme-exact origins made the checked redirect *itself* refuse
+    the https twin of the host just granted (phones type `http://`; the web
+    301s to https), an ask-again loop no wording fixes — origin coverage is
+    now **https-upgrade-tolerant** (a granted `http://X` covers `https://X`,
+    same host/port; never the reverse — no silent downgrade).
+    (The same turn showed tool errors flattening their cause chains — the
+    teaching text a wrapped error carries in its *source* never reached the
+    model; `classify_tool_error` now renders the chain. And a later turn
+    showed the refusal itself under-teaching: the model retried the same
+    refused fetch three times and gave up, never asking — escape refusals
+    now name the exact grant to ask the user for, copy-ready.)
     Bundle size, measured: 21 MB debug, 4.8 MB release (wasm-opt). Still
     open: the `π`-in-plot-title rendering bug; model temperament as a real
     variable (QwQ tutorializes where qwen32b calls the tool). Follow-ons

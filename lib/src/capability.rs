@@ -110,12 +110,17 @@ impl WebOrigin {
     /// URL a cache hit for the same page.
     pub fn resolve(&self, target: &str) -> Result<Url> {
         let mut url = Url::parse(target).or_else(|_| self.origin.join(target))?;
-        if !same_origin(&self.origin, &url) {
-            // The reason leads, the URL trails: frontends clip long tool
-            // errors from the tail, and the URL is the long part — the
-            // actionable half must survive the clip.
+        if !origin_covers(&self.origin, &url) {
+            // The remedy leads, then the reason, the URL last: frontends
+            // clip long tool errors from the tail, and the actionable half
+            // must survive the clip (observed live: a remedy placed after
+            // the origin list was clipped away, and the model fell back to
+            // general knowledge instead of asking). The remedy is spelled
+            // because the model cannot mint authority (CAP-3): its only
+            // move is asking the user.
             bail!(
-                "url escapes web origin {}: {url}",
+                "ask the user to grant {} — url escapes web origin {}: {url}",
+                origin_str(&url),
                 self.origin.as_str().trim_end_matches('/')
             );
         }
@@ -195,10 +200,15 @@ impl WebOrigins {
             bail!("no web origin granted");
         }
         if let Ok(url) = Url::parse(target) {
-            let Some(origin) = set.iter().find(|w| same_origin(w.origin(), &url)) else {
-                // Reason first, URL last (see WebOrigin::resolve on why).
+            let Some(origin) = set.iter().find(|w| origin_covers(w.origin(), &url)) else {
+                // The remedy leads, the reason follows, the URL trails (see
+                // WebOrigin::resolve on why — the actionable half must
+                // survive the tail clip): the model cannot mint authority,
+                // so the refusal names the exact grant to ask the user for.
                 bail!(
-                    "url escapes the granted web origins [{}]: {url}",
+                    "ask the user to grant {} — url escapes the granted web \
+                     origins [{}]: {url}",
+                    origin_str(&url),
                     set.iter()
                         .map(|w| w.origin().as_str().trim_end_matches('/'))
                         .collect::<Vec<_>>()
@@ -351,6 +361,35 @@ fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
+/// Whether a granted origin's authority covers `url` — [`same_origin`], plus
+/// the **https upgrade**: a granted `http://X` covers `https://X` (same host,
+/// same explicit port), because the upgrade is strictly stronger transport
+/// for the authority the user meant — phones type `http://`, and the web
+/// 301s to https; making the user re-grant the https twin of the host they
+/// just granted is the machine outsourcing its bookkeeping (observed live,
+/// at length). The reverse is never allowed: an https grant does not cover
+/// an http URL — no silent downgrade to plaintext. Directional, so it
+/// guards `resolve`/redirects only; set membership (`grant`/`revoke` dedup)
+/// stays exact.
+fn origin_covers(granted: &Url, url: &Url) -> bool {
+    same_origin(granted, url)
+        || (granted.scheme() == "http"
+            && url.scheme() == "https"
+            && granted.host_str() == url.host_str()
+            && granted.port() == url.port())
+}
+
+/// `url`'s origin, render-ready (`scheme://host[:port]`) — the exact string
+/// a user would `/grant`, so refusals can name it copy-ready.
+fn origin_str(url: &Url) -> String {
+    format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        url.port().map(|p| format!(":{p}")).unwrap_or_default()
+    )
+}
+
 /// The HTTP(S) origins named by URLs appearing in `text`.
 ///
 /// This is the auto-grant scanner and it is only ever fed **user utterances**
@@ -372,12 +411,7 @@ pub fn origins_in(text: &str) -> Vec<String> {
         if url.host_str().is_none() {
             continue;
         }
-        let origin = format!(
-            "{}://{}{}",
-            url.scheme(),
-            url.host_str().unwrap_or_default(),
-            url.port().map(|p| format!(":{p}")).unwrap_or_default()
-        );
+        let origin = origin_str(&url);
         if !out.contains(&origin) {
             out.push(origin);
         }
@@ -417,6 +451,59 @@ mod tests {
         let err = set.resolve("https://c.example/z").unwrap_err().to_string();
         assert!(err.contains("escapes the granted web origins"), "{err}");
         assert_eq!(set.list(), ["https://a.example", "https://b.example"]);
+    }
+
+    #[test]
+    fn granted_http_covers_its_https_upgrade_never_the_reverse() {
+        // upholds: CAP-2 — the https *upgrade* of a granted origin is the
+        // same authority over strictly stronger transport (phones type
+        // http://, the web 301s to https; the user must not be made to
+        // re-grant the host they just granted). The downgrade is refused:
+        // an https grant never covers plaintext http.
+        let set = WebOrigins::one("http://en.wikipedia.org").unwrap();
+        assert_eq!(
+            set.resolve("https://en.wikipedia.org/wiki/Roger_Penrose")
+                .unwrap()
+                .as_str(),
+            "https://en.wikipedia.org/wiki/Roger_Penrose"
+        );
+        let https_only = WebOrigins::one("https://a.example").unwrap();
+        let err = https_only
+            .resolve("http://a.example/x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes the granted web origins"), "{err}");
+        // Explicit ports must still match across the upgrade.
+        let ported = WebOrigin::new("http://a.example:8080").unwrap();
+        assert!(ported.resolve("https://a.example:8080/x").is_ok());
+        assert!(ported.resolve("https://a.example:9090/x").is_err());
+    }
+
+    #[test]
+    fn escape_refusals_name_the_grant_to_ask_for() {
+        // upholds: CAP-2/CAP-3 teaching style — the model cannot mint
+        // authority, so a refusal must name the exact origin to ask the
+        // user for, copy-ready. Observed live without it: the model retried
+        // the same refused fetch three times and gave up, never asking.
+        let set = WebOrigins::one("https://en.wikipedia.org").unwrap();
+        let err = set
+            .resolve("https://upload.wikimedia.org/wikipedia/commons/x.png")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ask the user to grant https://upload.wikimedia.org"),
+            "{err}"
+        );
+        // The single-capability form teaches the same way.
+        let one = WebOrigin::new("https://a.example").unwrap();
+        let err = one
+            .resolve("https://b.example:8443/x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ask the user to grant https://b.example:8443"),
+            "{err}"
+        );
     }
 
     #[test]

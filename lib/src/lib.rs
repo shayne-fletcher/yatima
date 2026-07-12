@@ -159,7 +159,13 @@
 //!   network destination). A web tool's authority is exactly its held origin
 //!   *set* ([`WebOrigins`]): membership checked at call time, escapes refused
 //!   before any network I/O, relative targets resolving only when exactly one
-//!   origin is granted. Stated, not compiler-absolute — see `notes/design.md`.
+//!   origin is granted — and every **redirect hop is re-checked** like a
+//!   fresh request (the network must not carry a granted request to an
+//!   ungranted origin; the ntfy publisher follows no redirects at all).
+//!   Coverage is **https-upgrade-tolerant**: a granted `http://X` covers
+//!   `https://X` (same host/port) — the same authority over strictly
+//!   stronger transport — never the reverse (no silent downgrade).
+//!   Stated, not compiler-absolute — see `notes/design.md`.
 //! - **CAP-3** web authority derives only from **user utterances**: an origin
 //!   enters a session's [`WebOrigins`] iff the user typed a URL (auto-grant,
 //!   scanned by [`origins_in`]) or issued an explicit grant command. Grants
