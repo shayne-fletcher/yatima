@@ -834,9 +834,10 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
             }
             AgentEvent::ToolArtifact(path) => {
                 // IMG-2: the typed artifact event is the display license —
-                // result prose is model-facing only, so a memo-served repeat
-                // (which mentions the file but emits no event) never
-                // re-shows the image.
+                // result prose is model-facing only. Every successful
+                // read_image emits one (repeats included): the memo governs
+                // narration, not pixels — a view may have reloaded since
+                // the first showing.
                 match read_artifact(&path) {
                     Ok((bytes, name)) => {
                         let _ = event_tx.send(HostEvent::Image {

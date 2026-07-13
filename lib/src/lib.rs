@@ -211,16 +211,20 @@
 //!   host displays it in its medium's idiom.
 //! - **IMG-2** display authority is the typed artifact event
 //!   ([`ToolCtx::emit_artifact`] → `ToolEvent::Artifact` →
-//!   `AgentEvent::ToolArtifact`), never a parse of result prose — and a
-//!   tool emits it exactly when the artifact is new to the user this
-//!   session. `read_image` keeps a fetch-once memo by URL *and* by content
-//!   hash (the artifact name), so a repeat URL and a different URL serving
-//!   byte-identical content both teach the model the user has already seen
-//!   the picture, emit nothing, and can never re-show it *unrequested* — an
-//!   explicit `{"again": true}` re-shows deliberately, spelled out as a
-//!   rerun. When every listed image has been shown, the teach states that
-//!   exhaustion as a computed fact. Cited by the repeat/duplicate, re-show,
-//!   and exhaustion tests on `read_image` and the artifact-event tests.
+//!   `AgentEvent::ToolArtifact`), never a parse of result prose — and
+//!   **every successful call emits it**. `read_image`'s fetch-once memo
+//!   (by URL *and* by content hash) governs the *network* and the
+//!   *narration* — a repeat never refetches, and its teaching text tells
+//!   the model not to present the picture as new — but never the pixels:
+//!   the host cannot assume a view still holds them (serve's browser
+//!   client reloads; withholding the event on "already shown" left a
+//!   reloaded view silently empty while the model narrated success —
+//!   observed live). Display dedup, if any view wants it, is that view's
+//!   policy. `{"again": true}` survives as the explicit re-show wording.
+//!   When every listed image has been shown, the teach states that
+//!   exhaustion as a computed fact. Cited by the repeat/duplicate,
+//!   re-show, and exhaustion tests on `read_image` and the artifact-event
+//!   tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL
 //!   transcription: `read_page`'s first window publishes its numbered
 //!   `[images]` list into a session-shared [`ImageListing`], and

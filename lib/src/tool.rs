@@ -1645,32 +1645,34 @@ impl Tool for ReadImage {
             )
         };
         if let Some((summary, path)) = memo_hit {
+            // Every successful call emits the display event (IMG-2): the
+            // fetch memo is about the *network* and the *narration*, never
+            // the pixels — a view may have reloaded since the first showing
+            // (serve's browser client does), and a host that withholds the
+            // event on "already shown" leaves that view silently empty
+            // while the model narrates success (observed live, at length).
+            ctx.emit_artifact(&path);
             if again {
-                // A deliberate re-show at the user's request (IMG-2's one
-                // sanctioned repeat): same artifact, spelled out as a rerun.
-                ctx.emit_artifact(&path);
                 return Ok(format!("{summary} — re-shown at the user's request"));
             }
             if exhausted {
                 // Not the model's guess: computed against a listing that
                 // covers the whole page. Name the productive next move.
                 return Ok(format!(
-                    "{summary} — already shown, and every image in the \
-                     current [images] list has now been shown this session. \
-                     Reading deeper windows of this page will not reveal new \
-                     images (the list covers the whole page); if the user \
-                     wants more, ask them for a different page or origin. To \
-                     re-show one the user asked to see again, repeat the \
-                     call with \"again\": true"
+                    "{summary} — re-shown; it was already fetched this \
+                     session, and every image in the current [images] list \
+                     has now been shown. Reading deeper windows of this page \
+                     will not reveal new images (the list covers the whole \
+                     page); if the user wants more, ask them for a different \
+                     page or origin"
                 ));
             }
             return Ok(format!(
-                "{summary} — already fetched and shown this session; do not \
-                 present it as new. Shown so far: {shown_urls}. If the user \
-                 wants another, pick a different number from the read_page \
-                 [images] list (call read_page again if you no longer have \
-                 the list). If the user asked to see this one again, repeat \
-                 the call with \"again\": true"
+                "{summary} — re-shown; it was already fetched this session, \
+                 so do not present it as new. Shown so far: {shown_urls}. If \
+                 the user wants another, pick a different number from the \
+                 read_page [images] list (call read_page again if you no \
+                 longer have the list)"
             ));
         }
         let mut response = self.client.get(url.clone()).send().await?;
@@ -1732,19 +1734,22 @@ impl Tool for ReadImage {
             if !memo.shown.insert(name.clone()) {
                 memo.by_url
                     .insert(url.to_string(), (summary.clone(), out.clone()));
+                // Emit here too (IMG-2): the dedup is narration policy, not
+                // display policy — the view may not have the pixels anymore.
                 if again {
                     drop(memo);
                     ctx.emit_artifact(&out);
                     return Ok(format!("{summary} — re-shown at the user's request"));
                 }
                 let shown_urls = sorted_urls(&memo.by_url);
+                drop(memo);
+                ctx.emit_artifact(&out);
                 return Ok(format!(
-                    "{summary} — byte-identical to an image already shown \
-                     this session under a different URL; do not present it \
-                     as new. Shown so far: {shown_urls}. If the user wants \
-                     another, pick a different number from the read_page \
-                     [images] list. If the user asked to see this one again, \
-                     repeat the call with \"again\": true"
+                    "{summary} — re-shown; byte-identical to an image \
+                     already fetched this session under a different URL, so \
+                     do not present it as new. Shown so far: {shown_urls}. \
+                     If the user wants another, pick a different number from \
+                     the read_page [images] list"
                 ));
             }
             memo.by_url
@@ -3251,7 +3256,7 @@ as the first window of the page without tripping any extraction guard.</p>
             "the memo returns the artifact: {repeat}"
         );
         assert!(
-            repeat.contains("already fetched and shown this session"),
+            repeat.contains("already fetched this session"),
             "a rerun teaches, not re-presents: {repeat}"
         );
 
@@ -3266,7 +3271,7 @@ as the first window of the page without tripping any extraction guard.</p>
             "identical bytes share an artifact: {copy}"
         );
         assert!(
-            copy.contains("byte-identical to an image already shown"),
+            copy.contains("byte-identical to an image already fetched"),
             "same bytes at a new URL teach, not re-present: {copy}"
         );
     }
@@ -3369,11 +3374,12 @@ as the first window of the page without tripping any extraction guard.</p>
     }
 
     #[tokio::test]
-    async fn read_image_emits_the_artifact_event_only_on_first_showing() {
+    async fn read_image_emits_the_artifact_event_on_every_success() {
         // upholds: IMG-2 — the typed artifact event is the display license,
-        // and it fires exactly once per content per session: the first fetch
-        // emits it; a repeat of the same URL emits nothing (memo hit); a
-        // different URL serving byte-identical content emits nothing either.
+        // and every successful call fires it: first fetch, memo-hit repeat,
+        // and byte-identical duplicate alike. The memo spares the network
+        // and shapes the narration; the pixels are the view's business, and
+        // a view may have reloaded since the first showing.
         let server = MockServer::start().await;
         let png: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-image-bytes";
         for route in ["/tri.png", "/tri-copy.png"] {
@@ -3420,18 +3426,20 @@ as the first window of the page without tripping any extraction guard.</p>
             artifacts[0]
         );
 
+        // Repeats emit too (IMG-2): the memo spares the network and shapes
+        // the narration, never the pixels — a view may have reloaded since
+        // the first showing, and a withheld event left it silently empty
+        // while the model narrated success (observed live).
         let (repeat, artifacts) = run("/tri.png").await;
         assert!(repeat.is_success(), "{repeat:?}");
-        assert!(
-            artifacts.is_empty(),
-            "a URL rerun never re-shows unrequested (IMG-2)"
-        );
+        assert_eq!(artifacts.len(), 1, "a URL rerun re-emits the display event");
 
         let (dup, artifacts) = run("/tri-copy.png").await;
         assert!(dup.is_success(), "{dup:?}");
-        assert!(
-            artifacts.is_empty(),
-            "byte-identical content under a new URL never re-shows (IMG-2)"
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "byte-identical content under a new URL re-emits too"
         );
 
         // The one sanctioned repeat: "again" asserts the user asked, and the
