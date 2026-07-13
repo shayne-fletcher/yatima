@@ -143,8 +143,9 @@ mod app {
         /// Reasoning fold: collapsed by default, one checkbox to reveal.
         show_reasoning: bool,
         /// Textures for decoded images, keyed by entry index (uploaded once,
-        /// on first render).
-        textures: HashMap<usize, egui::TextureHandle>,
+        /// on first render) — one per frame, so an animated GIF steps
+        /// through pre-uploaded textures instead of re-uploading.
+        textures: HashMap<usize, Vec<egui::TextureHandle>>,
     }
 
     impl WebApp {
@@ -258,17 +259,31 @@ mod app {
             parts.join("  ·  ")
         }
 
-        fn texture_for(
+        /// The frame textures for an image entry, uploaded once. A still is
+        /// one texture; an animated GIF is one per frame, stepped at render
+        /// time by [`yatima_web::frame_at`].
+        fn textures_for(
             ctx: &egui::Context,
-            textures: &mut HashMap<usize, egui::TextureHandle>,
+            textures: &mut HashMap<usize, Vec<egui::TextureHandle>>,
             index: usize,
             img: &yatima_web::DecodedImage,
-        ) -> egui::TextureHandle {
+        ) -> Vec<egui::TextureHandle> {
             textures
                 .entry(index)
                 .or_insert_with(|| {
-                    let color = egui::ColorImage::from_rgba_unmultiplied(img.size, &img.rgba);
-                    ctx.load_texture(&img.name, color, egui::TextureOptions::default())
+                    img.frames
+                        .iter()
+                        .enumerate()
+                        .map(|(i, frame)| {
+                            let color =
+                                egui::ColorImage::from_rgba_unmultiplied(img.size, &frame.rgba);
+                            ctx.load_texture(
+                                format!("{}#{i}", img.name),
+                                color,
+                                egui::TextureOptions::default(),
+                            )
+                        })
+                        .collect()
                 })
                 .clone()
         }
@@ -369,8 +384,19 @@ mod app {
                                     );
                                 }
                                 Entry::Image(img) => {
-                                    let tex =
-                                        Self::texture_for(&ctx, &mut self.textures, index, img);
+                                    let frames =
+                                        Self::textures_for(&ctx, &mut self.textures, index, img);
+                                    // An animated GIF steps through its
+                                    // pre-uploaded frames on egui's clock;
+                                    // the repaint is scheduled for exactly
+                                    // the next flip (stills schedule none).
+                                    let (frame, until_next) =
+                                        yatima_web::frame_at(&img.frames, ui.input(|i| i.time));
+                                    if let Some(secs) = until_next {
+                                        ctx.request_repaint_after(
+                                            std::time::Duration::from_secs_f64(secs),
+                                        );
+                                    }
                                     // Centered and clamped to the available
                                     // width (the GUI's exact treatment): an
                                     // over-wide chart fits a phone screen
@@ -380,7 +406,9 @@ mod app {
                                     ui.vertical_centered(|ui| {
                                         ui.add(
                                             egui::Image::new(
-                                                egui::load::SizedTexture::from_handle(&tex),
+                                                egui::load::SizedTexture::from_handle(
+                                                    &frames[frame],
+                                                ),
                                             )
                                             .max_width(max_w),
                                         );

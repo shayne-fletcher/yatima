@@ -1322,6 +1322,7 @@ const IMAGE_TYPES: &[(&str, &str)] = &[
     ("image/svg+xml", "svg"),
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
+    ("image/gif", "gif"),
 ];
 
 /// A quoted attribute's value inside an HTML tag body (`src="…"`), with a
@@ -1445,8 +1446,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// origin-set capability (CAP-2/CAP-3): the deliverable is a *file the user
 /// can see*, and each host displays it in its medium's idiom (IMG-1 — the
 /// GUI as an inline texture, the TUI via the platform viewer). The type
-/// gate is honest: SVG/PNG/JPEG by content-type, magic-byte sniff when the
-/// server is silent, and anything else teaches `read_url`/`read_page`.
+/// gate is honest: SVG/PNG/JPEG/GIF by content-type, magic-byte sniff when
+/// the server is silent, and anything else teaches `read_url`/`read_page`.
 /// Output is confined to the tool's [`WriteDir`] at a content-hash name.
 pub struct ReadImage {
     origins: WebOrigins,
@@ -1542,6 +1543,8 @@ fn image_ext(content_type: Option<&str>, body: &[u8]) -> Option<&'static str> {
         Some("png")
     } else if body.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some("jpg")
+    } else if body.starts_with(b"GIF87a") || body.starts_with(b"GIF89a") {
+        Some("gif")
     } else {
         let head = &body[..body.len().min(512)];
         let head = String::from_utf8_lossy(head);
@@ -1556,7 +1559,7 @@ impl Tool for ReadImage {
             name: "read_image".to_string(),
             // The spec states the tool's live authority (CAP-3a).
             description: format!(
-                "Fetch an image (SVG/PNG/JPEG) and save it for the user to \
+                "Fetch an image (SVG/PNG/JPEG/GIF) and save it for the user to \
                  view. Prefer {{\"image\": N}} — the entry's number in the \
                  most recent read_page [images] list. A url must be copied \
                  exactly from that list, never constructed. May read only \
@@ -1711,7 +1714,7 @@ impl Tool for ReadImage {
         // else teaches the text tools.
         let Some(ext) = image_ext(content_type.as_deref(), &body) else {
             bail!(
-                "read_image: {url} is not an SVG/PNG/JPEG image ({}); use \
+                "read_image: {url} is not an SVG/PNG/JPEG/GIF image ({}); use \
                  read_page for HTML or read_url for raw content",
                 content_type.as_deref().unwrap_or("no content-type")
             );
@@ -3454,6 +3457,54 @@ as the first window of the page without tripping any extraction guard.</p>
             content.contains("re-shown at the user's request"),
             "{content}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_image_accepts_a_gif_and_saves_it_honestly() {
+        // upholds: IMG-1 — GIF joins the format gate (the demo's animated
+        // Sierpiński was refused as "not an image"); accepted by
+        // content-type or by GIF87a/GIF89a sniff, saved with the honest
+        // .gif extension so every view knows what it holds.
+        let server = MockServer::start().await;
+        // The classic minimal 1×1 GIF89a.
+        let gif: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x21\xf9\x04\
+            \x00\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+        Mock::given(method("GET"))
+            .and(path("/anim.gif"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/gif")
+                    .set_body_bytes(gif),
+            )
+            .mount(&server)
+            .await;
+        // A silent server too: the sniff alone must recognize the magic.
+        Mock::given(method("GET"))
+            .and(path("/silent"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(gif),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadImage::new(origins, dir.path().join("images")).unwrap());
+        for route in ["/anim.gif", "/silent"] {
+            let result = tools
+                .dispatch_async(&ToolCall {
+                    name: "read_image".to_string(),
+                    args: json(&format!(r#"{{"url": "{route}"}}"#)),
+                })
+                .await;
+            let ToolOutcome::Success { content } = &result else {
+                panic!("{route}: {result:?}");
+            };
+            let path = content.split_whitespace().nth(1).unwrap();
+            assert!(path.ends_with(".gif"), "honest extension: {path}");
+        }
     }
 
     #[tokio::test]

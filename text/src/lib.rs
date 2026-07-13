@@ -472,16 +472,23 @@ pub fn tame_markdown_images(text: &str) -> String {
     out
 }
 
-/// Drop markdown image tags entirely, keeping only their alt text — for
-/// hosts that render *no* markdown. Where [`tame_markdown_images`] rewrites
-/// `![alt](url)` into a clickable link for markdown-rendering hosts, a
-/// plain-text view can make nothing of the URL: the artifact the model is
-/// citing already arrived inline as bytes, and a link it cannot click is
-/// noise. Observed live on the browser client: a model hallucinating a
-/// signed CDN URL for its own plot committed four hundred characters of
-/// signature into the transcript — under this pass it reduces to the alt
-/// text, or to nothing when the alt is empty.
+/// Rewrite markdown image tags for hosts that render *no* markdown. Where
+/// [`tame_markdown_images`] link-ifies for markdown-rendering hosts, the
+/// plain-text rules are:
+///
+/// - a **local/relative** target (`file://`, `./…`, anything schemeless):
+///   the artifact the model is citing already arrived inline as bytes, so
+///   the tag reduces to its alt text — or to nothing (an unclickable path
+///   is noise);
+/// - a **short remote** target (http/https, ≤ 100 chars): kept as literal
+///   `[alt](url)` text — the model is pointing at an image it did *not*
+///   fetch, and silently deleting the reference leaves its prose full of
+///   empty promises (observed live: a numbered list of Sierpiński images,
+///   every item blank);
+/// - a **long remote** target: alt only — the four-hundred-character
+///   signed-URL wall, also observed live, teaches nothing.
 pub fn strip_markdown_images(text: &str) -> String {
+    const KEEP_URL_MAX: usize = 100;
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut stripped = false;
@@ -492,9 +499,20 @@ pub fn strip_markdown_images(text: &str) -> String {
         let Some(close) = rest[bang + mid..].find(')') else {
             break;
         };
+        let alt = rest[bang + 2..bang + mid].trim();
+        let url = rest[bang + mid + 2..bang + mid + close].trim();
         out.push_str(&rest[..bang]);
-        out.push_str(rest[bang + 2..bang + mid].trim());
-        stripped = true;
+        let remote = url.starts_with("http://") || url.starts_with("https://");
+        if remote && url.len() <= KEEP_URL_MAX {
+            out.push('[');
+            out.push_str(if alt.is_empty() { "image" } else { alt });
+            out.push_str("](");
+            out.push_str(url);
+            out.push(')');
+        } else {
+            out.push_str(alt);
+            stripped = true;
+        }
         rest = &rest[bang + mid + close + 1..];
     }
     out.push_str(rest);
@@ -531,18 +549,25 @@ mod tests {
 
     #[test]
     fn stripped_images_reduce_to_their_alt_or_nothing() {
-        // The plain-text twin of `tame_markdown_images`: the tag vanishes,
-        // alt text survives, prose around it is untouched — including the
-        // observed live case, an empty-alt image with a signed-URL target.
-        assert_eq!(
-            strip_markdown_images(
-                "![](http://localhost:11111/plot.png?Expires=1&Signature=XfF) Here is the plot."
-            ),
-            " Here is the plot."
+        // The plain-text twin of `tame_markdown_images`. Local tags vanish
+        // (the artifact is already inline), prose around them untouched —
+        // including the observed live case, an empty-alt image whose
+        // signed-URL target ran past the keep cap.
+        let wall = format!(
+            "![](http://localhost:11111/plot.png?Expires=1&Signature={}) Here is the plot.",
+            "X".repeat(200)
         );
+        assert_eq!(strip_markdown_images(&wall), " Here is the plot.");
         assert_eq!(
             strip_markdown_images("see ![the chart](./plots/img-1.png), above"),
             "see the chart, above"
+        );
+        // A *short remote* target the model never fetched survives as
+        // literal link text (observed live: a numbered list of images,
+        // every item stripped blank — empty promises teach nothing).
+        assert_eq!(
+            strip_markdown_images("1. The basic one: ![basic](https://u.example/tri.gif)"),
+            "1. The basic one: [basic](https://u.example/tri.gif)"
         );
         assert_eq!(strip_markdown_images("no images here"), "no images here");
         // A malformed tag (no closing paren) passes through untouched.

@@ -9,7 +9,8 @@
 //!
 //! Spike cuts (chosen, not discovered — see plans/wasm-spike.plan.md): plain
 //! text only (no markdown — model-written image links strip at commit and
-//! LaTeX prettifies, but structure never renders), PNG/JPEG only (an SVG or
+//! LaTeX prettifies, but structure never renders), PNG/JPEG stills and
+//! animated GIF (every frame decoded, stepped on egui's clock; an SVG or
 //! other format renders as a named placeholder line, never an error), grant
 //! management by command or one tap (`/grant`, `/grants`, `/revoke`; a URL
 //! typed in a message auto-grants at the serve edge — CAP-3 — since this
@@ -90,25 +91,89 @@ pub enum Entry {
     Error(String),
 }
 
-/// An artifact decoded to raw RGBA — everything the view needs to make a
-/// texture, with no view types in the model (that keeps this half testable
-/// off-browser).
+/// An artifact decoded to raw RGBA — everything the view needs to make
+/// textures, with no view types in the model (that keeps this half testable
+/// off-browser). One frame for a still; many, each with its hold time, for
+/// an animated GIF.
 pub struct DecodedImage {
     pub name: String,
     pub size: [usize; 2],
-    pub rgba: Vec<u8>,
+    pub frames: Vec<AnimationFrame>,
 }
 
-/// Decode PNG/JPEG bytes to RGBA. `None` is not an error: the spike renders
-/// unknown formats (SVG, WebP, …) as a named placeholder line.
+/// One frame of a decoded image: raw RGBA plus how long it holds before
+/// the next (0 for a still).
+pub struct AnimationFrame {
+    pub rgba: Vec<u8>,
+    pub delay_ms: u32,
+}
+
+/// Animated GIFs keep at most this many frames — a runaway file (the fetch
+/// is already byte-capped upstream) degrades to a long-but-finite loop,
+/// never an unbounded texture upload.
+const MAX_GIF_FRAMES: usize = 128;
+
+/// Decode PNG/JPEG (one frame) or GIF (every frame, with delays) to RGBA.
+/// `None` is not an error: the spike renders unknown formats (SVG, WebP, …)
+/// as a named placeholder line.
 pub fn decode_rgba(bytes: &[u8]) -> Option<DecodedImage> {
+    if bytes.starts_with(b"GIF8") {
+        use image::AnimationDecoder;
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+        let mut frames = Vec::new();
+        let mut size = [0usize; 2];
+        for frame in decoder.into_frames().take(MAX_GIF_FRAMES) {
+            let frame = frame.ok()?;
+            // Browsers clamp near-zero GIF delays to ~100ms; a raw 0 would
+            // spin the repaint loop for no visible motion.
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let delay_ms = (numer / denom.max(1)).max(20);
+            let buf = frame.into_buffer();
+            size = [buf.width() as usize, buf.height() as usize];
+            frames.push(AnimationFrame {
+                rgba: buf.into_raw(),
+                delay_ms,
+            });
+        }
+        if frames.is_empty() {
+            return None;
+        }
+        return Some(DecodedImage {
+            name: String::new(),
+            size,
+            frames,
+        });
+    }
     let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = rgba.dimensions();
     Some(DecodedImage {
         name: String::new(),
         size: [w as usize, h as usize],
-        rgba: rgba.into_raw(),
+        frames: vec![AnimationFrame {
+            rgba: rgba.into_raw(),
+            delay_ms: 0,
+        }],
     })
+}
+
+/// Which frame an animation shows at time `t` (seconds, any monotonic
+/// clock), and how long until the next flip (`None` for a still — no
+/// repaint needed). Pure, so the stepping is testable off-browser; the
+/// view feeds it egui's clock and schedules a repaint for the flip.
+pub fn frame_at(frames: &[AnimationFrame], t: f64) -> (usize, Option<f64>) {
+    let total_ms: u64 = frames.iter().map(|f| f.delay_ms as u64).sum();
+    if frames.len() < 2 || total_ms == 0 {
+        return (0, None);
+    }
+    let mut into = ((t * 1000.0) as u64) % total_ms;
+    for (i, frame) in frames.iter().enumerate() {
+        let hold = frame.delay_ms as u64;
+        if into < hold {
+            return (i, Some((hold - into) as f64 / 1000.0));
+        }
+        into -= hold;
+    }
+    (0, Some(frames[0].delay_ms as f64 / 1000.0)) // unreachable by arithmetic
 }
 
 /// Render a tool-note payload in this view's marker vocabulary — the same
@@ -756,10 +821,12 @@ mod tests {
         // shows readable math. Both clean up at the commit edge.
         let mut t = Transcript::default();
         t.push_user(1, "plot it");
-        t.fold(fragment(
-            "![](http://localhost:11111/plot.png?Expires=1&Signature=XfFyvL) \
-             Here is the plot of \\( e^{-x} \\).",
-        ));
+        let wall = format!(
+            "![](http://localhost:11111/plot.png?Expires=1&Signature={}) \
+             Here is the plot of \\( e^{{-x}} \\).",
+            "X".repeat(200)
+        );
+        t.fold(fragment(&wall));
         t.fold(done());
         match t.entries.last() {
             Some(Entry::Assistant { answer, .. }) => {
@@ -978,7 +1045,8 @@ mod tests {
             Entry::Image(img) => {
                 assert_eq!(img.name, "plot.png");
                 assert_eq!(img.size, [2, 1]);
-                assert_eq!(img.rgba.len(), img.size[0] * img.size[1] * 4);
+                assert_eq!(img.frames.len(), 1, "a still is one frame");
+                assert_eq!(img.frames[0].rgba.len(), img.size[0] * img.size[1] * 4);
             }
             _ => panic!("expected a decoded PNG"),
         }
@@ -991,6 +1059,47 @@ mod tests {
             !t.entries.iter().any(|e| matches!(e, Entry::Error(_))),
             "an unrenderable image is never an error"
         );
+    }
+
+    #[test]
+    fn gif_decodes_to_frames_and_the_stepper_walks_them() {
+        // upholds: WEB-6 (the artifact renders honestly — an animated GIF
+        // is its frames, not a frozen first one). The stepper is pure: two
+        // 100ms frames → t picks 0, then 1, then wraps; a still never asks
+        // for a repaint.
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, Rgba, RgbaImage};
+        let mut bytes = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut bytes);
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for color in [[255u8, 0, 0, 255], [0, 255, 0, 255]] {
+                enc.encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(1, 1, Rgba(color)),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(100, 1),
+                ))
+                .unwrap();
+            }
+        }
+        let decoded = decode_rgba(&bytes).expect("gif decodes");
+        assert_eq!(decoded.frames.len(), 2);
+        assert!(decoded.frames.iter().all(|f| f.delay_ms >= 20));
+
+        let d = &decoded.frames;
+        assert_eq!(frame_at(d, 0.05).0, 0);
+        assert_eq!(frame_at(d, 0.15).0, 1);
+        assert_eq!(frame_at(d, 0.25).0, 0, "wraps");
+        assert!(
+            frame_at(d, 0.05).1.is_some(),
+            "animations schedule repaints"
+        );
+        let still = vec![AnimationFrame {
+            rgba: vec![0; 4],
+            delay_ms: 0,
+        }];
+        assert_eq!(frame_at(&still, 123.0), (0, None), "stills never repaint");
     }
 
     #[test]

@@ -1095,8 +1095,12 @@ and deliberately shelved — the note records why so we don't repeat them.
     open: the `π`-in-plot-title rendering bug; model temperament as a real
     variable (QwQ tutorializes where qwen32b calls the tool). Follow-ons
     recorded for later: binary image frames (image bytes ride as JSON number
-    arrays today), SVG in the browser client, multiple sessions, and the
-    shared frontend view-model (the `yatima-mirror` bullet below). What
+    arrays today), SVG in the browser client, multiple sessions, animated
+    GIF in the *GUI* (the demo's animated Sierpiński was refused outright by
+    IMG-1's SVG/PNG/JPEG gate — GIF now passes the gate and the browser
+    client decodes every frame and steps them on egui's clock; the GUI shows
+    the first frame only), and the shared frontend view-model (the
+    `yatima-mirror` bullet below). What
     remains *deferred* here is the multi-tenant service tier itself — auth,
     quotas, tenant isolation; the personal tailnet bridge deliberately has
     none (`/ws` is unauthenticated by posture).
