@@ -331,17 +331,20 @@ mod app {
                                 Entry::Image(img) => {
                                     let tex =
                                         Self::texture_for(&ctx, &mut self.textures, index, img);
-                                    // Clamped to the available width (the
-                                    // GUI's exact clamp): an over-wide chart
-                                    // fits a phone screen instead of pushing
-                                    // past its edge, aspect preserved.
+                                    // Centered and clamped to the available
+                                    // width (the GUI's exact treatment): an
+                                    // over-wide chart fits a phone screen
+                                    // instead of pushing past its edge,
+                                    // aspect preserved.
                                     let max_w = (ui.available_width() - 8.0).clamp(64.0, 640.0);
-                                    ui.add(
-                                        egui::Image::new(egui::load::SizedTexture::from_handle(
-                                            &tex,
-                                        ))
-                                        .max_width(max_w),
-                                    );
+                                    ui.vertical_centered(|ui| {
+                                        ui.add(
+                                            egui::Image::new(
+                                                egui::load::SizedTexture::from_handle(&tex),
+                                            )
+                                            .max_width(max_w),
+                                        );
+                                    });
                                 }
                                 Entry::Note(text) => {
                                     grant_inline |= label_maybe_grant(
