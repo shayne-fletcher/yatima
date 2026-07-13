@@ -226,11 +226,17 @@ mod app {
             if text.is_empty() || self.transcript.in_flight().is_some() {
                 return; // single-in-flight, as in the GUI/TUI
             }
+            self.submit_text(text);
+            self.input.clear();
+        }
+
+        /// Start a turn with `text` — the shared tail of a typed submit and
+        /// the implicit retry after a grant lands.
+        fn submit_text(&mut self, text: String) {
             let turn_id = self.next_turn_id;
             self.next_turn_id += 1;
             self.transcript.push_user(turn_id, &text);
             self.send(&HostRequest::Submit { turn_id, text });
-            self.input.clear();
         }
 
         fn status_line(&self) -> String {
@@ -273,6 +279,14 @@ mod app {
         // unified into `egui::Panel` (same as the GUI).
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             self.drain_socket();
+            // The implicit retry (WEB-7): the grant the conversation was
+            // blocked on just landed — tapping it already meant "try
+            // again", so nobody types it. Consumed regardless of state;
+            // acted on only when idle (a turn the user started meanwhile
+            // supersedes the retry).
+            if self.transcript.take_auto_retry() && self.transcript.in_flight().is_none() {
+                self.submit_text("try again".to_string());
+            }
 
             egui::Panel::top("status").show(ui, |ui| {
                 ui.horizontal(|ui| {

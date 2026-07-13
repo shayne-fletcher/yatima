@@ -56,7 +56,10 @@
 //!   sum ([`GrantSuggestion`]): *offered* by the refusal, *sent* by the tap
 //!   (the button disables at once — the request queues behind an in-flight
 //!   turn, and a dead-looking live button invites duplicate clicks), and
-//!   cleared by the landing grant report. The suggestion *text* comes from
+//!   cleared by the landing grant report — which also makes the **retry
+//!   implicit**: the view re-asks ("try again") on the user's behalf, since
+//!   the tap already meant exactly that. A report satisfying no suggestion
+//!   (the serve-edge auto-grant at submit) triggers nothing. The suggestion *text* comes from
 //!   the tool; the authority still flows only from the user's tap (CAP-3
 //!   preserved — the model can ask, never grant). Born of the canvas
 //!   clipboard problem: on a plain-http origin there is no clipboard API,
@@ -208,6 +211,12 @@ pub struct Transcript {
     /// The grant suggestion's lifecycle (WEB-7): offered by a refusal,
     /// sent by the user's tap, cleared by the landing report.
     suggestion: GrantSuggestion,
+    /// Set when a grant report lands that satisfies the active suggestion —
+    /// the retry is then implicit: the view consumes this and re-asks on
+    /// the user's behalf (the tap already meant "try again"). A report
+    /// satisfying no suggestion (e.g. the serve-edge auto-grant at submit)
+    /// never sets it.
+    retry_ripe: bool,
 }
 
 impl Transcript {
@@ -275,6 +284,14 @@ impl Transcript {
         if let GrantSuggestion::Offered(origin) = std::mem::take(&mut self.suggestion) {
             self.suggestion = GrantSuggestion::Sent(origin);
         }
+    }
+
+    /// Consume the implicit-retry signal: true exactly once, after a grant
+    /// report satisfied the active suggestion. The view re-asks on the
+    /// user's behalf when this fires while idle (WEB-7 — tapping the grant
+    /// already meant "try again"; typing it too is ceremony).
+    pub fn take_auto_retry(&mut self) -> bool {
+        std::mem::take(&mut self.retry_ripe)
     }
 
     /// Settle the streaming turn locally: commit its answer (with the
@@ -441,6 +458,9 @@ impl Transcript {
                 };
                 if satisfied {
                     self.suggestion = GrantSuggestion::None;
+                    // The blocked conversation just unblocked: the retry is
+                    // implicit (the view consumes this and re-asks).
+                    self.retry_ripe = true;
                 }
                 self.entries.push(Entry::Note(message))
             }
@@ -814,6 +834,23 @@ mod tests {
         });
         assert!(t.pending_grant().is_none(), "the landed grant clears it");
         assert!(t.sent_grant().is_none(), "the sent marker clears with it");
+        // …and makes the retry implicit: consumable exactly once.
+        assert!(t.take_auto_retry(), "the landed grant ripens a retry");
+        assert!(!t.take_auto_retry(), "consumed once");
+    }
+
+    #[test]
+    fn a_grant_satisfying_no_suggestion_never_ripens_a_retry() {
+        // upholds: WEB-7 — the serve-edge auto-grant at submit produces a
+        // grant report too; with no suggestion active it must not trigger
+        // an implicit "try again" (the turn it belongs to is already
+        // running).
+        let mut t = Transcript::default();
+        t.fold(HostEvent::Grants {
+            origins: vec!["https://en.wikipedia.org".into()],
+            message: "granted read access to https://en.wikipedia.org".into(),
+        });
+        assert!(!t.take_auto_retry());
     }
 
     #[test]
