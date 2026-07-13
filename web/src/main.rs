@@ -25,6 +25,36 @@ mod app {
         format!("{scheme}://{host}/ws")
     }
 
+    /// The grant button's chrome — a real border and drop shadow (the emacs
+    /// customize-button idiom). The button often appears *before* the
+    /// model's prose asks for it (the tool refusal sets the suggestion the
+    /// moment it happens), so it must read as a raised control in its own
+    /// right, never as stray underlined text. Returns whether it was
+    /// clicked; disabled (already-sent) buttons keep the chrome but grey
+    /// out.
+    fn grant_button(ui: &mut egui::Ui, label: egui::RichText, live: bool, hover: &str) -> bool {
+        egui::Frame::new()
+            .shadow(egui::Shadow {
+                offset: [1, 2],
+                blur: 5,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(60),
+            })
+            .corner_radius(egui::CornerRadius::same(4))
+            .show(ui, |ui| {
+                let border = ui.visuals().widgets.inactive.fg_stroke.color;
+                ui.add_enabled(
+                    live,
+                    egui::Button::new(label)
+                        .stroke(egui::Stroke::new(1.0, border))
+                        .corner_radius(egui::CornerRadius::same(4)),
+                )
+                .on_hover_text(hover)
+                .clicked()
+            })
+            .inner
+    }
+
     /// Render `text` as a label — except when it quotes the grant
     /// suggestion's origin, in which case the url itself renders as a
     /// raised, hyperlink-styled button in the flow of the sentence (WEB-7:
@@ -73,11 +103,7 @@ mod app {
             } else {
                 "grant sent — applies when the turn yields"
             };
-            if ui
-                .add_enabled(live, egui::Button::new(link))
-                .on_hover_text(hover)
-                .clicked()
-            {
+            if grant_button(ui, link, live, hover) {
                 *clicked = Some(origin.to_string());
             }
             rendered = true;
@@ -405,15 +431,12 @@ mod app {
                                 let link = egui::RichText::new(label)
                                     .underline()
                                     .color(ui.visuals().hyperlink_color);
-                                if ui
-                                    .add_enabled(live, egui::Button::new(link))
-                                    .on_hover_text(if live {
-                                        "grant read access to this origin"
-                                    } else {
-                                        "grant sent — applies when the turn yields"
-                                    })
-                                    .clicked()
-                                {
+                                let hover = if live {
+                                    "grant read access to this origin"
+                                } else {
+                                    "grant sent — applies when the turn yields"
+                                };
+                                if grant_button(ui, link, live, hover) {
                                     grant_click = Some(origin.clone());
                                 }
                                 ui.add_space(4.0);
