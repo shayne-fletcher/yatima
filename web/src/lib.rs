@@ -51,13 +51,17 @@
 //!   artifact renders as an image or a named placeholder, never an error.
 //! - **WEB-7** a suggested grant is one tap but still the user's act: when
 //!   a refusal names an origin to ask for ("ask the user to grant …"), the
-//!   client surfaces it as a button; tapping sends the grant request, and
-//!   the suggestion clears when the grant report lands. The suggestion
-//!   *text* comes from the tool; the authority still flows only from the
-//!   user's tap (CAP-3 preserved — the model can ask, never grant). Born of
-//!   the canvas clipboard problem: on a plain-http origin there is no
-//!   clipboard API, and re-typing origins into the input box was the
-//!   sharpest pain the demo found.
+//!   client surfaces it as a button — inline in any prose that quotes the
+//!   url, else standalone at the conversation's tail. Its lifecycle is a
+//!   sum ([`GrantSuggestion`]): *offered* by the refusal, *sent* by the tap
+//!   (the button disables at once — the request queues behind an in-flight
+//!   turn, and a dead-looking live button invites duplicate clicks), and
+//!   cleared by the landing grant report. The suggestion *text* comes from
+//!   the tool; the authority still flows only from the user's tap (CAP-3
+//!   preserved — the model can ask, never grant). Born of the canvas
+//!   clipboard problem: on a plain-http origin there is no clipboard API,
+//!   and re-typing origins into the input box was the sharpest pain the
+//!   demo found.
 //!
 //! The marker vocabulary a tool-note renders in is this view's own, not the
 //! wire's (**HOST-4**): egui's fonts lack `✓`/`✗`, so `tool_note_line` spells
@@ -154,6 +158,20 @@ pub fn grant_suggestion(text: &str) -> Option<String> {
     (origin.starts_with("http://") || origin.starts_with("https://")).then(|| origin.to_string())
 }
 
+/// A grant suggestion's lifecycle (WEB-7): `Offered` by a refusal that
+/// named the origin, `Sent` by the user's tap (one tap — the button then
+/// disables: the request rides the host's request queue, which is
+/// unserviced while a turn decodes, so the acknowledging report may take
+/// until the turn yields), cleared back to `None` by the landing grant
+/// report. A sum, not flags: "sent but still offered" cannot exist.
+#[derive(Default, Debug, PartialEq)]
+pub enum GrantSuggestion {
+    #[default]
+    None,
+    Offered(String),
+    Sent(String),
+}
+
 /// The turn in flight, if any. One sum where three parallel fields (an answer
 /// buffer, a reasoning buffer, an in-flight id) used to drift apart by hand:
 /// `Idle`/`Live` make "a streaming buffer without a live turn" — the state
@@ -187,9 +205,9 @@ pub struct Transcript {
     pub prompt_tokens: Option<usize>,
     /// A fatal load error: the session never starts.
     pub fatal: Option<String>,
-    /// The origin the latest refusal asked for, if any — the view renders it
-    /// as a one-tap grant button (WEB-7). Cleared when its grant lands.
-    pending_grant: Option<String>,
+    /// The grant suggestion's lifecycle (WEB-7): offered by a refusal,
+    /// sent by the user's tap, cleared by the landing report.
+    suggestion: GrantSuggestion,
 }
 
 impl Transcript {
@@ -230,10 +248,33 @@ impl Transcript {
         }
     }
 
-    /// The origin the latest refusal asked the user to grant, if any — the
-    /// view offers it as a one-tap grant button (WEB-7).
+    /// The origin the latest refusal asked the user to grant, if the tap is
+    /// still to be made — the view offers it as a one-tap button (WEB-7).
     pub fn pending_grant(&self) -> Option<&str> {
-        self.pending_grant.as_deref()
+        match &self.suggestion {
+            GrantSuggestion::Offered(origin) => Some(origin),
+            _ => None,
+        }
+    }
+
+    /// The origin whose grant the user has tapped but whose report hasn't
+    /// folded back yet — the view shows it disabled, so a queued request
+    /// (the host services requests between turns) reads as *sent*, not
+    /// ignored, and cannot be re-clicked into duplicates (WEB-7).
+    pub fn sent_grant(&self) -> Option<&str> {
+        match &self.suggestion {
+            GrantSuggestion::Sent(origin) => Some(origin),
+            _ => None,
+        }
+    }
+
+    /// The user tapped the offered grant: `Offered → Sent`, one way. The
+    /// view calls this alongside sending the request; the landing report
+    /// clears it.
+    pub fn mark_grant_sent(&mut self) {
+        if let GrantSuggestion::Offered(origin) = std::mem::take(&mut self.suggestion) {
+            self.suggestion = GrantSuggestion::Sent(origin);
+        }
     }
 
     /// Settle the streaming turn locally: commit its answer (with the
@@ -340,9 +381,15 @@ impl Transcript {
                 text,
             } => {
                 // A refusal that names a missing grant becomes a one-tap
-                // button (WEB-7); the newest suggestion wins.
+                // button (WEB-7); the newest suggestion wins — except when
+                // that same origin's grant is already sent and queued (a
+                // model retrying before the queue drains must not resurrect
+                // the button).
                 if let Some(origin) = grant_suggestion(&text) {
-                    self.pending_grant = Some(origin);
+                    match &self.suggestion {
+                        GrantSuggestion::Sent(sent) if *sent == origin => {}
+                        _ => self.suggestion = GrantSuggestion::Offered(origin),
+                    }
                 }
                 let line = tool_note_line(kind, &text);
                 match &mut self.turn {
@@ -383,14 +430,17 @@ impl Transcript {
             },
             HostEvent::Note(message) => self.entries.push(Entry::Note(message)),
             HostEvent::Grants { origins, message } => {
-                // A landed grant clears the suggestion it satisfies (the
-                // event carries the post-grant origin set).
-                if self
-                    .pending_grant
-                    .as_ref()
-                    .is_some_and(|pending| origins.iter().any(|o| o == pending))
-                {
-                    self.pending_grant = None;
+                // A landed grant clears the suggestion it satisfies —
+                // offered or sent — (the event carries the post-grant
+                // origin set).
+                let satisfied = match &self.suggestion {
+                    GrantSuggestion::Offered(o) | GrantSuggestion::Sent(o) => {
+                        origins.iter().any(|granted| granted == o)
+                    }
+                    GrantSuggestion::None => false,
+                };
+                if satisfied {
+                    self.suggestion = GrantSuggestion::None;
                 }
                 self.entries.push(Entry::Note(message))
             }
@@ -736,6 +786,25 @@ mod tests {
                 .into(),
         });
         assert_eq!(t.pending_grant(), Some("https://upload.wikimedia.org"));
+
+        // The tap: Offered → Sent, one way. The offer is gone (the button
+        // disables — no double-clicks into duplicate queued grants), and a
+        // model retrying the same refusal before the queue drains must not
+        // resurrect it.
+        t.mark_grant_sent();
+        assert!(t.pending_grant().is_none(), "no re-clickable offer");
+        assert_eq!(t.sent_grant(), Some("https://upload.wikimedia.org"));
+        t.fold(HostEvent::ToolNote {
+            turn_id: 1,
+            kind: ToolNoteKind::Failure,
+            text: "tool failed: ask the user to grant https://upload.wikimedia.org — again".into(),
+        });
+        assert!(
+            t.pending_grant().is_none(),
+            "a retry can't re-offer a sent grant"
+        );
+        assert_eq!(t.sent_grant(), Some("https://upload.wikimedia.org"));
+
         t.fold(HostEvent::Grants {
             origins: vec![
                 "https://en.wikipedia.org".into(),
@@ -744,6 +813,7 @@ mod tests {
             message: "granted read access to https://upload.wikimedia.org".into(),
         });
         assert!(t.pending_grant().is_none(), "the landed grant clears it");
+        assert!(t.sent_grant().is_none(), "the sent marker clears with it");
     }
 
     #[test]

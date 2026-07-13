@@ -25,6 +25,67 @@ mod app {
         format!("{scheme}://{host}/ws")
     }
 
+    /// Render `text` as a label — except when it quotes the grant
+    /// suggestion's origin, in which case the url itself renders as a
+    /// raised, hyperlink-styled button in the flow of the sentence (WEB-7:
+    /// the ask appears in prose; the control lives where the eye already
+    /// is). While the suggestion is *offered* the button is live and a
+    /// click lands in `clicked` (the caller sends outside the borrow);
+    /// once *sent* it renders disabled — visible state change, no
+    /// double-clicks into duplicate queued grants (the host services
+    /// requests between turns, so the acknowledging report can lag).
+    /// Returns whether a button rendered, so the caller can fall back to a
+    /// standalone one when the prose never quotes the origin.
+    fn label_maybe_grant(
+        ui: &mut egui::Ui,
+        text: &str,
+        offered: Option<&str>,
+        sent: Option<&str>,
+        muted: bool,
+        clicked: &mut Option<String>,
+    ) -> bool {
+        let plain = |ui: &mut egui::Ui, s: &str| {
+            if s.trim().is_empty() {
+                return;
+            }
+            if muted {
+                ui.weak(s);
+            } else {
+                ui.label(s);
+            }
+        };
+        let hit = offered
+            .and_then(|o| text.find(o).map(|i| (o, i, true)))
+            .or_else(|| sent.and_then(|o| text.find(o).map(|i| (o, i, false))));
+        let Some((origin, at, live)) = hit else {
+            plain(ui, text);
+            return false;
+        };
+        let mut rendered = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            plain(ui, &text[..at]);
+            let link = egui::RichText::new(origin)
+                .underline()
+                .color(ui.visuals().hyperlink_color);
+            let hover = if live {
+                "grant read access to this origin"
+            } else {
+                "grant sent — applies when the turn yields"
+            };
+            if ui
+                .add_enabled(live, egui::Button::new(link))
+                .on_hover_text(hover)
+                .clicked()
+            {
+                *clicked = Some(origin.to_string());
+            }
+            rendered = true;
+            plain(ui, &text[at + origin.len()..]);
+        });
+        rendered
+    }
+
     /// Open the socket, waking egui on every socket event — without the
     /// wakeup an idle frame never notices an arriving fragment.
     fn connect(ctx: &egui::Context) -> (ewebsock::WsSender, ewebsock::WsReceiver) {
@@ -232,18 +293,16 @@ mod app {
                             self.transcript.abort();
                         }
                     }
-                    // WEB-7: a refusal named this origin; the tap is the
-                    // user's grant (no clipboard on a plain-http canvas app,
-                    // so nobody retypes an origin). Clears when the grant
-                    // report folds back.
-                    if let Some(origin) = self.transcript.pending_grant().map(str::to_string) {
-                        if ui.button(format!("grant {origin}")).clicked() {
-                            self.send(&HostRequest::Grant { origin });
-                        }
-                    }
                 });
             });
 
+            // The grant suggestion, pre-cloned so the entry loop below can
+            // borrow entries freely; a click lands in `grant_click` and is
+            // sent after the panel releases its borrows.
+            let offered = self.transcript.pending_grant().map(str::to_string);
+            let sent = self.transcript.sent_grant().map(str::to_string);
+            let mut grant_click: Option<String> = None;
+            let mut grant_inline = false;
             egui::CentralPanel::default().show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
@@ -260,7 +319,14 @@ mod app {
                                             ui.weak(r);
                                         }
                                     }
-                                    ui.label(answer);
+                                    grant_inline |= label_maybe_grant(
+                                        ui,
+                                        answer,
+                                        offered.as_deref(),
+                                        sent.as_deref(),
+                                        false,
+                                        &mut grant_click,
+                                    );
                                 }
                                 Entry::Image(img) => {
                                     let tex =
@@ -278,7 +344,14 @@ mod app {
                                     );
                                 }
                                 Entry::Note(text) => {
-                                    ui.weak(text);
+                                    grant_inline |= label_maybe_grant(
+                                        ui,
+                                        text,
+                                        offered.as_deref(),
+                                        sent.as_deref(),
+                                        true,
+                                        &mut grant_click,
+                                    );
                                 }
                                 Entry::Error(text) => {
                                     ui.colored_label(
@@ -297,11 +370,62 @@ mod app {
                         }
                         if let Some(answer) = self.transcript.streaming_answer() {
                             if !answer.is_empty() {
-                                ui.label(answer);
+                                grant_inline |= label_maybe_grant(
+                                    ui,
+                                    answer,
+                                    offered.as_deref(),
+                                    sent.as_deref(),
+                                    false,
+                                    &mut grant_click,
+                                );
+                            }
+                        }
+                        // WEB-7 fallback: the suggestion exists but no
+                        // rendered prose quoted the origin (the model
+                        // paraphrased) — a standalone button at the
+                        // conversation's tail, live while offered, disabled
+                        // once sent, so the affordance never goes missing
+                        // and the state change is visible either way.
+                        if !grant_inline {
+                            let (origin, live) = match (&offered, &sent) {
+                                (Some(o), _) => (Some(o), true),
+                                (None, Some(o)) => (Some(o), false),
+                                (None, None) => (None, false),
+                            };
+                            if let Some(origin) = origin {
+                                ui.add_space(6.0);
+                                let label = if live {
+                                    format!("grant {origin}")
+                                } else {
+                                    format!("grant sent: {origin}")
+                                };
+                                let link = egui::RichText::new(label)
+                                    .underline()
+                                    .color(ui.visuals().hyperlink_color);
+                                if ui
+                                    .add_enabled(live, egui::Button::new(link))
+                                    .on_hover_text(if live {
+                                        "grant read access to this origin"
+                                    } else {
+                                        "grant sent — applies when the turn yields"
+                                    })
+                                    .clicked()
+                                {
+                                    grant_click = Some(origin.clone());
+                                }
+                                ui.add_space(4.0);
                             }
                         }
                     });
             });
+            // The tap is the user's grant (WEB-7) — sent here, outside the
+            // panel's borrows. The mirror marks it Sent at once (the button
+            // disables this same frame; no repeat clicks), and the landing
+            // grant report clears the suggestion.
+            if let Some(origin) = grant_click {
+                self.transcript.mark_grant_sent();
+                self.send(&HostRequest::Grant { origin });
+            }
         }
     }
 }
