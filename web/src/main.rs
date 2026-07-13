@@ -47,7 +47,14 @@ mod app {
                     live,
                     egui::Button::new(label)
                         .stroke(egui::Stroke::new(1.0, border))
-                        .corner_radius(egui::CornerRadius::same(4)),
+                        .corner_radius(egui::CornerRadius::same(4))
+                        // Never wrap the label: squeezed at the end of a
+                        // wrapped line, a button otherwise shrinks to a
+                        // sliver and wraps its url one character per row
+                        // (observed live as a letter-waterfall down the
+                        // screen edge). Extend forces the button whole onto
+                        // the next line instead.
+                        .wrap_mode(egui::TextWrapMode::Extend),
                 )
                 .on_hover_text(hover)
                 .clicked()
@@ -227,17 +234,11 @@ mod app {
             if text.is_empty() || self.transcript.in_flight().is_some() {
                 return; // single-in-flight, as in the GUI/TUI
             }
-            self.submit_text(text);
-            self.input.clear();
-        }
-
-        /// Start a turn with `text` — the shared tail of a typed submit and
-        /// the implicit retry after a grant lands.
-        fn submit_text(&mut self, text: String) {
             let turn_id = self.next_turn_id;
             self.next_turn_id += 1;
             self.transcript.push_user(turn_id, &text);
             self.send(&HostRequest::Submit { turn_id, text });
+            self.input.clear();
         }
 
         fn status_line(&self) -> String {
@@ -296,11 +297,21 @@ mod app {
             self.drain_socket();
             // The implicit retry (WEB-7): the grant the conversation was
             // blocked on just landed — tapping it already meant "try
-            // again", so nobody types it. Consumed regardless of state;
-            // acted on only when idle (a turn the user started meanwhile
-            // supersedes the retry).
+            // again", so nobody types it and *nothing is shown*: no
+            // fabricated user line in the transcript. The grant note is
+            // the visible cause, the model's continuation the effect; the
+            // nudge is plumbing. The mirror stays honest (it renders what
+            // the user typed plus host events — this is neither) and arms
+            // on demand when the host starts the turn (WEB-3). Consumed
+            // regardless of state; acted on only when idle (a turn the
+            // user started meanwhile supersedes the retry).
             if self.transcript.take_auto_retry() && self.transcript.in_flight().is_none() {
-                self.submit_text("try again".to_string());
+                let turn_id = self.next_turn_id;
+                self.next_turn_id += 1;
+                self.send(&HostRequest::Submit {
+                    turn_id,
+                    text: "try again".to_string(),
+                });
             }
 
             egui::Panel::top("status").show(ui, |ui| {

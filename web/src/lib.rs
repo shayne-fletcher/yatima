@@ -58,9 +58,12 @@
 //!   (the button disables at once — the request queues behind an in-flight
 //!   turn, and a dead-looking live button invites duplicate clicks), and
 //!   cleared by the landing grant report — which also makes the **retry
-//!   implicit**: the view re-asks ("try again") on the user's behalf, since
-//!   the tap already meant exactly that. A report satisfying no suggestion
-//!   (the serve-edge auto-grant at submit) triggers nothing. The suggestion *text* comes from
+//!   implicit and invisible**: the view nudges the host on the user's
+//!   behalf without fabricating a user line (the grant note is the visible
+//!   cause; the model's continuation the effect — the mirror renders what
+//!   the user typed plus host events, and the nudge is neither). A report
+//!   satisfying no suggestion (the serve-edge auto-grant at submit)
+//!   triggers nothing. The suggestion *text* comes from
 //!   the tool; the authority still flows only from the user's tap (CAP-3
 //!   preserved — the model can ask, never grant). Born of the canvas
 //!   clipboard problem: on a plain-http origin there is no clipboard API,
