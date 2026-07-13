@@ -11,10 +11,11 @@
 //! text only (no markdown — model-written image links strip at commit and
 //! LaTeX prettifies, but structure never renders), PNG/JPEG only (an SVG or
 //! other format renders as a named placeholder line, never an error), grant
-//! management by command only (`/grant`, `/grants`, `/revoke`; a URL typed
-//! in a message auto-grants at the serve edge — CAP-3 — since this client is
-//! protocol-only and cannot scan origins itself) with reports rendered as
-//! notes, no context meter beyond a token count.
+//! management by command or one tap (`/grant`, `/grants`, `/revoke`; a URL
+//! typed in a message auto-grants at the serve edge — CAP-3 — since this
+//! client is protocol-only and cannot scan origins itself; a refusal that
+//! names a missing origin surfaces a grant button — WEB-7) with reports
+//! rendered as notes, no context meter beyond a token count.
 //!
 //! # Invariant & law registry
 //!
@@ -48,6 +49,15 @@
 //!   carried non-whitespace text (a fully-retracted turn commits nothing,
 //!   never a blank bubble); retraction counts characters, never bytes; an
 //!   artifact renders as an image or a named placeholder, never an error.
+//! - **WEB-7** a suggested grant is one tap but still the user's act: when
+//!   a refusal names an origin to ask for ("ask the user to grant …"), the
+//!   client surfaces it as a button; tapping sends the grant request, and
+//!   the suggestion clears when the grant report lands. The suggestion
+//!   *text* comes from the tool; the authority still flows only from the
+//!   user's tap (CAP-3 preserved — the model can ask, never grant). Born of
+//!   the canvas clipboard problem: on a plain-http origin there is no
+//!   clipboard API, and re-typing origins into the input box was the
+//!   sharpest pain the demo found.
 //!
 //! The marker vocabulary a tool-note renders in is this view's own, not the
 //! wire's (**HOST-4**): egui's fonts lack `✓`/`✗`, so `tool_note_line` spells
@@ -131,6 +141,19 @@ pub fn parse_grant_command(text: &str) -> Option<HostRequest> {
     None
 }
 
+/// The origin a refusal asks for, if `text` carries the grant protocol's
+/// phrase ("ask the user to grant <origin>" — the wording every escape
+/// refusal leads with). The origin token must look like one, so arbitrary
+/// prose can't fabricate a button (WEB-7: the tool may suggest, only the
+/// user's tap grants).
+pub fn grant_suggestion(text: &str) -> Option<String> {
+    let at = text.find("ask the user to grant ")?;
+    let rest = &text[at + "ask the user to grant ".len()..];
+    let token = rest.split_whitespace().next()?;
+    let origin = token.trim_end_matches([',', ';', ':', '.', '!', '?', ')', ']']);
+    (origin.starts_with("http://") || origin.starts_with("https://")).then(|| origin.to_string())
+}
+
 /// The turn in flight, if any. One sum where three parallel fields (an answer
 /// buffer, a reasoning buffer, an in-flight id) used to drift apart by hand:
 /// `Idle`/`Live` make "a streaming buffer without a live turn" — the state
@@ -164,6 +187,9 @@ pub struct Transcript {
     pub prompt_tokens: Option<usize>,
     /// A fatal load error: the session never starts.
     pub fatal: Option<String>,
+    /// The origin the latest refusal asked for, if any — the view renders it
+    /// as a one-tap grant button (WEB-7). Cleared when its grant lands.
+    pending_grant: Option<String>,
 }
 
 impl Transcript {
@@ -202,6 +228,12 @@ impl Transcript {
             Turn::Live { reasoning, .. } => reasoning,
             Turn::Idle => "",
         }
+    }
+
+    /// The origin the latest refusal asked the user to grant, if any — the
+    /// view offers it as a one-tap grant button (WEB-7).
+    pub fn pending_grant(&self) -> Option<&str> {
+        self.pending_grant.as_deref()
     }
 
     /// Settle the streaming turn locally: commit its answer (with the
@@ -307,6 +339,11 @@ impl Transcript {
                 kind,
                 text,
             } => {
+                // A refusal that names a missing grant becomes a one-tap
+                // button (WEB-7); the newest suggestion wins.
+                if let Some(origin) = grant_suggestion(&text) {
+                    self.pending_grant = Some(origin);
+                }
                 let line = tool_note_line(kind, &text);
                 match &mut self.turn {
                     Turn::Idle => {
@@ -344,7 +381,17 @@ impl Transcript {
                     .entries
                     .push(Entry::Note(format!("[image {name} — not rendered here]"))),
             },
-            HostEvent::Note(message) | HostEvent::Grants { message, .. } => {
+            HostEvent::Note(message) => self.entries.push(Entry::Note(message)),
+            HostEvent::Grants { origins, message } => {
+                // A landed grant clears the suggestion it satisfies (the
+                // event carries the post-grant origin set).
+                if self
+                    .pending_grant
+                    .as_ref()
+                    .is_some_and(|pending| origins.iter().any(|o| o == pending))
+                {
+                    self.pending_grant = None;
+                }
                 self.entries.push(Entry::Note(message))
             }
             HostEvent::Context { prompt_tokens } => self.prompt_tokens = Some(prompt_tokens),
@@ -669,6 +716,54 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Entry::Assistant { .. })),
             "a stripped-empty answer must not commit"
+        );
+    }
+
+    #[test]
+    fn a_refusal_surfaces_a_pending_grant_and_the_report_clears_it() {
+        // upholds: WEB-7 — the refusal's named origin becomes a one-tap
+        // suggestion; the landed grant (whose report carries the post-grant
+        // set) clears it. The tap itself lives in the view; authority still
+        // flows only from the user (CAP-3).
+        let mut t = Transcript::default();
+        t.push_user(1, "show me");
+        t.fold(HostEvent::ToolNote {
+            turn_id: 1,
+            kind: ToolNoteKind::Failure,
+            text: "tool failed: ask the user to grant https://upload.wikimedia.org \
+                   — url escapes the granted web origins [https://en.wikipedia.org]: \
+                   https://upload.wikimedia.org/w"
+                .into(),
+        });
+        assert_eq!(t.pending_grant(), Some("https://upload.wikimedia.org"));
+        t.fold(HostEvent::Grants {
+            origins: vec![
+                "https://en.wikipedia.org".into(),
+                "https://upload.wikimedia.org".into(),
+            ],
+            message: "granted read access to https://upload.wikimedia.org".into(),
+        });
+        assert!(t.pending_grant().is_none(), "the landed grant clears it");
+    }
+
+    #[test]
+    fn grant_suggestions_parse_the_protocol_phrase_only() {
+        // upholds: WEB-7 — only the refusal wording with an origin-shaped
+        // token makes a button; prose cannot fabricate one.
+        assert_eq!(
+            grant_suggestion("tool failed: ask the user to grant https://a.example — x: y"),
+            Some("https://a.example".into())
+        );
+        assert_eq!(
+            grant_suggestion("ask the user to grant http://a.example:8443."),
+            Some("http://a.example:8443".into()),
+            "trailing punctuation trims; explicit ports survive"
+        );
+        assert_eq!(grant_suggestion("please grant me everything"), None);
+        assert_eq!(
+            grant_suggestion("ask the user to grant patience"),
+            None,
+            "a non-origin token is not a suggestion"
         );
     }
 

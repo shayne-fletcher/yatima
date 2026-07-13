@@ -232,6 +232,15 @@ mod app {
                             self.transcript.abort();
                         }
                     }
+                    // WEB-7: a refusal named this origin; the tap is the
+                    // user's grant (no clipboard on a plain-http canvas app,
+                    // so nobody retypes an origin). Clears when the grant
+                    // report folds back.
+                    if let Some(origin) = self.transcript.pending_grant().map(str::to_string) {
+                        if ui.button(format!("grant {origin}")).clicked() {
+                            self.send(&HostRequest::Grant { origin });
+                        }
+                    }
                 });
             });
 

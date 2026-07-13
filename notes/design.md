@@ -750,7 +750,7 @@ stack, the `yatima-protocol` doc (**PROTO-2**, and **WASM-1**: it — and the
 other libraries the browser client stands on, `yatima-text` — compile for
 `wasm32`, so `yatima-web` can build on them), the `yatima-host` doc
 (**HOST-1/2/3**), the `yatima-tui` doc (**TUI-1..7**), the `yatima-serve`
-doc (**SRV-1/2/3**), and the `yatima-web` doc (**WEB-1..6**). Each is
+doc (**SRV-1/2/3**), and the `yatima-web` doc (**WEB-1..7**). Each is
 protected by a test that cites its id in an `// upholds: <id>` comment
 (`grep -r 'upholds:'`) — except **WASM-1**, which is a *compile-time* law:
 its guard is `scripts/check-wasm.sh` (run in CI), not a citing test.
@@ -762,7 +762,7 @@ In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 (**TMPL-1/2**, **REASON-1**); CLI (**CLI-1/2/3**); the frontend host and its
 wire plane (**HOST-1/2/3**, **PROTO-2**, **WASM-1**), the terminal UI
 (**TUI-1..7**), the WebSocket bridge (**SRV-1/2/3**), and the browser client
-(**WEB-1..6**).
+(**WEB-1..7**).
 
 ## State machines
 
@@ -1114,6 +1114,18 @@ and deliberately shelved — the note records why so we don't repeat them.
   `yatima-host` (the extracted engine host) with `yatima-protocol` (its wire
   plane), and capability scoping are the concrete substrate the service tier
   builds on.
+- **Serve over https (tailnet certs) — the clipboard/platform fix.** The
+  browser client is a canvas app, and on a plain-http origin the browser's
+  async clipboard API simply does not exist (not a secure context) — so
+  copy/paste in the wasm client ranges browser-dependent to absent (observed
+  live, 2026-07-12: selectable but effectively uncopyable transcript on the
+  tailnet, and origins hand-retyped into a tiny input box). `tailscale cert`
+  mints a real certificate for the machine's `ts.net` name; serving https
+  makes the page a secure context and unlocks the clipboard API — and every
+  future API gated the same way (notifications, PWA install). An ops slice
+  more than a code slice (rustls listener or a `tailscale serve` front).
+  Tap-to-grant (WEB-7) already removed the sharpest copy/paste need; this
+  removes the class.
 - **Speculative decoding over the wire (idea, 2026-07-12).** Provenance in
   the vision log (`notes/vision.md`, 2026-07-12): proposed by a compilers/PL
   friend after the spike's phone demo. The idea: run a featherweight drafter
