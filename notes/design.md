@@ -1188,6 +1188,15 @@ and deliberately shelved — the note records why so we don't repeat them.
   (Kirisame-style cost eviction, matching MEM-1/2) and identity-tracked
   interpolative animation for provenance ("see what came from what"). Prior art:
   Ed Kmett's `codex`/Cadenza (commercialized as Enso) and acko.net/MathBox.
+  The MathBox citation was independently confirmed from outside
+  (2026-07-12, provenance in `notes/vision.md`): after the phone demo, a
+  compilers/PL friend proposed "a mathbox style timeline feature"
+  unprompted — and the browser client's architecture already holds the
+  door open: the mirror is a pure fold over the event stream, so a
+  session timeline is *re-folding a prefix* (keep the log, scrub `t`,
+  render `fold(events[0..t])`) — the same event-log primitive the
+  replay-on-connect plan wants, with wall-clock timestamps from the
+  live-turn-telemetry plan as the scrubber's axis.
   Large, separable, gated on a real trigger (typeset math, non-Latin scripts,
   inline plots); the TUI stays the default. Detailed working notes live in the
   (ephemeral, untracked) `plans/text-rendering.plan.md`.

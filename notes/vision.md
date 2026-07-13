@@ -34,6 +34,18 @@ on the serve seam. The spike's first external dividend: the surface
 invited a collaborator to design *with* it, which is what a surface is
 for.
 
+A third arrived by the end of the day: "now you just need to figure
+out a mathbox style timeline feature" — naming, unprompted, the exact
+prior art the GPU-frontend roadmap entry had already cited
+(acko.net/MathBox, for identity-tracked animation and "see what came
+from what"). Twice in one day the same friend converged on entries the
+roadmap wrote before the demo existed. And the architecture is already
+holding the door open: the browser client is a pure fold over the
+event stream, so a timeline is *re-folding a prefix* — keep the log,
+scrub t, render fold(events[0..t]). Time travel falls out of the
+catamorphism; the same event-log primitive the reload-replay plan
+wants.
+
 What the day taught, spike-style (the findings are recorded in the
 serve roadmap entry, design.md): reconnect semantics are the first
 thing a phone tests — idle tabs drop, zombie sockets answer keepalives
