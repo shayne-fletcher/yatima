@@ -1130,7 +1130,8 @@ and deliberately shelved — the note records why so we don't repeat them.
   more than a code slice (rustls listener or a `tailscale serve` front).
   Tap-to-grant (WEB-7) already removed the sharpest copy/paste need; this
   removes the class.
-- **Remote `Completer`, slice 1: Anthropic — NEXT (decided 2026-07-13).**
+- **Remote `Completer` — NEXT (decided 2026-07-13): rented per-token
+  compute for the open weights; Anthropic optional, not foundational.**
   The weekend's verdict, reached live: the stack is proven and the local
   quantized model is every remaining failure — it fabricates unguessable
   Wikimedia hash paths, abandons its own read_page → read_image plan
@@ -1168,6 +1169,16 @@ and deliberately shelved — the note records why so we don't repeat them.
   tool round end to end). On-host inference remains the private, free,
   offline tier — the *patient* tier — and the remote fork is exactly the
   identity the Serving & scale entry named: yatima orchestrates.
+  **Ordering, settled the same night ("i need compute, not anthropic"):
+  slice 1 is the OpenAI-dialect completer** fronting full-precision Qwen
+  at a per-token provider — the raw-prompt seam already fits (same
+  ChatML template, same codec, same loop; the local Engine with decode
+  swapped for HTTP), it costs cents per session with zero idle burn (no
+  rented boxes — idle-billing is good money after bad), and the weights
+  stay sovereign: a public artifact a fungible landlord serves today and
+  owned hardware runs at home someday. The Anthropic slice above keeps
+  its design (the structured seam, the stop-sequence quirk) as optional
+  capability headroom behind the same trait, built only if wanted.
 - **Browser-client near-term queue (distilled from local working plans,
   2026-07-13; full execution scripts held outside the repo per the
   plans-are-ephemeral convention).** In order, after the remote
