@@ -1579,7 +1579,7 @@ impl Tool for ReadImage {
                     },
                     "again": {
                         "type": "boolean",
-                        "description": "true only when the user asked to see an already-shown image again — re-displays it"
+                        "description": "true only when the user asked to see an already-shown image again — re-displays it. Alone it re-shows the only shown image; with several shown, add \"url\" naming which"
                     }
                 }
             }),
@@ -1594,17 +1594,55 @@ impl Tool for ReadImage {
         // IMG-3: selection by list number is the preferred path — an index
         // copy where the url form invites transcription errors and invented
         // thumbnail paths. Every miss teaches (PROTO-1).
+        let again = args
+            .get("again")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let selected;
         let target = match (args.get("url"), args.get("image")) {
             (Some(_), Some(_)) => bail!(
                 "read_image: pass either \"image\" (a number from the last \
                  read_page [images] list) or \"url\", not both"
             ),
-            (None, None) => bail!(
-                "read_image: pass {{\"image\": N}} — the entry's number in \
-                 the most recent read_page [images] list (or an exact \"url\" \
-                 from it)"
-            ),
+            (None, None) => {
+                if again {
+                    // "again" alone re-shows when unambiguous: the memo
+                    // knows exactly what has been shown, and with one
+                    // artifact there is nothing to ask (observed live: two
+                    // images shown, one plainly meant, and the model
+                    // interrogated the user anyway). Ambiguity names the
+                    // candidates copy-ready; zero teaches the first step.
+                    let (count, only, urls) = {
+                        let memo = self.fetched.lock().expect("read_image memo poisoned");
+                        (
+                            memo.shown.len(),
+                            memo.by_url.values().next().cloned(),
+                            sorted_urls(&memo.by_url),
+                        )
+                    };
+                    match (count, only) {
+                        (0, _) | (_, None) => bail!(
+                            "read_image: nothing has been shown this session \
+                             yet — call read_page and pick an [images] \
+                             number first"
+                        ),
+                        (1, Some((summary, path))) => {
+                            ctx.emit_artifact(&path);
+                            return Ok(format!("{summary} — re-shown at the user's request"));
+                        }
+                        (_, Some(_)) => bail!(
+                            "read_image: several images have been shown this \
+                             session — repeat with {{\"again\": true, \
+                             \"url\": …}} naming one of: {urls}"
+                        ),
+                    }
+                }
+                bail!(
+                    "read_image: pass {{\"image\": N}} — the entry's number \
+                     in the most recent read_page [images] list (or an exact \
+                     \"url\" from it)"
+                )
+            }
             (Some(url), None) => url
                 .as_str()
                 .ok_or_else(|| anyhow!("read_image: `url` must be a string, got {url}"))?,
@@ -1626,15 +1664,11 @@ impl Tool for ReadImage {
                 selected.as_str()
             }
         };
-        let again = args
-            .get("again")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         let url = self.origins.resolve(target)?; // CAP-2 before any network
-                                                 // Fetch-once: a repeat of a URL this session re-teaches, never
-                                                 // re-fetches — the artifact is already on disk and the user has
-                                                 // already seen it (IMG-2: no artifact event, so no re-display —
-                                                 // unless the user asked, which is what "again" asserts).
+
+        // Fetch-once: a repeat of a URL this session re-teaches and re-emits
+        // (IMG-2: the memo governs the network and the narration, never the
+        // pixels), but never re-fetches — the artifact is already on disk.
         let (memo_hit, shown_urls, exhausted) = {
             let memo = self.fetched.lock().expect("read_image memo poisoned");
             let listed = self.listing.urls();
@@ -3465,6 +3499,72 @@ as the first window of the page without tripping any extraction guard.</p>
             content.contains("re-shown at the user's request"),
             "{content}"
         );
+    }
+
+    #[tokio::test]
+    async fn again_alone_reshows_when_unambiguous() {
+        // upholds: IMG-2 — "show it again" with one artifact shown needs no
+        // selector: the memo knows what has been shown, and making the model
+        // interrogate the user over a one-element set was observed live
+        // ("we only loaded two images…"). Ambiguity (after a second image)
+        // names the candidates copy-ready; before anything is shown, the
+        // error teaches the first step.
+        let server = MockServer::start().await;
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nfirst-image-bytes";
+        let png2: &[u8] = b"\x89PNG\r\n\x1a\nsecond-image-bytes";
+        for (route, body) in [("/a.png", png), ("/b.png", png2)] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "image/png")
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadImage::new(origins, dir.path().join("images")).unwrap());
+        let call = |args: &str| ToolCall {
+            name: "read_image".to_string(),
+            args: json(args),
+        };
+
+        // Nothing shown yet: "again" alone teaches the first step.
+        let none = tools
+            .dispatch_async(&call(r#"{"again": true}"#))
+            .await
+            .render_for_model("");
+        assert!(none.is_error);
+        assert!(
+            none.content.contains("nothing has been shown"),
+            "{}",
+            none.content
+        );
+
+        // One artifact shown: "again" alone re-shows it, no interrogation.
+        let first = tools.dispatch_async(&call(r#"{"url": "/a.png"}"#)).await;
+        assert!(first.is_success(), "{first:?}");
+        let re = tools.dispatch_async(&call(r#"{"again": true}"#)).await;
+        let ToolOutcome::Success { content } = &re else {
+            panic!("{re:?}");
+        };
+        assert!(
+            content.contains("re-shown at the user's request"),
+            "{content}"
+        );
+
+        // Two artifacts shown: ambiguity names the candidates copy-ready.
+        let second = tools.dispatch_async(&call(r#"{"url": "/b.png"}"#)).await;
+        assert!(second.is_success(), "{second:?}");
+        let which = tools
+            .dispatch_async(&call(r#"{"again": true}"#))
+            .await
+            .render_for_model("");
+        assert!(which.is_error);
+        assert!(which.content.contains("/a.png"), "{}", which.content);
+        assert!(which.content.contains("/b.png"), "{}", which.content);
     }
 
     #[tokio::test]
