@@ -1130,6 +1130,62 @@ and deliberately shelved — the note records why so we don't repeat them.
   more than a code slice (rustls listener or a `tailscale serve` front).
   Tap-to-grant (WEB-7) already removed the sharpest copy/paste need; this
   removes the class.
+- **Remote `Completer`, slice 1: Anthropic — NEXT (decided 2026-07-13).**
+  The weekend's verdict, reached live: the stack is proven and the local
+  quantized model is every remaining failure — it fabricates unguessable
+  Wikimedia hash paths, abandons its own read_page → read_image plan
+  mid-way, narrates success over an empty screen, and loops the identical
+  failure verbatim. Two findings sharpen it. *Slow disguises shaky*: a 32B
+  on Metal grinding multi-round agent turns is minutes per turn, so
+  "working", "wedged", and "lying" look identical from the user's chair
+  (the telemetry entry below is the visibility half of the cure). And
+  *lean memory amplifies loops* (AGENT-3): persisted exchanges keep the
+  final answer but drop the tool evidence, so a weak model re-reads its
+  own confident failures with the refutation deleted and imitates them —
+  self-reinforcing theater a strong model escapes via the user's
+  complaints. The design, grounded and ready (working plan held locally):
+  a **structured seam** on `Completer` — `wants_turns()` +
+  `complete_turns_streaming(&[Turn], …)`, defaults preserving every
+  existing impl — cashing the promise `transcript` module docs already
+  reserve ("a future structured `Completer` boundary that takes turns
+  rather than a rendered string"); an `AnthropicCompleter` in yatima-lib
+  (reqwest + `stream`, a small hand-rolled SSE parser; `ANTHROPIC_API_KEY`
+  read at construction per the `HF_TOKEN` precedent and never logged —
+  OBS-2; API quirk: `stop_sequence` responses *exclude* the matched
+  string, which must be re-appended to honor the `Completion` contract
+  the tool codec depends on); the **text `ToolCallCodec` kept** in slice
+  1 (Claude follows codec markup; the whole AGENT/PROTO machinery runs
+  byte-identical — native `tool_use` blocks are slice 2, only if ever
+  needed); `HostConfig.dir` generalizing to `ModelBackend { Local { dir,
+  cpu }, Anthropic { model } }` with the Engine-only surfaces (DepthWatch,
+  CTX-2, arch/backend probing) bypassed for remote; selection via builtin
+  **profiles** (`claude` → sonnet, `claude-opus`, `claude-haiku`) so
+  `--profile claude` works in every frontend; GenOpts mapping: max_tokens
+  and temperature/top_p map (clamped), Greedy → temperature 0, **seed and
+  repeat_penalty do not map** (drop "seed N" from the remote sampling
+  summary). All tests offline via wiremock (the agent's `Scripted`
+  streaming completer is the shape; a canned SSE stream drives a real
+  tool round end to end). On-host inference remains the private, free,
+  offline tier — the *patient* tier — and the remote fork is exactly the
+  identity the Serving & scale entry named: yatima orchestrates.
+- **Browser-client near-term queue (distilled from local working plans,
+  2026-07-13; full execution scripts held outside the repo per the
+  plans-are-ephemeral convention).** In order, after the remote
+  Completer: (3) **live-turn telemetry** — a `Phase { Thinking,
+  Calling(tool), ToolRunning, Answering }` sum + fragment count *inside*
+  `Turn::Live` (derived by the fold, natively testable), wall clock on
+  the view plane via egui time, status line reading `⚙ read_page · 1:03`
+  — born of watching minutes-long turns behind a mute spinner; (4)
+  **light up the web app** — the TUI's HAL breathing eye (`a1cd059`)
+  resurrected as a painted egui widget dressed in the aurora ramp (GUI's
+  `aurora_at` ported to true RGB), phase driving tempo, plus Source Code
+  Pro embedded exactly as the GUI does and text styles raised to ~16px
+  body (the user's standing tastes); (5) **replay on connect** — a
+  reload wipes the mirror while the host holds the truth; a `Backfill`
+  request re-emits the committed session as ordinary events (user turns
+  + final answers + persisted artifact files; reasoning folds are
+  ephemeral by design, AGENT-3), which is also the event-log primitive
+  the MathBox-style timeline (GPU-frontend entry) re-folds.
 - **Speculative decoding over the wire (idea, 2026-07-12).** Provenance in
   the vision log (`notes/vision.md`, 2026-07-12): proposed by a compilers/PL
   friend after the spike's phone demo. The idea: run a featherweight drafter
