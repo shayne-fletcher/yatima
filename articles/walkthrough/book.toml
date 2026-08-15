@@ -1,0 +1,9 @@
+[book]
+authors = ["Shayne Fletcher"]
+language = "en"
+src = "src"
+title = "The Yatima Maintainer Walkthrough"
+
+[output.html]
+git-repository-url = "https://github.com/shayne-fletcher/yatima"
+edit-url-template = "https://github.com/shayne-fletcher/yatima/edit/main/articles/walkthrough/src/{path}"
