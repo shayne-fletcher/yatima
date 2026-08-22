@@ -10,15 +10,18 @@
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use tracing_subscriber::EnvFilter;
 use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
-    ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir, ModelId,
-    ModelProfile, ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage,
-    ReasoningSplitter, Sampling, ToolCallCodec, Tools, WebOrigins,
+    ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir,
+    LlamaServerCompleter, LlamaServerConfig, ModelId, ModelProfile, ModelSource, PlainTemplate,
+    PromptTemplate, QwenToolCall, ReadFile, ReadPage, ReasoningSplitter, Sampling, ToolCallCodec,
+    Tools, WebOrigins,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -148,8 +151,27 @@ struct AgentArgs {
     verbose: bool,
 }
 
+/// Which inference backend serves a chat session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum BackendArg {
+    /// The local Candle engine: resolves and loads the model in-process.
+    Engine,
+    /// An already-running llama-server, attached via `--server-url`. Requires
+    /// an explicit `--format` (there is no local model to infer one from) and
+    /// never touches the model cache.
+    LlamaServer,
+}
+
 #[derive(clap::Args)]
 struct ChatArgs {
+    /// Inference backend: the local Candle engine (default) or an attached
+    /// llama-server.
+    #[arg(long, value_enum, default_value = "engine")]
+    backend: BackendArg,
+    /// Base URL of a running llama-server (e.g. `http://127.0.0.1:8080`), for
+    /// `--backend llama-server`.
+    #[arg(long)]
+    server_url: Option<String>,
     /// A built-in model profile (e.g. `kimi-dev`, `deepseek-r1`): sets the model,
     /// chat format, and generation defaults. A reasoning profile raises the token
     /// budget and enables sampling. Replaces `--model`/`--repo`; an explicit
@@ -253,6 +275,35 @@ async fn chat(args: ChatArgs) -> Result<()> {
         None => None,
     };
 
+    let base = GenOpts {
+        max_tokens: args.max_tokens,
+        sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
+        prefill_chunk: args.prefill_chunk,
+        ..Default::default()
+    };
+    let opts = match &profile {
+        Some(p) => p.apply_gen_overrides(base),
+        None => base,
+    };
+
+    // Attached llama-server: the transport swap the `Completer` seam exists
+    // for. No model resolution and no Candle initialization happen on this
+    // path; the argument matrix is enforced by `attached_chat_config`.
+    if args.backend == BackendArg::LlamaServer {
+        let (url, format) = attached_chat_config(&args, profile.as_ref())?;
+        eprintln!("attached llama-server at {url} [{}]", format.name());
+        let mut completer = LlamaServerCompleter::new(LlamaServerConfig::new(url))?;
+        return run_chat(
+            &mut completer,
+            format.template(),
+            opts,
+            args.system,
+            args.prompt,
+            format.pre_seeds_reasoning(),
+        )
+        .await;
+    }
+
     let dir = match &profile {
         Some(p) => p.to_source(args.offline)?.resolve()?,
         None => ModelSource::from_args(
@@ -279,58 +330,125 @@ async fn chat(args: ChatArgs) -> Result<()> {
     if let Some(m) = mismatch {
         eprintln!("warning: {m}");
     }
-    let template = format.template();
-    let base = GenOpts {
-        max_tokens: args.max_tokens,
-        sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
-        prefill_chunk: args.prefill_chunk,
-        ..Default::default()
-    };
-    let opts = match &profile {
-        Some(p) => p.apply_gen_overrides(base),
-        None => base,
-    };
+    run_chat(
+        &mut engine,
+        format.template(),
+        opts,
+        args.system,
+        args.prompt,
+        format.pre_seeds_reasoning(),
+    )
+    .await
+}
 
-    let system = args.system;
-    let mut session = ChatSession::new(&mut engine, template).with_opts(opts);
+/// Resolve the attached-server argument matrix: `--backend llama-server`
+/// requires `--server-url` and an explicit format (flag or profile — there is
+/// no local architecture to infer from), and rejects local model sources so
+/// the model cache is demonstrably untouched. Pure, so the matrix is
+/// unit-testable.
+fn attached_chat_config(
+    args: &ChatArgs,
+    profile: Option<&ModelProfile>,
+) -> Result<(String, ChatFormat)> {
+    let url = args.server_url.clone().ok_or_else(|| {
+        anyhow::anyhow!("--backend llama-server requires --server-url (the server to attach to)")
+    })?;
+    let format = args
+        .format
+        .or_else(|| profile.and_then(|p| p.format()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--backend llama-server requires --format: with no local model there \
+                 is no architecture to infer a chat format from"
+            )
+        })?;
+    if args.model.is_some()
+        || args.repo.is_some()
+        || args.models_dir.is_some()
+        || args.gguf.is_some()
+    {
+        anyhow::bail!(
+            "--model/--repo/--models-dir/--gguf are not used with --backend \
+             llama-server: the attached server owns the model"
+        );
+    }
+    Ok((url, format))
+}
+
+/// The shared chat tail: the local `Engine` and an attached llama-server
+/// drive the same `ChatSession`; the arms differ only in who implements
+/// [`Completer`]. One-shot `--prompt` dogfoods the batch embedding API;
+/// omitting it opens the streaming REPL.
+async fn run_chat<C: Completer>(
+    completer: &mut C,
+    template: Box<dyn PromptTemplate>,
+    opts: GenOpts,
+    system: Option<String>,
+    prompt: Option<String>,
+    pre_seeds: bool,
+) -> Result<()> {
+    let mut session = ChatSession::new(completer, template).with_opts(opts);
     if let Some(sys) = system {
         session = session.with_system(sys);
     }
-    match args.prompt {
-        // One-shot: dogfood the library `ChatSession` (batch). Memory isn't
-        // needed for a single turn, but this exercises the public embedding API.
+    match prompt {
         Some(prompt) => {
             println!("{}", session.turn_async(&prompt).await?);
         }
-        // Interactive: stream each turn through the same `ChatSession`, fully
-        // dogfooding the library's streaming API (`turn_streaming_async`).
-        None => chat_repl(session, format.pre_seeds_reasoning()).await?,
+        None => chat_repl(session, pre_seeds).await?,
     }
     Ok(())
 }
 
-/// Interactive multi-turn loop over a library [`ChatSession`]: `you> ` prompt,
-/// stdin line by line, the answer streamed to stdout token-by-token via
+/// Interactive multi-turn loop over a library [`ChatSession`]: a terminal gets
+/// editable input with in-memory Up/Down history; redirected stdin retains plain
+/// line reads. Answers stream to stdout token-by-token via
 /// [`ChatSession::turn_streaming`]. A reasoning model's chain-of-thought is
 /// routed through a [`ReasoningSplitter`] and dimmed (on a terminal), so the
 /// answer stands out and the markers never print (REASON-1). `pre_seeds` selects
 /// the splitter mode for a format whose cue opens the think block (DeepSeek).
-/// EOF (Ctrl-D) or `/exit` ends the session; `/reset` clears history.
+/// EOF (Ctrl-D) or `/exit` ends the session; `/reset` clears model history but
+/// leaves input recall intact.
 async fn chat_repl<C: Completer, T: PromptTemplate>(
     mut session: ChatSession<'_, C, T>,
     pre_seeds: bool,
 ) -> Result<()> {
     let stdin = std::io::stdin();
+    let mut editor = if stdin.is_terminal() {
+        Some(DefaultEditor::new().context("initialize chat line editor")?)
+    } else {
+        None
+    };
     let color = std::io::stdout().is_terminal();
     eprintln!("entering chat — /exit to quit, /reset to clear history");
     loop {
-        eprint!("\nyou> ");
-        std::io::stderr().flush()?;
-        let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
-            eprintln!("\nbye");
-            break; // EOF / Ctrl-D
-        }
+        let line = match editor.as_mut() {
+            Some(editor) => {
+                eprintln!();
+                match editor.readline("you> ") {
+                    Ok(line) => line,
+                    Err(ReadlineError::Interrupted) => {
+                        eprintln!("(input cancelled)");
+                        continue;
+                    }
+                    Err(ReadlineError::Eof) => {
+                        eprintln!("bye");
+                        break;
+                    }
+                    Err(error) => return Err(error).context("read chat input"),
+                }
+            }
+            None => {
+                eprint!("\nyou> ");
+                std::io::stderr().flush()?;
+                let mut line = String::new();
+                if stdin.read_line(&mut line)? == 0 {
+                    eprintln!("\nbye");
+                    break;
+                }
+                line
+            }
+        };
         let line = line.trim();
         match line {
             "" => continue,
@@ -344,6 +462,11 @@ async fn chat_repl<C: Completer, T: PromptTemplate>(
                 continue;
             }
             _ => {}
+        }
+        if let Some(editor) = editor.as_mut() {
+            editor
+                .add_history_entry(line)
+                .context("record chat input history")?;
         }
         let mut stdout = std::io::stdout();
         let mut splitter = if pre_seeds {
@@ -643,6 +766,78 @@ mod tests {
         assert!(
             Cli::try_parse_from(["yatima", "chat", "--repo", "x/y", "--format", "llama3"]).is_err()
         );
+    }
+
+    fn chat_args(argv: &[&str]) -> ChatArgs {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Command::Chat(args) = cli.command else {
+            panic!("expected the chat subcommand");
+        };
+        args
+    }
+
+    #[test]
+    fn chat_backend_defaults_to_the_local_engine() {
+        let args = chat_args(&["yatima", "chat", "--repo", "x/y"]);
+        assert_eq!(args.backend, BackendArg::Engine);
+    }
+
+    #[test]
+    fn chat_parses_an_attached_llama_server() {
+        let args = chat_args(&[
+            "yatima",
+            "chat",
+            "--backend",
+            "llama-server",
+            "--server-url",
+            "http://127.0.0.1:8080",
+            "--format",
+            "muse-glimmer",
+        ]);
+        assert_eq!(args.backend, BackendArg::LlamaServer);
+        let (url, format) = attached_chat_config(&args, None).unwrap();
+        assert_eq!(url, "http://127.0.0.1:8080");
+        assert_eq!(format, ChatFormat::MuseGlimmer);
+    }
+
+    #[test]
+    fn attached_backend_requires_url_and_format() {
+        // The argument matrix: attached mode has no local model, so neither
+        // the server nor the format can be inferred — both are required.
+        let args = chat_args(&["yatima", "chat", "--backend", "llama-server"]);
+        let err = attached_chat_config(&args, None).unwrap_err();
+        assert!(err.to_string().contains("--server-url"));
+
+        let args = chat_args(&[
+            "yatima",
+            "chat",
+            "--backend",
+            "llama-server",
+            "--server-url",
+            "http://127.0.0.1:8080",
+        ]);
+        let err = attached_chat_config(&args, None).unwrap_err();
+        assert!(err.to_string().contains("--format"));
+    }
+
+    #[test]
+    fn attached_backend_rejects_local_model_sources() {
+        // Attached mode must demonstrably never touch the model cache: local
+        // source flags are contradictions, not silently ignored.
+        let args = chat_args(&[
+            "yatima",
+            "chat",
+            "--backend",
+            "llama-server",
+            "--server-url",
+            "http://127.0.0.1:8080",
+            "--format",
+            "qwen",
+            "--repo",
+            "x/y",
+        ]);
+        let err = attached_chat_config(&args, None).unwrap_err();
+        assert!(err.to_string().contains("not used with"));
     }
 
     #[test]

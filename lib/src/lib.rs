@@ -48,6 +48,11 @@
 //!   (temperature, with optional `top_p` nucleus truncation); **SAM-2** `Greedy`
 //!   ignores any seed, while a seeded `Sample` is reproducible — the seed is
 //!   threaded through to the sampler (gated e2e `seeded_sampling_is_reproducible`).
+//! - **SAM-3** a backend adapter preserves Yatima's requested sampling policy:
+//!   every backend sampler knob that can change the distribution is either set
+//!   from Yatima's policy or explicitly neutralized; backend defaults never
+//!   participate silently. The llama-server request-shape test is the dynamic
+//!   witness.
 //! - **STOP-1** every successful generation returns exactly one [`StopReason`].
 //! - **GEN-3** a generation emits at most `max_tokens` tokens.
 //! - **GE-1** stateless: repeated `Greedy` runs on the same engine + prompt are
@@ -125,6 +130,21 @@
 //!   spawned), so no global `Send` bound is imposed (`async_fn_in_trait` is
 //!   `#[allow]`ed with that rationale). Contrast [`Tool`], which is `dyn` +
 //!   spawned, hence `#[async_trait]` + `Send`.
+//! - **LSRV-3** llama-server stop fidelity: returned and streamed text includes
+//!   a matched caller-supplied stop marker even though the server excludes it
+//!   from content (re-appended from the final event's `stopping_word`), and a
+//!   word stop that names no marker — or names one the caller never supplied —
+//!   is a protocol error, never a quiet `Stopped`. EOS is not required to
+//!   appear in text (an EOS-ended turn carries no marker).
+//! - **LSRV-4** llama-server stream cancellation: once the response stream is
+//!   established, cancellation is observed within a bounded interval whether
+//!   the server is silent (the pending read is raced against a tick) or
+//!   continuously producing (the flag is polled per chunk and per buffered
+//!   event); the result carries only pre-cancellation text, with `Stopped`.
+//!   Scoped to the established stream — cancellation around the initial
+//!   `send()` is recorded stage-2 debt (plans/llama-server.plan.md). LSRV-1
+//!   (child lifecycle) and LSRV-2 (loopback) register with stage 2, when
+//!   their obligations gain implementations.
 //!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
@@ -256,11 +276,21 @@
 //!   tokenizer adds one (Gemma `<bos>`, Mistral `<s>`) — never double-BOS.
 //! - **TMPL-2** for a model with no system role (Gemma, Mistral), system text is
 //!   folded into the first user turn rather than emitted as a system turn.
-//! - **REASON-1** a reasoning model's chain-of-thought is split off at the
-//!   completion→turn boundary ([`split_reasoning`]): it never enters the
-//!   transcript re-rendered into the next prompt, and the surfaced answer is the
-//!   post-reasoning text. The split recognizes every known marker dialect and is
-//!   the identity when none is present (safe for any model/format).
+//! - **REASON-1** every active response-framing protocol separates reasoning
+//!   from answer text at the completion→turn boundary: reasoning and protocol
+//!   framing never enter the committed transcript re-rendered into a later
+//!   prompt, and a reply with **no** answer text (all reasoning/framing — a
+//!   truncated think block, a Muse turn that never reaches `to=user`) commits
+//!   nothing at all. The boundary is [`PromptTemplate::interpret_response`] —
+//!   owned by the same template that renders the prompt, so each protocol has
+//!   one definition of its *final* interpretation (live-stream display is
+//!   classified separately until the stage-3 streaming interpreter).
+//!   Implementations: the marker-dialect splitter ([`split_reasoning`],
+//!   identity when no marker is present; an unterminated opener classifies as
+//!   reasoning), its seeded variant (`split_seeded_reasoning`, crate-private,
+//!   used by the pre-seeded templates — a close-less reply never left the
+//!   think block), and the Muse ATEM interpreter ([`MuseGlimmerTemplate`]'s
+//!   override).
 //! - **CHAT-1** a [`ChatSession`] turn is atomic: if its completion errors, the
 //!   user turn is rolled back so the transcript is unchanged. A failed turn never
 //!   poisons the session — a later turn re-renders clean history and succeeds.
@@ -270,6 +300,7 @@
 //!   re-enters a prompt (cited by `a_degenerate_turn_is_not_committed`).
 
 mod agent;
+mod backend;
 mod cancel;
 mod capability;
 mod chat;
@@ -285,6 +316,7 @@ mod tool;
 mod transcript;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
+pub use backend::{LlamaServerCompleter, LlamaServerConfig};
 pub use cancel::Cancel;
 pub use capability::{origins_in, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir};
 pub use chat::{looks_degenerate, ChatSession};
@@ -303,7 +335,7 @@ pub use reasoning::{split_reasoning, strip_reasoning, Channel, Reasoned, Reasoni
 pub use runtime::run_blocking;
 pub use template::{
     ChatMlTemplate, ChatMlThinkTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate,
-    MistralTemplate, PlainTemplate, PromptTemplate,
+    MistralTemplate, MuseGlimmerTemplate, PlainTemplate, PromptTemplate, ReasoningStrength,
 };
 pub use tool::{
     ImageListing, JsonToolCall, ListDir, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile,

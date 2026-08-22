@@ -879,6 +879,15 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                     );
                     StopReason::MaxTokens
                 }
+                AgentStop::NoAnswer => {
+                    note(
+                        ToolNoteKind::Warning,
+                        "the model produced no answer text (reasoning-only reply; \
+                         nothing committed)"
+                            .to_string(),
+                    );
+                    StopReason::Stopped
+                }
             };
             let _ = event_tx.send(HostEvent::Done {
                 turn_id,

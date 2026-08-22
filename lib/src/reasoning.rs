@@ -48,9 +48,13 @@ pub struct Reasoned {
 ///
 /// The answer is everything after the **last** recognized close marker; the span
 /// before it (minus the open marker, if present) is the reasoning. With no
-/// recognized marker this is the identity: the whole trimmed text is the answer
-/// and `reasoning` is `None`. An unterminated open marker (no close) is also
-/// treated as no split — content is never lost to a half-emitted marker.
+/// marker at all this is the identity: the whole trimmed text is the answer and
+/// `reasoning` is `None`. An **unterminated** open marker (no close — a
+/// truncated chain-of-thought) classifies everything after the opener as
+/// reasoning and only the prefix before it (usually empty) as answer: a
+/// half-emitted think block must never leak into the committed answer
+/// (REASON-1), and no content is lost — the span is surfaced as `reasoning`,
+/// and an empty answer commits nothing at the chat/agent boundary.
 ///
 /// A trailing tool call (`<tool_call>…`) sits after the close marker, so it
 /// stays in `answer` and the agent codec still parses it.
@@ -64,10 +68,27 @@ pub fn split_reasoning(text: &str) -> Reasoned {
         .max_by_key(|(_, close_at)| *close_at);
 
     match split {
-        None => Reasoned {
-            reasoning: None,
-            answer: text.trim().to_string(),
-        },
+        None => {
+            // No close marker: either no reasoning at all (identity), or a
+            // truncated span opened and never closed (earliest opener wins).
+            let opened = DIALECTS
+                .iter()
+                .filter_map(|d| text.find(d.open).map(|open_at| (d, open_at)))
+                .min_by_key(|(_, open_at)| *open_at);
+            match opened {
+                None => Reasoned {
+                    reasoning: None,
+                    answer: text.trim().to_string(),
+                },
+                Some((dialect, open_at)) => {
+                    let reasoning = text[open_at + dialect.open.len()..].trim();
+                    Reasoned {
+                        reasoning: (!reasoning.is_empty()).then(|| reasoning.to_string()),
+                        answer: text[..open_at].trim().to_string(),
+                    }
+                }
+            }
+        }
         Some((dialect, close_at)) => {
             let answer = text[close_at + dialect.close.len()..].trim().to_string();
             let before = &text[..close_at];
@@ -90,6 +111,25 @@ pub fn split_reasoning(text: &str) -> Reasoned {
             );
             reasoned
         }
+    }
+}
+
+/// [`split_reasoning`] for a **pre-seeded** cue (REASON-1): the prompt already
+/// opened the reasoning block (`<think>` in the cue — DeepSeek, QwenThink), so
+/// the model's output begins *inside* it and normally carries only the close
+/// marker. With a close marker present this is the ordinary split; without
+/// one, the reply never left the block — a truncated chain-of-thought — so the
+/// whole text is reasoning and the answer is empty (and an empty answer
+/// commits nothing at the chat/agent boundary). The streaming twin is
+/// [`ReasoningSplitter::seeded`]; final and streaming classification agree.
+pub(crate) fn split_seeded_reasoning(text: &str) -> Reasoned {
+    if DIALECTS.iter().any(|d| text.contains(d.close)) {
+        return split_reasoning(text);
+    }
+    let reasoning = text.trim();
+    Reasoned {
+        reasoning: (!reasoning.is_empty()).then(|| reasoning.to_string()),
+        answer: String::new(),
     }
 }
 
@@ -290,10 +330,40 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_open_is_left_intact() {
+    fn unterminated_reasoning_never_reaches_the_answer() {
+        // upholds: REASON-1 — a truncated chain-of-thought (opened, never
+        // closed) is reasoning, not answer: committing it would replay the
+        // think block into every later prompt. The span is surfaced, the
+        // answer is the (empty) prefix, and an empty answer commits nothing
+        // at the chat/agent boundary.
         let r = split_reasoning("<think>still thinking");
-        assert_eq!(r.reasoning, None);
-        assert_eq!(r.answer, "<think>still thinking");
+        assert_eq!(r.reasoning.as_deref(), Some("still thinking"));
+        assert_eq!(r.answer, "");
+
+        // A non-empty prefix before the opener survives as the answer.
+        let r = split_reasoning("Sure.<think>truncated");
+        assert_eq!(r.reasoning.as_deref(), Some("truncated"));
+        assert_eq!(r.answer, "Sure.");
+    }
+
+    #[test]
+    fn seeded_split_treats_a_closed_reply_normally() {
+        let r = split_seeded_reasoning("thinking</think>the answer");
+        assert_eq!(r.reasoning.as_deref(), Some("thinking"));
+        assert_eq!(r.answer, "the answer");
+    }
+
+    #[test]
+    fn seeded_truncation_is_all_reasoning() {
+        // upholds: REASON-1 — under a pre-seeded cue a reply with no close
+        // marker never left the think block: nothing may surface as answer,
+        // and the empty answer commits nothing downstream.
+        let r = split_seeded_reasoning("half a thought, then the budget");
+        assert_eq!(
+            r.reasoning.as_deref(),
+            Some("half a thought, then the budget")
+        );
+        assert_eq!(r.answer, "");
     }
 
     #[test]

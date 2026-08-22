@@ -24,7 +24,7 @@
 //! [`Agent`]: crate::Agent
 
 use crate::completer::Completer;
-use crate::reasoning::{split_reasoning, Reasoned};
+use crate::reasoning::Reasoned;
 use crate::template::PromptTemplate;
 use crate::transcript::{Role, Turn};
 use crate::{Cancel, GenOpts, StopReason};
@@ -114,18 +114,26 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         };
         self.last_stop = Some(completion.stop);
         // Keep only the answer in history; the reasoning span is surfaced via
-        // `last_reasoning`, never re-fed into the next prompt (REASON-1).
-        let Reasoned { reasoning, answer } = split_reasoning(&completion.text);
+        // `last_reasoning`, never re-fed into the next prompt (REASON-1). The
+        // template owns the *final* interpretation — the same format that
+        // renders the prompt reads the completed reply (marker dialects by
+        // default; ATEM addressing for Muse). Live streams are classified
+        // separately until the stage-3 streaming interpreter unifies them.
+        let Reasoned { reasoning, answer } = self.template.interpret_response(&completion.text);
         self.last_reasoning = reasoning;
-        // A degenerate answer never enters history (CHAT-2): committed garbage
-        // re-renders into every later prompt and poisons the session. The
-        // exchange rolls back whole, as CHAT-1 does on error; the text is
-        // still handed back (stashed outside the transcript) so the caller
-        // can show what happened.
-        if looks_degenerate(&answer) {
+        // An empty answer — a reply that was all reasoning or framing, e.g. a
+        // truncated Muse turn that never reached `to=user`, or an unterminated
+        // think block — commits nothing (REASON-1): an empty assistant turn in
+        // history is protocol residue. A degenerate answer likewise never
+        // enters history (CHAT-2): committed garbage re-renders into every
+        // later prompt and poisons the session. Either way the exchange rolls
+        // back whole, as CHAT-1 does on error; the text is still handed back
+        // (stashed outside the transcript) so the caller can show what
+        // happened.
+        if answer.is_empty() || looks_degenerate(&answer) {
             tracing::warn!(
                 chars = answer.chars().count(),
-                "final answer looks degenerate; exchange not committed (CHAT-2)"
+                "final answer empty or degenerate; exchange not committed (CHAT-2, REASON-1)"
             );
             self.turns.pop();
             self.uncommitted = answer;
@@ -188,17 +196,18 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         };
         self.last_stop = Some(completion.stop);
         // The live `on_token` stream is raw (reasoning tokens included; a
-        // channel-tagged stream is a follow-up), but the stored turn is
-        // answer-only so history stays clean (REASON-1).
-        let Reasoned { reasoning, answer } = split_reasoning(&completion.text);
+        // channel-tagged stream is stage 3's), but the stored turn is
+        // answer-only so history stays clean (REASON-1) — the template owns
+        // its format's *final* interpretation, shared with the batch path.
+        let Reasoned { reasoning, answer } = self.template.interpret_response(&completion.text);
         self.last_reasoning = reasoning;
-        // CHAT-2: a degenerate answer rolls the exchange back (see
-        // `turn_async`); the streamed tokens cannot be un-emitted, but the
-        // stored history stays clean.
-        if looks_degenerate(&answer) {
+        // REASON-1 / CHAT-2: an empty or degenerate answer rolls the exchange
+        // back (see `turn_async`); the streamed tokens cannot be un-emitted,
+        // but the stored history stays clean.
+        if answer.is_empty() || looks_degenerate(&answer) {
             tracing::warn!(
                 chars = answer.chars().count(),
-                "final answer looks degenerate; exchange not committed (CHAT-2)"
+                "final answer empty or degenerate; exchange not committed (CHAT-2, REASON-1)"
             );
             self.turns.pop();
             self.uncommitted = answer;
@@ -364,6 +373,133 @@ mod tests {
                 stop: StopReason::Eos,
             })
         }
+    }
+
+    const MUSE_REPLY_1: &str = " to=self<|message|>User wants a river. Nile is canonical.\
+                                <|start|>assistant to=user<|message|>The Nile.";
+
+    #[test]
+    fn muse_atem_reply_commits_answer_only_across_turns() {
+        // upholds: REASON-1 — the 2026-08-21 correction-pass regression: the
+        // raw ATEM envelope was previously committed whole as the assistant
+        // turn and re-nested inside the next render's `to=user` message. The
+        // template's single interpretation governs both the surfaced answer
+        // and the committed turn.
+        let mut c = Scripted::new(&[MUSE_REPLY_1, " to=user<|message|>The Amazon."]);
+        {
+            let mut s = ChatSession::new(&mut c, crate::MuseGlimmerTemplate::default());
+            let a1 = s.turn("Name a river.").unwrap();
+            assert_eq!(a1, "The Nile.", "surfaced answer is the to=user body");
+            assert_eq!(
+                s.last_reasoning(),
+                Some("User wants a river. Nile is canonical.")
+            );
+            assert_eq!(s.turn("Another?").unwrap(), "The Amazon.");
+        }
+        // The second rendered prompt: the previous answer exactly once, as a
+        // clean `to=user` turn agreeing with what the caller was handed — no
+        // replayed reasoning, no nested envelope.
+        let prompt = &c.last_prompt;
+        assert_eq!(prompt.matches("The Nile.").count(), 1);
+        assert!(prompt.contains("<|start|>assistant to=user<|message|>The Nile.<|eot|>"));
+        assert!(
+            !prompt.contains("to=self"),
+            "no reasoning in history: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<|message|> to="),
+            "no nested ATEM envelope: {prompt}"
+        );
+    }
+
+    #[test]
+    fn muse_truncated_reply_commits_nothing() {
+        // upholds: REASON-1 — the observed Glimmer failure mode: a turn that
+        // ends after `to=self` reasoning without ever addressing the user has
+        // no answer. Nothing may enter history — not the reasoning, and not
+        // an empty assistant turn; the exchange rolls back whole.
+        let mut c = Scripted::new(&[" to=self<|message|>only thinking", " to=user<|message|>Ok."]);
+        {
+            let mut s = ChatSession::new(&mut c, crate::MuseGlimmerTemplate::default());
+            let a1 = s.turn("Name a river.").unwrap();
+            assert_eq!(a1, "", "no answer text was addressed to the user");
+            assert_eq!(s.last_reasoning(), Some("only thinking"));
+            assert_eq!(s.turn("Another?").unwrap(), "Ok.");
+        }
+        let prompt = &c.last_prompt;
+        assert!(!prompt.contains("only thinking"), "no reasoning: {prompt}");
+        assert!(
+            !prompt.contains("to=user<|message|><|eot|>"),
+            "no empty assistant turn: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Name a river."),
+            "the truncated exchange rolled back whole: {prompt}"
+        );
+    }
+
+    #[test]
+    fn seeded_truncated_reply_commits_nothing() {
+        // upholds: REASON-1 — under a pre-seeded cue (QwQ/DeepSeek) a turn
+        // truncated inside the think block carries no markers at all; the
+        // seeded final interpreter classifies it all as reasoning and the
+        // empty answer rolls the exchange back. A closed reply commits
+        // normally.
+        let mut c = Scripted::new(&["half a thought", "</think>recovered"]);
+        {
+            let mut s = ChatSession::new(&mut c, crate::ChatMlThinkTemplate);
+            assert_eq!(s.turn("hi").unwrap(), "");
+            assert_eq!(s.last_reasoning(), Some("half a thought"));
+            assert_eq!(s.turn("again").unwrap(), "recovered");
+        }
+        assert!(!c.last_prompt.contains("half a thought"));
+    }
+
+    #[test]
+    fn unterminated_think_reply_commits_nothing() {
+        // upholds: REASON-1 — the marker-dialect twin of the Muse truncation
+        // case: an unterminated think block is reasoning, and the resulting
+        // empty answer leaves history untouched.
+        let mut c = Scripted::new(&["<think>partial thought", "recovered"]);
+        {
+            let mut s = ChatSession::new(&mut c, PlainTemplate);
+            let a1 = s.turn("hi").unwrap();
+            assert_eq!(a1, "");
+            assert_eq!(s.last_reasoning(), Some("partial thought"));
+            assert_eq!(s.turn("again").unwrap(), "recovered");
+        }
+        assert!(!c.last_prompt.contains("partial thought"));
+        assert!(!c.last_prompt.contains("<think>"));
+    }
+
+    #[tokio::test]
+    async fn muse_streaming_turn_commits_via_the_final_interpretation() {
+        // upholds: REASON-1 — scope: *final* interpretation and commit. The
+        // streaming and batch paths share the template's one final
+        // interpretation for the returned answer and the stored turn. The
+        // live token stream is deliberately raw in stage 1 (the CLI's
+        // marker-only splitter does not classify ATEM); unifying display is
+        // stage 3's streaming interpreter, not this test's claim.
+        let mut c = Scripted::new(&[MUSE_REPLY_1]);
+        let mut s = ChatSession::new(&mut c, crate::MuseGlimmerTemplate::default());
+        let mut streamed = String::new();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            s.turn_streaming_async("Name a river.", &mut |t| streamed.push_str(t)),
+        )
+        .await
+        .expect("bounded")
+        .unwrap()
+        .to_string();
+        assert_eq!(answer, "The Nile.");
+        assert!(
+            streamed.contains("to=self"),
+            "the live stream is raw in stage 1: {streamed}"
+        );
+        assert_eq!(
+            s.last_reasoning(),
+            Some("User wants a river. Nile is canonical.")
+        );
     }
 
     /// A [`Completer`] that errors on its first call, then succeeds — so we can

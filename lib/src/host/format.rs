@@ -6,7 +6,7 @@
 
 use crate::{
     Arch, ChatMlTemplate, ChatMlThinkTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate,
-    MistralTemplate, PlainTemplate, PromptTemplate,
+    MistralTemplate, MuseGlimmerTemplate, PlainTemplate, PromptTemplate,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -33,6 +33,12 @@ pub enum ChatFormat {
     /// `<|im_start|>assistant\n<think>\n`, so the model emits only the closing
     /// `</think>` (chat only; reasoning model).
     QwenThink,
+    /// Muse Glimmer's ATEM format: `<|start|>role<|message|>…<|eot|>` turns
+    /// (text-chat subset — chat only in stage 1; the model's addressed output
+    /// streams raw until the ATEM interpreter lands in stage 3). Served via
+    /// the llama-server backend — no local `Arch` maps to it.
+    #[serde(rename = "muse-glimmer")]
+    MuseGlimmer,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
     Plain,
 }
@@ -40,13 +46,14 @@ pub enum ChatFormat {
 impl ChatFormat {
     /// Every format's name, in declaration order — the accepted spellings for
     /// [`FromStr`] and a ready-made list for a CLI `PossibleValuesParser`.
-    pub const NAMES: [&'static str; 7] = [
+    pub const NAMES: [&'static str; 8] = [
         "qwen",
         "gemma",
         "mistral",
         "glm",
         "deepseek",
         "qwen-think",
+        "muse-glimmer",
         "plain",
     ];
 
@@ -59,6 +66,7 @@ impl ChatFormat {
             ChatFormat::Glm => "glm",
             ChatFormat::DeepSeek => "deepseek",
             ChatFormat::QwenThink => "qwen-think",
+            ChatFormat::MuseGlimmer => "muse-glimmer",
             ChatFormat::Plain => "plain",
         }
     }
@@ -72,6 +80,7 @@ impl ChatFormat {
             ChatFormat::Glm => Box::new(GlmTemplate),
             ChatFormat::DeepSeek => Box::new(DeepSeekTemplate),
             ChatFormat::QwenThink => Box::new(ChatMlThinkTemplate),
+            ChatFormat::MuseGlimmer => Box::new(MuseGlimmerTemplate::default()),
             ChatFormat::Plain => Box::new(PlainTemplate),
         }
     }
@@ -112,6 +121,7 @@ impl FromStr for ChatFormat {
             "glm" => Ok(ChatFormat::Glm),
             "deepseek" => Ok(ChatFormat::DeepSeek),
             "qwen-think" => Ok(ChatFormat::QwenThink),
+            "muse-glimmer" => Ok(ChatFormat::MuseGlimmer),
             "plain" => Ok(ChatFormat::Plain),
             other => anyhow::bail!(
                 "unknown chat format {other:?}; expected one of {:?}",
@@ -272,6 +282,7 @@ mod tests {
             ChatFormat::Glm,
             ChatFormat::DeepSeek,
             ChatFormat::QwenThink,
+            ChatFormat::MuseGlimmer,
         ] {
             assert!(!fmt.supports_tools());
         }
@@ -297,6 +308,26 @@ mod tests {
                 "format {name}: template-seeds-<think> ({template_seeds_think}) must \
                  equal pre_seeds_reasoning() ({})",
                 fmt.pre_seeds_reasoning()
+            );
+        }
+    }
+
+    #[test]
+    fn pre_seeded_formats_use_the_seeded_final_interpreter() {
+        // upholds: REASON-1 — a format whose cue opens the think block must
+        // pair it with the seeded *final* interpreter: a truncated reply (no
+        // close marker) is all reasoning, never answer. The streaming side of
+        // the same coupling is pre_seeds_matches_template.
+        for name in ChatFormat::NAMES {
+            let fmt: ChatFormat = name.parse().unwrap();
+            let r = fmt
+                .template()
+                .interpret_response("truncated with no markers");
+            let truncation_is_reasoning = r.answer.is_empty() && r.reasoning.is_some();
+            assert_eq!(
+                truncation_is_reasoning,
+                fmt.pre_seeds_reasoning(),
+                "format {name}: seeded cue ⇔ seeded final interpreter"
             );
         }
     }

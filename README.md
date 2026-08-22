@@ -97,7 +97,7 @@ canary test used to retire the fork on each candle upgrade are documented in
   caveat, GGUF i-quant limits, and the candle fork.
 - [Reasoning models](articles/reasoning-models.md) — think-block splitting,
   profiles, seeded vs. emitted markers.
-- [CLI usage](articles/cli.md) — `generate`, `chat`, and the one-shot agent.
+- [CLI usage](articles/cli.md) — `generate`, `chat`, the one-shot agent, and the attached llama-server workflow.
 - [Embedding](articles/embedding.md) — the library surface and examples.
 - [Auditable research](articles/auditable-research.md) — the SEC/XBRL
   investment-thesis demo and `sieve`.

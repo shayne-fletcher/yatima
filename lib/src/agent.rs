@@ -11,7 +11,7 @@
 //! turn.
 
 use crate::completer::Completer;
-use crate::reasoning::{split_reasoning, Channel, Reasoned, ReasoningSplitter};
+use crate::reasoning::{Channel, Reasoned, ReasoningSplitter};
 use crate::template::PromptTemplate;
 use crate::tool::{
     ToolCall, ToolCallCodec, ToolEvent, ToolOutcome, ToolRejection, ToolResult, Tools,
@@ -64,6 +64,10 @@ pub enum AgentStop {
     MaxSteps,
     /// The caller's fold returned `ControlFlow::Break`.
     Stopped,
+    /// The last reply carried neither a tool call nor any answer text — all
+    /// reasoning or protocol framing, e.g. a truncated turn (REASON-1).
+    /// Nothing was committed; the caller was not told the model answered.
+    NoAnswer,
 }
 
 /// The outcome of a run.
@@ -406,18 +410,27 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             }
             tracing::trace!(step = steps, completion_stop = ?completion.stop,
                 completion = %completion.text, "agent step completion");
-            // Split off the reasoning span at the completion→turn boundary: the
-            // transcript (re-rendered into the next prompt) carries only the
-            // answer, never the chain-of-thought (REASON-1). The reply still
-            // holds any trailing tool call, so the codec parses it below.
+            // Interpret the completed reply at the completion→turn boundary
+            // through the template — REASON-1's declared boundary
+            // (`PromptTemplate::interpret_response`), so a non-marker protocol
+            // override is honored here exactly as in chat. The transcript
+            // (re-rendered into the next prompt) carries only the answer,
+            // never reasoning or framing. The reply still holds any trailing
+            // tool call, so the codec parses it below.
             let Reasoned {
                 reasoning,
                 answer: reply,
-            } = split_reasoning(&completion.text);
-            transcript.push(Turn {
-                role: Role::Assistant,
-                content: reply.clone(),
-            });
+            } = self.template.interpret_response(&completion.text);
+            // A reply with no answer text builds no turn (the Turn contract):
+            // an empty assistant entry would still reach verbose callers via
+            // `Run::transcript` even though nothing was said. Such a reply
+            // carries no tool call either, so the parse below ends the run.
+            if !reply.is_empty() {
+                transcript.push(Turn {
+                    role: Role::Assistant,
+                    content: reply.clone(),
+                });
+            }
             if let Some(reasoning) = reasoning {
                 match step(acc, AgentEvent::Reasoning(reasoning))? {
                     ControlFlow::Continue(a) => acc = a,
@@ -433,6 +446,15 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 // A plain answer: the run is done (the reasoning span, if any, has
                 // already been stripped from `reply`).
                 None => {
+                    // No tool call and no answer text — the reply was all
+                    // reasoning or framing (a truncated turn). Emitting
+                    // `Final("")` would tell the caller the model answered;
+                    // it did not (REASON-1). The run ends `NoAnswer` and the
+                    // Final-only gate below leaves history untouched.
+                    if reply.is_empty() {
+                        stop = AgentStop::NoAnswer;
+                        break;
+                    }
                     match step(acc, AgentEvent::Final(reply.clone()))? {
                         ControlFlow::Continue(a) | ControlFlow::Break(a) => acc = a,
                     }
@@ -568,13 +590,16 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         // Persist the exchange into session history only when it completed
         // (AGENT-3): the user turn and the final answer. Interrupted or
         // step-exhausted runs leave history untouched, so the caller can
-        // simply re-ask. A Final answer that looks like decode degeneration
-        // (CHAT-2's judgment) also commits nothing — a poisoned answer
-        // re-rendered into every later prompt poisons the whole session.
-        if stop == AgentStop::Final && crate::chat::looks_degenerate(&answer) {
+        // simply re-ask. A Final answer that is empty (all reasoning or
+        // framing — REASON-1: protocol residue never enters history) or that
+        // looks like decode degeneration (CHAT-2's judgment) also commits
+        // nothing — a poisoned answer re-rendered into every later prompt
+        // poisons the whole session.
+        if stop == AgentStop::Final && (answer.is_empty() || crate::chat::looks_degenerate(&answer))
+        {
             tracing::warn!(
                 chars = answer.chars().count(),
-                "final answer looks degenerate; exchange not committed (AGENT-3)"
+                "final answer empty or degenerate; exchange not committed (AGENT-3, REASON-1)"
             );
         } else if stop == AgentStop::Final {
             self.history.push(Turn {
@@ -799,6 +824,73 @@ mod tests {
             .transcript
             .iter()
             .any(|t| t.role == Role::Tool && t.content.contains("the sky is blue")));
+    }
+
+    #[test]
+    fn agent_commits_through_the_template_interpretation() {
+        // upholds: REASON-1 — the agent honors the template's protocol
+        // override at the completion→turn boundary, not a hardwired marker
+        // split: a Muse ATEM reply commits and answers with the `to=user`
+        // body only. Guards the stage-4 path — with a hardwired split, raw
+        // ATEM would re-enter history the day Muse tools are enabled.
+        let tools = Tools::new();
+        let scripted =
+            [" to=self<|message|>plan the reply<|start|>assistant to=user<|message|>Done."];
+        let mut model = Scripted::new(&scripted);
+        let mut agent = Agent::new(
+            &mut model,
+            &tools,
+            JsonToolCall,
+            crate::MuseGlimmerTemplate::default(),
+            "helper",
+            5,
+        );
+        let run = agent.run("task").unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.answer, "Done.");
+        assert_eq!(agent.history().len(), 2);
+        assert_eq!(agent.history()[1].content, "Done.");
+        assert!(
+            !agent.history()[1].content.contains("to="),
+            "no ATEM framing in history"
+        );
+    }
+
+    #[test]
+    fn an_empty_reply_is_no_answer_not_final() {
+        // upholds: REASON-1 — a reply with no tool call and no answer text (a
+        // turn truncated inside its reasoning) must not masquerade as a final
+        // answer: the run ends NoAnswer, no Final event fires, the run
+        // transcript carries no assistant turn (the Turn contract: no answer
+        // text builds no turn), and history is untouched.
+        let tools = Tools::new();
+        let scripted = [" to=self<|message|>only thinking"];
+        let mut model = Scripted::new(&scripted);
+        let mut agent = Agent::new(
+            &mut model,
+            &tools,
+            JsonToolCall,
+            crate::MuseGlimmerTemplate::default(),
+            "helper",
+            5,
+        );
+        let (events, run) = agent
+            .run_with("task", Vec::new(), |mut acc, event| {
+                acc.push(event);
+                Ok(std::ops::ControlFlow::Continue(acc))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::NoAnswer);
+        assert_eq!(run.answer, "");
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Final(_))),
+            "no Final event fired: {events:?}"
+        );
+        assert!(
+            !run.transcript.iter().any(|t| t.role == Role::Assistant),
+            "no assistant turn in the run transcript"
+        );
+        assert!(agent.history().is_empty(), "nothing entered history");
     }
 
     #[test]

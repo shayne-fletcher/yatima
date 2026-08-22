@@ -8,20 +8,40 @@
 //! [`PlainTemplate`] keeps the minimal layout for models with no known template
 //! and for tests.
 
+use crate::reasoning::{split_reasoning, split_seeded_reasoning, Reasoned};
 use crate::transcript::{Role, Turn};
 
 /// Render a transcript into the prompt string fed to the model, ending with the
 /// cue that makes the model speak next.
 pub trait PromptTemplate {
     fn render(&self, turns: &[Turn]) -> String;
+
+    /// Interpret the model's **completed** reply into reasoning and answer —
+    /// the inverse direction of [`render`](PromptTemplate::render), owned by
+    /// the same format so each protocol has exactly one definition of its
+    /// *final* interpretation (a live token stream is classified separately by
+    /// the streaming layer until the stage-3 streaming interpreter unifies
+    /// them). The default is the marker-based [`split_reasoning`] (`<think>`
+    /// dialects); [`MuseGlimmerTemplate`] overrides it with ATEM
+    /// addressed-message interpretation. `ChatSession` commits only a
+    /// non-empty returned `answer` to history (REASON-1).
+    fn interpret_response(&self, raw: &str) -> Reasoned {
+        split_reasoning(raw)
+    }
 }
 
 /// A boxed template is a template — lets a runtime-chosen `Box<dyn
 /// PromptTemplate>` (e.g. the CLI's `--format`) satisfy generic bounds like
-/// `ChatSession<_, T: PromptTemplate>`.
+/// `ChatSession<_, T: PromptTemplate>`. Forwards **every** method: a default
+/// here would silently strip an override (a boxed Muse template must keep its
+/// ATEM interpretation).
 impl<T: PromptTemplate + ?Sized> PromptTemplate for Box<T> {
     fn render(&self, turns: &[Turn]) -> String {
         (**self).render(turns)
+    }
+
+    fn interpret_response(&self, raw: &str) -> Reasoned {
+        (**self).interpret_response(raw)
     }
 }
 
@@ -74,6 +94,12 @@ pub struct ChatMlThinkTemplate;
 impl PromptTemplate for ChatMlThinkTemplate {
     fn render(&self, turns: &[Turn]) -> String {
         render_chatml(turns, true)
+    }
+
+    /// The cue opened the think block, so a close-less reply is a truncated
+    /// chain-of-thought, not an answer (REASON-1).
+    fn interpret_response(&self, raw: &str) -> Reasoned {
+        split_seeded_reasoning(raw)
     }
 }
 
@@ -237,6 +263,12 @@ const DS_TOOL_OUT_BEGIN: &str = "<\u{ff5c}tool\u{2581}output\u{2581}begin\u{ff5c
 const DS_TOOL_OUT_END: &str = "<\u{ff5c}tool\u{2581}output\u{2581}end\u{ff5c}>";
 
 impl PromptTemplate for DeepSeekTemplate {
+    /// The cue opened the think block, so a close-less reply is a truncated
+    /// chain-of-thought, not an answer (REASON-1).
+    fn interpret_response(&self, raw: &str) -> Reasoned {
+        split_seeded_reasoning(raw)
+    }
+
     fn render(&self, turns: &[Turn]) -> String {
         let mut s = String::from(DS_BOS);
         // System text is hoisted to the front, raw (no wrapper).
@@ -267,6 +299,207 @@ impl PromptTemplate for DeepSeekTemplate {
         s.push_str(DS_ASSISTANT);
         s.push_str("<think>\n");
         s
+    }
+}
+
+/// Muse Glimmer's ATEM chat format — the **text-chat subset** (stage 1 of
+/// plans/llama-server.plan.md): `<|start|>role<|message|>content<|eot|>`
+/// turns and a bare `<|start|>assistant` cue. The full addressed-output
+/// protocol (`to=self` reasoning, `to=<tool>` invocations, `<|eom|>` joins)
+/// is the model's *output* format, interpreted upstream; stage 3 extends
+/// this renderer, it never replaces it.
+///
+/// Byte-checked against the `/apply-template` oracle renders captured from
+/// the official GGUF's embedded template (`tests/fixtures/llama_server/`,
+/// template sha256 in provenance.json). Two behaviors mirror that template
+/// exactly:
+///
+/// - A system turn is normalized ("Reasoning effort" → "Reasoning strength",
+///   four casings) and, unless it already states one, a
+///   `Reasoning strength: {level}.` line is appended; every system block ends
+///   with the advertised recipient list (chat subset: `"self", "user"`).
+/// - With no system turn, the template's default system block is emitted
+///   (assistant greeting + knowledge cutoff). `current_date` is optional and
+///   omitted when `None` so renders stay deterministic for tests — the
+///   upstream template injects the wall-clock date here, which oracle
+///   comparisons must inject explicitly.
+///
+/// Emits no BOS (the oracle renders carry none). A prior assistant turn is
+/// answer-only (REASON-1) and renders as `to=user` with terminal `<|eot|>`. A
+/// `Tool` turn renders as a bare `tool` role for totality; the named-tool
+/// form is stage 4's.
+#[derive(Default)]
+pub struct MuseGlimmerTemplate {
+    /// Rendered as `Reasoning strength: {level}.`; the upstream template's
+    /// default is `high` (the [`ReasoningStrength`] default).
+    pub reasoning_strength: ReasoningStrength,
+    /// `Current date: {date}.` in the default system block; `None` omits the
+    /// line.
+    pub current_date: Option<String>,
+}
+
+/// Muse Glimmer's reasoning-strength directive — the four levels the model is
+/// trained on, as a sum type so an invalid strength is unrepresentable rather
+/// than a string caught (or not) at render time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningStrength {
+    Low,
+    Medium,
+    #[default]
+    High,
+    XHigh,
+}
+
+impl ReasoningStrength {
+    /// The directive spelling the upstream template uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningStrength::Low => "low",
+            ReasoningStrength::Medium => "medium",
+            ReasoningStrength::High => "high",
+            ReasoningStrength::XHigh => "xhigh",
+        }
+    }
+}
+
+const MUSE_START: &str = "<|start|>";
+const MUSE_MESSAGE: &str = "<|message|>";
+const MUSE_EOT: &str = "<|eot|>";
+const MUSE_EOM: &str = "<|eom|>";
+const MUSE_KNOWLEDGE_CUTOFF: &str = "2026-01-04";
+const MUSE_RECIPIENTS: &str = "# Valid recipients: \"self\", \"user\".";
+
+/// Interpret a raw Muse completion — the minimal ATEM reading: addressed
+/// messages, `to=self` (and any other non-user recipient) to the reasoning
+/// span, `to=user` (or unaddressed) to the answer. The generation cue was a
+/// bare `<|start|>assistant`, so the completion *continues* the first header
+/// (` to=self<|message|>…`); restoring the cue makes every segment uniform.
+/// Trailing `<|eot|>`/`<|eom|>` framing is consumed; text with no `<|message|>`
+/// marker at all is a whole-text answer (a model that ignored the protocol
+/// loses nothing). Tool-call payloads are not yet interpreted — an addressed
+/// tool invocation classifies as reasoning, never as answer text.
+fn interpret_atem(raw: &str) -> Reasoned {
+    if !raw.contains(MUSE_MESSAGE) {
+        return Reasoned {
+            reasoning: None,
+            answer: raw.trim().to_string(),
+        };
+    }
+    let full = format!("{MUSE_START}assistant{raw}");
+    let mut reasoning = String::new();
+    let mut answer = String::new();
+    for segment in full.split(MUSE_START) {
+        let Some((header, body)) = segment.split_once(MUSE_MESSAGE) else {
+            continue;
+        };
+        let body = body.strip_suffix(MUSE_EOT).unwrap_or(body);
+        let body = body.strip_suffix(MUSE_EOM).unwrap_or(body);
+        let recipient = header
+            .split_once("to=")
+            .map(|(_, r)| r.trim())
+            .unwrap_or("user");
+        let bucket = if recipient == "user" {
+            &mut answer
+        } else {
+            &mut reasoning
+        };
+        if !bucket.is_empty() {
+            bucket.push('\n');
+        }
+        bucket.push_str(body);
+    }
+    let reasoning = reasoning.trim().to_string();
+    Reasoned {
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        answer: answer.trim().to_string(),
+    }
+}
+
+impl MuseGlimmerTemplate {
+    fn reasoning_line(&self) -> String {
+        format!("Reasoning strength: {}.", self.reasoning_strength.as_str())
+    }
+
+    /// The block the upstream template emits when the caller supplies no
+    /// system message.
+    fn default_system(&self, s: &mut String) {
+        s.push_str(MUSE_START);
+        s.push_str("system");
+        s.push_str(MUSE_MESSAGE);
+        s.push_str("You are a helpful AI assistant.");
+        s.push_str(&format!("\nKnowledge cutoff: {MUSE_KNOWLEDGE_CUTOFF}."));
+        if let Some(date) = &self.current_date {
+            s.push_str(&format!("\nCurrent date: {date}."));
+        }
+        s.push_str("\n\n");
+        s.push_str(&self.reasoning_line());
+        s.push_str("\n\n");
+        s.push_str(MUSE_RECIPIENTS);
+        s.push_str(MUSE_EOT);
+    }
+}
+
+/// The upstream template's normalization of caller-written directives (jinja
+/// has no case-insensitive replace, hence the four realistic casings).
+fn muse_normalize_effort(text: &str) -> String {
+    text.replace("Reasoning effort", "Reasoning strength")
+        .replace("Reasoning Effort", "Reasoning Strength")
+        .replace("reasoning effort", "reasoning strength")
+        .replace("REASONING EFFORT", "REASONING STRENGTH")
+}
+
+impl PromptTemplate for MuseGlimmerTemplate {
+    fn render(&self, turns: &[Turn]) -> String {
+        let mut s = String::new();
+        if !turns.iter().any(|t| t.role == Role::System) {
+            self.default_system(&mut s);
+        }
+        for turn in turns {
+            match turn.role {
+                Role::System => {
+                    let sys = muse_normalize_effort(&turn.content);
+                    s.push_str(MUSE_START);
+                    s.push_str("system");
+                    s.push_str(MUSE_MESSAGE);
+                    s.push_str(&sys);
+                    if !sys.to_lowercase().contains("reasoning strength") {
+                        s.push_str("\n\n");
+                        s.push_str(&self.reasoning_line());
+                    }
+                    s.push_str("\n\n");
+                    s.push_str(MUSE_RECIPIENTS);
+                    s.push_str(MUSE_EOT);
+                }
+                Role::User => {
+                    s.push_str(MUSE_START);
+                    s.push_str("user");
+                    s.push_str(MUSE_MESSAGE);
+                    s.push_str(&turn.content);
+                    s.push_str(MUSE_EOT);
+                }
+                Role::Assistant => {
+                    s.push_str(MUSE_START);
+                    s.push_str("assistant to=user");
+                    s.push_str(MUSE_MESSAGE);
+                    s.push_str(&turn.content);
+                    s.push_str(MUSE_EOT);
+                }
+                Role::Tool => {
+                    s.push_str(MUSE_START);
+                    s.push_str("tool");
+                    s.push_str(MUSE_MESSAGE);
+                    s.push_str(&turn.content);
+                    s.push_str(MUSE_EOT);
+                }
+            }
+        }
+        s.push_str(MUSE_START);
+        s.push_str("assistant");
+        s
+    }
+
+    fn interpret_response(&self, raw: &str) -> Reasoned {
+        interpret_atem(raw)
     }
 }
 
@@ -385,6 +618,170 @@ mod tests {
             "<\u{ff5c}Assistant\u{ff5c}>4<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>"
         ));
         assert!(s.ends_with("<\u{ff5c}Assistant\u{ff5c}><think>\n"));
+    }
+
+    /// The `/apply-template` oracle renders captured in stage 0 (see
+    /// tests/fixtures/llama_server/provenance.json for the template digest
+    /// and capture provenance).
+    const ORACLE1: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llama_server/oracle1-prompt.txt"
+    ));
+    const ORACLE2: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llama_server/oracle2-prompt.txt"
+    ));
+
+    #[test]
+    fn muse_matches_the_oracle_render_byte_for_byte() {
+        // The renderer is checked against the official embedded template via
+        // the stage-0 /apply-template capture, not against our own reading of
+        // the jinja. oracle1: explicit system + user, default strength.
+        let s = MuseGlimmerTemplate::default().render(&[
+            turn(Role::System, "You are a helpful assistant."),
+            turn(Role::User, "What is a river?"),
+        ]);
+        assert_eq!(s, ORACLE1);
+    }
+
+    #[test]
+    fn muse_matches_oracle2_minus_the_reasoning_replay() {
+        // oracle2 exercises effort→strength normalization and multi-turn
+        // history. The upstream render replays prior reasoning as a
+        // `to=self …<|eom|>` message; yatima's transcript is answer-only by
+        // law (REASON-1), so the expectation is the oracle with that one
+        // segment excised — a deliberate subset, not an approximation.
+        let replay =
+            "<|start|>assistant to=self<|message|>User wants any river. Nile is canonical.<|eom|>";
+        let expected = ORACLE2.replacen(replay, "", 1);
+        assert_ne!(expected, ORACLE2, "fixture contains the replay segment");
+        let s = MuseGlimmerTemplate::default().render(&[
+            turn(Role::System, "You are terse.\n\nReasoning effort: low."),
+            turn(Role::User, "Name a river."),
+            turn(Role::Assistant, "The Nile."),
+            turn(Role::User, "Another?"),
+        ]);
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn muse_default_system_is_deterministic_without_a_date() {
+        // With no system turn the default block is emitted; current_date None
+        // omits the date line entirely (the upstream template would inject
+        // wall-clock time — the determinism knob oracle comparisons must set).
+        let s = MuseGlimmerTemplate::default().render(&[turn(Role::User, "hi")]);
+        assert!(s.starts_with(
+            "<|start|>system<|message|>You are a helpful AI assistant.\n\
+             Knowledge cutoff: 2026-01-04.\n\nReasoning strength: high."
+        ));
+        assert!(!s.contains("Current date:"));
+        assert!(s.ends_with("<|start|>assistant"));
+    }
+
+    #[test]
+    fn muse_interprets_addressed_output() {
+        // One definition of the protocol: the same interpretation feeds the
+        // caller-visible answer and the committed turn. gen1's observed shape:
+        // reasoning continues the bare cue, the answer opens a fresh header.
+        let raw = " to=self<|message|>User wants a river. Nile is canonical.\
+                   <|start|>assistant to=user<|message|>The Nile.";
+        let r = interpret_atem(raw);
+        assert_eq!(
+            r.reasoning.as_deref(),
+            Some("User wants a river. Nile is canonical.")
+        );
+        assert_eq!(r.answer, "The Nile.");
+    }
+
+    #[test]
+    fn muse_interpretation_consumes_framing_markers() {
+        // <|eom|> joins in-turn messages; a trailing <|eot|> may survive when
+        // it arrives as a caller stop rather than EOS. Neither reaches text.
+        let raw = " to=self<|message|>thinking<|eom|>\
+                   <|start|>assistant to=user<|message|>Answer.<|eot|>";
+        let r = interpret_atem(raw);
+        assert_eq!(r.reasoning.as_deref(), Some("thinking"));
+        assert_eq!(r.answer, "Answer.");
+    }
+
+    #[test]
+    fn muse_unaddressed_output_is_the_answer() {
+        // A model that ignored the protocol loses nothing: no <|message|>
+        // marker means the whole text is the answer.
+        let r = interpret_atem("Just a plain reply.");
+        assert_eq!(r.reasoning, None);
+        assert_eq!(r.answer, "Just a plain reply.");
+    }
+
+    #[test]
+    fn muse_non_user_recipients_never_reach_the_answer() {
+        // An addressed tool invocation (uninterpreted until stage 4) must not
+        // leak into answer text; conservatively it classifies as reasoning.
+        let raw = " to=self<|message|>plan<|start|>assistant \
+                   to=fs.stat_file<|message|><atem:function_calls>…</atem:function_calls>\
+                   <|start|>assistant to=user<|message|>Done.";
+        let r = interpret_atem(raw);
+        assert_eq!(r.answer, "Done.");
+        let reasoning = r.reasoning.unwrap();
+        assert!(reasoning.contains("plan") && reasoning.contains("atem:function_calls"));
+    }
+
+    #[test]
+    fn seeded_templates_interpret_truncation_as_reasoning() {
+        // upholds: REASON-1 — a pre-seeded cue means a close-less reply never
+        // left the think block; the final interpreter must agree with
+        // ReasoningSplitter::seeded rather than surface the span as answer.
+        for t in [
+            &ChatMlThinkTemplate as &dyn PromptTemplate,
+            &DeepSeekTemplate,
+        ] {
+            let r = t.interpret_response("truncated reasoning only");
+            assert_eq!(r.answer, "");
+            assert_eq!(r.reasoning.as_deref(), Some("truncated reasoning only"));
+        }
+    }
+
+    #[test]
+    fn boxed_template_keeps_its_interpretation() {
+        // upholds: REASON-1 — the CLI carries templates as Box<dyn
+        // PromptTemplate>; the Box impl must forward interpret_response, or a
+        // default would silently strip the Muse override and recommit raw
+        // ATEM.
+        let b: Box<dyn PromptTemplate> = Box::new(MuseGlimmerTemplate::default());
+        let r = b.interpret_response(" to=self<|message|>t<|start|>assistant to=user<|message|>a");
+        assert_eq!(r.answer, "a");
+        assert_eq!(r.reasoning.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn muse_strength_levels_render_their_directive() {
+        // The sum type makes an invalid strength unrepresentable; each level
+        // renders the upstream template's spelling.
+        for (level, spelled) in [
+            (ReasoningStrength::Low, "low"),
+            (ReasoningStrength::Medium, "medium"),
+            (ReasoningStrength::High, "high"),
+            (ReasoningStrength::XHigh, "xhigh"),
+        ] {
+            let t = MuseGlimmerTemplate {
+                reasoning_strength: level,
+                current_date: None,
+            };
+            let s = t.render(&[turn(Role::User, "hi")]);
+            assert!(s.contains(&format!("Reasoning strength: {spelled}.")));
+        }
+    }
+
+    #[test]
+    fn muse_respects_a_caller_stated_strength() {
+        // A system prompt that already states a strength (after
+        // normalization) is not given a second directive line.
+        let s = MuseGlimmerTemplate::default().render(&[
+            turn(Role::System, "Reasoning effort: low."),
+            turn(Role::User, "hi"),
+        ]);
+        assert!(s.contains("Reasoning strength: low."));
+        assert!(!s.contains("Reasoning strength: high."));
     }
 
     #[test]

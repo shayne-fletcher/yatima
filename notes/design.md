@@ -513,10 +513,7 @@ $YATIMA_MODELS_DIR  (else  ${XDG_CACHE_HOME:-~/.cache}/yatima/models)
         config.json  tokenizer.json  *.safetensors  [model.safetensors.index.json]
 ```
 
-This mirrors the layout written by
-[`possum`](https://github.com/shayne-fletcher/possum), our standalone Hugging
-Face downloader: **possum acquires, yatima loads** — agreement by *convention,
-not coupling* (MS-2). `Engine::load` is HF-agnostic (takes a directory).
+This mirrors the layout written by [`possum`](https://github.com/shayne-fletcher/possum), our standalone Hugging Face downloader: **possum acquires, Yatima resolves, the selected backend loads** — agreement by convention, not coupling (MS-2). Yatima owns the exact artifact choice, cache layout, and offline policy even when an external inference backend can download weights itself. `Engine::load` is HF-agnostic and takes a directory; the llama-server backend receives the resolved GGUF path.
 
 - **`ModelId`** is a validated newtype: a `--repo` id (untrusted input) is parsed
   rejecting empty / absolute / `..` / empty-component ids, so `model_dir` cannot
@@ -948,10 +945,13 @@ and deliberately shelved — the note records why so we don't repeat them.
   GGUF tokenizers are **done**. Remaining: sharded multi-file GGUF + more
   quantized arches; other backends (mistral.rs, llama.cpp) via more `Completer`
   impls.
+- **Local llama.cpp backend — NEXT (decided 2026-08-21).** Yatima will run `llama-server` as a loopback-only child and implement the `Completer` trait over its raw `/completion` endpoint. The division is deliberate: llama.cpp owns model execution, architecture support, quantization, Metal acceleration, tokenization, and KV caches; Yatima owns prompt rendering, transcripts, reasoning and tool protocols, capabilities, agent control flow, invariants, and frontends. Keeping the boundary at raw prompts and streamed text prevents `/v1/chat/completions` from becoming a second owner of chat or tool meaning; `/apply-template` may be used as a fixture oracle while Yatima's renderer remains authoritative. `ModelSource` and possum continue to select and acquire the exact artifact, and the managed server receives that resolved GGUF with `-m`; `llama-server -hf` is a useful manual convenience but is not the product path because it would create a second cache and bypass Yatima's source and offline rules. A model's generated self-description and an attached server's `/props` are not identity evidence. Attached mode is operator-attested and unverified; a managed profile may name a verified model only after Yatima checks the profile-pinned artifact digest and passes that exact path to its owned child, with build and template checks as compatibility evidence rather than the root of trust (LSRV-5 when implemented). Candle remains the in-process Rust backend rather than a prerequisite for every model family. The first proof is CLI text chat with Muse Glimmer; process supervision and protocol fidelity follow before host integration, while vision, DFlash, tools, and in-process llama.cpp FFI remain later work. This establishes Yatima as the invariant-governed interaction and agent system over interchangeable inference engines, not as a project that must port every model architecture into Candle.
 - **Remote `Completer` (Anthropic / OpenAI)** — the payoff of the async-`Completer`
-  generalization (CMP-1): a `RemoteCompleter` holds only `Send` state, so its
-  future is naturally `Send` (per-impl inference, no `?Send`), and it **awaits
-  HTTP directly** — no `run_blocking`, no `BlockingIsland` (RT-2 gates only the
+  generalization (CMP-1): a `RemoteCompleter` holds only `Send` state and its
+  `complete` future can therefore be `Send` by per-implementation inference; the
+  current streaming method also borrows a callback without a `Send` bound, so no
+  blanket Send claim applies to `complete_streaming`. It **awaits HTTP directly**
+  — no `run_blocking`, no `BlockingIsland` (RT-2 gates only the
   local sync decode). Rust has no official Anthropic SDK, so use raw `reqwest`
   (already a dep) against `POST /v1/messages`: headers `x-api-key` +
   `anthropic-version: 2023-06-01`; body `{model, max_tokens, system?, messages,
@@ -1130,8 +1130,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   more than a code slice (rustls listener or a `tailscale serve` front).
   Tap-to-grant (WEB-7) already removed the sharpest copy/paste need; this
   removes the class.
-- **Remote `Completer` — NEXT (decided 2026-07-13): rented per-token
-  compute for the open weights; Anthropic optional, not foundational.**
+- **Remote `Completer` — deferred behind the local llama-server backend (reordered 2026-08-21; design retained): rented per-token compute for the open weights; Anthropic optional, not foundational.**
   The weekend's verdict, reached live: the stack is proven and the local
   quantized model is every remaining failure — it fabricates unguessable
   Wikimedia hash paths, abandons its own read_page → read_image plan
@@ -1169,16 +1168,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   tool round end to end). On-host inference remains the private, free,
   offline tier — the *patient* tier — and the remote fork is exactly the
   identity the Serving & scale entry named: yatima orchestrates.
-  **Ordering, settled the same night ("i need compute, not anthropic"):
-  slice 1 is the OpenAI-dialect completer** fronting full-precision Qwen
-  at a per-token provider — the raw-prompt seam already fits (same
-  ChatML template, same codec, same loop; the local Engine with decode
-  swapped for HTTP), it costs cents per session with zero idle burn (no
-  rented boxes — idle-billing is good money after bad), and the weights
-  stay sovereign: a public artifact a fungible landlord serves today and
-  owned hardware runs at home someday. The Anthropic slice above keeps
-  its design (the structured seam, the stop-sequence quirk) as optional
-  capability headroom behind the same trait, built only if wanted.
+  **Ordering revised 2026-08-21:** prove the same raw-prompt HTTP boundary locally with `llama-server` and Muse Glimmer first. This immediately unlocks a model Candle cannot run, preserves sovereign local weights, and exercises child ownership and protocol fidelity without provider credentials or dialect uncertainty. The OpenAI-dialect rented backend remains the next scale-out use of the same transport work when local throughput becomes the constraint; the Anthropic design remains optional capability headroom, built only if wanted.
 - **Browser-client near-term queue (distilled from local working plans,
   2026-07-13; full execution scripts held outside the repo per the
   plans-are-ephemeral convention).** In order, after the remote

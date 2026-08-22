@@ -22,10 +22,11 @@ pub enum Role {
 /// One transcript entry: a role and its text content.
 ///
 /// `content` is renderable turn text. For an [`Assistant`](Role::Assistant) turn
-/// it is the *answer* only: a reasoning model's chain-of-thought is split off at
-/// the completion→turn boundary (REASON-1, [`crate::split_reasoning`]) before the
-/// turn is built, so it never enters a transcript that is re-rendered into a
-/// later prompt.
+/// it is the *answer* only: reasoning and protocol framing are split off at the
+/// completion→turn boundary (REASON-1, the format's
+/// [`crate::PromptTemplate::interpret_response`]) before the turn is built, so
+/// they never enter a transcript that is re-rendered into a later prompt — and
+/// a reply with no answer text builds no turn at all.
 #[derive(Debug, Clone)]
 pub struct Turn {
     pub role: Role,
