@@ -1,0 +1,21 @@
+{
+  "captured": "2026-08-21",
+  "stage": "stage 0 of plans/llama-server.plan.md, accepted 2026-08-21",
+  "llama_cpp_build": "b10520-cd644c395 (brew)",
+  "gguf_file": "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
+  "gguf_sha256": "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e",
+  "gguf_repo": "meta-models/Muse-Glimmer-30B-GGUF (main as of 2026-08-21)",
+  "template_sha256": "6cd0e94d9b489fdb9a000743791f20e7e52b62c1e5cbb66fcc91c6716595223a",
+  "glimmer_server_flags": "--jinja -np 1 -c 131072 --host 127.0.0.1",
+  "probe_model": "bartowski/Qwen2.5-32B-Instruct-GGUF Q4_K_M",
+  "files": {
+    "glimmer-template.jinja": "embedded chat template from /props (golden)",
+    "oracle1*": "minimal system+user history -> /apply-template render (golden)",
+    "oracle2*": "reasoning-effort normalization + assistant reasoning re-render (golden)",
+    "oracle3*": "namespaced tool round: defs, atem invocation, tool_output (golden; render embeds 'Current date: 2026-08-21' from the template's default system block - comparisons must inject current_date)",
+    "p1-response.json": "wire shape: EOS-ended /completion response (shape fixture, text is model output)",
+    "p2-stream.txt": "wire shape: streamed SSE events incl. final stop event with sampler echo (shape fixture)",
+    "p3-response.json": "wire shape: word-stop response - stopping_word named, content excludes it (shape fixture)"
+  },
+  "behavioral_samples_not_here": "gen1 (seed 7 generation) is a behavioral sample, kept in gitignored plans/stage0-fixtures/, deliberately not a test golden"
+}

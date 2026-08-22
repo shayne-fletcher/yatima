@@ -1,0 +1,6 @@
+{"messages":[
+  {"role":"user","content":"How large is README.md?"},
+  {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs.stat_file","arguments":{"path":"README.md","follow_symlinks":true}}}]},
+  {"role":"tool","tool_call_id":"call_1","content":"{\"bytes\": 4096}"}
+],
+"tools":[{"type":"function","function":{"name":"fs.stat_file","description":"Report file metadata.","parameters":{"type":"object","properties":{"path":{"type":"string"},"follow_symlinks":{"type":"boolean"}},"required":["path"]}}}]}

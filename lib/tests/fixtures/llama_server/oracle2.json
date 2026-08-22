@@ -1,0 +1,6 @@
+{"messages":[
+  {"role":"system","content":"You are terse.\n\nReasoning effort: low."},
+  {"role":"user","content":"Name a river."},
+  {"role":"assistant","content":"The Nile.","reasoning_content":"User wants any river. Nile is canonical."},
+  {"role":"user","content":"Another?"}
+]}

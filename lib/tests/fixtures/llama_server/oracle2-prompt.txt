@@ -1,0 +1,5 @@
+<|start|>system<|message|>You are terse.
+
+Reasoning strength: low.
+
+# Valid recipients: "self", "user".<|eot|><|start|>user<|message|>Name a river.<|eot|><|start|>assistant to=self<|message|>User wants any river. Nile is canonical.<|eom|><|start|>assistant to=user<|message|>The Nile.<|eot|><|start|>user<|message|>Another?<|eot|><|start|>assistant

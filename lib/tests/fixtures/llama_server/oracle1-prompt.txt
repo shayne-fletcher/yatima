@@ -1,0 +1,5 @@
+<|start|>system<|message|>You are a helpful assistant.
+
+Reasoning strength: high.
+
+# Valid recipients: "self", "user".<|eot|><|start|>user<|message|>What is a river?<|eot|><|start|>assistant
