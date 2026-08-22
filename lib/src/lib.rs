@@ -197,7 +197,7 @@
 //!   tool whose capability is empty is absent from [`Tools::specs`] (the
 //!   model never sees a tool it cannot use), and a web tool's description
 //!   enumerates its granted origins.
-//! - **FETCH-1** within a session, [`ReadPage`] fetches each resolved URL at
+//! - **PAGE-1** within a session, [`ReadPage`] fetches each resolved URL at
 //!   most once: repeat and continuation (`offset`) reads are served from a
 //!   per-tool, FIFO-bounded cache and never touch the network — re-fetching
 //!   is the expensive act for throttled hosts (EDGAR), re-reading is free.

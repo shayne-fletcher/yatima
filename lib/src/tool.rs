@@ -3988,7 +3988,7 @@ position over the coming years.</p>
 
     #[tokio::test]
     async fn read_page_fetches_once_across_windows() {
-        // upholds: FETCH-1 — continuation reads are cache hits; the mock's
+        // upholds: PAGE-1 — continuation reads are cache hits; the mock's
         // expect(1) proves the network was touched exactly once.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4086,7 +4086,7 @@ position over the coming years.</p>
 
     #[tokio::test]
     async fn read_page_cache_is_per_url() {
-        // upholds: FETCH-1 — the cache keys on the resolved URL: two pages
+        // upholds: PAGE-1 — the cache keys on the resolved URL: two pages
         // fetch once each, and re-reads of either stay off the network.
         let server = MockServer::start().await;
         for p in ["/a", "/b"] {
@@ -4407,7 +4407,7 @@ position over the coming years.</p>
 
     #[test]
     fn page_cache_evicts_oldest() {
-        // upholds: FETCH-1's bound — the cache is FIFO-capped, so a session
+        // upholds: PAGE-1's bound — the cache is FIFO-capped, so a session
         // reading many pages cannot grow memory without limit.
         let mut cache = PageCache::default();
         for i in 0..=READ_PAGE_CACHE_PAGES {
