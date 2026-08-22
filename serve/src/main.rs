@@ -62,7 +62,7 @@ struct Args {
 
 /// Mirror of the GUI/TUI config resolution (a shared-host candidate once a
 /// third copy exists; today the duplication is the cheaper debt).
-fn resolve(args: &Args) -> Result<HostConfig> {
+async fn resolve(args: &Args) -> Result<HostConfig> {
     let profile = match &args.profile {
         Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -74,7 +74,13 @@ fn resolve(args: &Args) -> Result<HostConfig> {
     };
 
     let (dir, label) = match &profile {
-        Some(p) => (p.to_source(args.offline)?.resolve()?, p.name.clone()),
+        Some(p) => (
+            p.to_source(args.offline)?
+                .resolve_async()
+                .await?
+                .into_directory(),
+            p.name.clone(),
+        ),
         None => {
             let dir = ModelSource::from_args(
                 args.model.clone(),
@@ -83,7 +89,9 @@ fn resolve(args: &Args) -> Result<HostConfig> {
                 args.offline,
                 args.gguf.clone(),
             )?
-            .resolve()?;
+            .resolve_async()
+            .await?
+            .into_directory();
             let label = dir.display().to_string();
             (dir, label)
         }
@@ -118,7 +126,7 @@ async fn main() -> Result<()> {
     // calls with args, `trace` adds whole prompts).
     init_stderr_logging("serve")?;
     let bind = validate_bind(&args.bind)?; // SRV-1 before any model load
-    let config = resolve(&args)?;
+    let config = resolve(&args).await?;
 
     // Bind before loading the model so an EADDRINUSE fails fast, not after a
     // full (possibly weight-fetching) load.

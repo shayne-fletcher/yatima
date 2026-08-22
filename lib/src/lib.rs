@@ -23,6 +23,10 @@
 //! - **MS-2** [`model_dir`] mirrors possum's `<root>/<org>/<name>` layout.
 //! - **MS-3** a [`ModelId`] and index shard names never escape the root / model
 //!   directory (untrusted input is contained).
+//! - **MS-4** exact GGUF resolution preserves a requested safe literal basename; one
+//!   cached GGUF can never satisfy a request for another. An unnamed local
+//!   directory resolves to a managed-server artifact only when it contains
+//!   exactly one GGUF.
 //! - **MD-1** unsharded discovery is every `*.safetensors`, sorted.
 //! - **MD-2** indexed discovery is the unique `weight_map` values, deduped and
 //!   sorted (also covers the dedup/order half of **DISC**).
@@ -130,21 +134,30 @@
 //!   spawned), so no global `Send` bound is imposed (`async_fn_in_trait` is
 //!   `#[allow]`ed with that rationale). Contrast [`Tool`], which is `dyn` +
 //!   spawned, hence `#[async_trait]` + `Send`.
+//! - **CANCEL-1** [`Cancel`] is one monotone state with synchronous and
+//!   asynchronous observations: cancellation by any clone is permanent, and
+//!   every present or future poll or wait observes it without a lost wakeup.
+//! - **LSRV-1** a managed llama-server child has one owner; both output pipes
+//!   are drained concurrently into bounded tails, and every explicit shutdown
+//!   or child-owning startup failure kills, reaps, and joins those drains under
+//!   a bound. In-flight completion races child death; `Drop` is only a
+//!   kill-request fallback.
+//! - **LSRV-2** every llama-server endpoint is a validated HTTP loopback origin.
+//!   Managed mode constructs its own `127.0.0.1` endpoint; attached mode
+//!   accepts loopback literals or `localhost`, normalizing the latter before a
+//!   request is built. Paths, userinfo, query, fragment, and non-loopback hosts
+//!   are unrepresentable after configuration, and HTTP redirects are never
+//!   followed.
 //! - **LSRV-3** llama-server stop fidelity: returned and streamed text includes
 //!   a matched caller-supplied stop marker even though the server excludes it
 //!   from content (re-appended from the final event's `stopping_word`), and a
 //!   word stop that names no marker — or names one the caller never supplied —
 //!   is a protocol error, never a quiet `Stopped`. EOS is not required to
 //!   appear in text (an EOS-ended turn carries no marker).
-//! - **LSRV-4** llama-server stream cancellation: once the response stream is
-//!   established, cancellation is observed within a bounded interval whether
-//!   the server is silent (the pending read is raced against a tick) or
-//!   continuously producing (the flag is polled per chunk and per buffered
-//!   event); the result carries only pre-cancellation text, with `Stopped`.
-//!   Scoped to the established stream — cancellation around the initial
-//!   `send()` is recorded stage-2 debt (plans/llama-server.plan.md). LSRV-1
-//!   (child lifecycle) and LSRV-2 (loopback) register with stage 2, when
-//!   their obligations gain implementations.
+//! - **LSRV-4** llama-server cancellation races the pending initial response
+//!   and every response-stream read through CANCEL-1; continuously buffered
+//!   events also check the same state before delivery. The result carries only
+//!   pre-cancellation text, with `Stopped`, and no polling interval participates.
 //!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
@@ -316,7 +329,9 @@ mod tool;
 mod transcript;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
-pub use backend::{LlamaServerCompleter, LlamaServerConfig};
+pub use backend::{
+    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ServerProps,
+};
 pub use cancel::Cancel;
 pub use capability::{origins_in, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir};
 pub use chat::{looks_degenerate, ChatSession};
@@ -328,8 +343,8 @@ pub use engine::{
     PrefillLogits, PrefillProgress, Sampling, StopReason, TokenLogit, METAL_KV_VALIDATED,
 };
 pub use host::{
-    caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, ModelProfile, ModelSource,
-    REASONING_MIN_TOKENS,
+    caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, GgufArtifact, ModelProfile,
+    ModelSource, ResolvedModel, REASONING_MIN_TOKENS,
 };
 pub use reasoning::{split_reasoning, strip_reasoning, Channel, Reasoned, ReasoningSplitter};
 pub use runtime::run_blocking;
@@ -422,6 +437,13 @@ pub(crate) fn is_safe_relative(s: &str) -> bool {
     p.is_relative() && p.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
+/// Whether a literal filename would be interpreted as a pattern by possum's
+/// `glob`-based include filter.
+pub(crate) fn has_glob_metachar(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\'))
+}
+
 /// Pure core of [`models_root`], taking the relevant environment values as
 /// arguments so it can be tested without mutating process state.
 fn resolve_models_root(
@@ -441,6 +463,113 @@ fn resolve_models_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_ids_are_unique_across_crate_docs() {
+        // Registry well-formedness: one id names at most one declared law.
+        // A declaration is a crate-doc bullet beginning `- **ID**`; additional
+        // bold ids in the same bullet are declarations too (SAM-2 is written
+        // this way). Bold references outside a declaration bullet are ignored.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("yatima-lib lives one directory below the workspace root");
+        let mut declarations = std::collections::BTreeMap::<String, Vec<String>>::new();
+
+        for entry in std::fs::read_dir(root).expect("read workspace root") {
+            let dir = entry.expect("read workspace entry").path();
+            if !dir.join("Cargo.toml").is_file() {
+                continue;
+            }
+            for source in [dir.join("src/lib.rs"), dir.join("src/main.rs")] {
+                let Ok(text) = std::fs::read_to_string(&source) else {
+                    continue;
+                };
+                for (line_no, id) in declared_law_ids(&text) {
+                    declarations.entry(id).or_default().push(format!(
+                        "{}:{}",
+                        source.strip_prefix(root).unwrap_or(&source).display(),
+                        line_no
+                    ));
+                }
+            }
+        }
+
+        let duplicates: Vec<_> = declarations
+            .into_iter()
+            .filter(|(_, sites)| sites.len() > 1)
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "duplicate invariant/law ids: {duplicates:#?}"
+        );
+    }
+
+    fn declared_law_ids(text: &str) -> Vec<(usize, String)> {
+        let mut ids = Vec::new();
+        let mut declaration_bullet = false;
+        for (line_no, line) in text.lines().enumerate() {
+            let Some(doc) = line.strip_prefix("//!") else {
+                declaration_bullet = false;
+                continue;
+            };
+            let body = doc.trim_start();
+            if body.starts_with("- **") {
+                declaration_bullet = true;
+            } else if body.starts_with("- ") || body.is_empty() {
+                declaration_bullet = false;
+            }
+            if declaration_bullet {
+                ids.extend(bold_law_ids(body).into_iter().map(|id| (line_no + 1, id)));
+            }
+        }
+        ids
+    }
+
+    fn bold_law_ids(line: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut rest = line;
+        while let Some(open) = rest.find("**") {
+            rest = &rest[open + 2..];
+            let Some(close) = rest.find("**") else {
+                break;
+            };
+            let candidate = &rest[..close];
+            let Some((prefix, ordinal)) = candidate.split_once('-') else {
+                rest = &rest[close + 2..];
+                continue;
+            };
+            let digit_count = ordinal.chars().take_while(char::is_ascii_digit).count();
+            let (number, suffix) = ordinal.split_at(digit_count);
+            if !prefix.is_empty()
+                && prefix.chars().all(|c| c.is_ascii_uppercase())
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+                && suffix.chars().all(|c| c.is_ascii_lowercase())
+            {
+                ids.push(candidate.to_owned());
+            }
+            rest = &rest[close + 2..];
+        }
+        ids
+    }
+
+    #[test]
+    fn registry_parser_includes_letter_suffixed_ids_after_attributes() {
+        let source = concat!(
+            "#![allow(dead_code)]\n",
+            "//! Registry\n",
+            "//! - **CAP-3a** first declaration\n",
+            "//! - **SAM-1** and **SAM-2** share a bullet\n",
+            "fn item() {}\n",
+            "//! - **CAP-3a** planted duplicate\n",
+        );
+        let ids: Vec<_> = declared_law_ids(source)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(ids, ["CAP-3a", "SAM-1", "SAM-2", "CAP-3a"]);
+        assert_eq!(ids.iter().filter(|id| id.as_str() == "CAP-3a").count(), 2);
+    }
 
     #[test]
     fn models_root_prefers_yatima_models_dir() {

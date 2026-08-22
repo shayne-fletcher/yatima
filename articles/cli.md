@@ -63,9 +63,24 @@ cargo run -p yatima-cli --release --bin yatima --features metal -- chat \
 A missing model is fetched on demand when the `fetch` feature is enabled;
 `--offline` never touches the network.
 
+## Managed llama-server
+
+Omit `--server-url` to let Yatima acquire one exact GGUF, start `llama-server` on loopback, wait for readiness, run the chat, and reap the child when the session ends. `llama-server` must be on `PATH`.
+
+```bash
+cargo run -p yatima-cli --release -- chat \
+  --backend llama-server \
+  --repo bartowski/Qwen2.5-32B-Instruct-GGUF \
+  --gguf Qwen2.5-32B-Instruct-Q4_K_M.gguf \
+  --format qwen \
+  --prompt "In one sentence, what is a CRDT?"
+```
+
+A named `--gguf` is exact: another quant already in the cache cannot substitute for it. With `--model <dir>`, managed mode requires exactly one GGUF and reports the candidates when the directory is ambiguous. Stage 2 records the exact launched path but does not yet authenticate its digest, so the banner remains explicit about unverified identity.
+
 ## Muse Glimmer through an attached llama-server
 
-The current llama-server backend is an attached development path: start `llama-server` yourself, then point `yatima chat` at it. Managed startup is planned but not implemented yet.
+Attached mode remains useful for development and for the Stage 3 Muse work: start `llama-server` yourself, then point `yatima chat` at its loopback origin. Yatima validates the endpoint and inspects `/props`, but does not own the process.
 
 From the repository root, start a named tmux session:
 
@@ -133,4 +148,4 @@ In tmux, `Ctrl-b o` changes panes. To scroll, type `Ctrl-b [`, use Page Up, Page
 
 ### What the checks establish
 
-The file digest proves the bytes at `MODEL`. `/props` helps catch an accidental wrong process, model path, build, context, or template. Neither a generated statement such as "I am Muse Glimmer" nor `/props` authenticates an arbitrary attached process: both are claims made by that process, and the digest does not prove that it loaded the file you checked. Treat attached mode as operator-attested and unverified. The planned managed path closes this gap by verifying the profile-pinned artifact, passing that exact path to a child Yatima owns, and refusing prompts when its compatibility checks fail.
+The file digest proves the bytes at `MODEL`. `/props` helps catch an accidental wrong process, model path, build, context, or template. Neither a generated statement such as "I am Muse Glimmer" nor `/props` authenticates an arbitrary attached process: both are claims made by that process, and the digest does not prove that it loaded the file you checked. Treat attached mode as operator-attested and unverified. Managed mode closes the process-ownership and exact-path gaps in Stage 2; Stage 3 adds profile-pinned digest and compatibility checks before it claims verified model identity.

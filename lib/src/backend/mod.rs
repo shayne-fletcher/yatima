@@ -10,4 +10,6 @@
 mod llama_server;
 mod sse;
 
-pub use llama_server::{LlamaServerCompleter, LlamaServerConfig};
+pub use llama_server::{
+    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ServerProps,
+};

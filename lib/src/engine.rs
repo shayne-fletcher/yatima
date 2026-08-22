@@ -1440,10 +1440,9 @@ pub fn is_model_present(dir: &Path) -> bool {
 /// completeness after download so a partial fetch is never handed to
 /// [`Engine::load`].
 ///
-/// `gguf` selects a single quantized file to fetch (plus `*.json` for the
-/// tokenizer) instead of the safetensors shards — for `--repo <id> --gguf
-/// <file>`. Note GGUF repos often omit `tokenizer.json`; if it's missing after
-/// the fetch, the completeness check fails with a clear error.
+/// `gguf` selects one exact quantized file instead of the safetensors shards —
+/// for `--repo <id> --gguf <file>`. Its cache predicate is that exact file,
+/// never another GGUF already present in the directory (MS-4).
 #[cfg(feature = "fetch")]
 pub(crate) async fn ensure_model(
     repo: &crate::ModelId,
@@ -1451,16 +1450,58 @@ pub(crate) async fn ensure_model(
     gguf: Option<&str>,
 ) -> Result<PathBuf> {
     let dir = crate::model_dir(models_root, repo);
-    if is_model_present(&dir) {
+    let (exact_gguf, cached) = match gguf {
+        Some(file) => {
+            let (path, cached) = requested_gguf_cache_state(&dir, file)?;
+            (Some(path), cached)
+        }
+        None => (None, is_model_present(&dir)),
+    };
+    if cached {
         return Ok(dir);
     }
+    let request = model_download_request(repo, &dir, gguf)?;
+    possum_lib::model::download(&request)
+        .await
+        .map_err(|e| anyhow!("fetching {repo}: {e}"))?;
+    if let Some(path) = exact_gguf {
+        if !path.is_file() {
+            bail!(
+                "model {repo} still missing requested GGUF {} after fetch at {}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                dir.display()
+            );
+        }
+    } else {
+        let p = presence(&dir);
+        if p.complete {
+            return Ok(dir);
+        }
+        bail!(
+            "model {repo} still incomplete after fetch at {} (missing: {:?})",
+            dir.display(),
+            p.missing
+        );
+    }
+    Ok(dir)
+}
+
+#[cfg(feature = "fetch")]
+fn model_download_request(
+    repo: &crate::ModelId,
+    dir: &Path,
+    gguf: Option<&str>,
+) -> Result<possum_lib::model::DownloadRequest> {
     let include = match gguf {
-        Some(file) => vec![file.to_string(), "*.json".to_string()],
+        Some(file) => {
+            requested_gguf_path(dir, file)?;
+            vec![file.to_string(), "*.json".to_string()]
+        }
         None => vec!["*.safetensors".to_string(), "*.json".to_string()],
     };
-    let request = possum_lib::model::DownloadRequest {
+    Ok(possum_lib::model::DownloadRequest {
         repository: repo.as_str().to_string(),
-        to: dir.clone(),
+        to: dir.to_path_buf(),
         include,
         exclude: vec!["figures/*".to_string()],
         concurrency: 4,
@@ -1469,21 +1510,30 @@ pub(crate) async fn ensure_model(
         // otherwise, so public repos download exactly as before.
         token: std::env::var("HF_TOKEN").ok(),
         ..Default::default()
-    };
-    possum_lib::model::download(&request)
-        .await
-        .map_err(|e| anyhow!("fetching {repo}: {e}"))?;
-    let p = presence(&dir);
-    if !p.complete {
-        bail!(
-            "model {repo} still incomplete after fetch at {} (missing: {:?}). \
-             For a GGUF repo without tokenizer.json, place the .gguf + a \
-             tokenizer.json in a dir and use --model.",
-            dir.display(),
-            p.missing
-        );
+    })
+}
+
+#[cfg(feature = "fetch")]
+fn requested_gguf_path(dir: &Path, file: &str) -> Result<PathBuf> {
+    let path = Path::new(file);
+    if !crate::is_safe_relative(file)
+        || crate::has_glob_metachar(file)
+        || path.components().count() != 1
+        || !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        bail!("GGUF name {file:?} must be one safe literal .gguf basename");
     }
-    Ok(dir)
+    Ok(dir.join(file))
+}
+
+#[cfg(feature = "fetch")]
+fn requested_gguf_cache_state(dir: &Path, file: &str) -> Result<(PathBuf, bool)> {
+    let path = requested_gguf_path(dir, file)?;
+    let cached = path.is_file();
+    Ok((path, cached))
 }
 
 /// Blocking wrapper around `ensure_model` for synchronous callers; drives the
@@ -1540,6 +1590,50 @@ mod tests {
         let o = GenOpts::default();
         assert_eq!(o.max_tokens, 256);
         assert_eq!(o.sampling, Sampling::Greedy);
+    }
+
+    #[cfg(feature = "fetch")]
+    #[test]
+    fn requested_gguf_cache_predicate_never_substitutes_another_quant() {
+        // upholds: MS-4 — this is the predicate used directly by
+        // `ensure_model` before deciding whether to invoke possum.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("other.gguf"), "other").unwrap();
+        let (wanted, cached) = requested_gguf_cache_state(root.path(), "wanted.gguf").unwrap();
+        assert_eq!(wanted, root.path().join("wanted.gguf"));
+        assert!(!cached, "another quant must not make this a cache hit");
+
+        std::fs::write(&wanted, "wanted").unwrap();
+        assert!(
+            requested_gguf_cache_state(root.path(), "wanted.gguf")
+                .unwrap()
+                .1,
+            "the exact requested artifact is the cache hit"
+        );
+    }
+
+    #[cfg(feature = "fetch")]
+    #[test]
+    fn requested_gguf_rejects_possum_glob_syntax() {
+        // upholds: MS-4 — an exact filename never becomes a possum pattern.
+        for name in ["*.gguf", "model?.gguf", "model[12].gguf", "model\\*.gguf"] {
+            assert!(
+                requested_gguf_cache_state(Path::new("/models"), name).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "fetch")]
+    #[test]
+    fn requested_gguf_is_the_literal_possum_include() {
+        // upholds: MS-4 — the downloader receives the requested filename, not
+        // a substitute chosen from the cache or a caller-controlled pattern.
+        let repo = crate::ModelId::parse("org/model").unwrap();
+        let request =
+            model_download_request(&repo, Path::new("/models/org/model"), Some("wanted.gguf"))
+                .unwrap();
+        assert_eq!(request.include, ["wanted.gguf", "*.json"]);
     }
 
     #[test]

@@ -19,9 +19,9 @@ use tracing_subscriber::EnvFilter;
 use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir,
-    LlamaServerCompleter, LlamaServerConfig, ModelId, ModelProfile, ModelSource, PlainTemplate,
-    PromptTemplate, QwenToolCall, ReadFile, ReadPage, ReasoningSplitter, Sampling, ToolCallCodec,
-    Tools, WebOrigins,
+    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ModelId, ModelProfile,
+    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage,
+    ReasoningSplitter, Sampling, ToolCallCodec, Tools, WebOrigins,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -156,16 +156,14 @@ struct AgentArgs {
 enum BackendArg {
     /// The local Candle engine: resolves and loads the model in-process.
     Engine,
-    /// An already-running llama-server, attached via `--server-url`. Requires
-    /// an explicit `--format` (there is no local model to infer one from) and
-    /// never touches the model cache.
+    /// llama-server over HTTP: attach via `--server-url`, or omit it to let
+    /// Yatima resolve the GGUF and own the child process.
     LlamaServer,
 }
 
 #[derive(clap::Args)]
 struct ChatArgs {
-    /// Inference backend: the local Candle engine (default) or an attached
-    /// llama-server.
+    /// Inference backend: the local Candle engine (default) or llama-server.
     #[arg(long, value_enum, default_value = "engine")]
     backend: BackendArg,
     /// Base URL of a running llama-server (e.g. `http://127.0.0.1:8080`), for
@@ -286,26 +284,81 @@ async fn chat(args: ChatArgs) -> Result<()> {
         None => base,
     };
 
-    // Attached llama-server: the transport swap the `Completer` seam exists
-    // for. No model resolution and no Candle initialization happen on this
-    // path; the argument matrix is enforced by `attached_chat_config`.
-    if args.backend == BackendArg::LlamaServer {
-        let (url, format) = attached_chat_config(&args, profile.as_ref())?;
-        eprintln!("attached llama-server at {url} [{}]", format.name());
-        let mut completer = LlamaServerCompleter::new(LlamaServerConfig::new(url))?;
-        return run_chat(
-            &mut completer,
-            format.template(),
-            opts,
-            args.system,
-            args.prompt,
-            format.pre_seeds_reasoning(),
-        )
-        .await;
+    match chat_backend_config(&args, profile.as_ref())? {
+        ChatBackendConfig::Attached { url, format } => {
+            let config = LlamaServerConfig::new(url)?;
+            let mut completer = LlamaServerCompleter::new(config)?;
+            let props = completer.introspect().await?;
+            eprintln!(
+                "attached llama-server [{}]; unverified: {} ({}, {} ctx, {} slot)",
+                format.name(),
+                props.model_self_report,
+                props.build,
+                props.n_ctx,
+                props.total_slots,
+            );
+            return run_chat(
+                &mut completer,
+                format.template(),
+                opts,
+                args.system,
+                args.prompt,
+                format.pre_seeds_reasoning(),
+            )
+            .await;
+        }
+        ChatBackendConfig::Managed { format } => {
+            let resolved = match &profile {
+                Some(profile) => profile.to_source(args.offline)?.resolve_async().await?,
+                None => {
+                    ModelSource::from_args(
+                        args.model,
+                        args.repo,
+                        args.models_dir,
+                        args.offline,
+                        args.gguf,
+                    )?
+                    .resolve_async()
+                    .await?
+                }
+            };
+            let artifact = resolved.into_gguf()?;
+            let mut server = LlamaServer::spawn(LlamaServerSpawn::new(artifact)).await?;
+            eprintln!(
+                "managed llama-server [{}]; launched {} (unverified self-report: {}, {})",
+                format.name(),
+                server.launched_artifact().display(),
+                server.props().model_self_report,
+                server.props().build,
+            );
+            let chat = run_chat(
+                &mut server,
+                format.template(),
+                opts,
+                args.system,
+                args.prompt,
+                format.pre_seeds_reasoning(),
+            )
+            .await;
+            let shutdown = server.shutdown().await;
+            return match (chat, shutdown) {
+                (Ok(()), Ok(_)) => Ok(()),
+                (Ok(()), Err(error)) => Err(error).context("shut down managed llama-server"),
+                (Err(error), Ok(_)) => Err(error),
+                (Err(error), Err(shutdown)) => Err(error).context(format!(
+                    "managed llama-server also failed to shut down: {shutdown:#}"
+                )),
+            };
+        }
+        ChatBackendConfig::Engine => {}
     }
 
     let dir = match &profile {
-        Some(p) => p.to_source(args.offline)?.resolve()?,
+        Some(p) => p
+            .to_source(args.offline)?
+            .resolve_async()
+            .await?
+            .into_directory(),
         None => ModelSource::from_args(
             args.model,
             args.repo,
@@ -313,7 +366,9 @@ async fn chat(args: ChatArgs) -> Result<()> {
             args.offline,
             args.gguf,
         )?
-        .resolve()?,
+        .resolve_async()
+        .await?
+        .into_directory(),
     };
 
     let dev = device(args.cpu)?;
@@ -341,38 +396,55 @@ async fn chat(args: ChatArgs) -> Result<()> {
     .await
 }
 
-/// Resolve the attached-server argument matrix: `--backend llama-server`
-/// requires `--server-url` and an explicit format (flag or profile — there is
-/// no local architecture to infer from), and rejects local model sources so
-/// the model cache is demonstrably untouched. Pure, so the matrix is
-/// unit-testable.
-fn attached_chat_config(
+#[derive(Debug, PartialEq, Eq)]
+enum ChatBackendConfig {
+    Engine,
+    Attached { url: String, format: ChatFormat },
+    Managed { format: ChatFormat },
+}
+
+/// Resolve the three backend modes before model acquisition or process work.
+/// Attached mode owns no model source; managed mode owns one; the Candle
+/// engine rejects server-only flags. Pure, so the matrix is unit-testable.
+fn chat_backend_config(
     args: &ChatArgs,
     profile: Option<&ModelProfile>,
-) -> Result<(String, ChatFormat)> {
-    let url = args.server_url.clone().ok_or_else(|| {
-        anyhow::anyhow!("--backend llama-server requires --server-url (the server to attach to)")
-    })?;
-    let format = args
-        .format
-        .or_else(|| profile.and_then(|p| p.format()))
-        .ok_or_else(|| {
+) -> Result<ChatBackendConfig> {
+    if args.backend == BackendArg::Engine {
+        if args.server_url.is_some() {
+            bail!("--server-url requires --backend llama-server");
+        }
+        return Ok(ChatBackendConfig::Engine);
+    }
+
+    if let Some(url) = args.server_url.clone() {
+        if profile.is_some()
+            || args.model.is_some()
+            || args.repo.is_some()
+            || args.models_dir.is_some()
+            || args.gguf.is_some()
+        {
+            bail!(
+                "--profile/--model/--repo/--models-dir/--gguf are not used with an attached \
+                 llama-server: the attached server owns the model"
+            );
+        }
+        let format = args.format.ok_or_else(|| {
             anyhow::anyhow!(
-                "--backend llama-server requires --format: with no local model there \
-                 is no architecture to infer a chat format from"
+                "an attached llama-server requires --format: there is no local model to infer it"
             )
         })?;
-    if args.model.is_some()
-        || args.repo.is_some()
-        || args.models_dir.is_some()
-        || args.gguf.is_some()
-    {
-        anyhow::bail!(
-            "--model/--repo/--models-dir/--gguf are not used with --backend \
-             llama-server: the attached server owns the model"
-        );
+        return Ok(ChatBackendConfig::Attached { url, format });
     }
-    Ok((url, format))
+
+    let format = args
+        .format
+        .or_else(|| profile.and_then(ModelProfile::format))
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server requires --format or a profile"))?;
+    if profile.is_none() && args.model.is_none() && args.repo.is_none() {
+        bail!("managed llama-server requires --profile, --model, or --repo");
+    }
+    Ok(ChatBackendConfig::Managed { format })
 }
 
 /// The shared chat tail: the local `Engine` and an attached llama-server
@@ -535,7 +607,9 @@ async fn agent(args: AgentArgs) -> Result<()> {
         args.offline,
         args.gguf,
     )?
-    .resolve()?;
+    .resolve_async()
+    .await?
+    .into_directory();
 
     let root = match args.root {
         Some(r) => r,
@@ -645,7 +719,9 @@ async fn generate(args: GenerateArgs) -> Result<()> {
         args.offline,
         args.gguf,
     )?
-    .resolve()?;
+    .resolve_async()
+    .await?
+    .into_directory();
 
     let prompt = match args.prompt {
         Some(p) => p,
@@ -795,19 +871,35 @@ mod tests {
             "muse-glimmer",
         ]);
         assert_eq!(args.backend, BackendArg::LlamaServer);
-        let (url, format) = attached_chat_config(&args, None).unwrap();
-        assert_eq!(url, "http://127.0.0.1:8080");
-        assert_eq!(format, ChatFormat::MuseGlimmer);
+        assert_eq!(
+            chat_backend_config(&args, None).unwrap(),
+            ChatBackendConfig::Attached {
+                url: "http://127.0.0.1:8080".into(),
+                format: ChatFormat::MuseGlimmer,
+            }
+        );
     }
 
     #[test]
-    fn attached_backend_requires_url_and_format() {
-        // The argument matrix: attached mode has no local model, so neither
-        // the server nor the format can be inferred — both are required.
+    fn managed_backend_requires_a_source_and_format() {
         let args = chat_args(&["yatima", "chat", "--backend", "llama-server"]);
-        let err = attached_chat_config(&args, None).unwrap_err();
-        assert!(err.to_string().contains("--server-url"));
+        let err = chat_backend_config(&args, None).unwrap_err();
+        assert!(err.to_string().contains("--format"));
 
+        let args = chat_args(&[
+            "yatima",
+            "chat",
+            "--backend",
+            "llama-server",
+            "--format",
+            "qwen",
+        ]);
+        let err = chat_backend_config(&args, None).unwrap_err();
+        assert!(err.to_string().contains("--profile, --model, or --repo"));
+    }
+
+    #[test]
+    fn attached_backend_requires_an_explicit_format() {
         let args = chat_args(&[
             "yatima",
             "chat",
@@ -816,7 +908,7 @@ mod tests {
             "--server-url",
             "http://127.0.0.1:8080",
         ]);
-        let err = attached_chat_config(&args, None).unwrap_err();
+        let err = chat_backend_config(&args, None).unwrap_err();
         assert!(err.to_string().contains("--format"));
     }
 
@@ -836,8 +928,44 @@ mod tests {
             "--repo",
             "x/y",
         ]);
-        let err = attached_chat_config(&args, None).unwrap_err();
+        let err = chat_backend_config(&args, None).unwrap_err();
         assert!(err.to_string().contains("not used with"));
+    }
+
+    #[test]
+    fn managed_backend_reuses_model_source_flags() {
+        let args = chat_args(&[
+            "yatima",
+            "chat",
+            "--backend",
+            "llama-server",
+            "--repo",
+            "org/name",
+            "--gguf",
+            "model.gguf",
+            "--format",
+            "qwen",
+        ]);
+        assert_eq!(
+            chat_backend_config(&args, None).unwrap(),
+            ChatBackendConfig::Managed {
+                format: ChatFormat::Qwen
+            }
+        );
+    }
+
+    #[test]
+    fn engine_backend_rejects_a_server_url() {
+        let args = chat_args(&[
+            "yatima",
+            "chat",
+            "--repo",
+            "org/name",
+            "--server-url",
+            "http://127.0.0.1:8080",
+        ]);
+        let err = chat_backend_config(&args, None).unwrap_err();
+        assert!(err.to_string().contains("--backend llama-server"));
     }
 
     #[test]

@@ -139,7 +139,11 @@ async fn main() -> Result<()> {
         profile.format = args.format;
     }
 
-    let dir = profile.to_source(args.offline)?.resolve()?;
+    let dir = profile
+        .to_source(args.offline)?
+        .resolve_async()
+        .await?
+        .into_directory();
     let dev = device(args.cpu)?;
     let mut engine = run_blocking(|| Engine::load(&dir, dev))
         .with_context(|| format!("loading {}", dir.display()))?;

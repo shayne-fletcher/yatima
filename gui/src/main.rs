@@ -89,7 +89,10 @@ fn resolve(args: &Args) -> Result<HostConfig> {
     };
 
     let (dir, label) = match &profile {
-        Some(p) => (p.to_source(args.offline)?.resolve()?, p.name.clone()),
+        Some(p) => (
+            p.to_source(args.offline)?.resolve()?.into_directory(),
+            p.name.clone(),
+        ),
         None => {
             let dir = ModelSource::from_args(
                 args.model.clone(),
@@ -98,7 +101,8 @@ fn resolve(args: &Args) -> Result<HostConfig> {
                 args.offline,
                 args.gguf.clone(),
             )?
-            .resolve()?;
+            .resolve()?
+            .into_directory();
             (dir.clone(), dir.display().to_string())
         }
     };

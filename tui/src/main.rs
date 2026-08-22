@@ -86,7 +86,13 @@ async fn main() -> Result<()> {
     };
 
     let (dir, model_label) = match &profile {
-        Some(p) => (p.to_source(args.offline)?.resolve()?, p.name.clone()),
+        Some(p) => (
+            p.to_source(args.offline)?
+                .resolve_async()
+                .await?
+                .into_directory(),
+            p.name.clone(),
+        ),
         None => {
             let dir = ModelSource::from_args(
                 args.model.clone(),
@@ -95,7 +101,9 @@ async fn main() -> Result<()> {
                 args.offline,
                 args.gguf.clone(),
             )?
-            .resolve()?;
+            .resolve_async()
+            .await?
+            .into_directory();
             (dir.clone(), dir.display().to_string())
         }
     };
