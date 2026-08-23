@@ -158,6 +158,18 @@
 //!   and every response-stream read through CANCEL-1; continuously buffered
 //!   events also check the same state before delivery. The result carries only
 //!   pre-cancellation text, with `Stopped`, and no polling interval participates.
+//! - **LSRV-5** verified managed identity starts with a [`GgufArtifact`] refined
+//!   by [`verify`] into a [`VerifiedModelArtifact`]: the complete canonical file
+//!   matches the expected [`Sha256Digest`], and the same private identity value
+//!   supplies the child process's `-m` pathname. [`LlamaServerSpawn::verified`]
+//!   inseparably carries build-floor, embedded-template-digest, context, and slot
+//!   [`ServerGates`], which run after introspection and before a server value can
+//!   serve a completion. Digest failure spawns nothing; gate failure reaps and
+//!   joins the child. Ordinary managed and attached sessions remain
+//!   [`ServerIdentity::Unverified`]. Generated text and `/props` self-reports
+//!   are never identity evidence. The trust boundary is the local process and
+//!   filesystem: pathname replacement between verification and child open is
+//!   outside it.
 //!
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
@@ -331,7 +343,8 @@ mod transcript;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
 pub use backend::{
-    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ServerProps,
+    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ServerGates,
+    ServerIdentity, ServerProps,
 };
 pub use cancel::Cancel;
 pub use capability::{origins_in, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir};
@@ -344,8 +357,8 @@ pub use engine::{
     PrefillLogits, PrefillProgress, Sampling, StopReason, TokenLogit, METAL_KV_VALIDATED,
 };
 pub use host::{
-    caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, GgufArtifact, ModelProfile,
-    ModelSource, ResolvedModel, REASONING_MIN_TOKENS,
+    caps_for, resolve_format, verify, Caps, ChatFormat, FormatMismatch, GgufArtifact, ModelProfile,
+    ModelSource, ResolvedModel, Sha256Digest, VerifiedModelArtifact, REASONING_MIN_TOKENS,
 };
 pub use reasoning::{
     split_reasoning, strip_reasoning, AtemInterpreter, Channel, Reasoned, ReasoningSplitter,

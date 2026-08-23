@@ -5,7 +5,13 @@
 
 use crate::{is_model_present, model_dir, models_root, ModelId};
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::fs::File;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// Where a model's files come from — exactly one source (CLI-1). Opaque: build
 /// one with [`from_args`](ModelSource::from_args), then resolve it with
@@ -100,6 +106,119 @@ impl GgufArtifact {
         }
         Ok(GgufArtifact(canonical_path))
     }
+}
+
+/// A SHA-256 digest with one canonical textual form: 64 lowercase hex digits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+    pub(crate) fn of_bytes(bytes: &[u8]) -> Sha256Digest {
+        Sha256Digest(Sha256::digest(bytes).into())
+    }
+}
+
+impl fmt::Debug for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Sha256Digest")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for Sha256Digest {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Sha256Digest> {
+        if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("SHA-256 digest must be exactly 64 hexadecimal characters");
+        }
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+                .expect("ASCII hex pair was validated");
+        }
+        Ok(Sha256Digest(bytes))
+    }
+}
+
+impl Serialize for Sha256Digest {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Digest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Sha256Digest, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A resolved GGUF whose complete contents matched an expected SHA-256 digest.
+/// Only [`verify`] can construct this refinement.
+#[derive(Debug, Clone)]
+pub struct VerifiedModelArtifact {
+    artifact: GgufArtifact,
+    digest: Sha256Digest,
+}
+
+impl VerifiedModelArtifact {
+    pub(crate) fn artifact(&self) -> &GgufArtifact {
+        &self.artifact
+    }
+
+    pub fn path(&self) -> &Path {
+        self.artifact.path()
+    }
+
+    pub fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+}
+
+/// Hash the exact canonical GGUF selected by resolution and refine it to a
+/// verified artifact only when every byte matches `expected` (LSRV-5).
+pub async fn verify(
+    artifact: GgufArtifact,
+    expected: &Sha256Digest,
+) -> Result<VerifiedModelArtifact> {
+    let path = artifact.path().to_path_buf();
+    let actual = crate::run_blocking(|| sha256_file(&path))?;
+    if actual != *expected {
+        bail!(
+            "SHA-256 mismatch for {}: expected {expected}, found {actual}",
+            artifact.path().display()
+        );
+    }
+    Ok(VerifiedModelArtifact {
+        artifact,
+        digest: actual,
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<Sha256Digest> {
+    let file = File::open(path).with_context(|| format!("open {} for SHA-256", path.display()))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    io::copy(&mut reader, &mut hasher)
+        .with_context(|| format!("read {} for SHA-256", path.display()))?;
+    Ok(Sha256Digest(hasher.finalize().into()))
 }
 
 enum Source {
@@ -500,5 +619,62 @@ mod tests {
             resolved.into_gguf().unwrap().path(),
             directory.path().join("only.gguf").canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn sha256_digest_parses_displays_and_round_trips_serde() {
+        let lower = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let upper = lower.to_ascii_uppercase();
+        let digest: Sha256Digest = upper.parse().unwrap();
+        assert_eq!(digest.to_string(), lower);
+        let json = serde_json::to_string(&digest).unwrap();
+        assert_eq!(json, format!("\"{lower}\""));
+        assert_eq!(serde_json::from_str::<Sha256Digest>(&json).unwrap(), digest);
+    }
+
+    #[test]
+    fn sha256_digest_rejects_wrong_length_and_non_hex() {
+        for invalid in ["", "00", &"g".repeat(64), &"0".repeat(63), &"0".repeat(65)] {
+            assert!(invalid.parse::<Sha256Digest>().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_refines_only_the_matching_artifact() {
+        // upholds: LSRV-5 — the opaque verified value is returned only after
+        // hashing the complete canonical file selected by resolution.
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"small deterministic GGUF fixture";
+        std::fs::write(directory.path().join("model.gguf"), bytes).unwrap();
+        let artifact = resolve_directory(directory.path().to_path_buf())
+            .unwrap()
+            .into_gguf()
+            .unwrap();
+        let expected = Sha256Digest::of_bytes(bytes);
+        let verified = verify(artifact, &expected).await.unwrap();
+        assert_eq!(verified.digest(), &expected);
+        assert_eq!(
+            verified.path(),
+            directory.path().join("model.gguf").canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_digest_cannot_construct_a_verified_artifact() {
+        // upholds: LSRV-5 — verification failure occurs before a verified
+        // spawn input exists; the error names both expected and actual bytes.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        std::fs::write(&path, b"actual").unwrap();
+        let artifact = resolve_directory(directory.path().to_path_buf())
+            .unwrap()
+            .into_gguf()
+            .unwrap();
+        let expected = Sha256Digest::of_bytes(b"expected");
+        let actual = Sha256Digest::of_bytes(b"actual");
+        let error = verify(artifact, &expected).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&expected.to_string()), "{message}");
+        assert!(message.contains(&actual.to_string()), "{message}");
     }
 }

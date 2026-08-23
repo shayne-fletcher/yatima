@@ -14,4 +14,6 @@ mod source;
 
 pub use format::{caps_for, resolve_format, Caps, ChatFormat, FormatMismatch};
 pub use profile::{ModelProfile, REASONING_MIN_TOKENS};
-pub use source::{GgufArtifact, ModelSource, ResolvedModel};
+pub use source::{
+    verify, GgufArtifact, ModelSource, ResolvedModel, Sha256Digest, VerifiedModelArtifact,
+};

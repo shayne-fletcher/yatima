@@ -1,4 +1,5 @@
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -7,16 +8,34 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use yatima_lib::{
-    Agent, AgentStop, ChatMlTemplate, ChatSession, Completer, Dir, GenOpts, JsonToolCall,
+    verify, Agent, AgentStop, ChatMlTemplate, ChatSession, Completer, Dir, GenOpts, JsonToolCall,
     LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ModelSource,
-    PlainTemplate, ReadFile, StopReason, Tools,
+    PlainTemplate, ReadFile, ServerGates, ServerIdentity, Sha256Digest, StopReason, Tools,
 };
 
 const WITHIN: Duration = Duration::from_secs(8);
+const STUB_BYTES: &[u8] = b"stub";
+const STUB_TEMPLATE: &str = "stub-template";
+
+fn digest(bytes: &[u8]) -> Sha256Digest {
+    format!("{:x}", Sha256::digest(bytes)).parse().unwrap()
+}
+
+fn stub_gates() -> ServerGates {
+    ServerGates::new(10520, digest(STUB_TEMPLATE.as_bytes()), 4096, 1)
+}
+
+fn completion_sentinel(model: &std::path::Path) -> PathBuf {
+    model.with_extension("completion-hit")
+}
 
 async fn artifact(behavior: &str) -> (TempDir, yatima_lib::GgufArtifact) {
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join(format!("{behavior}.gguf")), "stub").unwrap();
+    std::fs::write(
+        directory.path().join(format!("{behavior}.gguf")),
+        STUB_BYTES,
+    )
+    .unwrap();
     let resolved =
         ModelSource::from_args(Some(directory.path().to_path_buf()), None, None, true, None)
             .unwrap()
@@ -44,7 +63,7 @@ async fn spawn_pins_arguments_waits_for_readiness_and_reaps() {
     // count, or missing --jinja; delayed readiness exercises repeated health
     // probes, and shutdown returns only after reap and drain joins.
     let (_directory, server) = spawn_stub("ready-after-2", Duration::from_secs(2)).await;
-    assert_eq!(server.props().build, "stub-b10520");
+    assert_eq!(server.props().build, "b10520-stub");
     assert_eq!(server.props().total_slots, 1);
     assert!(server.launched_artifact().ends_with("ready-after-2.gguf"));
     let status = tokio::time::timeout(WITHIN, server.shutdown())
@@ -55,6 +74,116 @@ async fn spawn_pins_arguments_waits_for_readiness_and_reaps() {
         !status.success(),
         "SIGKILL is successful cleanup, not child success"
     );
+}
+
+async fn assert_verified_gate_failure(behavior: &str, expected_error: &str) {
+    let (_directory, artifact) = artifact(behavior).await;
+    let sentinel = completion_sentinel(artifact.path());
+    let verified = verify(artifact, &digest(STUB_BYTES)).await.unwrap();
+    let mut spec = LlamaServerSpawn::verified(verified, stub_gates());
+    spec.binary = PathBuf::from(env!("CARGO_BIN_EXE_llama-server-stub"));
+    spec.readiness_timeout = Duration::from_secs(2);
+    let error = tokio::time::timeout(WITHIN, LlamaServer::spawn(spec))
+        .await
+        .expect("verified gate failure stayed bounded")
+        .err()
+        .expect("bad verified props must fail");
+    let message = format!("{error:#}");
+    assert!(message.contains(expected_error), "{message}");
+    assert!(
+        message.contains("reaped child") && message.contains("joined"),
+        "{message}"
+    );
+    assert!(
+        !sentinel.exists(),
+        "a failed startup gate must not permit /completion"
+    );
+}
+
+#[tokio::test]
+async fn verified_identity_hashes_and_launches_the_same_path() {
+    // upholds: LSRV-5 — the digest-refined artifact supplies both the identity
+    // claim and the exact -m pathname observed by the trusted stub.
+    let (_directory, artifact) = artifact("verified-good").await;
+    let launched = artifact.path().to_path_buf();
+    let expected = digest(STUB_BYTES);
+    let verified = verify(artifact, &expected).await.unwrap();
+    let mut spec = LlamaServerSpawn::verified(verified, stub_gates());
+    spec.binary = PathBuf::from(env!("CARGO_BIN_EXE_llama-server-stub"));
+    spec.readiness_timeout = Duration::from_secs(2);
+    let server = tokio::time::timeout(WITHIN, LlamaServer::spawn(spec))
+        .await
+        .expect("verified spawn stayed bounded")
+        .unwrap();
+    assert_eq!(server.launched_artifact(), launched);
+    assert_eq!(server.props().model_self_report, launched.to_string_lossy());
+    assert_eq!(
+        server.identity(),
+        &ServerIdentity::Verified { digest: expected }
+    );
+    assert!(!completion_sentinel(&launched).exists());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn verified_build_gate_fails_closed_and_reaps() {
+    // upholds: LSRV-5 — both an old build and an unparseable self-report fail
+    // before a completer can be returned.
+    assert_verified_gate_failure("gate-old-build", "build gate failed").await;
+    assert_verified_gate_failure("gate-unparseable-build", "unparseable build_info").await;
+}
+
+#[tokio::test]
+async fn verified_template_gate_requires_the_exact_embedded_bytes() {
+    // upholds: LSRV-5 — absent and different chat templates both fail closed.
+    assert_verified_gate_failure("gate-wrong-template", "template gate failed").await;
+    assert_verified_gate_failure("gate-missing-template", "omitted chat_template").await;
+}
+
+#[tokio::test]
+async fn verified_context_gate_reaps_without_serving() {
+    // upholds: LSRV-5.
+    assert_verified_gate_failure("gate-wrong-context", "context gate failed").await;
+}
+
+#[tokio::test]
+async fn verified_slot_gate_reaps_without_serving() {
+    // upholds: LSRV-5.
+    assert_verified_gate_failure("gate-wrong-slots", "slot gate failed").await;
+}
+
+#[tokio::test]
+async fn ordinary_managed_and_attached_sessions_remain_unverified() {
+    // upholds: LSRV-5 — neither ordinary managed construction nor attached
+    // /props introspection can manufacture a Verified identity.
+    let (_directory, server) = spawn_stub("unverified-managed", Duration::from_secs(2)).await;
+    assert!(matches!(
+        server.identity(),
+        ServerIdentity::Unverified { .. }
+    ));
+    server.shutdown().await.unwrap();
+
+    let attached = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "build_info": "b10520-stub",
+            "model_path": "/operator/claimed.gguf",
+            "total_slots": 1,
+            "default_generation_settings": { "n_ctx": 4096 },
+            "chat_template": STUB_TEMPLATE,
+        })))
+        .mount(&attached)
+        .await;
+    let props = LlamaServerCompleter::new(LlamaServerConfig::new(attached.uri()).unwrap())
+        .unwrap()
+        .introspect()
+        .await
+        .unwrap();
+    assert!(matches!(
+        props.identity(),
+        ServerIdentity::Unverified { .. }
+    ));
 }
 
 #[tokio::test]

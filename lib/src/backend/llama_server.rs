@@ -11,6 +11,10 @@
 //! Managed child death is observed during startup, introspection, completion,
 //! and shutdown. There is deliberately no monitor while the backend is idle;
 //! the next completion or explicit shutdown observes an intervening exit.
+//! A managed launch is unverified by default. [`LlamaServerSpawn::verified`]
+//! accepts only a content-verified artifact paired with [`ServerGates`]; all
+//! gates pass before [`LlamaServer::spawn`] returns a server that reports
+//! [`ServerIdentity::Verified`] (LSRV-5).
 //!
 //! Wire behavior is implemented against the stage-0 observations recorded in
 //! `tests/fixtures/llama_server/provenance.json` (llama.cpp build 10520):
@@ -26,7 +30,10 @@
 //!   omission would silently change yatima's policy.
 
 use super::sse::SseFramer;
-use crate::{Cancel, Completer, Completion, GenOpts, GgufArtifact, Sampling, StopReason};
+use crate::{
+    Cancel, Completer, Completion, GenOpts, GgufArtifact, Sampling, Sha256Digest, StopReason,
+    VerifiedModelArtifact,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -142,6 +149,88 @@ pub struct ServerProps {
     pub model_self_report: String,
     pub n_ctx: u32,
     pub total_slots: u32,
+    pub chat_template: Option<String>,
+}
+
+impl ServerProps {
+    /// An attached server's `/props` response is diagnostic, never verified
+    /// identity evidence (LSRV-5).
+    pub fn identity(&self) -> ServerIdentity {
+        ServerIdentity::Unverified {
+            self_report: self.model_self_report.clone(),
+        }
+    }
+}
+
+/// What Yatima can honestly claim about the model behind a server session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerIdentity {
+    Unverified { self_report: String },
+    Verified { digest: Sha256Digest },
+}
+
+/// Compatibility conditions checked after `/props` and before a verified
+/// managed server can be returned to a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerGates {
+    build_floor: u32,
+    template_sha256: Sha256Digest,
+    expected_context: u32,
+    expected_slots: u32,
+}
+
+impl ServerGates {
+    pub fn new(
+        build_floor: u32,
+        template_sha256: Sha256Digest,
+        expected_context: u32,
+        expected_slots: u32,
+    ) -> ServerGates {
+        ServerGates {
+            build_floor,
+            template_sha256,
+            expected_context,
+            expected_slots,
+        }
+    }
+
+    fn check(&self, props: &ServerProps) -> Result<()> {
+        let build = parse_build_number(&props.build)?;
+        if build < self.build_floor {
+            bail!(
+                "llama-server build gate failed: require b{} or newer, reported {:?}",
+                self.build_floor,
+                props.build
+            );
+        }
+
+        let template = props.chat_template.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("llama-server template gate failed: /props omitted chat_template")
+        })?;
+        let template_sha256 = Sha256Digest::of_bytes(template.as_bytes());
+        if template_sha256 != self.template_sha256 {
+            bail!(
+                "llama-server template gate failed: expected SHA-256 {}, found {}",
+                self.template_sha256,
+                template_sha256
+            );
+        }
+        if props.n_ctx != self.expected_context {
+            bail!(
+                "llama-server context gate failed: expected {}, found {}",
+                self.expected_context,
+                props.n_ctx
+            );
+        }
+        if props.total_slots != self.expected_slots {
+            bail!(
+                "llama-server slot gate failed: expected {}, found {}",
+                self.expected_slots,
+                props.total_slots
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The transport adapter. Holds only `Send` state, so the non-streaming
@@ -181,11 +270,23 @@ impl LlamaServerCompleter {
             .ok_or_else(|| anyhow::anyhow!("llama-server /props has no integer total_slots"))?
             .try_into()
             .context("llama-server /props total_slots does not fit u32")?;
+        let chat_template = match value.get("chat_template") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("llama-server /props chat_template is not a string")
+                    })?
+                    .to_string(),
+            ),
+        };
         Ok(ServerProps {
             build,
             model_self_report,
             n_ctx,
             total_slots,
+            chat_template,
         })
     }
 
@@ -396,23 +497,76 @@ impl Completer for LlamaServerCompleter {
     }
 }
 
-/// How to launch one managed llama-server process.
+#[derive(Clone)]
+enum SpecIdentity {
+    Known(GgufArtifact),
+    Verified {
+        artifact: VerifiedModelArtifact,
+        gates: ServerGates,
+    },
+}
+
+impl SpecIdentity {
+    fn path(&self) -> &Path {
+        match self {
+            SpecIdentity::Known(artifact) => artifact.path(),
+            SpecIdentity::Verified { artifact, .. } => artifact.path(),
+        }
+    }
+
+    fn artifact(&self) -> &GgufArtifact {
+        match self {
+            SpecIdentity::Known(artifact) => artifact,
+            SpecIdentity::Verified { artifact, .. } => artifact.artifact(),
+        }
+    }
+
+    fn gates(&self) -> Option<&ServerGates> {
+        match self {
+            SpecIdentity::Known(_) => None,
+            SpecIdentity::Verified { gates, .. } => Some(gates),
+        }
+    }
+
+    fn server_identity(&self, props: &ServerProps) -> ServerIdentity {
+        match self {
+            SpecIdentity::Known(_) => props.identity(),
+            SpecIdentity::Verified { artifact, .. } => ServerIdentity::Verified {
+                digest: *artifact.digest(),
+            },
+        }
+    }
+}
+
+/// How to launch one managed llama-server process. The model identity is
+/// private: use [`LlamaServerSpawn::new`] for an unverified launch or
+/// [`LlamaServerSpawn::verified`] for a digest-and-gate-checked launch.
 pub struct LlamaServerSpawn {
     pub binary: PathBuf,
-    pub gguf: GgufArtifact,
     pub context: Option<u32>,
     pub readiness_timeout: Duration,
     pub top_k: u32,
+    identity: SpecIdentity,
 }
 
 impl LlamaServerSpawn {
     pub fn new(gguf: GgufArtifact) -> LlamaServerSpawn {
+        LlamaServerSpawn::with_identity(SpecIdentity::Known(gguf))
+    }
+
+    /// Construct a managed launch that cannot claim verified identity without
+    /// both a content-verified artifact and compatibility gates (LSRV-5).
+    pub fn verified(artifact: VerifiedModelArtifact, gates: ServerGates) -> LlamaServerSpawn {
+        LlamaServerSpawn::with_identity(SpecIdentity::Verified { artifact, gates })
+    }
+
+    fn with_identity(identity: SpecIdentity) -> LlamaServerSpawn {
         LlamaServerSpawn {
             binary: PathBuf::from("llama-server"),
-            gguf,
             context: None,
             readiness_timeout: DEFAULT_READINESS_TIMEOUT,
             top_k: 0,
+            identity,
         }
     }
 }
@@ -428,6 +582,7 @@ pub struct LlamaServer {
     completer: LlamaServerCompleter,
     props: Option<ServerProps>,
     artifact: GgufArtifact,
+    identity: Option<ServerIdentity>,
 }
 
 impl LlamaServer {
@@ -486,6 +641,17 @@ impl LlamaServer {
             };
             match outcome {
                 Introspection::Props(Ok(props)) => {
+                    if let Some(gates) = spec.identity.gates() {
+                        if let Err(error) = gates.check(&props) {
+                            let cleanup = server.cleanup().await;
+                            let diagnostics = server.diagnostics();
+                            return Err(error).context(format!(
+                                "managed llama-server verification gate failed; {cleanup}; \
+                                 diagnostics:\n{diagnostics}"
+                            ));
+                        }
+                    }
+                    server.identity = Some(spec.identity.server_identity(&props));
                     server.props = Some(props);
                     return Ok(server);
                 }
@@ -533,7 +699,7 @@ impl LlamaServer {
         let mut command = Command::new(&spec.binary);
         command
             .arg("-m")
-            .arg(spec.gguf.path())
+            .arg(spec.identity.path())
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
@@ -565,7 +731,8 @@ impl LlamaServer {
             stderr_tail,
             completer,
             props: None,
-            artifact: spec.gguf.clone(),
+            artifact: spec.identity.artifact().clone(),
+            identity: None,
         })
     }
 
@@ -633,6 +800,12 @@ impl LlamaServer {
 
     pub fn launched_artifact(&self) -> &Path {
         self.artifact.path()
+    }
+
+    pub fn identity(&self) -> &ServerIdentity {
+        self.identity
+            .as_ref()
+            .expect("LlamaServer::spawn returns only after identity is established")
     }
 
     async fn cleanup(&mut self) -> String {
@@ -819,6 +992,22 @@ enum StartupWait {
     EarlyExit(ExitStatus),
     Timeout,
     Io(anyhow::Error),
+}
+
+fn parse_build_number(build: &str) -> Result<u32> {
+    let rest = build.strip_prefix('b').ok_or_else(|| {
+        anyhow::anyhow!("llama-server build gate failed: unparseable build_info {build:?}")
+    })?;
+    let digits = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        bail!("llama-server build gate failed: unparseable build_info {build:?}");
+    }
+    digits.parse().with_context(|| {
+        format!("llama-server build gate failed: unparseable build_info {build:?}")
+    })
 }
 
 #[derive(Clone)]
@@ -1048,6 +1237,7 @@ mod tests {
                 "model_path": "/models/qwen.gguf",
                 "total_slots": 1,
                 "default_generation_settings": { "n_ctx": 32768 },
+                "chat_template": "stub template",
                 "untrusted_extra": "ignored"
             })))
             .mount(&server)
@@ -1060,6 +1250,7 @@ mod tests {
                 model_self_report: "/models/qwen.gguf".into(),
                 n_ctx: 32768,
                 total_slots: 1,
+                chat_template: Some("stub template".into()),
             }
         );
 

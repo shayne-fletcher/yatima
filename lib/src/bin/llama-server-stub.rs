@@ -43,6 +43,10 @@ fn main() {
     for stream in listener.incoming() {
         let mut stream = stream.unwrap_or_else(|error| fail(&format!("accept: {error}")));
         let path = request_path(&mut stream);
+        if path == "/completion" {
+            std::fs::write(completion_sentinel(model), b"completion requested")
+                .unwrap_or_else(|error| fail(&format!("write completion sentinel: {error}")));
+        }
         match path.as_str() {
             "/health" => {
                 health_polls += 1;
@@ -63,10 +67,7 @@ fn main() {
                 &mut stream,
                 200,
                 "application/json",
-                &format!(
-                    r#"{{"build_info":"stub-b10520","model_path":{:?},"total_slots":1,"default_generation_settings":{{"n_ctx":4096}}}}"#,
-                    model
-                ),
+                &props(behavior, model),
             ),
             "/completion" if behavior == "die-after-ready" => {
                 eprintln!("die-after-ready marker");
@@ -90,6 +91,41 @@ fn main() {
             _ => respond(&mut stream, 404, "text/plain", "not found"),
         }
     }
+}
+
+fn props(behavior: &str, model: &str) -> String {
+    let build = match behavior {
+        "gate-old-build" => "b10000-stub",
+        "gate-unparseable-build" => "stub-b10520",
+        _ => "b10520-stub",
+    };
+    let context = if behavior == "gate-wrong-context" {
+        2048
+    } else {
+        4096
+    };
+    let slots = if behavior == "gate-wrong-slots" { 2 } else { 1 };
+    let template = if behavior == "gate-wrong-template" {
+        Some("wrong-template")
+    } else if behavior == "gate-missing-template" {
+        None
+    } else {
+        Some("stub-template")
+    };
+    let mut value = serde_json::json!({
+        "build_info": build,
+        "model_path": model,
+        "total_slots": slots,
+        "default_generation_settings": { "n_ctx": context },
+    });
+    if let Some(template) = template {
+        value["chat_template"] = serde_json::Value::String(template.to_string());
+    }
+    value.to_string()
+}
+
+fn completion_sentinel(model: &str) -> std::path::PathBuf {
+    Path::new(model).with_extension("completion-hit")
 }
 
 fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
