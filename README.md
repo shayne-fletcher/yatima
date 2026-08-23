@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./images/logo.png" width="340" alt="yatima logo">
+  <img src="./images/yatima-2.png" width="340" alt="yatima logo">
 </p>
 <h1 align="center">yatima</h1>
 <p align="center">
@@ -19,10 +19,10 @@
 The point is to make model calls part of ordinary Rust control flow: fetch evidence, normalize it into typed values, ask a local model, then validate what it said against the data your program supplied. Yatima owns the prompt and response protocols, transcript, tool loop, and capability checks regardless of which backend produces the completion. Model weights are acquired by [`possum`](https://github.com/shayne-fletcher/possum).
 
 <p align="center">
-  <img src="./images/yatima-2.png" width="820" alt="a figure looking through a vast mechanical aperture toward a distant landscape">
+  <img src="./images/yatima-penrose.png" width="820" alt="yatima-tui mid-turn: a typed URL auto-granted its origin, the read_page tool ran, and the answer is streaming live at 1.4 tok/s">
 </p>
 
-The backend supplies completions; Yatima supplies the program semantics. A model can propose a tool call, but only the capabilities explicitly held by that tool determine what the program may do.
+That frame is one turn, unstaged: the URL typed in the prompt **granted its origin** for the session (nothing else can — a fetched page cannot mint authority), the model fetched the page through its capability-scoped tool, and the answer is streaming token-by-token with a live rate — cancellable at any token with Esc.
 
 ## Quickstart
 
