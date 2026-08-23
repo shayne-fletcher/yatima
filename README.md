@@ -14,25 +14,15 @@
   </a>
 </p>
 
-`yatima` is a Rust runtime for using local LLMs inside typed programs. It loads
-models in-process, renders each family's native chat template, and lets
-tool-trained models act only through explicit, capability-scoped tools.
+`yatima` is a Rust runtime for using local LLMs inside typed programs. Its model-facing code targets the `Completer` trait: supported models can run in-process through [Candle](https://github.com/huggingface/candle), while CLI chat can use [llama.cpp](https://github.com/ggml-org/llama.cpp) through a supervised or already-running `llama-server`.
 
-The point is not to wrap an LLM service, but to make model calls part of ordinary
-Rust control flow: fetch evidence, normalize it into typed values, ask a local
-model, then validate what it said against the data your program supplied. The
-inference engine is rented from [candle](https://github.com/huggingface/candle);
-weights are acquired by [`possum`](https://github.com/shayne-fletcher/possum).
+The point is to make model calls part of ordinary Rust control flow: fetch evidence, normalize it into typed values, ask a local model, then validate what it said against the data your program supplied. Yatima owns the prompt and response protocols, transcript, tool loop, and capability checks regardless of which backend produces the completion. Model weights are acquired by [`possum`](https://github.com/shayne-fletcher/possum).
 
 <p align="center">
-  <img src="./images/yatima-penrose.png" width="820" alt="yatima-tui mid-turn: a typed URL auto-granted its origin, the read_page tool ran, and the answer is streaming live at 1.4 tok/s">
+  <img src="./images/yatima-2.png" width="820" alt="a figure looking through a vast mechanical aperture toward a distant landscape">
 </p>
 
-That frame is one turn, unstaged: the URL typed in the prompt **granted its
-origin** for the session (nothing else can — a fetched page cannot mint
-authority), the model fetched the page through its capability-scoped tool, and
-the answer is streaming token-by-token with a live rate — cancellable at any
-token with Esc.
+The backend supplies completions; Yatima supplies the program semantics. A model can propose a tool call, but only the capabilities explicitly held by that tool determine what the program may do.
 
 ## Quickstart
 
@@ -46,17 +36,23 @@ cargo run -p yatima-tui --release --features metal -- --profile qwen32b
 # one-shot CLI chat
 cargo run -p yatima-cli --release --features metal -- chat \
   --repo Qwen/Qwen2.5-7B-Instruct --format qwen --prompt "Explain Rust in two sentences."
+
+# managed llama-server chat: acquire one exact GGUF, launch it, then reap it
+cargo run -p yatima-cli --release -- chat \
+  --backend llama-server \
+  --repo bartowski/Qwen2.5-32B-Instruct-GGUF \
+  --gguf Qwen2.5-32B-Instruct-Q4_K_M.gguf \
+  --format qwen \
+  --prompt "Explain Rust in two sentences."
 ```
 
-Build with `--features metal` on Apple Silicon. A missing model is fetched on
-demand with the `fetch` feature; `--offline` never touches the network.
+Build the Candle backend with `--features metal` on Apple Silicon. Managed `llama-server` mode requires `llama-server` on `PATH`; Yatima binds it to loopback, waits for readiness, and stops and reaps it when the chat ends. A missing model is fetched on demand with the `fetch` feature; `--offline` never touches the network.
 
 ## What it does
 
-- **Generate / chat / agent** over local safetensors or GGUF/quantized weights.
-- **Embed** the runtime in Rust — model output flows into native values and
-  branches, no service boundary. Async-first; decode runs as a compute island
-  that never stalls the executor.
+- **Generate / chat / agent** through the in-process Candle engine over local safetensors or GGUF weights.
+- **CLI chat through llama-server** — attach to a loopback server, or have Yatima acquire an exact GGUF and own the server process from startup through reap. This path brings llama.cpp-supported architectures into the same `Completer` interface without moving transcript or tool semantics into the server.
+- **Embed** the runtime in Rust — model output flows into native values and branches. Candle inference stays in-process; `llama-server` is an explicit local transport adapter. Async completion does not block the executor's ordinary work.
 - **Capability-scoped tools** — a tool holds its own authority (a root dir, a
   set of web origins); the model supplies arguments, not access. Web authority
   derives only from *user utterances*: type a URL and its origin is granted for
@@ -72,9 +68,7 @@ demand with the `fetch` feature; `--offline` never touches the network.
 - **Reasoning models** — the chain-of-thought is split from the answer and kept
   out of conversation history.
 
-Many families are supported across generate/chat; the agent/tools path is
-narrower by design (Qwen/ChatML today). A `yatima-gui` crate (egui/wgpu) is an
-early sibling frontend over the same engine actor.
+Many families are supported across generate/chat; the agent/tools path is narrower by design (Qwen/ChatML today). The `llama-server` backend currently serves CLI chat; the TUI, GUI, server, and agent commands still use the in-process engine. A `yatima-gui` crate (egui/wgpu) is an early sibling frontend over the same engine actor.
 
 Every guarantee above is a named invariant in the crate's registry, pinned by
 tests that cite it — see the [design notes](notes/design.md).
@@ -97,7 +91,7 @@ canary test used to retire the fork on each candle upgrade are documented in
   caveat, GGUF i-quant limits, and the candle fork.
 - [Reasoning models](articles/reasoning-models.md) — think-block splitting,
   profiles, seeded vs. emitted markers.
-- [CLI usage](articles/cli.md) — `generate`, `chat`, the one-shot agent, and the attached llama-server workflow.
+- [CLI usage](articles/cli.md) — `generate`, `chat`, the one-shot agent, and managed or attached `llama-server` workflows.
 - [Embedding](articles/embedding.md) — the library surface and examples.
 - [Auditable research](articles/auditable-research.md) — the SEC/XBRL
   investment-thesis demo and `sieve`.
