@@ -24,7 +24,7 @@
 //! [`Agent`]: crate::Agent
 
 use crate::completer::Completer;
-use crate::reasoning::Reasoned;
+use crate::reasoning::{Reasoned, ResponseClassifier};
 use crate::template::PromptTemplate;
 use crate::transcript::{Role, Turn};
 use crate::{Cancel, GenOpts, StopReason};
@@ -117,8 +117,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         // `last_reasoning`, never re-fed into the next prompt (REASON-1). The
         // template owns the *final* interpretation — the same format that
         // renders the prompt reads the completed reply (marker dialects by
-        // default; ATEM addressing for Muse). Live streams are classified
-        // separately until the stage-3 streaming interpreter unifies them.
+        // default; the same ATEM machine used for live Muse classification).
         let Reasoned { reasoning, answer } = self.template.interpret_response(&completion.text);
         self.last_reasoning = reasoning;
         // An empty answer — a reply that was all reasoning or framing, e.g. a
@@ -195,10 +194,9 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             }
         };
         self.last_stop = Some(completion.stop);
-        // The live `on_token` stream is raw (reasoning tokens included; a
-        // channel-tagged stream is stage 3's), but the stored turn is
-        // answer-only so history stays clean (REASON-1) — the template owns
-        // its format's *final* interpretation, shared with the batch path.
+        // `on_token` remains the backend's raw stream; a caller obtains the
+        // template-matched live classifier through `classifier`. The stored
+        // turn is answer-only (REASON-1), interpreted by that same protocol.
         let Reasoned { reasoning, answer } = self.template.interpret_response(&completion.text);
         self.last_reasoning = reasoning;
         // REASON-1 / CHAT-2: an empty or degenerate answer rolls the exchange
@@ -248,6 +246,13 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
     /// (REASON-1); this is the only place it is surfaced.
     pub fn last_reasoning(&self) -> Option<&str> {
         self.last_reasoning.as_deref()
+    }
+
+    /// A fresh streaming classifier selected by this session's prompt
+    /// template. Feed the raw fragments supplied to a streaming turn through
+    /// it before displaying them (REASON-1).
+    pub fn classifier(&self) -> ResponseClassifier {
+        self.template.classifier()
     }
 
     /// Tokens in the most recent rendered prompt, if the completer exposes a
@@ -473,29 +478,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn muse_streaming_turn_commits_via_the_final_interpretation() {
-        // upholds: REASON-1 — scope: *final* interpretation and commit. The
-        // streaming and batch paths share the template's one final
-        // interpretation for the returned answer and the stored turn. The
-        // live token stream is deliberately raw in stage 1 (the CLI's
-        // marker-only splitter does not classify ATEM); unifying display is
-        // stage 3's streaming interpreter, not this test's claim.
+    async fn muse_streaming_turn_uses_one_protocol_live_and_at_commit() {
+        // upholds: REASON-1 — the selected template supplies the same ATEM
+        // machine used by final interpretation. Live output is classified and
+        // framing-free; final history receives only the to=user body.
         let mut c = Scripted::new(&[MUSE_REPLY_1]);
         let mut s = ChatSession::new(&mut c, crate::MuseGlimmerTemplate::default());
-        let mut streamed = String::new();
+        let mut classifier = s.classifier();
+        let mut live_reasoning = String::new();
+        let mut live_answer = String::new();
         let answer = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            s.turn_streaming_async("Name a river.", &mut |t| streamed.push_str(t)),
+            s.turn_streaming_async("Name a river.", &mut |fragment| {
+                classifier.push(fragment, |channel, text| match channel {
+                    crate::Channel::Reasoning => live_reasoning.push_str(text),
+                    crate::Channel::Answer => live_answer.push_str(text),
+                });
+            }),
         )
         .await
         .expect("bounded")
         .unwrap()
         .to_string();
+        classifier.finish(|channel, text| match channel {
+            crate::Channel::Reasoning => live_reasoning.push_str(text),
+            crate::Channel::Answer => live_answer.push_str(text),
+        });
         assert_eq!(answer, "The Nile.");
-        assert!(
-            streamed.contains("to=self"),
-            "the live stream is raw in stage 1: {streamed}"
-        );
+        assert_eq!(live_reasoning, "User wants a river. Nile is canonical.");
+        assert_eq!(live_answer, "The Nile.");
+        assert!(!live_reasoning.contains("<|") && !live_answer.contains("<|"));
         assert_eq!(
             s.last_reasoning(),
             Some("User wants a river. Nile is canonical.")

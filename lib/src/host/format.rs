@@ -34,9 +34,9 @@ pub enum ChatFormat {
     /// `</think>` (chat only; reasoning model).
     QwenThink,
     /// Muse Glimmer's ATEM format: `<|start|>role<|message|>…<|eot|>` turns
-    /// (text-chat subset — chat only in stage 1; the model's addressed output
-    /// streams raw until the ATEM interpreter lands in stage 3). Served via
-    /// the llama-server backend — no local `Arch` maps to it.
+    /// (text-chat subset — chat only; addressed output is classified by the
+    /// template's ATEM interpreter). Served via the llama-server backend — no
+    /// local `Arch` maps to it.
     #[serde(rename = "muse-glimmer")]
     MuseGlimmer,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
@@ -328,6 +328,45 @@ mod tests {
                 truncation_is_reasoning,
                 fmt.pre_seeds_reasoning(),
                 "format {name}: seeded cue ⇔ seeded final interpreter"
+            );
+        }
+    }
+
+    #[test]
+    fn template_classifier_matches_final_interpretation() {
+        // upholds: REASON-1 — the runtime-selected boxed template owns both
+        // live classification and final interpretation. Their reasoning and
+        // answer buckets agree for every format, including Muse ATEM.
+        for name in ChatFormat::NAMES {
+            let fmt: ChatFormat = name.parse().unwrap();
+            let raw = match fmt {
+                ChatFormat::MuseGlimmer => {
+                    " to=self<|message|>think<|eom|><|start|>assistant \
+                     to=user<|message|>answer<|eot|>"
+                }
+                ChatFormat::DeepSeek | ChatFormat::QwenThink => "truncated reasoning",
+                _ => "plain answer",
+            };
+            let template = fmt.template();
+            let expected = template.interpret_response(raw);
+            let mut classifier = template.classifier();
+            let mut reasoning = String::new();
+            let mut answer = String::new();
+            classifier.push(raw, |channel, text| match channel {
+                crate::Channel::Reasoning => reasoning.push_str(text),
+                crate::Channel::Answer => answer.push_str(text),
+            });
+            classifier.finish(|channel, text| match channel {
+                crate::Channel::Reasoning => reasoning.push_str(text),
+                crate::Channel::Answer => answer.push_str(text),
+            });
+            assert_eq!(
+                crate::Reasoned {
+                    reasoning: (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_string()),
+                    answer: answer.trim().to_string(),
+                },
+                expected,
+                "format {name}: live classifier and final interpreter"
             );
         }
     }

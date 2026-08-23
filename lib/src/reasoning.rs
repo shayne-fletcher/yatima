@@ -1,15 +1,16 @@
 //! The reasoning channel: separating a model's chain-of-thought from its answer.
 //!
-//! Reasoning models (Kimi-Dev, Qwen3, the DeepSeek-R1 family) emit an inline
-//! *thinking* span before their answer, wrapped in model-specific markers. That
-//! span is **ephemeral**: it must not be surfaced to the user, and — crucially —
-//! must not enter the transcript that is re-rendered into the next prompt, or the
-//! model re-reads its own stale reasoning off-distribution (trained chat
-//! templates drop prior think spans). [`split_reasoning`] performs that split at
-//! the completion→turn boundary (REASON-1).
+//! Marker-based reasoning models (Kimi-Dev, Qwen3, the DeepSeek-R1 family) emit
+//! an inline *thinking* span before their answer. Muse Glimmer instead emits a
+//! sequence of assistant messages addressed to `self`, `user`, or a tool. In
+//! either form, reasoning is **ephemeral**: callers may observe it separately,
+//! but it must not enter the answer or transcript re-rendered into the next
+//! prompt. [`split_reasoning`] handles complete marker-based replies,
+//! [`ReasoningSplitter`] handles their streams, and [`AtemInterpreter`] handles
+//! both complete and streamed Muse replies (REASON-1).
 //!
-//! The split is the identity when no marker is present, so it is safe for any
-//! model or format — a non-reasoning model's output passes through unchanged.
+//! Marker splitting is the identity when no marker is present. ATEM likewise
+//! preserves a plain reply that never begins its addressed-message grammar.
 
 /// One reasoning-marker dialect: the open/close pair a model wraps its
 /// chain-of-thought in.
@@ -141,13 +142,11 @@ pub fn strip_reasoning(text: &str) -> String {
 
 /// Which channel a streamed span belongs to.
 ///
-/// Intentionally binary: it is the *complete* partition for what streams today
-/// (the chat path, which has no tools — reasoning vs. answer is everything). A
-/// tool call is not a stream channel here because the only tool consumer, the
-/// [`Agent`](crate::Agent), runs non-streaming and extracts calls downstream via
-/// its [`ToolCallCodec`](crate::ToolCallCodec) (PROTO-1). If the agent ever
-/// streams, or a harmony/gpt-oss-style multi-channel model is enabled, this enum
-/// grows a `ToolCall` (and perhaps `Commentary`) arm — a non-breaking addition.
+/// Intentionally binary for the protocols active today. Chat displays both
+/// channels directly. The agent also emits both as live fragments, but its
+/// answer gate withholds tool-call markup before it can reach the answer
+/// channel. Muse tool recipients are conservatively reasoning until Stage 4
+/// adds their codec and event path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     /// The model's chain-of-thought (between reasoning markers).
@@ -292,6 +291,442 @@ fn held_back_len(buf: &str) -> usize {
         }
     }
     best
+}
+
+pub(crate) const ATEM_START: &str = "<|start|>";
+pub(crate) const ATEM_MESSAGE: &str = "<|message|>";
+pub(crate) const ATEM_EOM: &str = "<|eom|>";
+pub(crate) const ATEM_EOT: &str = "<|eot|>";
+const ATEM_MAX_HEADER: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtemState {
+    TurnStart,
+    Header,
+    Body,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recipient {
+    User,
+    Reasoning,
+}
+
+/// Incrementally interprets Muse Glimmer's addressed assistant messages.
+///
+/// The prompt already supplied the first `<|start|>assistant` cue, so generated
+/// text begins with the rest of that header. Later messages carry the full
+/// header. The accepted text-completion subset is:
+///
+/// ```ebnf
+/// completion      = first-message, { EOM, message }, [ EOT ] ;
+/// first-message   = [ address ], MESSAGE, body ;
+/// message         = START, "assistant", [ address ], MESSAGE, body ;
+/// address         = " to=", recipient ;
+/// recipient       = ? a nonempty recipient name containing no whitespace or "<" ? ;
+/// body            = ? text containing none of START, MESSAGE, EOM, or EOT ? ;
+/// START           = "<|start|>" ;
+/// MESSAGE         = "<|message|>" ;
+/// EOM             = "<|eom|>" ;
+/// EOT             = "<|eot|>" ;
+/// ```
+///
+/// An absent recipient and `to=user` select [`Channel::Answer`]; every other
+/// recipient selects [`Channel::Reasoning`] until the tool protocol lands.
+/// The grammar describes complete, well-formed replies. `push` additionally
+/// handles arbitrary fragment boundaries, a plain-text fallback, and bounded
+/// partial markers and headers. At end of stream, an incomplete ATEM header or
+/// control marker is reasoning rather than answer. An invalid or overlong
+/// header rejects the reply: all retained text is reasoning and the final
+/// answer is empty, so the conversation boundary commits nothing (REASON-1).
+/// Live fragments cannot be recalled, so a later rejection may invalidate text
+/// already emitted on the answer channel even though no answer is committed.
+pub struct AtemInterpreter {
+    state: AtemState,
+    recipient: Recipient,
+    header: String,
+    held: String,
+    reasoning: String,
+    answer: String,
+    initial_header: bool,
+    message_started: bool,
+    ended: bool,
+}
+
+impl Default for AtemInterpreter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AtemInterpreter {
+    /// Start at the continuation of the assistant cue already in the prompt.
+    pub fn new() -> Self {
+        Self {
+            state: AtemState::Header,
+            recipient: Recipient::User,
+            header: String::new(),
+            held: String::new(),
+            reasoning: String::new(),
+            answer: String::new(),
+            initial_header: true,
+            message_started: false,
+            ended: false,
+        }
+    }
+
+    /// Feed one decoded text fragment and emit every newly classified span.
+    pub fn push(&mut self, fragment: &str, mut emit: impl FnMut(Channel, &str)) {
+        let mut input = fragment;
+        while !input.is_empty() {
+            if self.ended {
+                let tail = input.trim_start_matches(char::is_whitespace);
+                if !tail.is_empty() {
+                    self.reject(tail, &mut emit);
+                }
+                break;
+            }
+            match self.state {
+                AtemState::Rejected => {
+                    self.append_rejected(input, &mut emit);
+                    break;
+                }
+                AtemState::TurnStart => {
+                    let next = input.chars().next().expect("input is nonempty");
+                    let len = next.len_utf8();
+                    self.header.push(next);
+                    input = &input[len..];
+                    if self.header == ATEM_START {
+                        self.header.clear();
+                        self.state = AtemState::Header;
+                        self.initial_header = false;
+                    } else if !ATEM_START.starts_with(&self.header) {
+                        let invalid = std::mem::take(&mut self.header);
+                        self.reject(&invalid, &mut emit);
+                    }
+                }
+                AtemState::Header => {
+                    let next = input.chars().next().expect("input is nonempty");
+                    let len = next.len_utf8();
+                    self.header.push(next);
+                    input = &input[len..];
+
+                    if let Some(message_at) = self.header.find(ATEM_MESSAGE) {
+                        if message_at > ATEM_MAX_HEADER {
+                            let invalid = std::mem::take(&mut self.header);
+                            self.reject(&invalid, &mut emit);
+                            continue;
+                        }
+                        let recipient =
+                            parse_atem_header(&self.header[..message_at], self.initial_header);
+                        if let Some(recipient) = recipient {
+                            self.header.clear();
+                            self.state = AtemState::Body;
+                            self.recipient = recipient;
+                            self.initial_header = false;
+                            self.message_started = false;
+                        } else if self.initial_header && !looks_like_atem_header(&self.header) {
+                            let plain = std::mem::take(&mut self.header);
+                            self.state = AtemState::Body;
+                            self.recipient = Recipient::User;
+                            self.initial_header = false;
+                            self.message_started = false;
+                            self.emit_body(&plain, &mut emit);
+                        } else {
+                            let invalid = std::mem::take(&mut self.header);
+                            self.reject(&invalid, &mut emit);
+                        }
+                    } else if !atem_header_prefix_possible(&self.header, self.initial_header) {
+                        if self.initial_header && !looks_like_atem_header(&self.header) {
+                            let plain = std::mem::take(&mut self.header);
+                            self.state = AtemState::Body;
+                            self.recipient = Recipient::User;
+                            self.initial_header = false;
+                            self.message_started = false;
+                            self.emit_body(&plain, &mut emit);
+                        } else {
+                            let invalid = std::mem::take(&mut self.header);
+                            self.reject(&invalid, &mut emit);
+                        }
+                    } else if self.header.len() > ATEM_MAX_HEADER {
+                        let invalid = std::mem::take(&mut self.header);
+                        self.reject(&invalid, &mut emit);
+                    }
+                }
+                AtemState::Body => {
+                    if !self.held.is_empty() {
+                        let next = input.chars().next().expect("input is nonempty");
+                        let len = next.len_utf8();
+                        self.held.push(next);
+                        input = &input[len..];
+                        if let Some((at, marker)) = earliest_atem_control(&self.held) {
+                            debug_assert_eq!(at + marker.len(), self.held.len());
+                            if at > 0 {
+                                let text = self.held[..at].to_string();
+                                self.emit_body(&text, &mut emit);
+                            }
+                            self.held.clear();
+                            self.consume_control(marker, &mut emit);
+                        } else {
+                            let keep = atem_held_back_len(&self.held);
+                            let upto = self.held.len() - keep;
+                            if upto > 0 {
+                                let text = self.held[..upto].to_string();
+                                let suffix = self.held[upto..].to_string();
+                                self.held = suffix;
+                                self.emit_body(&text, &mut emit);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if let Some((at, marker)) = earliest_atem_control(input) {
+                        if at > 0 {
+                            self.emit_body(&input[..at], &mut emit);
+                        }
+                        input = &input[at + marker.len()..];
+                        self.consume_control(marker, &mut emit);
+                    } else {
+                        let keep = atem_held_back_len(input);
+                        let upto = input.len() - keep;
+                        if upto > 0 {
+                            self.emit_body(&input[..upto], &mut emit);
+                        }
+                        if keep > 0 {
+                            self.held.push_str(&input[upto..]);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Finish the response, returning the same answer/reasoning split used by
+    /// final transcript commit. Streamed output preserves whitespace; these
+    /// stored spans are trimmed like [`split_reasoning`].
+    pub fn finish(mut self, mut emit: impl FnMut(Channel, &str)) -> Reasoned {
+        match self.state {
+            AtemState::Body if !self.held.is_empty() => {
+                let partial_marker = std::mem::take(&mut self.held);
+                self.emit_reasoning_tail(&partial_marker, &mut emit);
+            }
+            AtemState::Header if !self.header.is_empty() => {
+                let partial_header = std::mem::take(&mut self.header);
+                if self.initial_header && !looks_like_atem_header(&partial_header) {
+                    self.recipient = Recipient::User;
+                    self.message_started = false;
+                    self.emit_body(&partial_header, &mut emit);
+                } else {
+                    self.emit_reasoning_tail(&partial_header, &mut emit);
+                }
+            }
+            AtemState::TurnStart if !self.header.is_empty() => {
+                let partial_start = std::mem::take(&mut self.header);
+                self.emit_reasoning_tail(&partial_start, &mut emit);
+            }
+            _ => {}
+        }
+
+        let reasoning = self.reasoning.trim().to_string();
+        Reasoned {
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            answer: self.answer.trim().to_string(),
+        }
+    }
+
+    /// Interpret one complete response through the incremental machine.
+    pub fn interpret(raw: &str) -> Reasoned {
+        let mut interpreter = Self::new();
+        interpreter.push(raw, |_, _| {});
+        interpreter.finish(|_, _| {})
+    }
+
+    fn emit_body(&mut self, text: &str, emit: &mut impl FnMut(Channel, &str)) {
+        if text.is_empty() {
+            return;
+        }
+        let (channel, bucket) = match self.recipient {
+            Recipient::User => (Channel::Answer, &mut self.answer),
+            Recipient::Reasoning => (Channel::Reasoning, &mut self.reasoning),
+        };
+        if !self.message_started && !bucket.is_empty() {
+            bucket.push('\n');
+            emit(channel, "\n");
+        }
+        bucket.push_str(text);
+        emit(channel, text);
+        self.message_started = true;
+    }
+
+    fn consume_control(&mut self, marker: &str, emit: &mut impl FnMut(Channel, &str)) {
+        self.message_started = false;
+        match marker {
+            ATEM_EOM => {
+                self.state = AtemState::TurnStart;
+                self.header.clear();
+            }
+            ATEM_START => {
+                self.state = AtemState::Header;
+                self.header.clear();
+                self.initial_header = false;
+            }
+            ATEM_EOT => {
+                self.state = AtemState::TurnStart;
+                self.header.clear();
+                self.ended = true;
+            }
+            ATEM_MESSAGE => self.reject("", emit),
+            _ => unreachable!("earliest_atem_control returned a known marker"),
+        }
+    }
+
+    fn emit_reasoning_tail(&mut self, text: &str, emit: &mut impl FnMut(Channel, &str)) {
+        if text.is_empty() {
+            return;
+        }
+        self.reasoning.push_str(text);
+        emit(Channel::Reasoning, text);
+    }
+
+    fn reject(&mut self, text: &str, emit: &mut impl FnMut(Channel, &str)) {
+        if !self.answer.is_empty() {
+            if !self.reasoning.is_empty() {
+                self.reasoning.push('\n');
+            }
+            self.reasoning.push_str(&self.answer);
+            self.answer.clear();
+        }
+        self.header.clear();
+        self.held.clear();
+        self.state = AtemState::Rejected;
+        self.ended = false;
+        self.append_rejected(text, emit);
+    }
+
+    fn append_rejected(&mut self, text: &str, emit: &mut impl FnMut(Channel, &str)) {
+        if text.is_empty() {
+            return;
+        }
+        self.reasoning.push_str(text);
+        emit(Channel::Reasoning, text);
+    }
+}
+
+/// The streaming response classifier selected by a prompt template.
+pub enum ResponseClassifier {
+    Markers(ReasoningSplitter),
+    Atem(AtemInterpreter),
+}
+
+impl ResponseClassifier {
+    pub fn markers() -> Self {
+        Self::Markers(ReasoningSplitter::new())
+    }
+
+    pub fn seeded_markers() -> Self {
+        Self::Markers(ReasoningSplitter::seeded())
+    }
+
+    pub fn atem() -> Self {
+        Self::Atem(AtemInterpreter::new())
+    }
+
+    pub fn push(&mut self, fragment: &str, mut emit: impl FnMut(Channel, &str)) {
+        match self {
+            Self::Markers(splitter) => splitter.push(fragment, &mut emit),
+            Self::Atem(interpreter) => interpreter.push(fragment, &mut emit),
+        }
+    }
+
+    pub fn finish(self, mut emit: impl FnMut(Channel, &str)) {
+        match self {
+            Self::Markers(splitter) => splitter.finish(&mut emit),
+            Self::Atem(interpreter) => {
+                interpreter.finish(&mut emit);
+            }
+        }
+    }
+}
+
+fn parse_atem_header(header: &str, initial: bool) -> Option<Recipient> {
+    let suffix = if initial {
+        header
+    } else {
+        header.strip_prefix("assistant")?
+    };
+    if suffix.is_empty() {
+        return Some(Recipient::User);
+    }
+    let recipient = suffix.strip_prefix(" to=")?;
+    valid_recipient(recipient).then_some(if recipient == "user" {
+        Recipient::User
+    } else {
+        Recipient::Reasoning
+    })
+}
+
+fn valid_recipient(recipient: &str) -> bool {
+    !recipient.is_empty() && !recipient.chars().any(|c| c.is_whitespace() || c == '<')
+}
+
+fn atem_header_prefix_possible(header: &str, initial: bool) -> bool {
+    let suffix = if initial {
+        header
+    } else if "assistant".starts_with(header) {
+        return true;
+    } else if let Some(suffix) = header.strip_prefix("assistant") {
+        suffix
+    } else {
+        return false;
+    };
+
+    if ATEM_MESSAGE.starts_with(suffix) {
+        return true;
+    }
+    if " to=".starts_with(suffix) {
+        return true;
+    }
+    let Some(recipient_and_marker) = suffix.strip_prefix(" to=") else {
+        return false;
+    };
+    match recipient_and_marker.find('<') {
+        Some(marker_at) => {
+            valid_recipient(&recipient_and_marker[..marker_at])
+                && ATEM_MESSAGE.starts_with(&recipient_and_marker[marker_at..])
+        }
+        None => valid_recipient(recipient_and_marker),
+    }
+}
+
+fn looks_like_atem_header(header: &str) -> bool {
+    !header.is_empty()
+        && (" to=".starts_with(header)
+            || header.starts_with(" to=")
+            || header == "<"
+            || header.starts_with("<|"))
+}
+
+fn earliest_atem_control(buf: &str) -> Option<(usize, &'static str)> {
+    [ATEM_EOM, ATEM_EOT, ATEM_START, ATEM_MESSAGE]
+        .into_iter()
+        .filter_map(|marker| buf.find(marker).map(|at| (at, marker)))
+        .min_by_key(|(at, _)| *at)
+}
+
+fn atem_held_back_len(buf: &str) -> usize {
+    [ATEM_EOM, ATEM_EOT, ATEM_START, ATEM_MESSAGE]
+        .into_iter()
+        .map(|marker| {
+            let max = marker.len().min(buf.len());
+            (1..=max)
+                .rev()
+                .find(|&len| buf.as_bytes().ends_with(&marker.as_bytes()[..len]))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -509,5 +944,223 @@ mod tests {
         let (r, a) = stream_char_by_char(ReasoningSplitter::new(), raw);
         assert_eq!(r, "weigh it");
         assert_eq!(a, "final");
+    }
+
+    fn stream_atem(fragments: &[&str]) -> (String, String, Reasoned) {
+        let mut interpreter = AtemInterpreter::new();
+        let mut reasoning = String::new();
+        let mut answer = String::new();
+        let mut sink = |channel: Channel, text: &str| match channel {
+            Channel::Reasoning => reasoning.push_str(text),
+            Channel::Answer => answer.push_str(text),
+        };
+        for fragment in fragments {
+            interpreter.push(fragment, &mut sink);
+        }
+        let final_split = interpreter.finish(&mut sink);
+        (reasoning, answer, final_split)
+    }
+
+    const ATEM_CANONICAL: &str = " to=self<|message|>think café<|eom|>\
+                                  <|start|>assistant to=user<|message|>answer<|eot|>";
+    const ATEM_MULTI_MESSAGE: &str = " to=self<|message|>first<|eom|>\
+                                      <|start|>assistant to=self<|message|>second<|eom|>\
+                                      <|start|>assistant to=user<|message|>done<|eot|>";
+
+    #[test]
+    fn atem_interprets_addressed_messages() {
+        // upholds: REASON-1 — addressed reasoning and protocol framing never
+        // enter the answer; streamed and final buckets agree.
+        let (live_reasoning, live_answer, final_split) = stream_atem(&[ATEM_CANONICAL]);
+        assert_eq!(live_reasoning, "think café");
+        assert_eq!(live_answer, "answer");
+        assert_eq!(final_split.reasoning.as_deref(), Some("think café"));
+        assert_eq!(final_split.answer, "answer");
+        assert!(!live_reasoning.contains("<|") && !live_answer.contains("<|"));
+    }
+
+    #[test]
+    fn atem_preserves_a_plain_unframed_reply() {
+        let (reasoning, answer, final_split) = stream_atem(&["Just a plain reply."]);
+        assert_eq!(reasoning, "");
+        assert_eq!(answer, "Just a plain reply.");
+        assert_eq!(final_split.reasoning, None);
+        assert_eq!(final_split.answer, "Just a plain reply.");
+    }
+
+    #[test]
+    fn atem_preserves_angle_bracket_initial_unframed_replies() {
+        for raw in ["<3 that idea!", "<div> is an HTML element"] {
+            let (reasoning, answer, final_split) = stream_atem(&[raw]);
+            assert_eq!(reasoning, "");
+            assert_eq!(answer, raw);
+            assert_eq!(final_split.reasoning, None);
+            assert_eq!(final_split.answer, raw);
+        }
+    }
+
+    #[test]
+    fn atem_ignores_only_whitespace_after_eot() {
+        let turn = " to=user<|message|>answer<|eot|>";
+        for fragments in [
+            vec![turn, "\n\t"],
+            vec![" to=user<|message|>answer<|eot|>\n\t"],
+        ] {
+            let (reasoning, answer, final_split) = stream_atem(&fragments);
+            assert_eq!(reasoning, "");
+            assert_eq!(answer, "answer");
+            assert_eq!(final_split.reasoning, None);
+            assert_eq!(final_split.answer, "answer");
+        }
+
+        let (_, _, rejected) = stream_atem(&[" to=user<|message|>answer<|eot|>not whitespace"]);
+        assert!(rejected.answer.is_empty());
+        let reasoning = rejected.reasoning.expect("rejected tail is inspectable");
+        assert!(reasoning.contains("answer"));
+        assert!(reasoning.contains("not whitespace"));
+    }
+
+    #[test]
+    fn atem_post_eot_rejection_is_chunk_invariant() {
+        let whole = stream_atem(&[" to=user<|message|>answer<|eot|>\n\tnot whitespace"]);
+        let fragmented =
+            stream_atem(&[" to=user<|message|>answer<|eot|>", "\n\t", "not whitespace"]);
+        assert_eq!(fragmented, whole);
+    }
+
+    #[test]
+    fn atem_routes_every_non_user_recipient_to_reasoning() {
+        // Tool payloads remain uninterpreted until stage 4, but can never leak
+        // to the user-facing answer in stage 3.
+        let raw = " to=fs.stat_file<|message|><atem:function_calls>x</atem:function_calls>\
+                   <|start|>assistant to=user<|message|>Done.";
+        let (reasoning, answer, final_split) = stream_atem(&[raw]);
+        assert!(reasoning.contains("atem:function_calls"));
+        assert_eq!(answer, "Done.");
+        assert_eq!(final_split.answer, "Done.");
+    }
+
+    #[test]
+    fn atem_accepts_the_observed_start_without_eom_recovery_shape() {
+        // Stage 1 captured a generation with a fresh START directly after the
+        // reasoning body. The formal grammar uses EOM; consuming START here is
+        // the conservative recovery behavior pinned by that real trace.
+        let raw = " to=self<|message|>think\
+                   <|start|>assistant to=user<|message|>answer";
+        let (_, _, final_split) = stream_atem(&[raw]);
+        assert_eq!(final_split.reasoning.as_deref(), Some("think"));
+        assert_eq!(final_split.answer, "answer");
+    }
+
+    #[test]
+    fn atem_rejects_an_overlong_header_without_an_answer() {
+        // upholds: REASON-1 — the header buffer is bounded and a reply that
+        // exceeds it is not committable protocol text.
+        let raw = format!(" to={}", "x".repeat(ATEM_MAX_HEADER + 1));
+        let (_, answer, final_split) = stream_atem(&[&raw]);
+        assert!(answer.is_empty());
+        assert!(final_split.answer.is_empty());
+        assert!(final_split.reasoning.is_some());
+    }
+
+    #[test]
+    fn atem_rejects_an_invalid_later_header_and_clears_the_answer() {
+        let raw = " to=user<|message|>partial answer<|start|>not-assistant";
+        let (_, _, final_split) = stream_atem(&[raw]);
+        assert!(final_split.answer.is_empty());
+        let reasoning = final_split
+            .reasoning
+            .expect("rejected reply is inspectable");
+        assert!(reasoning.contains("partial answer"));
+        assert!(reasoning.contains("not-assistant"));
+    }
+
+    #[test]
+    fn atem_partial_control_markers_never_reach_the_answer() {
+        // Every incomplete header marker is framing; every incomplete body
+        // control is withheld and conservatively finalized as reasoning.
+        for marker in [ATEM_MESSAGE, ATEM_START, ATEM_EOM, ATEM_EOT] {
+            for len in 1..marker.len() {
+                let prefix = &marker[..len];
+                let (_, _, header_split) = stream_atem(&[prefix]);
+                assert!(
+                    header_split.answer.is_empty(),
+                    "header prefix leaked: {prefix:?}"
+                );
+                assert_eq!(header_split.reasoning.as_deref(), Some(prefix));
+            }
+        }
+        for marker in [ATEM_MESSAGE, ATEM_START, ATEM_EOM, ATEM_EOT] {
+            for len in 1..marker.len() {
+                let prefix = &marker[..len];
+                let raw = format!(" to=user<|message|>answer{prefix}");
+                let (_, _, body_split) = stream_atem(&[&raw]);
+                assert_eq!(body_split.answer, "answer");
+                assert_eq!(body_split.reasoning.as_deref(), Some(prefix));
+            }
+        }
+    }
+
+    #[test]
+    fn atem_rejects_a_message_delimiter_inside_a_body() {
+        let raw = " to=user<|message|>answer<|message|>not-a-header";
+        let (live_reasoning, _, final_split) = stream_atem(&[raw]);
+        assert!(final_split.answer.is_empty());
+        assert!(live_reasoning.contains("not-a-header"));
+    }
+
+    fn scalar_boundaries(text: &str) -> Vec<usize> {
+        text.char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(text.len()))
+            .collect()
+    }
+
+    #[test]
+    fn atem_is_invariant_under_every_single_scalar_split() {
+        // upholds: REASON-1 — finite witnesses for the chunking law: every
+        // single split of both canonical responses matches whole-input parsing.
+        for raw in [ATEM_CANONICAL, ATEM_MULTI_MESSAGE] {
+            let expected = stream_atem(&[raw]);
+            for split in scalar_boundaries(raw) {
+                assert_eq!(
+                    stream_atem(&[&raw[..split], &raw[split..]]),
+                    expected,
+                    "split at byte {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn atem_is_invariant_under_one_character_fragments() {
+        for raw in [ATEM_CANONICAL, ATEM_MULTI_MESSAGE] {
+            let boundaries = scalar_boundaries(raw);
+            let fragments: Vec<&str> = boundaries
+                .windows(2)
+                .map(|pair| &raw[pair[0]..pair[1]])
+                .collect();
+            assert_eq!(stream_atem(&fragments), stream_atem(&[raw]));
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn atem_is_invariant_under_random_chunk_partitions(
+            case in 0usize..2,
+            cuts in proptest::collection::vec(proptest::bool::ANY, 0..160),
+        ) {
+            let raw = [ATEM_CANONICAL, ATEM_MULTI_MESSAGE][case];
+            let boundaries = scalar_boundaries(raw);
+            let mut fragments = Vec::new();
+            let mut start = 0;
+            for (index, &end) in boundaries.iter().enumerate().skip(1) {
+                if end == raw.len() || cuts.get(index - 1).copied().unwrap_or(false) {
+                    fragments.push(&raw[start..end]);
+                    start = end;
+                }
+            }
+            proptest::prop_assert_eq!(stream_atem(&fragments), stream_atem(&[raw]));
+        }
     }
 }

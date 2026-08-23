@@ -20,8 +20,8 @@ use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir,
     LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ModelId, ModelProfile,
-    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage,
-    ReasoningSplitter, Sampling, ToolCallCodec, Tools, WebOrigins,
+    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage, Sampling,
+    ToolCallCodec, Tools, WebOrigins,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -303,7 +303,6 @@ async fn chat(args: ChatArgs) -> Result<()> {
                 opts,
                 args.system,
                 args.prompt,
-                format.pre_seeds_reasoning(),
             )
             .await;
         }
@@ -337,7 +336,6 @@ async fn chat(args: ChatArgs) -> Result<()> {
                 opts,
                 args.system,
                 args.prompt,
-                format.pre_seeds_reasoning(),
             )
             .await;
             let shutdown = server.shutdown().await;
@@ -391,7 +389,6 @@ async fn chat(args: ChatArgs) -> Result<()> {
         opts,
         args.system,
         args.prompt,
-        format.pre_seeds_reasoning(),
     )
     .await
 }
@@ -457,7 +454,6 @@ async fn run_chat<C: Completer>(
     opts: GenOpts,
     system: Option<String>,
     prompt: Option<String>,
-    pre_seeds: bool,
 ) -> Result<()> {
     let mut session = ChatSession::new(completer, template).with_opts(opts);
     if let Some(sys) = system {
@@ -467,7 +463,7 @@ async fn run_chat<C: Completer>(
         Some(prompt) => {
             println!("{}", session.turn_async(&prompt).await?);
         }
-        None => chat_repl(session, pre_seeds).await?,
+        None => chat_repl(session).await?,
     }
     Ok(())
 }
@@ -475,15 +471,13 @@ async fn run_chat<C: Completer>(
 /// Interactive multi-turn loop over a library [`ChatSession`]: a terminal gets
 /// editable input with in-memory Up/Down history; redirected stdin retains plain
 /// line reads. Answers stream to stdout token-by-token via
-/// [`ChatSession::turn_streaming`]. A reasoning model's chain-of-thought is
-/// routed through a [`ReasoningSplitter`] and dimmed (on a terminal), so the
-/// answer stands out and the markers never print (REASON-1). `pre_seeds` selects
-/// the splitter mode for a format whose cue opens the think block (DeepSeek).
+/// [`ChatSession::turn_streaming`]. The session's template supplies the
+/// response classifier, so marker-based and ATEM reasoning are dimmed while
+/// answer text remains normal and protocol framing never prints (REASON-1).
 /// EOF (Ctrl-D) or `/exit` ends the session; `/reset` clears model history but
 /// leaves input recall intact.
 async fn chat_repl<C: Completer, T: PromptTemplate>(
     mut session: ChatSession<'_, C, T>,
-    pre_seeds: bool,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let mut editor = if stdin.is_terminal() {
@@ -541,20 +535,16 @@ async fn chat_repl<C: Completer, T: PromptTemplate>(
                 .context("record chat input history")?;
         }
         let mut stdout = std::io::stdout();
-        let mut splitter = if pre_seeds {
-            ReasoningSplitter::seeded()
-        } else {
-            ReasoningSplitter::new()
-        };
+        let mut classifier = session.classifier();
         let mut current: Option<Channel> = None;
         session
             .turn_streaming_async(line, &mut |piece| {
-                splitter.push(piece, |ch, text| {
+                classifier.push(piece, |ch, text| {
                     write_channel(&mut stdout, ch, text, &mut current, color)
                 });
             })
             .await?;
-        splitter.finish(|ch, text| write_channel(&mut stdout, ch, text, &mut current, color));
+        classifier.finish(|ch, text| write_channel(&mut stdout, ch, text, &mut current, color));
         if color {
             let _ = stdout.write_all(b"\x1b[0m"); // ensure dim is cleared
         }

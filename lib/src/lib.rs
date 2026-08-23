@@ -294,16 +294,17 @@
 //!   framing never enter the committed transcript re-rendered into a later
 //!   prompt, and a reply with **no** answer text (all reasoning/framing — a
 //!   truncated think block, a Muse turn that never reaches `to=user`) commits
-//!   nothing at all. The boundary is [`PromptTemplate::interpret_response`] —
-//!   owned by the same template that renders the prompt, so each protocol has
-//!   one definition of its *final* interpretation (live-stream display is
-//!   classified separately until the stage-3 streaming interpreter).
+//!   nothing at all. The selected [`PromptTemplate`] owns both
+//!   [`PromptTemplate::classifier`] for live fragments and
+//!   [`PromptTemplate::interpret_response`] for final commit, so format
+//!   selection cannot pair rendering with another protocol's classifier.
 //!   Implementations: the marker-dialect splitter ([`split_reasoning`],
 //!   identity when no marker is present; an unterminated opener classifies as
 //!   reasoning), its seeded variant (`split_seeded_reasoning`, crate-private,
 //!   used by the pre-seeded templates — a close-less reply never left the
-//!   think block), and the Muse ATEM interpreter ([`MuseGlimmerTemplate`]'s
-//!   override).
+//!   think block), and [`AtemInterpreter`] for Muse addressed messages. Muse
+//!   streaming and final interpretation are the same state machine; arbitrary
+//!   fragment boundaries cannot change its classified output.
 //! - **CHAT-1** a [`ChatSession`] turn is atomic: if its completion errors, the
 //!   user turn is rolled back so the transcript is unchanged. A failed turn never
 //!   poisons the session — a later turn re-renders clean history and succeeds.
@@ -346,7 +347,10 @@ pub use host::{
     caps_for, resolve_format, Caps, ChatFormat, FormatMismatch, GgufArtifact, ModelProfile,
     ModelSource, ResolvedModel, REASONING_MIN_TOKENS,
 };
-pub use reasoning::{split_reasoning, strip_reasoning, Channel, Reasoned, ReasoningSplitter};
+pub use reasoning::{
+    split_reasoning, strip_reasoning, AtemInterpreter, Channel, Reasoned, ReasoningSplitter,
+    ResponseClassifier,
+};
 pub use runtime::run_blocking;
 pub use template::{
     ChatMlTemplate, ChatMlThinkTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate,

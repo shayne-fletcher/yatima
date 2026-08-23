@@ -8,7 +8,10 @@
 //! [`PlainTemplate`] keeps the minimal layout for models with no known template
 //! and for tests.
 
-use crate::reasoning::{split_reasoning, split_seeded_reasoning, Reasoned};
+use crate::reasoning::{
+    split_reasoning, split_seeded_reasoning, AtemInterpreter, Reasoned, ResponseClassifier,
+    ATEM_EOT as MUSE_EOT, ATEM_MESSAGE as MUSE_MESSAGE, ATEM_START as MUSE_START,
+};
 use crate::transcript::{Role, Turn};
 
 /// Render a transcript into the prompt string fed to the model, ending with the
@@ -16,15 +19,21 @@ use crate::transcript::{Role, Turn};
 pub trait PromptTemplate {
     fn render(&self, turns: &[Turn]) -> String;
 
+    /// Construct the streaming classifier for replies in this template's
+    /// protocol. Marker-based formats use the default; pre-seeded marker
+    /// formats and Muse override it. Keeping this choice on the template avoids
+    /// a second format switch drifting from final interpretation (REASON-1).
+    fn classifier(&self) -> ResponseClassifier {
+        ResponseClassifier::markers()
+    }
+
     /// Interpret the model's **completed** reply into reasoning and answer —
     /// the inverse direction of [`render`](PromptTemplate::render), owned by
-    /// the same format so each protocol has exactly one definition of its
-    /// *final* interpretation (a live token stream is classified separately by
-    /// the streaming layer until the stage-3 streaming interpreter unifies
-    /// them). The default is the marker-based [`split_reasoning`] (`<think>`
-    /// dialects); [`MuseGlimmerTemplate`] overrides it with ATEM
-    /// addressed-message interpretation. `ChatSession` commits only a
-    /// non-empty returned `answer` to history (REASON-1).
+    /// the same template that selects [`classifier`](Self::classifier). The
+    /// default is the marker-based [`split_reasoning`] (`<think>` dialects);
+    /// [`MuseGlimmerTemplate`] feeds the completed reply through the same ATEM
+    /// machine used for its live stream. `ChatSession` commits only a non-empty
+    /// returned `answer` to history (REASON-1).
     fn interpret_response(&self, raw: &str) -> Reasoned {
         split_reasoning(raw)
     }
@@ -38,6 +47,10 @@ pub trait PromptTemplate {
 impl<T: PromptTemplate + ?Sized> PromptTemplate for Box<T> {
     fn render(&self, turns: &[Turn]) -> String {
         (**self).render(turns)
+    }
+
+    fn classifier(&self) -> ResponseClassifier {
+        (**self).classifier()
     }
 
     fn interpret_response(&self, raw: &str) -> Reasoned {
@@ -85,15 +98,18 @@ impl PromptTemplate for ChatMlTemplate {
 /// ChatML that **pre-seeds `<think>\n`** in the assistant cue — the format of
 /// reasoning Qwen models (QwQ-32B, Qwen3 in thinking mode), whose chat template
 /// ends `<|im_start|>assistant\n<think>\n`. Because the opener is in the prompt,
-/// the model emits only the *closing* `</think>`, so a host pairs this with
-/// [`crate::ReasoningSplitter::seeded`] (see
-/// [`ChatFormat::pre_seeds_reasoning`](crate::ChatFormat::pre_seeds_reasoning))
-/// to classify the stream (REASON-1).
+/// the model emits only the *closing* `</think>`. Its `PromptTemplate`
+/// implementation therefore selects [`crate::ReasoningSplitter::seeded`] for
+/// streaming and the matching seeded final interpretation (REASON-1).
 pub struct ChatMlThinkTemplate;
 
 impl PromptTemplate for ChatMlThinkTemplate {
     fn render(&self, turns: &[Turn]) -> String {
         render_chatml(turns, true)
+    }
+
+    fn classifier(&self) -> ResponseClassifier {
+        ResponseClassifier::seeded_markers()
     }
 
     /// The cue opened the think block, so a close-less reply is a truncated
@@ -300,14 +316,19 @@ impl PromptTemplate for DeepSeekTemplate {
         s.push_str("<think>\n");
         s
     }
+
+    fn classifier(&self) -> ResponseClassifier {
+        ResponseClassifier::seeded_markers()
+    }
 }
 
-/// Muse Glimmer's ATEM chat format — the **text-chat subset** (stage 1 of
+/// Muse Glimmer's ATEM chat format — the **text-chat subset** (stage 3 of
 /// plans/llama-server.plan.md): `<|start|>role<|message|>content<|eot|>`
 /// turns and a bare `<|start|>assistant` cue. The full addressed-output
 /// protocol (`to=self` reasoning, `to=<tool>` invocations, `<|eom|>` joins)
-/// is the model's *output* format, interpreted upstream; stage 3 extends
-/// this renderer, it never replaces it.
+/// is the model's output format. [`AtemInterpreter`] classifies it for both
+/// live display and final transcript commit; the renderer remains responsible
+/// only for the prompt direction.
 ///
 /// Byte-checked against the `/apply-template` oracle renders captured from
 /// the official GGUF's embedded template (`tests/fixtures/llama_server/`,
@@ -362,58 +383,8 @@ impl ReasoningStrength {
     }
 }
 
-const MUSE_START: &str = "<|start|>";
-const MUSE_MESSAGE: &str = "<|message|>";
-const MUSE_EOT: &str = "<|eot|>";
-const MUSE_EOM: &str = "<|eom|>";
 const MUSE_KNOWLEDGE_CUTOFF: &str = "2026-01-04";
 const MUSE_RECIPIENTS: &str = "# Valid recipients: \"self\", \"user\".";
-
-/// Interpret a raw Muse completion — the minimal ATEM reading: addressed
-/// messages, `to=self` (and any other non-user recipient) to the reasoning
-/// span, `to=user` (or unaddressed) to the answer. The generation cue was a
-/// bare `<|start|>assistant`, so the completion *continues* the first header
-/// (` to=self<|message|>…`); restoring the cue makes every segment uniform.
-/// Trailing `<|eot|>`/`<|eom|>` framing is consumed; text with no `<|message|>`
-/// marker at all is a whole-text answer (a model that ignored the protocol
-/// loses nothing). Tool-call payloads are not yet interpreted — an addressed
-/// tool invocation classifies as reasoning, never as answer text.
-fn interpret_atem(raw: &str) -> Reasoned {
-    if !raw.contains(MUSE_MESSAGE) {
-        return Reasoned {
-            reasoning: None,
-            answer: raw.trim().to_string(),
-        };
-    }
-    let full = format!("{MUSE_START}assistant{raw}");
-    let mut reasoning = String::new();
-    let mut answer = String::new();
-    for segment in full.split(MUSE_START) {
-        let Some((header, body)) = segment.split_once(MUSE_MESSAGE) else {
-            continue;
-        };
-        let body = body.strip_suffix(MUSE_EOT).unwrap_or(body);
-        let body = body.strip_suffix(MUSE_EOM).unwrap_or(body);
-        let recipient = header
-            .split_once("to=")
-            .map(|(_, r)| r.trim())
-            .unwrap_or("user");
-        let bucket = if recipient == "user" {
-            &mut answer
-        } else {
-            &mut reasoning
-        };
-        if !bucket.is_empty() {
-            bucket.push('\n');
-        }
-        bucket.push_str(body);
-    }
-    let reasoning = reasoning.trim().to_string();
-    Reasoned {
-        reasoning: (!reasoning.is_empty()).then_some(reasoning),
-        answer: answer.trim().to_string(),
-    }
-}
 
 impl MuseGlimmerTemplate {
     fn reasoning_line(&self) -> String {
@@ -498,8 +469,12 @@ impl PromptTemplate for MuseGlimmerTemplate {
         s
     }
 
+    fn classifier(&self) -> ResponseClassifier {
+        ResponseClassifier::atem()
+    }
+
     fn interpret_response(&self, raw: &str) -> Reasoned {
-        interpret_atem(raw)
+        AtemInterpreter::interpret(raw)
     }
 }
 
@@ -685,7 +660,7 @@ mod tests {
         // reasoning continues the bare cue, the answer opens a fresh header.
         let raw = " to=self<|message|>User wants a river. Nile is canonical.\
                    <|start|>assistant to=user<|message|>The Nile.";
-        let r = interpret_atem(raw);
+        let r = AtemInterpreter::interpret(raw);
         assert_eq!(
             r.reasoning.as_deref(),
             Some("User wants a river. Nile is canonical.")
@@ -699,7 +674,7 @@ mod tests {
         // it arrives as a caller stop rather than EOS. Neither reaches text.
         let raw = " to=self<|message|>thinking<|eom|>\
                    <|start|>assistant to=user<|message|>Answer.<|eot|>";
-        let r = interpret_atem(raw);
+        let r = AtemInterpreter::interpret(raw);
         assert_eq!(r.reasoning.as_deref(), Some("thinking"));
         assert_eq!(r.answer, "Answer.");
     }
@@ -708,7 +683,7 @@ mod tests {
     fn muse_unaddressed_output_is_the_answer() {
         // A model that ignored the protocol loses nothing: no <|message|>
         // marker means the whole text is the answer.
-        let r = interpret_atem("Just a plain reply.");
+        let r = AtemInterpreter::interpret("Just a plain reply.");
         assert_eq!(r.reasoning, None);
         assert_eq!(r.answer, "Just a plain reply.");
     }
@@ -720,7 +695,7 @@ mod tests {
         let raw = " to=self<|message|>plan<|start|>assistant \
                    to=fs.stat_file<|message|><atem:function_calls>…</atem:function_calls>\
                    <|start|>assistant to=user<|message|>Done.";
-        let r = interpret_atem(raw);
+        let r = AtemInterpreter::interpret(raw);
         assert_eq!(r.answer, "Done.");
         let reasoning = r.reasoning.unwrap();
         assert!(reasoning.contains("plan") && reasoning.contains("atem:function_calls"));

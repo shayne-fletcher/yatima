@@ -11,7 +11,7 @@
 //! turn.
 
 use crate::completer::Completer;
-use crate::reasoning::{Channel, Reasoned, ReasoningSplitter};
+use crate::reasoning::{Channel, Reasoned};
 use crate::template::PromptTemplate;
 use crate::tool::{
     ToolCall, ToolCallCodec, ToolEvent, ToolOutcome, ToolRejection, ToolResult, Tools,
@@ -357,10 +357,10 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         }
                     }
                 };
-                let mut splitter = ReasoningSplitter::new();
+                let mut classifier = self.template.classifier();
                 let mut gate = AnswerGate::new(self.codec.open_marker());
                 let mut on_token = |frag: &str| {
-                    splitter.push(frag, |channel, text| match channel {
+                    classifier.push(frag, |channel, text| match channel {
                         Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
                         Channel::Answer => {
                             if let Some(safe) = gate.push(text) {
@@ -373,10 +373,10 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     .completer
                     .complete_streaming(&prompt, &self.opts, &stops, cancel, &mut on_token)
                     .await?;
-                // Flush the splitter's tail through the same pipeline, then
+                // Flush the classifier's tail through the same pipeline, then
                 // the gate's held answer text (a final step may end on a
                 // partial-opener lookalike that turned out to be prose).
-                splitter.finish(|channel, text| match channel {
+                classifier.finish(|channel, text| match channel {
                     Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
                     Channel::Answer => {
                         if let Some(safe) = gate.push(text) {
@@ -1294,6 +1294,45 @@ mod tests {
         assert!(!streamed.contains("think"), "{streamed:?}");
         assert_eq!(streamed.trim(), run.answer);
         assert_eq!(run.answer, "The answer is 42.");
+    }
+
+    #[test]
+    fn agent_uses_the_templates_response_classifier() {
+        // upholds: REASON-1 — Agent does not hard-code the marker splitter.
+        // A Muse text-only reply uses the template's ATEM machine for live
+        // fragments and the same protocol for final commit.
+        let tools = Tools::new();
+        let reply = " to=self<|message|>work<|eom|>\
+                     <|start|>assistant to=user<|message|>Done.<|eot|>";
+        let mut model = Scripted::new(&[reply]);
+        let mut agent = Agent::new(
+            &mut model,
+            &tools,
+            JsonToolCall,
+            crate::MuseGlimmerTemplate::default(),
+            "helper",
+            5,
+        );
+        let (events, run) = agent
+            .run_with("q", Vec::new(), |mut acc, event| {
+                acc.push(event);
+                Ok(ControlFlow::Continue(acc))
+            })
+            .unwrap();
+        let reasoning: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Fragment {
+                    channel: Channel::Reasoning,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "work");
+        assert_eq!(answer_stream(&events), "Done.");
+        assert_eq!(run.answer, "Done.");
+        assert!(!reasoning.contains("<|"));
     }
 
     #[test]
