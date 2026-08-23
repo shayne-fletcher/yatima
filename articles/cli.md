@@ -1,13 +1,24 @@
 # CLI usage
 
-The `yatima` binary (crate `yatima-cli`) exposes `generate`, `chat`, and `agent`.
-Build with `--features metal` on Apple Silicon.
+The `yatima` binary (crate `yatima-cli`) exposes `generate`, `chat`, and `agent`. Build with `--features metal` on Apple Silicon.
 
 ```bash
 cargo build
 cargo test
 cargo run --bin yatima -- --help
 ```
+
+## Muse Glimmer in one command
+
+With `llama-server` on `PATH`, Yatima can acquire the exact profile-pinned GGUF, verify its SHA-256 digest, check the server build and embedded prompt template, and own the server for the whole chat:
+
+```bash
+cargo run -p yatima-cli --release -- chat --profile muse-glimmer
+```
+
+The first run downloads the 16.8 GB model when the `fetch` feature is enabled; later runs use the cache. Startup prints the file being verified before hashing it, then reports the verified digest, canonical path, and compatible `llama-server` build. The profile also pins the 131072-token context, one server slot, Muse sampling recipe, prompt format, and the rules that separate reasoning from answer text.
+
+Use `/reset` to clear the model conversation and `/exit` to leave. Up and Down recall prompts entered during the current run. On exit or a chat error, Yatima kills and reaps the managed server process.
 
 ## Agent with capability-scoped tools
 
@@ -76,11 +87,11 @@ cargo run -p yatima-cli --release -- chat \
   --prompt "In one sentence, what is a CRDT?"
 ```
 
-A named `--gguf` is exact: another quant already in the cache cannot substitute for it. With `--model <dir>`, managed mode requires exactly one GGUF and reports the candidates when the directory is ambiguous. Stage 2 records the exact launched path but does not yet authenticate its digest, so the banner remains explicit about unverified identity.
+A named `--gguf` is exact: another quant already in the cache cannot substitute for it. With `--model <dir>`, managed mode requires exactly one GGUF and reports the candidates when the directory is ambiguous. This general command does not carry an expected digest, so its banner remains explicit about unverified identity. A verified profile such as `muse-glimmer` supplies the digest and compatibility gates.
 
-## Muse Glimmer through an attached llama-server
+## Attached Muse Glimmer for diagnostics
 
-Attached mode remains useful for development and for the Stage 3 Muse work: start `llama-server` yourself, then point `yatima chat` at its loopback origin. Yatima validates the endpoint and inspects `/props`, but does not own the process.
+Attached mode remains useful when inspecting `llama-server` directly: start it yourself, then point `yatima chat` at its loopback origin. Yatima validates the endpoint and inspects `/props`, but does not own the process or authenticate its model identity.
 
 From the repository root, start a named tmux session:
 
@@ -142,10 +153,10 @@ cargo run -p yatima-cli --release -- chat \
   --seed 7
 ```
 
-Use `/reset` to clear the conversation and `/exit` to leave. Up and Down recall prompts entered during the current run; `/reset` clears the model conversation but leaves that input history available. Stage 1 still displays Muse's raw ATEM framing while generation is in progress; final transcript commits are interpreted.
+Use `/reset` to clear the conversation and `/exit` to leave. Up and Down recall prompts entered during the current run; `/reset` clears the model conversation but leaves that input history available. Muse reasoning is dimmed while the answer remains normal; ATEM framing is neither displayed as answer text nor committed to the transcript.
 
 In tmux, `Ctrl-b o` changes panes. To scroll, type `Ctrl-b [`, use Page Up, Page Down, or the arrow keys, then type `q` to leave copy mode. After `/exit`, change to the server pane and type `Ctrl-c`; wait for the shell prompt before closing the session. This orderly stop matters because the attached path does not own or reap the server process.
 
 ### What the checks establish
 
-The file digest proves the bytes at `MODEL`. `/props` helps catch an accidental wrong process, model path, build, context, or template. Neither a generated statement such as "I am Muse Glimmer" nor `/props` authenticates an arbitrary attached process: both are claims made by that process, and the digest does not prove that it loaded the file you checked. Treat attached mode as operator-attested and unverified. Managed mode closes the process-ownership and exact-path gaps in Stage 2; Stage 3 adds profile-pinned digest and compatibility checks before it claims verified model identity.
+The file digest proves the bytes at `MODEL`. `/props` helps catch an accidental wrong process, model path, build, context, or template. Neither a generated statement such as "I am Muse Glimmer" nor `/props` authenticates an arbitrary attached process: both are claims made by that process, and the digest does not prove that it loaded the file you checked. Treat attached mode as operator-attested and unverified. The managed `muse-glimmer` profile closes those gaps by verifying its resolved artifact and passing that same canonical path to the child Yatima owns.

@@ -18,11 +18,12 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use tracing_subscriber::EnvFilter;
 use yatima_lib::{
-    device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
-    ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir,
-    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerProfile, LlamaServerSpawn,
-    ModelId, ModelProfile, ModelSource, PlainTemplate, ProfileBackend, PromptTemplate,
-    QwenToolCall, ReadFile, ReadPage, Sampling, ToolCallCodec, Tools, WebOrigins,
+    device, model_dir, models_root, resolve_format, run_blocking, verify, Agent, Channel,
+    ChatFormat, ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall,
+    ListDir, LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerProfile,
+    LlamaServerSpawn, ModelId, ModelProfile, ModelSource, PlainTemplate, ProfileBackend,
+    PromptTemplate, QwenToolCall, ReadFile, ReadPage, Sampling, ServerIdentity, ToolCallCodec,
+    Tools, WebOrigins,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -314,11 +315,6 @@ async fn chat(args: ChatArgs) -> Result<()> {
             format,
             llama_server_profile,
         } => {
-            if llama_server_profile.is_some() {
-                bail!(
-                    "a verified managed profile cannot enter the unverified llama-server launch path"
-                );
-            }
             let resolved = match &profile {
                 Some(profile) => profile.to_source(args.offline)?.resolve_async().await?,
                 None => {
@@ -334,14 +330,25 @@ async fn chat(args: ChatArgs) -> Result<()> {
                 }
             };
             let artifact = resolved.into_gguf()?;
-            let mut server = LlamaServer::spawn(LlamaServerSpawn::new(artifact)).await?;
-            eprintln!(
-                "managed llama-server [{}]; launched {} (unverified self-report: {}, {})",
-                format.name(),
-                server.launched_artifact().display(),
-                server.props().model_self_report,
-                server.props().build,
-            );
+            let spawn = match llama_server_profile {
+                Some(server_profile) => {
+                    eprintln!("verifying {} (sha256)...", artifact.path().display());
+                    let verified = with_wait_timer(
+                        "verifying sha256",
+                        verify(artifact, &server_profile.expected_sha256),
+                    )
+                    .await?;
+                    let mut spawn =
+                        LlamaServerSpawn::verified(verified, server_profile.server_gates());
+                    spawn.context = Some(server_profile.context);
+                    spawn.top_k = server_profile.top_k;
+                    spawn
+                }
+                None => LlamaServerSpawn::new(artifact),
+            };
+            let mut server =
+                with_wait_timer("starting llama-server", LlamaServer::spawn(spawn)).await?;
+            eprintln!("{}", managed_server_banner(format, &server));
             let chat = run_chat(
                 &mut server,
                 format.template_with_date(Some(current_date)),
@@ -521,6 +528,77 @@ fn chat_backend_config(
         format,
         llama_server_profile: None,
     })
+}
+
+/// Await `fut` while a spawned ticker keeps one transient stderr line alive:
+/// `{label} — you have been waiting {n}s`. The ticker is a separate task so it
+/// keeps printing even while the awaited work holds its own thread inside the
+/// runtime's blocking boundary (the sha256 hash under `run_blocking`); it
+/// starts after one full second, so fast paths stay silent, and it only writes
+/// to a terminal — piped stderr sees the ordinary begin/end lines and no
+/// carriage-return animation. On completion the line is cleared and replaced
+/// by `{label}: done in {n}s`.
+async fn with_wait_timer<T>(label: &'static str, fut: impl std::future::Future<Output = T>) -> T {
+    let started = std::time::Instant::now();
+    let animate = std::io::stderr().is_terminal();
+    let ticker = animate.then(|| {
+        tokio::spawn(async move {
+            let mut seconds = 0u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                seconds += 1;
+                eprint!("\r\x1b[2K{}", waiting_line(label, seconds));
+                let _ = std::io::stderr().flush();
+            }
+        })
+    });
+    let out = fut.await;
+    if let Some(ticker) = ticker {
+        ticker.abort();
+        // Reap the aborted task; a `JoinError::is_cancelled` result is the
+        // expected outcome, not a failure.
+        let _ = ticker.await;
+        eprint!("\r\x1b[2K");
+    }
+    eprintln!("{label}: done in {:.1}s", started.elapsed().as_secs_f64());
+    out
+}
+
+/// The transient wait line — pure so the copy is testable.
+fn waiting_line(label: &str, seconds: u64) -> String {
+    format!("{label} — you have been waiting {seconds}s")
+}
+
+fn managed_server_banner(format: ChatFormat, server: &LlamaServer) -> String {
+    format_managed_server_banner(
+        format,
+        server.identity(),
+        server.launched_artifact(),
+        &server.props().build,
+    )
+}
+
+fn format_managed_server_banner(
+    format: ChatFormat,
+    identity: &ServerIdentity,
+    artifact: &std::path::Path,
+    build: &str,
+) -> String {
+    match identity {
+        ServerIdentity::Verified { digest } => format!(
+            "managed llama-server [{}]; verified sha256 {digest} ({}); build {}",
+            format.name(),
+            artifact.display(),
+            build,
+        ),
+        ServerIdentity::Unverified { self_report } => format!(
+            "managed llama-server [{}]; launched {} (unverified self-report: {}, {})",
+            format.name(),
+            artifact.display(),
+            self_report,
+            build,
+        ),
+    }
 }
 
 /// The shared chat tail: the local `Engine` and an attached llama-server
@@ -1145,6 +1223,39 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("pins --format muse-glimmer"), "{error}");
+    }
+
+    #[test]
+    fn waiting_line_counts_in_the_requested_voice() {
+        assert_eq!(
+            waiting_line("verifying sha256", 34),
+            "verifying sha256 — you have been waiting 34s"
+        );
+        assert_eq!(
+            waiting_line("starting llama-server", 1),
+            "starting llama-server — you have been waiting 1s"
+        );
+    }
+
+    #[test]
+    fn verified_managed_banner_names_its_evidence() {
+        // upholds: LSRV-5 — the CLI's identity claim comes from the verified
+        // state, while build remains a separately reported compatibility fact.
+        let digest = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e"
+            .parse()
+            .unwrap();
+        let banner = format_managed_server_banner(
+            ChatFormat::MuseGlimmer,
+            &ServerIdentity::Verified { digest },
+            std::path::Path::new("/models/muse.gguf"),
+            "b10520-cd644c395",
+        );
+        assert_eq!(
+            banner,
+            "managed llama-server [muse-glimmer]; verified sha256 \
+             4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e \
+             (/models/muse.gguf); build b10520-cd644c395"
+        );
     }
 
     #[test]

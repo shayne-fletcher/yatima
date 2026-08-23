@@ -9,11 +9,13 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use yatima_lib::{
     verify, Agent, AgentStop, ChatMlTemplate, ChatSession, Completer, Dir, GenOpts, JsonToolCall,
-    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ModelSource,
-    PlainTemplate, ReadFile, ServerGates, ServerIdentity, Sha256Digest, StopReason, Tools,
+    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ModelProfile,
+    ModelSource, PlainTemplate, ProfileBackend, ReadFile, ServerGates, ServerIdentity,
+    Sha256Digest, StopReason, Tools,
 };
 
 const WITHIN: Duration = Duration::from_secs(8);
+const LIVE_WITHIN: Duration = Duration::from_secs(15 * 60);
 const STUB_BYTES: &[u8] = b"stub";
 const STUB_TEMPLATE: &str = "stub-template";
 
@@ -404,5 +406,68 @@ async fn live_managed_qwen_chat() -> Result<()> {
     assert!(!answer.trim().is_empty());
     drop(chat);
     server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires llama-server on PATH and the local Muse Glimmer Q4_K_M GGUF"]
+async fn live_managed_muse_chat() -> Result<()> {
+    // upholds: LSRV-5 / REASON-1 — the built-in profile composes exact
+    // resolution, digest refinement, compatibility gates, and answer-only
+    // transcript commits over the real managed server.
+    let profile = ModelProfile::builtin("muse-glimmer").expect("Muse profile is built in");
+    let ProfileBackend::LlamaServer(server_profile) = profile.backend.clone() else {
+        unreachable!("Muse profile must select llama-server")
+    };
+    let artifact = profile
+        .to_source(true)?
+        .resolve_async()
+        .await?
+        .into_gguf()?;
+    let verified = verify(artifact, &server_profile.expected_sha256).await?;
+    let mut spawn = LlamaServerSpawn::verified(verified, server_profile.server_gates());
+    spawn.context = Some(server_profile.context);
+    spawn.top_k = server_profile.top_k;
+    let mut server = LlamaServer::spawn(spawn).await?;
+    assert_eq!(
+        server.identity(),
+        &ServerIdentity::Verified {
+            digest: server_profile.expected_sha256
+        }
+    );
+
+    let format = profile.format().expect("Muse profile pins its format");
+    let opts = profile.apply_gen_overrides(GenOpts::default());
+    let mut chat = ChatSession::new(
+        &mut server,
+        format.template_with_date(Some("2026-08-23".into())),
+    )
+    .with_opts(opts);
+    let turn = match tokio::time::timeout(
+        LIVE_WITHIN,
+        chat.turn_async("In one sentence, what is a CRDT?"),
+    )
+    .await
+    {
+        Ok(Ok(answer)) => Ok((answer.to_owned(), chat.history().to_vec())),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(anyhow::anyhow!(
+            "live Muse turn exceeded {} seconds",
+            LIVE_WITHIN.as_secs()
+        )),
+    };
+    drop(chat);
+    let shutdown = server.shutdown().await;
+    let (answer, history) = turn?;
+    shutdown?;
+    assert!(!answer.trim().is_empty());
+    for framing in ["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"] {
+        assert!(
+            !answer.contains(framing),
+            "answer leaked {framing}: {answer}"
+        );
+    }
+    assert_eq!(history.len(), 2, "the exchange must be committed");
+    assert_eq!(history[1].content, answer);
     Ok(())
 }
