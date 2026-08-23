@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
 
     let (dir, model_label) = match &profile {
         Some(p) => (
-            p.to_source(args.offline)?
+            p.to_engine_source(args.offline)?
                 .resolve_async()
                 .await?
                 .into_directory(),

@@ -83,7 +83,9 @@
 //!   ([`ChatFormat::supports_tools`]); a chat-only format cannot enter it.
 //! - **PROFILE-1** generation-option precedence is explicit and pure
 //!   ([`ModelProfile::apply_gen_overrides`]): profile fields override a caller
-//!   base `GenOpts`, and an unset `prefill_chunk` defers to the engine default.
+//!   base `GenOpts`, except a reasoning profile's token budget is a floor that
+//!   never reduces a larger caller budget; an unset `prefill_chunk` defers to
+//!   the engine default.
 //! - **PROFILE-2** a [`ModelProfile`] resolves to exactly one source (`repo`
 //!   xor `dir`) before load.
 //! - **CTX-1** the context window is discovered from model config at load
@@ -357,8 +359,9 @@ pub use engine::{
     PrefillLogits, PrefillProgress, Sampling, StopReason, TokenLogit, METAL_KV_VALIDATED,
 };
 pub use host::{
-    caps_for, resolve_format, verify, Caps, ChatFormat, FormatMismatch, GgufArtifact, ModelProfile,
-    ModelSource, ResolvedModel, Sha256Digest, VerifiedModelArtifact, REASONING_MIN_TOKENS,
+    caps_for, resolve_format, verify, Caps, ChatFormat, FormatMismatch, GgufArtifact,
+    LlamaServerProfile, ModelProfile, ModelSource, ProfileBackend, ResolvedModel, Sha256Digest,
+    VerifiedModelArtifact, REASONING_MIN_TOKENS,
 };
 pub use reasoning::{
     split_reasoning, strip_reasoning, AtemInterpreter, Channel, Reasoned, ReasoningSplitter,

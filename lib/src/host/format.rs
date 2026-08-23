@@ -6,7 +6,7 @@
 
 use crate::{
     Arch, ChatMlTemplate, ChatMlThinkTemplate, DeepSeekTemplate, GemmaTemplate, GlmTemplate,
-    MistralTemplate, MuseGlimmerTemplate, PlainTemplate, PromptTemplate,
+    MistralTemplate, MuseGlimmerTemplate, PlainTemplate, PromptTemplate, ReasoningStrength,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -73,6 +73,12 @@ impl ChatFormat {
 
     /// The prompt template for this format (used by `chat` and the examples).
     pub fn template(self) -> Box<dyn PromptTemplate> {
+        self.template_with_date(None)
+    }
+
+    /// Construct the prompt template with an optional runtime date. Only Muse
+    /// consumes the date; other formats remain byte-for-byte unchanged.
+    pub fn template_with_date(self, current_date: Option<String>) -> Box<dyn PromptTemplate> {
         match self {
             ChatFormat::Qwen => Box::new(ChatMlTemplate),
             ChatFormat::Gemma => Box::new(GemmaTemplate),
@@ -80,7 +86,10 @@ impl ChatFormat {
             ChatFormat::Glm => Box::new(GlmTemplate),
             ChatFormat::DeepSeek => Box::new(DeepSeekTemplate),
             ChatFormat::QwenThink => Box::new(ChatMlThinkTemplate),
-            ChatFormat::MuseGlimmer => Box::new(MuseGlimmerTemplate::default()),
+            ChatFormat::MuseGlimmer => Box::new(MuseGlimmerTemplate {
+                reasoning_strength: ReasoningStrength::High,
+                current_date,
+            }),
             ChatFormat::Plain => Box::new(PlainTemplate),
         }
     }
@@ -269,6 +278,24 @@ mod tests {
             content: "x".into(),
         }]);
         assert!(rendered.contains("[INST]"));
+    }
+
+    #[test]
+    fn muse_template_accepts_an_injected_runtime_date() {
+        let turns = [Turn {
+            role: Role::User,
+            content: "x".into(),
+        }];
+        let rendered = ChatFormat::MuseGlimmer
+            .template_with_date(Some("2026-08-23".into()))
+            .render(&turns);
+        assert!(rendered.contains("Current date: 2026-08-23."));
+
+        let ordinary = ChatFormat::Qwen.template().render(&turns);
+        let dated = ChatFormat::Qwen
+            .template_with_date(Some("2026-08-23".into()))
+            .render(&turns);
+        assert_eq!(dated, ordinary, "non-Muse formats ignore the date");
     }
 
     #[test]

@@ -90,7 +90,9 @@ fn resolve(args: &Args) -> Result<HostConfig> {
 
     let (dir, label) = match &profile {
         Some(p) => (
-            p.to_source(args.offline)?.resolve()?.into_directory(),
+            p.to_engine_source(args.offline)?
+                .resolve()?
+                .into_directory(),
             p.name.clone(),
         ),
         None => {

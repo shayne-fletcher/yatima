@@ -4,8 +4,8 @@
 //! are serde-ready (a config-file loader is a trivial later add) and currently
 //! sourced from a small compiled-in [`builtin`] registry.
 
-use crate::{ChatFormat, GenOpts, ModelSource, Sampling};
-use anyhow::Result;
+use crate::{ChatFormat, GenOpts, ModelSource, Sampling, ServerGates, Sha256Digest};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -15,20 +15,49 @@ use std::path::PathBuf;
 /// budget here (raising it only — never reducing a larger caller budget).
 pub const REASONING_MIN_TOKENS: usize = 2048;
 
-/// A model and its run configuration. Every field beyond `name` is optional:
-/// an unset field falls back to the loaded engine's default (e.g.
-/// `prefill_chunk` → [`crate::Engine::default_prefill_chunk`]) or a caller base
-/// [`GenOpts`], so a profile is a *layer of overrides*, never a full snapshot.
+/// Which inference implementation a profile requires. The default preserves
+/// existing profiles: they load through the in-process Candle engine.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ProfileBackend {
+    #[default]
+    Engine,
+    LlamaServer(LlamaServerProfile),
+}
+
+/// The llama-server-specific part of a profile's launch recipe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlamaServerProfile {
+    pub expected_sha256: Sha256Digest,
+    pub build_floor: u32,
+    pub template_sha256: Sha256Digest,
+    pub context: u32,
+    pub top_k: u32,
+}
+
+impl LlamaServerProfile {
+    /// Compatibility gates for the managed process. Profiles use one slot so
+    /// the declared context is not divided among concurrent server slots.
+    pub fn server_gates(&self) -> ServerGates {
+        ServerGates::new(self.build_floor, self.template_sha256, self.context, 1)
+    }
+}
+
+/// A model and its run configuration. The backend defaults to the local engine;
+/// unset generation fields fall back to the loaded engine's default or a caller
+/// base [`GenOpts`], so a profile is a layer of overrides rather than a full
+/// runtime snapshot.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelProfile {
     /// The profile's name (the `--profile` key).
     pub name: String,
+    /// The inference implementation this profile requires.
+    #[serde(default)]
+    pub backend: ProfileBackend,
     /// A repository id, resolved (and fetched on a cache miss) via [`ModelSource`].
     pub repo: Option<String>,
     /// An explicit local model directory (mutually exclusive with `repo`).
     pub dir: Option<PathBuf>,
-    /// The single GGUF quant to fetch for a `repo` (ignored once cached: the
-    /// loader finds the `.gguf` in the directory).
+    /// The exact GGUF quant to fetch and resolve for a `repo`.
     pub gguf: Option<String>,
     /// The chat format; `None` infers it from the model's architecture.
     pub format: Option<ChatFormat>,
@@ -135,13 +164,37 @@ impl ModelProfile {
                 None,
                 ChatFormat::Mistral,
             ),
+            "muse-glimmer" => ModelProfile {
+                backend: ProfileBackend::LlamaServer(LlamaServerProfile {
+                    expected_sha256:
+                        "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e"
+                            .parse()
+                            .expect("built-in Muse artifact digest is valid"),
+                    build_floor: 10353,
+                    template_sha256:
+                        "6cd0e94d9b489fdb9a000743791f20e7e52b62c1e5cbb66fcc91c6716595223a"
+                            .parse()
+                            .expect("built-in Muse template digest is valid"),
+                    context: 131_072,
+                    top_k: 64,
+                }),
+                reasoning: true,
+                max_tokens: Some(4096),
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                ..p(
+                    "meta-models/Muse-Glimmer-30B-GGUF",
+                    Some("Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf"),
+                    ChatFormat::MuseGlimmer,
+                )
+            },
             _ => return None,
         };
         Some(profile)
     }
 
     /// The names of every built-in profile (for `--help` / listing).
-    pub const BUILTIN_NAMES: [&'static str; 7] = [
+    pub const BUILTIN_NAMES: [&'static str; 8] = [
         "qwen32b",
         "glm4-32b",
         "gemma2",
@@ -149,6 +202,7 @@ impl ModelProfile {
         "kimi-dev",
         "deepseek-r1",
         "qwq",
+        "muse-glimmer",
     ];
 
     /// The model source this profile names — a directory **xor** a repository
@@ -163,6 +217,19 @@ impl ModelProfile {
         )
     }
 
+    /// Resolve this profile only when it is compatible with the in-process
+    /// Candle engine. Native frontends use this boundary until they can host
+    /// alternate backends themselves.
+    pub fn to_engine_source(&self, offline: bool) -> Result<ModelSource> {
+        if matches!(self.backend, ProfileBackend::LlamaServer(_)) {
+            bail!(
+                "profile {:?} is served by a managed llama-server; supported by `yatima chat` only until stage 5",
+                self.name
+            );
+        }
+        self.to_source(offline)
+    }
+
     /// Layer this profile's set fields over a caller-built `base` (PROFILE-1:
     /// the caller chooses the use-case base — chat keeps [`GenOpts::default`],
     /// the agent sets `repeat_penalty = 1.0`). `prefill_chunk` is override-only:
@@ -171,7 +238,11 @@ impl ModelProfile {
     pub fn apply_gen_overrides(&self, base: GenOpts) -> GenOpts {
         let mut opts = base;
         if let Some(max_tokens) = self.max_tokens {
-            opts.max_tokens = max_tokens;
+            opts.max_tokens = if self.reasoning {
+                opts.max_tokens.max(max_tokens)
+            } else {
+                max_tokens
+            };
         }
         if let Some(repeat_penalty) = self.repeat_penalty {
             opts.repeat_penalty = repeat_penalty;
@@ -222,11 +293,60 @@ mod tests {
     fn builtin_lookup() {
         let glm = ModelProfile::builtin("glm4-32b").expect("glm4-32b is built in");
         assert_eq!(glm.format, Some(ChatFormat::Glm));
+        assert_eq!(glm.backend, ProfileBackend::Engine);
         assert!(glm.repo.as_deref().unwrap().contains("GLM-4-32B"));
         assert!(ModelProfile::builtin("nope").is_none());
         for name in ModelProfile::BUILTIN_NAMES {
             assert!(ModelProfile::builtin(name).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn muse_glimmer_pins_the_verified_llama_server_recipe() {
+        // upholds: LSRV-5 — the built-in recipe supplies the artifact digest
+        // and every compatibility gate required by verified construction.
+        let profile = ModelProfile::builtin("muse-glimmer").unwrap();
+        assert_eq!(profile.format, Some(ChatFormat::MuseGlimmer));
+        assert_eq!(
+            profile.repo.as_deref(),
+            Some("meta-models/Muse-Glimmer-30B-GGUF")
+        );
+        assert_eq!(
+            profile.gguf.as_deref(),
+            Some("Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf")
+        );
+        assert!(profile.reasoning);
+        assert_eq!(profile.max_tokens, Some(4096));
+        assert_eq!(profile.temperature, Some(1.0));
+        assert_eq!(profile.top_p, Some(0.95));
+        let opts = profile.apply_gen_overrides(GenOpts::default());
+        assert_eq!(opts.max_tokens, 4096);
+        assert_eq!(
+            opts.sampling,
+            Sampling::Sample {
+                temperature: 1.0,
+                top_p: Some(0.95),
+                seed: 0,
+            }
+        );
+        let ProfileBackend::LlamaServer(server) = profile.backend else {
+            panic!("Muse must select llama-server structurally");
+        };
+        assert_eq!(server.build_floor, 10353);
+        assert_eq!(server.context, 131_072);
+        assert_eq!(server.top_k, 64);
+        assert_eq!(
+            server.expected_sha256.to_string(),
+            "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e"
+        );
+        assert_eq!(
+            server.template_sha256.to_string(),
+            "6cd0e94d9b489fdb9a000743791f20e7e52b62c1e5cbb66fcc91c6716595223a"
+        );
+        assert_eq!(
+            server.server_gates(),
+            ServerGates::new(10353, server.template_sha256, 131_072, 1)
+        );
     }
 
     #[test]
@@ -246,8 +366,8 @@ mod tests {
 
     #[test]
     fn reasoning_profile_floors_the_token_budget() {
-        // A reasoning profile raises a too-small budget to the floor (so the
-        // think block is not truncated), but never reduces a larger one.
+        // upholds: PROFILE-1 — a reasoning profile raises a too-small budget to
+        // its floor but never reduces a larger caller budget.
         let p = ModelProfile::builtin("deepseek-r1").expect("deepseek-r1 is built in");
         assert!(p.reasoning);
         assert_eq!(p.format, Some(ChatFormat::DeepSeek));
@@ -263,6 +383,18 @@ mod tests {
             p.apply_gen_overrides(big).max_tokens,
             REASONING_MIN_TOKENS * 4
         );
+        for name in ["qwq", "muse-glimmer"] {
+            let profile = ModelProfile::builtin(name).unwrap();
+            let big = GenOpts {
+                max_tokens: 8192,
+                ..Default::default()
+            };
+            assert_eq!(
+                profile.apply_gen_overrides(big).max_tokens,
+                8192,
+                "{name} profile budget is a floor"
+            );
+        }
         // a non-reasoning profile leaves the budget alone.
         let plain = ModelProfile::builtin("gemma2").unwrap();
         assert!(!plain.reasoning);
@@ -298,6 +430,23 @@ mod tests {
             ..Default::default()
         };
         assert!(neither.to_source(false).is_err());
+    }
+
+    #[test]
+    fn engine_source_rejects_a_llama_server_profile() {
+        let muse = ModelProfile::builtin("muse-glimmer").unwrap();
+        let error = muse
+            .to_engine_source(true)
+            .err()
+            .expect("Muse must not enter Candle")
+            .to_string();
+        assert!(error.contains("managed llama-server"), "{error}");
+        assert!(error.contains("yatima chat"), "{error}");
+
+        assert!(ModelProfile::builtin("gemma2")
+            .unwrap()
+            .to_engine_source(true)
+            .is_ok());
     }
 
     #[test]
@@ -388,9 +537,11 @@ mod tests {
     #[test]
     fn serde_round_trips() {
         // serde-ready: a profile survives a JSON/TOML-shaped round trip.
-        let profile = ModelProfile::builtin("qwen32b").unwrap();
-        let json = serde_json::to_string(&profile).unwrap();
-        let back: ModelProfile = serde_json::from_str(&json).unwrap();
-        assert_eq!(profile, back);
+        for name in ["qwen32b", "muse-glimmer"] {
+            let profile = ModelProfile::builtin(name).unwrap();
+            let json = serde_json::to_string(&profile).unwrap();
+            let back: ModelProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(profile, back, "{name}");
+        }
     }
 }

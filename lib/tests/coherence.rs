@@ -177,7 +177,10 @@ fn reasoning_profiles_surface_a_reasoning_channel() -> anyhow::Result<()> {
         let profile = ModelProfile::builtin(name).unwrap();
         assert!(profile.reasoning, "{name} should be a reasoning profile");
         // Resolve offline; skip if not cached.
-        let dir = match profile.to_source(true).and_then(|s| s.resolve()) {
+        let dir = match profile
+            .to_engine_source(true)
+            .and_then(|source| source.resolve())
+        {
             Ok(resolved) => resolved.into_directory(),
             Err(_) => {
                 eprintln!("skip {name}: not cached");

@@ -11,6 +11,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use chrono::Local;
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 use rustyline::error::ReadlineError;
@@ -19,9 +20,9 @@ use tracing_subscriber::EnvFilter;
 use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, Agent, Channel, ChatFormat,
     ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall, ListDir,
-    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ModelId, ModelProfile,
-    ModelSource, PlainTemplate, PromptTemplate, QwenToolCall, ReadFile, ReadPage, Sampling,
-    ToolCallCodec, Tools, WebOrigins,
+    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerProfile, LlamaServerSpawn,
+    ModelId, ModelProfile, ModelSource, PlainTemplate, ProfileBackend, PromptTemplate,
+    QwenToolCall, ReadFile, ReadPage, Sampling, ToolCallCodec, Tools, WebOrigins,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -163,17 +164,19 @@ enum BackendArg {
 
 #[derive(clap::Args)]
 struct ChatArgs {
-    /// Inference backend: the local Candle engine (default) or llama-server.
-    #[arg(long, value_enum, default_value = "engine")]
-    backend: BackendArg,
+    /// Inference backend. Omit to use the profile's backend, or Candle when no
+    /// profile selects another backend.
+    #[arg(long, value_enum)]
+    backend: Option<BackendArg>,
     /// Base URL of a running llama-server (e.g. `http://127.0.0.1:8080`), for
     /// `--backend llama-server`.
     #[arg(long)]
     server_url: Option<String>,
     /// A built-in model profile (e.g. `kimi-dev`, `deepseek-r1`): sets the model,
     /// chat format, and generation defaults. A reasoning profile raises the token
-    /// budget and enables sampling. Replaces `--model`/`--repo`; an explicit
-    /// `--format` still wins, and `--max-tokens` raises (never lowers) the budget.
+    /// budget and enables sampling. Verified profiles reject model-source and
+    /// conflicting format overrides; `--max-tokens` raises (never lowers) their
+    /// budget.
     #[arg(long)]
     profile: Option<String>,
     /// Explicit model directory.
@@ -260,9 +263,9 @@ fn init_tracing() {
 /// `generate` and the `agent` tool loop. `--prompt` gives one shot; omitting it
 /// opens an interactive multi-turn session that remembers the conversation.
 async fn chat(args: ChatArgs) -> Result<()> {
-    // A `--profile` names the model + format + generation defaults; explicit
-    // flags below still layer on top (the profile is a set of overrides over a
-    // CLI-built base — PROFILE-1).
+    // A `--profile` names the model + format + generation defaults. Generation
+    // options layer over the CLI base (PROFILE-1); backend/source consistency is
+    // resolved separately before acquisition.
     let profile = match &args.profile {
         Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -283,6 +286,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
         Some(p) => p.apply_gen_overrides(base),
         None => base,
     };
+    let current_date = Local::now().format("%Y-%m-%d").to_string();
 
     match chat_backend_config(&args, profile.as_ref())? {
         ChatBackendConfig::Attached { url, format } => {
@@ -299,14 +303,22 @@ async fn chat(args: ChatArgs) -> Result<()> {
             );
             return run_chat(
                 &mut completer,
-                format.template(),
+                format.template_with_date(Some(current_date)),
                 opts,
                 args.system,
                 args.prompt,
             )
             .await;
         }
-        ChatBackendConfig::Managed { format } => {
+        ChatBackendConfig::Managed {
+            format,
+            llama_server_profile,
+        } => {
+            if llama_server_profile.is_some() {
+                bail!(
+                    "a verified managed profile cannot enter the unverified llama-server launch path"
+                );
+            }
             let resolved = match &profile {
                 Some(profile) => profile.to_source(args.offline)?.resolve_async().await?,
                 None => {
@@ -332,7 +344,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
             );
             let chat = run_chat(
                 &mut server,
-                format.template(),
+                format.template_with_date(Some(current_date)),
                 opts,
                 args.system,
                 args.prompt,
@@ -353,7 +365,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
 
     let dir = match &profile {
         Some(p) => p
-            .to_source(args.offline)?
+            .to_engine_source(args.offline)?
             .resolve_async()
             .await?
             .into_directory(),
@@ -385,7 +397,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
     }
     run_chat(
         &mut engine,
-        format.template(),
+        format.template_with_date(Some(current_date)),
         opts,
         args.system,
         args.prompt,
@@ -396,8 +408,14 @@ async fn chat(args: ChatArgs) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 enum ChatBackendConfig {
     Engine,
-    Attached { url: String, format: ChatFormat },
-    Managed { format: ChatFormat },
+    Attached {
+        url: String,
+        format: ChatFormat,
+    },
+    Managed {
+        format: ChatFormat,
+        llama_server_profile: Option<LlamaServerProfile>,
+    },
 }
 
 /// Resolve the three backend modes before model acquisition or process work.
@@ -407,7 +425,65 @@ fn chat_backend_config(
     args: &ChatArgs,
     profile: Option<&ModelProfile>,
 ) -> Result<ChatBackendConfig> {
-    if args.backend == BackendArg::Engine {
+    if let Some(profile) = profile {
+        if let ProfileBackend::LlamaServer(server) = &profile.backend {
+            if args.backend == Some(BackendArg::Engine) {
+                bail!(
+                    "profile {:?} requires managed llama-server and cannot use --backend engine",
+                    profile.name
+                );
+            }
+            if args.server_url.is_some() {
+                bail!(
+                    "profile {:?} requires a verified managed llama-server and cannot attach with --server-url",
+                    profile.name
+                );
+            }
+            let mut substitutions = Vec::new();
+            if args.model.is_some() {
+                substitutions.push("--model");
+            }
+            if args.repo.is_some() {
+                substitutions.push("--repo");
+            }
+            if args.gguf.is_some() {
+                substitutions.push("--gguf");
+            }
+            if args.models_dir.is_some() {
+                substitutions.push("--models-dir");
+            }
+            if !substitutions.is_empty() {
+                bail!(
+                    "verified profile {:?} rejects model-source overrides: {}",
+                    profile.name,
+                    substitutions.join(", ")
+                );
+            }
+            let format = profile.format.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verified llama-server profile {:?} does not pin a chat format",
+                    profile.name
+                )
+            })?;
+            if let Some(explicit) = args.format {
+                if explicit != format {
+                    bail!(
+                        "profile {:?} pins --format {}; cannot use {}",
+                        profile.name,
+                        format.name(),
+                        explicit.name()
+                    );
+                }
+            }
+            return Ok(ChatBackendConfig::Managed {
+                format,
+                llama_server_profile: Some(server.clone()),
+            });
+        }
+    }
+
+    let backend = args.backend.unwrap_or(BackendArg::Engine);
+    if backend == BackendArg::Engine {
         if args.server_url.is_some() {
             bail!("--server-url requires --backend llama-server");
         }
@@ -441,7 +517,10 @@ fn chat_backend_config(
     if profile.is_none() && args.model.is_none() && args.repo.is_none() {
         bail!("managed llama-server requires --profile, --model, or --repo");
     }
-    Ok(ChatBackendConfig::Managed { format })
+    Ok(ChatBackendConfig::Managed {
+        format,
+        llama_server_profile: None,
+    })
 }
 
 /// The shared chat tail: the local `Engine` and an attached llama-server
@@ -845,7 +924,11 @@ mod tests {
     #[test]
     fn chat_backend_defaults_to_the_local_engine() {
         let args = chat_args(&["yatima", "chat", "--repo", "x/y"]);
-        assert_eq!(args.backend, BackendArg::Engine);
+        assert_eq!(args.backend, None);
+        assert_eq!(
+            chat_backend_config(&args, None).unwrap(),
+            ChatBackendConfig::Engine
+        );
     }
 
     #[test]
@@ -860,7 +943,7 @@ mod tests {
             "--format",
             "muse-glimmer",
         ]);
-        assert_eq!(args.backend, BackendArg::LlamaServer);
+        assert_eq!(args.backend, Some(BackendArg::LlamaServer));
         assert_eq!(
             chat_backend_config(&args, None).unwrap(),
             ChatBackendConfig::Attached {
@@ -939,9 +1022,129 @@ mod tests {
         assert_eq!(
             chat_backend_config(&args, None).unwrap(),
             ChatBackendConfig::Managed {
-                format: ChatFormat::Qwen
+                format: ChatFormat::Qwen,
+                llama_server_profile: None,
             }
         );
+    }
+
+    #[test]
+    fn muse_profile_selects_managed_llama_server_structurally() {
+        let args = chat_args(&["yatima", "chat", "--profile", "muse-glimmer"]);
+        let mut profile = ModelProfile::builtin("muse-glimmer").unwrap();
+        profile.name = "renamed-without-changing-its-backend".into();
+        let ChatBackendConfig::Managed {
+            format,
+            llama_server_profile,
+        } = chat_backend_config(&args, Some(&profile)).unwrap()
+        else {
+            panic!("Muse must select managed llama-server");
+        };
+        assert_eq!(format, ChatFormat::MuseGlimmer);
+        assert_eq!(
+            llama_server_profile,
+            match &profile.backend {
+                ProfileBackend::LlamaServer(server) => Some(server.clone()),
+                ProfileBackend::Engine => None,
+            }
+        );
+
+        let explicit = chat_args(&[
+            "yatima",
+            "chat",
+            "--profile",
+            "muse-glimmer",
+            "--backend",
+            "llama-server",
+            "--format",
+            "muse-glimmer",
+        ]);
+        assert!(matches!(
+            chat_backend_config(&explicit, Some(&profile)).unwrap(),
+            ChatBackendConfig::Managed {
+                format: ChatFormat::MuseGlimmer,
+                llama_server_profile: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn muse_profile_rejects_backend_and_attached_substitution() {
+        let profile = ModelProfile::builtin("muse-glimmer").unwrap();
+        let engine = chat_args(&[
+            "yatima",
+            "chat",
+            "--profile",
+            "muse-glimmer",
+            "--backend",
+            "engine",
+        ]);
+        let error = chat_backend_config(&engine, Some(&profile))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires managed llama-server"), "{error}");
+
+        let attached = chat_args(&[
+            "yatima",
+            "chat",
+            "--profile",
+            "muse-glimmer",
+            "--backend",
+            "llama-server",
+            "--server-url",
+            "http://127.0.0.1:8080",
+        ]);
+        let error = chat_backend_config(&attached, Some(&profile))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot attach"), "{error}");
+    }
+
+    #[test]
+    fn muse_profile_rejects_every_identity_override() {
+        let profile = ModelProfile::builtin("muse-glimmer").unwrap();
+        for override_args in [
+            &["--model", "/tmp/model"][..],
+            &["--repo", "someone/else"][..],
+            &["--gguf", "another.gguf"][..],
+            &["--models-dir", "/tmp/models"][..],
+        ] {
+            let mut argv = vec!["yatima", "chat", "--profile", "muse-glimmer"];
+            argv.extend_from_slice(override_args);
+            let args = chat_args(&argv);
+            let error = chat_backend_config(&args, Some(&profile))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("rejects model-source overrides"), "{error}");
+            assert!(error.contains(override_args[0]), "{error}");
+        }
+    }
+
+    #[test]
+    fn muse_profile_accepts_only_its_pinned_format() {
+        let profile = ModelProfile::builtin("muse-glimmer").unwrap();
+        let matching = chat_args(&[
+            "yatima",
+            "chat",
+            "--profile",
+            "muse-glimmer",
+            "--format",
+            "muse-glimmer",
+        ]);
+        assert!(chat_backend_config(&matching, Some(&profile)).is_ok());
+
+        let conflicting = chat_args(&[
+            "yatima",
+            "chat",
+            "--profile",
+            "muse-glimmer",
+            "--format",
+            "qwen",
+        ]);
+        let error = chat_backend_config(&conflicting, Some(&profile))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pins --format muse-glimmer"), "{error}");
     }
 
     #[test]

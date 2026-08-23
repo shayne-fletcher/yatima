@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
     }
 
     let dir = profile
-        .to_source(args.offline)?
+        .to_engine_source(args.offline)?
         .resolve_async()
         .await?
         .into_directory();
