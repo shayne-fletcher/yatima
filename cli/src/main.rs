@@ -720,10 +720,14 @@ fn write_channel(
     current: &mut Option<Channel>,
     color: bool,
 ) {
+    if channel == Channel::ToolCall {
+        return;
+    }
     if color && *current != Some(channel) {
         let code: &[u8] = match channel {
             Channel::Reasoning => b"\x1b[2m", // dim
             Channel::Answer => b"\x1b[0m",    // reset
+            Channel::ToolCall => unreachable!("handled above"),
         };
         let _ = out.write_all(code);
     }
@@ -850,7 +854,7 @@ async fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
 
     if verbose {
         for turn in &run.transcript {
-            eprintln!("── {:?} ──\n{}\n", turn.role, turn.content);
+            eprintln!("── {:?} ──\n{turn}\n", turn.role());
         }
     }
     println!("{}", run.answer);

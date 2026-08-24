@@ -15,6 +15,8 @@
 //! standard (JSON Schema params, name + JSON args).
 
 use crate::capability::{Dir, NtfyTopic, PlotSandbox, WebOrigins, WriteDir};
+use crate::reasoning::{AtemInterpreter, AtemToolMessage, Reasoned};
+use crate::transcript::{render_json_inline, ToolArguments, Turn};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use reqwest::{Client, Url};
@@ -446,11 +448,53 @@ pub trait ToolCallCodec {
     /// streaming consumer withholds answer text from the first (possibly
     /// partial) occurrence on, so codec markup never reaches a live answer
     /// channel (AGENT-4).
-    fn open_marker(&self) -> String;
+    fn open_marker(&self) -> Option<&str>;
     /// Parse a completion: `None` if it is a plain answer (no call attempted),
     /// `Some(Ok(call))` for a well-formed call, `Some(Err(_))` for an attempted
     /// but malformed one (which becomes an error turn — PROTO-1).
     fn parse(&self, text: &str) -> Option<Result<ToolCall>>;
+
+    /// Interpret a completed model reply at the agent boundary. Existing
+    /// marker codecs preserve their behavior through this default. A codec
+    /// whose call is not part of answer text (Muse ATEM) can return a
+    /// structured assistant invocation or model-readable rejection turns.
+    fn extract(&self, _raw: &str, interpreted: &Reasoned) -> ToolExtraction {
+        match self.parse(&interpreted.answer) {
+            None => ToolExtraction::None,
+            Some(Ok(call)) => ToolExtraction::Call {
+                call,
+                assistant_turn: Turn::assistant(interpreted.answer.clone()),
+            },
+            Some(Err(error)) => {
+                let message = format!("malformed tool call: {error}");
+                let mut transcript = Vec::new();
+                if !interpreted.answer.is_empty() {
+                    transcript.push(Turn::assistant(interpreted.answer.clone()));
+                }
+                transcript.push(Turn::tool_result("", message.clone(), true));
+                ToolExtraction::Rejected {
+                    transcript,
+                    message,
+                }
+            }
+        }
+    }
+}
+
+/// What a codec found at the completion-to-agent boundary.
+#[derive(Debug)]
+pub enum ToolExtraction {
+    None,
+    Call {
+        call: ToolCall,
+        assistant_turn: Turn,
+    },
+    /// Protocol-level rejection. These turns are fed back to the model; no
+    /// tool is dispatched.
+    Rejected {
+        transcript: Vec<Turn>,
+        message: String,
+    },
 }
 
 /// A neutral `<tool_call>{ "name": ..., "args": {...} }</tool_call>` convention —
@@ -479,7 +523,9 @@ impl ToolCallCodec for JsonToolCall {
         for spec in specs {
             s.push_str(&format!(
                 "- {}: {} (args schema: {})\n",
-                spec.name, spec.description, spec.params
+                spec.name,
+                spec.description,
+                render_json_sorted(&spec.params)
             ));
         }
         s
@@ -489,8 +535,8 @@ impl ToolCallCodec for JsonToolCall {
         vec![CLOSE.to_string()]
     }
 
-    fn open_marker(&self) -> String {
-        OPEN.to_string()
+    fn open_marker(&self) -> Option<&str> {
+        Some(OPEN)
     }
 
     fn parse(&self, text: &str) -> Option<Result<ToolCall>> {
@@ -553,7 +599,7 @@ impl ToolCallCodec for QwenToolCall {
                 }
             });
             s.push('\n');
-            s.push_str(&signature.to_string());
+            s.push_str(&render_json_sorted(&signature));
         }
         s.push_str(
             "\n</tools>\n\nFor each function call, return a json object with function \
@@ -570,8 +616,8 @@ impl ToolCallCodec for QwenToolCall {
         vec![QWEN_CLOSE.to_string()]
     }
 
-    fn open_marker(&self) -> String {
-        QWEN_OPEN.to_string()
+    fn open_marker(&self) -> Option<&str> {
+        Some(QWEN_OPEN)
     }
 
     fn parse(&self, text: &str) -> Option<Result<ToolCall>> {
@@ -582,6 +628,45 @@ impl ToolCallCodec for QwenToolCall {
             None => return Some(Err(anyhow!("unterminated <tool_call> (no closing tag)"))),
         };
         Some(parse_qwen_call(json))
+    }
+}
+
+/// `serde_json::Map` used sorted keys before Muse enabled `preserve_order`.
+/// Qwen and Plain prompts retain that established byte representation; Muse's
+/// native template uses the insertion-ordered renderer in `transcript`.
+fn render_json_sorted(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => {
+            serde_json::to_string(value).expect("serializing a JSON string cannot fail")
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(render_json_sorted)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(values) => {
+            let mut fields: Vec<_> = values.iter().collect();
+            fields.sort_unstable_by_key(|(name, _)| *name);
+            format!(
+                "{{{}}}",
+                fields
+                    .into_iter()
+                    .map(|(name, value)| format!(
+                        "{}:{}",
+                        serde_json::to_string(name)
+                            .expect("serializing a JSON object key cannot fail"),
+                        render_json_sorted(value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
     }
 }
 
@@ -623,6 +708,267 @@ fn lenient_qwen_call(json: &str) -> Result<ToolCall> {
         None => Value::Object(Default::default()),
     };
     Ok(ToolCall { name, args })
+}
+
+/// Muse Glimmer's addressed ATEM tool protocol. The response classifier owns
+/// message framing; this codec owns tool definitions and the body grammar of a
+/// tool-directed message.
+pub struct MuseAtemCodec;
+
+const ATEM_CALLS_OPEN: &str = "<atem:function_calls>";
+const ATEM_CALLS_CLOSE: &str = "</atem:function_calls>";
+const ATEM_INVOKE_OPEN: &str = "<atem:invoke name=\"";
+const ATEM_INVOKE_CLOSE: &str = "</atem:invoke>";
+const ATEM_PARAMETER_OPEN: &str = "<atem:parameter name=\"";
+const ATEM_PARAMETER_CLOSE: &str = "</atem:parameter>";
+
+#[derive(Debug, Clone)]
+struct AtemInvocation {
+    name: String,
+    arguments: ToolArguments,
+}
+
+impl ToolCallCodec for MuseAtemCodec {
+    fn render_system(&self, specs: &[ToolSpec]) -> String {
+        if specs.is_empty() {
+            return String::new();
+        }
+
+        let mut namespaces = Vec::<String>::new();
+        let mut recipients = Vec::<String>::new();
+        for spec in specs {
+            if let Some((namespace, _)) = spec.name.split_once('.') {
+                if !namespaces.iter().any(|seen| seen == namespace) {
+                    namespaces.push(namespace.to_string());
+                }
+                let recipient = format!("{namespace}.*");
+                if !recipients.contains(&recipient) {
+                    recipients.push(recipient);
+                }
+            } else if !recipients.contains(&spec.name) {
+                recipients.push(spec.name.clone());
+            }
+        }
+
+        let mut out = String::from(
+            "In this environment you have access to a set of tools you can use to answer the user's question.\n\n\
+             You can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n\
+             <atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n\
+             <atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n\
+             ...\n</atem:invoke>\n</atem:function_calls>\n\n\
+             String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\n\
+             Here are the functions available in JSONSchema format:\n\
+             // Tool metadata\n",
+        );
+        for namespace in &namespaces {
+            out.push_str(&format!(
+                "{{\"name\": {}, \"description\": \"\"}}\n",
+                serde_json::to_string(namespace).expect("a string always serializes")
+            ));
+        }
+        out.push_str("// Function schemas");
+        for spec in specs {
+            out.push_str(&format!(
+                "\n{{\"name\": {}, \"description\": {}, \"parameters\": {}}}",
+                serde_json::to_string(&spec.name).expect("a string always serializes"),
+                serde_json::to_string(&spec.description).expect("a string always serializes"),
+                render_json_inline(&spec.params),
+            ));
+        }
+        out.push_str(
+            "\n\nHere's an example of how to call a function in the tool set:\n\
+             (If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\n\
+             to=example_tool_name.example_function_name\n\n\
+             <atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n\
+             <atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n\
+             <atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\n\
+             that can span\n\"multiple\" lines\n</atem:parameter>\n\
+             </atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\"",
+        );
+        for recipient in recipients {
+            out.push_str(", \"");
+            out.push_str(&recipient);
+            out.push('"');
+        }
+        out.push_str(", \"user\".");
+        out
+    }
+
+    fn stop_strings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn open_marker(&self) -> Option<&str> {
+        None
+    }
+
+    fn parse(&self, text: &str) -> Option<Result<ToolCall>> {
+        let interpreted = AtemInterpreter::interpret(text);
+        match self.extract(text, &interpreted) {
+            ToolExtraction::None => None,
+            ToolExtraction::Call { call, .. } => Some(Ok(call)),
+            ToolExtraction::Rejected { message, .. } => Some(Err(anyhow!(message))),
+        }
+    }
+
+    fn extract(&self, raw: &str, interpreted: &Reasoned) -> ToolExtraction {
+        let response = AtemInterpreter::interpret_full(raw);
+        debug_assert_eq!(&response.reasoned, interpreted);
+        if response.tool_messages.is_empty() {
+            return ToolExtraction::None;
+        }
+
+        let parsed = response
+            .tool_messages
+            .iter()
+            .map(|message| parse_atem_tool_message(message).map(|calls| (message, calls)))
+            .collect::<Result<Vec<_>>>();
+
+        let rejection = match &parsed {
+            Err(error) => Some(error.to_string()),
+            Ok(messages) if response.rejected => {
+                Some("ATEM response framing was rejected".to_string())
+            }
+            Ok(_) if !response.reasoned.answer.is_empty() => Some(
+                "ATEM turn mixed answer text with a tool call; expected exactly one or the other"
+                    .to_string(),
+            ),
+            Ok(messages) if messages.len() != 1 => Some(format!(
+                "ATEM turn contained {} tool messages; exactly one is supported",
+                messages.len()
+            )),
+            Ok(messages) if messages[0].1.len() != 1 => Some(format!(
+                "ATEM tool message contained {} invocations; exactly one is supported",
+                messages[0].1.len()
+            )),
+            Ok(messages) if messages[0].0.recipient != messages[0].1[0].name => Some(format!(
+                "ATEM recipient {:?} does not match invocation {:?}",
+                messages[0].0.recipient, messages[0].1[0].name
+            )),
+            Ok(_) => None,
+        };
+
+        if let Some(message) = rejection {
+            return ToolExtraction::Rejected {
+                transcript: atem_rejection_transcript(
+                    &response.tool_messages,
+                    parsed.ok(),
+                    &message,
+                ),
+                message,
+            };
+        }
+
+        let (_, mut calls) =
+            parsed.expect("the rejection cases established one parsed message")[0].clone();
+        let invocation = calls
+            .pop()
+            .expect("the rejection cases established one call");
+        let call = ToolCall {
+            name: invocation.name.clone(),
+            args: invocation.arguments.to_json_object(),
+        };
+        ToolExtraction::Call {
+            call,
+            assistant_turn: Turn::assistant_tool_call(invocation.name, invocation.arguments),
+        }
+    }
+}
+
+fn parse_atem_tool_message(message: &AtemToolMessage) -> Result<Vec<AtemInvocation>> {
+    let mut rest = message.body.trim();
+    rest = rest
+        .strip_prefix(ATEM_CALLS_OPEN)
+        .ok_or_else(|| anyhow!("ATEM tool payload must begin with {ATEM_CALLS_OPEN}"))?;
+    rest = trim_one_line_break(rest);
+
+    let mut calls = Vec::new();
+    while rest.starts_with(ATEM_INVOKE_OPEN) {
+        let (name, tail) = take_quoted_tag(rest, ATEM_INVOKE_OPEN, "ATEM invoke")?;
+        rest = trim_one_line_break(tail);
+        let mut parameters = Vec::new();
+        while rest.starts_with(ATEM_PARAMETER_OPEN) {
+            let (parameter, tail) = take_quoted_tag(rest, ATEM_PARAMETER_OPEN, "ATEM parameter")?;
+            let end = tail
+                .find(ATEM_PARAMETER_CLOSE)
+                .ok_or_else(|| anyhow!("ATEM parameter {parameter:?} has no closing tag"))?;
+            let raw_value = &tail[..end];
+            let value = serde_json::from_str(raw_value)
+                .unwrap_or_else(|_| Value::String(raw_value.to_string()));
+            parameters.push((parameter, value));
+            rest = trim_one_line_break(&tail[end + ATEM_PARAMETER_CLOSE.len()..]);
+        }
+        rest = rest
+            .strip_prefix(ATEM_INVOKE_CLOSE)
+            .ok_or_else(|| anyhow!("ATEM invocation {name:?} has trailing or malformed payload"))?;
+        rest = trim_one_line_break(rest);
+        let arguments = ToolArguments::try_from_pairs(parameters).map_err(anyhow::Error::msg)?;
+        calls.push(AtemInvocation { name, arguments });
+    }
+    rest = rest
+        .strip_prefix(ATEM_CALLS_CLOSE)
+        .ok_or_else(|| anyhow!("ATEM tool payload has no closing {ATEM_CALLS_CLOSE}"))?;
+    if !rest.trim().is_empty() {
+        bail!("ATEM tool payload has trailing text after {ATEM_CALLS_CLOSE}");
+    }
+    Ok(calls)
+}
+
+fn take_quoted_tag<'a>(input: &'a str, prefix: &str, label: &str) -> Result<(String, &'a str)> {
+    let rest = input
+        .strip_prefix(prefix)
+        .ok_or_else(|| anyhow!("malformed {label}"))?;
+    let end = rest
+        .find("\">")
+        .ok_or_else(|| anyhow!("{label} has no closing quote"))?;
+    let name = &rest[..end];
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '<' || ch == '"')
+    {
+        bail!("{label} has invalid name {name:?}");
+    }
+    Ok((name.to_string(), &rest[end + 2..]))
+}
+
+fn trim_one_line_break(input: &str) -> &str {
+    input
+        .strip_prefix("\r\n")
+        .or_else(|| input.strip_prefix('\n'))
+        .unwrap_or(input)
+}
+
+fn atem_rejection_transcript(
+    messages: &[AtemToolMessage],
+    parsed: Option<Vec<(&AtemToolMessage, Vec<AtemInvocation>)>>,
+    error: &str,
+) -> Vec<Turn> {
+    let mut transcript = Vec::new();
+    for message in messages {
+        let arguments = parsed
+            .as_ref()
+            .and_then(|parsed| {
+                parsed
+                    .iter()
+                    .find(|(candidate, _)| std::ptr::eq(*candidate, message))
+            })
+            .and_then(|(_, calls)| calls.first())
+            .map(|call| call.arguments.clone())
+            .unwrap_or_default();
+        transcript.push(Turn::assistant_tool_call(
+            message.recipient.clone(),
+            arguments,
+        ));
+    }
+    for message in messages {
+        transcript.push(Turn::tool_result(
+            message.recipient.clone(),
+            format!("tool protocol rejected: {error}"),
+            true,
+        ));
+    }
+    transcript
 }
 
 /// The substring just after `key` and its `:` separator.
@@ -2442,6 +2788,7 @@ impl Tool for ListDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PromptTemplate;
     use std::io::Write;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2490,6 +2837,7 @@ mod tests {
         fn codecs_never_panic_on_arbitrary_text(s in ".*") {
             let _ = JsonToolCall.parse(&s);
             let _ = QwenToolCall.parse(&s);
+            let _ = MuseAtemCodec.parse(&s);
             let wrapped = format!("<tool_call>{s}</tool_call>");
             let _ = JsonToolCall.parse(&wrapped);
             let _ = QwenToolCall.parse(&wrapped);
@@ -2567,6 +2915,149 @@ mod tests {
             .unwrap()
             .is_err());
         assert_eq!(codec.stop_strings(), vec!["</tool_call>".to_string()]);
+    }
+
+    #[test]
+    fn marker_codec_schema_bytes_remain_sorted() {
+        // Stage 4 enables insertion-ordered JSON for Muse's native template.
+        // Qwen and Plain retain serde_json's prior sorted-key representation.
+        let spec = ToolSpec {
+            name: "read_file".to_string(),
+            description: "read".to_string(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        };
+        let schema = "{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}";
+        assert!(JsonToolCall
+            .render_system(std::slice::from_ref(&spec))
+            .contains(&format!("args schema: {schema}")));
+        assert!(QwenToolCall
+            .render_system(&[spec])
+            .contains(&format!(
+                "{{\"function\":{{\"description\":\"read\",\"name\":\"read_file\",\"parameters\":{schema}}},\"type\":\"function\"}}"
+            )));
+    }
+
+    fn atem_turn(recipient: &str, body: &str) -> String {
+        format!(" to={recipient}<|message|>{body}<|eot|>")
+    }
+
+    fn atem_invoke(name: &str, parameters: &[(&str, &str)]) -> String {
+        let mut body = format!("<atem:function_calls>\n<atem:invoke name=\"{name}\">\n");
+        for (parameter, value) in parameters {
+            body.push_str(&format!(
+                "<atem:parameter name=\"{parameter}\">{value}</atem:parameter>\n"
+            ));
+        }
+        body.push_str("</atem:invoke>\n</atem:function_calls>");
+        body
+    }
+
+    #[test]
+    fn muse_codec_projects_namespaces_and_flat_recipients() {
+        // upholds: CAPS-1 — namespaced tools advertise their namespace while
+        // Yatima's flat tool names remain exact, executable recipients.
+        let rendered = MuseAtemCodec.render_system(&[
+            ToolSpec {
+                name: "fs.stat_file".to_string(),
+                description: "stat".to_string(),
+                params: serde_json::json!({}),
+            },
+            ToolSpec {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                params: serde_json::json!({}),
+            },
+        ]);
+        assert!(
+            rendered.contains("# Valid recipients: \"self\", \"fs.*\", \"read_file\", \"user\".")
+        );
+        assert!(!rendered.contains("\"read_file.*\""));
+        assert_eq!(MuseAtemCodec.render_system(&[]), "");
+    }
+
+    #[test]
+    fn muse_codec_extracts_one_matching_invocation() {
+        // upholds: PROTO-1 — complete JSON values retain their type, while
+        // ordinary scalar text remains a string, in source order.
+        let body = atem_invoke(
+            "read_file",
+            &[("path", "README.md"), ("line", "3"), ("raw", "[1, 2]")],
+        );
+        let raw = atem_turn("read_file", &body);
+        let interpreted = crate::MuseGlimmerTemplate::default().interpret_response(&raw);
+        assert_eq!(
+            interpreted,
+            AtemInterpreter::interpret_full(&raw).reasoned,
+            "template and codec passes share one ATEM definition"
+        );
+        let ToolExtraction::Call {
+            call,
+            assistant_turn,
+        } = MuseAtemCodec.extract(&raw, &interpreted)
+        else {
+            panic!("one matching invocation must be callable")
+        };
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.args["path"], "README.md");
+        assert_eq!(call.args["line"], 3);
+        assert_eq!(call.args["raw"], serde_json::json!([1, 2]));
+        assert!(matches!(
+            assistant_turn,
+            Turn::AssistantToolCall { name, .. } if name == "read_file"
+        ));
+    }
+
+    #[test]
+    fn muse_codec_rejects_every_unsupported_call_shape() {
+        // upholds: PROTO-1 — malformed, ambiguous, or parallel attempts yield
+        // model-readable structured feedback and never a dispatchable call.
+        let one = atem_invoke("read_file", &[("path", "README.md")]);
+        let second = "<atem:invoke name=\"read_file\">\n<atem:parameter name=\"path\">Cargo.toml</atem:parameter>\n</atem:invoke>\n";
+        let two_invokes = one.replacen("</atem:function_calls>", second, 1);
+        let duplicate = atem_invoke(
+            "read_file",
+            &[("path", "README.md"), ("path", "Cargo.toml")],
+        );
+        let trailing = format!("{one} trailing");
+        let mismatch = atem_turn("list_dir", &one);
+        let two_messages = format!(
+            "{}<|eom|><|start|>assistant to=read_file<|message|>{}<|eot|>",
+            atem_turn("read_file", &one).trim_end_matches("<|eot|>"),
+            one
+        );
+        let mixed = format!(
+            "{}<|eom|><|start|>assistant to=user<|message|>Done.<|eot|>",
+            atem_turn("read_file", &one).trim_end_matches("<|eot|>")
+        );
+
+        for (label, raw) in [
+            ("two invokes", atem_turn("read_file", &two_invokes)),
+            ("two messages", two_messages),
+            ("recipient mismatch", mismatch),
+            ("duplicate parameter", atem_turn("read_file", &duplicate)),
+            ("trailing payload", atem_turn("read_file", &trailing)),
+            ("mixed answer and call", mixed),
+        ] {
+            let interpreted = AtemInterpreter::interpret(&raw);
+            let ToolExtraction::Rejected {
+                transcript,
+                message,
+            } = MuseAtemCodec.extract(&raw, &interpreted)
+            else {
+                panic!("{label} was not rejected")
+            };
+            assert!(!message.is_empty(), "{label}: feedback explains the fault");
+            assert!(
+                transcript
+                    .iter()
+                    .any(|turn| matches!(turn, Turn::ToolResult { is_error: true, .. })),
+                "{label}: structured error turn"
+            );
+        }
     }
 
     #[test]
@@ -4369,6 +4860,7 @@ position over the coming years.</p>
         // reads as plain chat; the prompt never claims absent authority.
         assert_eq!(QwenToolCall.render_system(&[]), "");
         assert_eq!(JsonToolCall.render_system(&[]), "");
+        assert_eq!(MuseAtemCodec.render_system(&[]), "");
         let spec = ToolSpec {
             name: "plot".into(),
             description: "d".into(),

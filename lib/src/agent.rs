@@ -14,9 +14,11 @@ use crate::completer::Completer;
 use crate::reasoning::{Channel, Reasoned};
 use crate::template::PromptTemplate;
 use crate::tool::{
-    ToolCall, ToolCallCodec, ToolEvent, ToolOutcome, ToolRejection, ToolResult, Tools,
+    ToolCall, ToolCallCodec, ToolEvent, ToolExtraction, ToolOutcome, ToolRejection, Tools,
 };
-use crate::transcript::{Role, Turn};
+#[cfg(test)]
+use crate::transcript::Role;
+use crate::transcript::Turn;
 use crate::{Cancel, GenOpts};
 use anyhow::Result;
 use std::cell::RefCell;
@@ -36,9 +38,10 @@ pub enum AgentEvent {
     ToolOutcome(ToolOutcome),
     /// A live slice of the current step's decode (AGENT-4), classified as it
     /// streams: chain-of-thought on [`Channel::Reasoning`], prose on
-    /// [`Channel::Answer`]. Codec markup never reaches the answer channel —
-    /// text that turns out to open a tool call is withheld; the call itself
-    /// arrives as [`AgentEvent::ToolCall`]. Answer fragments of a step that
+    /// [`Channel::Answer`]. Codec markup never reaches the answer channel:
+    /// marker codecs withhold it, while addressed protocols classify it on an
+    /// internal tool channel. The parsed call itself arrives as
+    /// [`AgentEvent::ToolCall`]. Answer fragments of a step that
     /// ends in a tool call are *narration* (prose the model wrote before
     /// calling): the following `ToolCall` event licenses a consumer to fold
     /// them into working matter.
@@ -199,16 +202,9 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
     /// [`trim_history_to`](Agent::trim_history_to) measures against `budget`.
     fn render_history_prompt(&self) -> String {
         let rendered_tools = self.codec.render_system(&self.tools.specs());
-        let system = if rendered_tools.is_empty() {
-            self.system.clone()
-        } else {
-            format!("{}\n\n{rendered_tools}", self.system)
-        };
+        let system = self.template.compose_system(&self.system, &rendered_tools);
         let mut transcript = Vec::with_capacity(self.history.len() + 1);
-        transcript.push(Turn {
-            role: Role::System,
-            content: system,
-        });
+        transcript.push(Turn::system(system));
         transcript.extend(self.history.iter().cloned());
         self.template.render(&transcript)
     }
@@ -296,24 +292,14 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             "agent run started"
         );
         let rendered_tools = self.codec.render_system(&self.tools.specs());
-        let system = if rendered_tools.is_empty() {
-            self.system.clone()
-        } else {
-            format!("{}\n\n{rendered_tools}", self.system)
-        };
+        let system = self.template.compose_system(&self.system, &rendered_tools);
         // Seed the working transcript with the session history (AGENT-3): prior
         // exchanges' user/answer turns only — their tool rounds and reasoning
         // were ephemeral to their runs.
         let mut transcript = Vec::with_capacity(self.history.len() + 2);
-        transcript.push(Turn {
-            role: Role::System,
-            content: system,
-        });
+        transcript.push(Turn::system(system));
         transcript.extend(self.history.iter().cloned());
-        transcript.push(Turn {
-            role: Role::User,
-            content: user.to_string(),
-        });
+        transcript.push(Turn::user(user));
 
         let stops = self.codec.stop_strings();
         let mut acc = init;
@@ -358,15 +344,19 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     }
                 };
                 let mut classifier = self.template.classifier();
-                let mut gate = AnswerGate::new(self.codec.open_marker());
+                let mut gate = self.codec.open_marker().map(AnswerGate::new);
                 let mut on_token = |frag: &str| {
                     classifier.push(frag, |channel, text| match channel {
                         Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
-                        Channel::Answer => {
-                            if let Some(safe) = gate.push(text) {
-                                deliver(Channel::Answer, safe);
+                        Channel::Answer => match gate.as_mut() {
+                            Some(gate) => {
+                                if let Some(safe) = gate.push(text) {
+                                    deliver(Channel::Answer, safe);
+                                }
                             }
-                        }
+                            None => deliver(Channel::Answer, text.to_string()),
+                        },
+                        Channel::ToolCall => {}
                     });
                 };
                 let completion = self
@@ -378,14 +368,20 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 // partial-opener lookalike that turned out to be prose).
                 classifier.finish(|channel, text| match channel {
                     Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
-                    Channel::Answer => {
-                        if let Some(safe) = gate.push(text) {
-                            deliver(Channel::Answer, safe);
+                    Channel::Answer => match gate.as_mut() {
+                        Some(gate) => {
+                            if let Some(safe) = gate.push(text) {
+                                deliver(Channel::Answer, safe);
+                            }
                         }
-                    }
+                        None => deliver(Channel::Answer, text.to_string()),
+                    },
+                    Channel::ToolCall => {}
                 });
-                if let Some(rest) = gate.finish() {
-                    deliver(Channel::Answer, rest);
+                if let Some(gate) = gate {
+                    if let Some(rest) = gate.finish() {
+                        deliver(Channel::Answer, rest);
+                    }
                 }
                 completion
             };
@@ -414,25 +410,16 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             // through the template — REASON-1's declared boundary
             // (`PromptTemplate::interpret_response`), so a non-marker protocol
             // override is honored here exactly as in chat. The transcript
-            // (re-rendered into the next prompt) carries only the answer,
-            // never reasoning or framing. The reply still holds any trailing
-            // tool call, so the codec parses it below.
+            // never carries reasoning or framing: a final reply contributes
+            // answer text, while a codec may contribute a structured tool
+            // invocation for the next prompt.
+            let interpreted = self.template.interpret_response(&completion.text);
             let Reasoned {
                 reasoning,
                 answer: reply,
-            } = self.template.interpret_response(&completion.text);
-            // A reply with no answer text builds no turn (the Turn contract):
-            // an empty assistant entry would still reach verbose callers via
-            // `Run::transcript` even though nothing was said. Such a reply
-            // carries no tool call either, so the parse below ends the run.
-            if !reply.is_empty() {
-                transcript.push(Turn {
-                    role: Role::Assistant,
-                    content: reply.clone(),
-                });
-            }
+            } = &interpreted;
             if let Some(reasoning) = reasoning {
-                match step(acc, AgentEvent::Reasoning(reasoning))? {
+                match step(acc, AgentEvent::Reasoning(reasoning.clone()))? {
                     ControlFlow::Continue(a) => acc = a,
                     ControlFlow::Break(a) => {
                         acc = a;
@@ -442,10 +429,10 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 }
             }
 
-            match self.codec.parse(&reply) {
+            match self.codec.extract(&completion.text, &interpreted) {
                 // A plain answer: the run is done (the reasoning span, if any, has
                 // already been stripped from `reply`).
-                None => {
+                ToolExtraction::None => {
                     // No tool call and no answer text — the reply was all
                     // reasoning or framing (a truncated turn). Emitting
                     // `Final("")` would tell the caller the model answered;
@@ -455,119 +442,112 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         stop = AgentStop::NoAnswer;
                         break;
                     }
+                    transcript.push(Turn::assistant(reply.clone()));
                     match step(acc, AgentEvent::Final(reply.clone()))? {
                         ControlFlow::Continue(a) | ControlFlow::Break(a) => acc = a,
                     }
-                    answer = reply;
+                    answer = reply.clone();
                     stop = AgentStop::Final;
                     break;
                 }
-                // A tool call (well-formed or not): dispatch / make an error
-                // result, feed it back, and continue under the step budget.
-                Some(parsed) => {
-                    let (tool_name, outcome) = match parsed {
-                        Ok(call) => {
-                            match step(acc, AgentEvent::ToolCall(call.clone()))? {
-                                ControlFlow::Continue(a) => acc = a,
-                                ControlFlow::Break(a) => {
-                                    acc = a;
-                                    stop = AgentStop::Stopped;
-                                    break;
+                ToolExtraction::Call {
+                    call,
+                    assistant_turn,
+                } => {
+                    transcript.push(assistant_turn);
+                    match step(acc, AgentEvent::ToolCall(call.clone()))? {
+                        ControlFlow::Continue(a) => acc = a,
+                        ControlFlow::Break(a) => {
+                            acc = a;
+                            stop = AgentStop::Stopped;
+                            break;
+                        }
+                    }
+                    let tool_name = call.name.clone();
+                    let mut task = self.tools.spawn(call);
+                    let outcome = loop {
+                        match task.recv().await {
+                            Some(ToolEvent::Started { call, .. }) => {
+                                match step(acc, AgentEvent::ToolStarted(call))? {
+                                    ControlFlow::Continue(a) => acc = a,
+                                    ControlFlow::Break(a) => {
+                                        task.cancel();
+                                        let _ = task.join().await;
+                                        tracing::info!(
+                                            steps,
+                                            stop = ?AgentStop::Stopped,
+                                            "agent run finished"
+                                        );
+                                        return Ok((
+                                            a,
+                                            Run {
+                                                answer,
+                                                transcript,
+                                                steps,
+                                                stop: AgentStop::Stopped,
+                                            },
+                                        ));
+                                    }
                                 }
                             }
-                            let tool_name = call.name.clone();
-                            let mut task = self.tools.spawn(call);
-                            let outcome = loop {
-                                match task.recv().await {
-                                    Some(ToolEvent::Started { call, .. }) => {
-                                        match step(acc, AgentEvent::ToolStarted(call))? {
-                                            ControlFlow::Continue(a) => acc = a,
-                                            ControlFlow::Break(a) => {
-                                                task.cancel();
-                                                let _ = task.join().await;
-                                                tracing::info!(
-                                                    steps,
-                                                    stop = ?AgentStop::Stopped,
-                                                    "agent run finished"
-                                                );
-                                                return Ok((
-                                                    a,
-                                                    Run {
-                                                        answer,
-                                                        transcript,
-                                                        steps,
-                                                        stop: AgentStop::Stopped,
-                                                    },
-                                                ));
-                                            }
-                                        }
+                            Some(ToolEvent::Artifact { path, .. }) => {
+                                match step(acc, AgentEvent::ToolArtifact(path))? {
+                                    ControlFlow::Continue(a) => acc = a,
+                                    ControlFlow::Break(a) => {
+                                        task.cancel();
+                                        let _ = task.join().await;
+                                        tracing::info!(
+                                            steps,
+                                            stop = ?AgentStop::Stopped,
+                                            "agent run finished"
+                                        );
+                                        return Ok((
+                                            a,
+                                            Run {
+                                                answer,
+                                                transcript,
+                                                steps,
+                                                stop: AgentStop::Stopped,
+                                            },
+                                        ));
                                     }
-                                    Some(ToolEvent::Artifact { path, .. }) => {
-                                        match step(acc, AgentEvent::ToolArtifact(path))? {
-                                            ControlFlow::Continue(a) => acc = a,
-                                            ControlFlow::Break(a) => {
-                                                task.cancel();
-                                                let _ = task.join().await;
-                                                tracing::info!(
-                                                    steps,
-                                                    stop = ?AgentStop::Stopped,
-                                                    "agent run finished"
-                                                );
-                                                return Ok((
-                                                    a,
-                                                    Run {
-                                                        answer,
-                                                        transcript,
-                                                        steps,
-                                                        stop: AgentStop::Stopped,
-                                                    },
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    Some(ToolEvent::Progress { message, .. }) => {
-                                        match step(acc, AgentEvent::ToolProgress(message))? {
-                                            ControlFlow::Continue(a) => acc = a,
-                                            ControlFlow::Break(a) => {
-                                                task.cancel();
-                                                let _ = task.join().await;
-                                                tracing::info!(
-                                                    steps,
-                                                    stop = ?AgentStop::Stopped,
-                                                    "agent run finished"
-                                                );
-                                                return Ok((
-                                                    a,
-                                                    Run {
-                                                        answer,
-                                                        transcript,
-                                                        steps,
-                                                        stop: AgentStop::Stopped,
-                                                    },
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    Some(ToolEvent::Finished { outcome, .. }) => break outcome,
-                                    Some(ToolEvent::Cancelled { .. }) => {}
-                                    None => break task.join().await,
                                 }
-                            };
-                            (tool_name, outcome)
+                            }
+                            Some(ToolEvent::Progress { message, .. }) => {
+                                match step(acc, AgentEvent::ToolProgress(message))? {
+                                    ControlFlow::Continue(a) => acc = a,
+                                    ControlFlow::Break(a) => {
+                                        task.cancel();
+                                        let _ = task.join().await;
+                                        tracing::info!(
+                                            steps,
+                                            stop = ?AgentStop::Stopped,
+                                            "agent run finished"
+                                        );
+                                        return Ok((
+                                            a,
+                                            Run {
+                                                answer,
+                                                transcript,
+                                                steps,
+                                                stop: AgentStop::Stopped,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(ToolEvent::Finished { outcome, .. }) => break outcome,
+                            Some(ToolEvent::Cancelled { .. }) => {}
+                            None => break task.join().await,
                         }
-                        Err(e) => (
-                            String::new(),
-                            ToolOutcome::Rejected(ToolRejection::InvalidArgs {
-                                message: format!("malformed tool call: {e}"),
-                            }),
-                        ),
                     };
 
                     let result = outcome.render_for_model(&tool_name);
-                    transcript.push(Turn {
-                        role: Role::Tool,
-                        content: render_result(&result),
-                    });
+                    transcript.push(Turn::tool_result(
+                        result.name,
+                        result.content,
+                        result.is_error,
+                    ));
                     match step(acc, AgentEvent::ToolOutcome(outcome))? {
                         ControlFlow::Continue(a) => acc = a,
                         ControlFlow::Break(a) => {
@@ -577,6 +557,28 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         }
                     }
 
+                    steps += 1;
+                    if steps >= self.max_steps {
+                        stop = AgentStop::MaxSteps;
+                        break;
+                    }
+                }
+                ToolExtraction::Rejected {
+                    transcript: rejection,
+                    message,
+                } => {
+                    // upholds: PROTO-1 — protocol rejection dispatches no tool;
+                    // its structured turns teach the model how to recover.
+                    transcript.extend(rejection);
+                    let outcome = ToolOutcome::Rejected(ToolRejection::InvalidArgs { message });
+                    match step(acc, AgentEvent::ToolOutcome(outcome))? {
+                        ControlFlow::Continue(a) => acc = a,
+                        ControlFlow::Break(a) => {
+                            acc = a;
+                            stop = AgentStop::Stopped;
+                            break;
+                        }
+                    }
                     steps += 1;
                     if steps >= self.max_steps {
                         stop = AgentStop::MaxSteps;
@@ -602,14 +604,8 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 "final answer empty or degenerate; exchange not committed (AGENT-3, REASON-1)"
             );
         } else if stop == AgentStop::Final {
-            self.history.push(Turn {
-                role: Role::User,
-                content: user.to_string(),
-            });
-            self.history.push(Turn {
-                role: Role::Assistant,
-                content: answer.clone(),
-            });
+            self.history.push(Turn::user(user));
+            self.history.push(Turn::assistant(answer.clone()));
         }
         Ok((
             acc,
@@ -621,12 +617,6 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             },
         ))
     }
-}
-
-/// Render a tool result as the `tool`-turn content the model reads back.
-fn render_result(result: &ToolResult) -> String {
-    let tag = if result.is_error { "error" } else { "ok" };
-    format!("[{} {}] {}", result.name, tag, result.content)
 }
 
 /// The fold's state while a step streams: the accumulator threads through the
@@ -650,9 +640,9 @@ struct AnswerGate {
 }
 
 impl AnswerGate {
-    fn new(opener: String) -> AnswerGate {
+    fn new(opener: &str) -> AnswerGate {
         AnswerGate {
-            opener,
+            opener: opener.to_string(),
             held: String::new(),
             suppressed: false,
         }
@@ -796,6 +786,31 @@ mod tests {
         )
     }
 
+    fn muse_call(tool: &str, paths: &[&str]) -> String {
+        let mut body =
+            format!(" to={tool}<|message|><atem:function_calls>\n<atem:invoke name=\"{tool}\">\n");
+        for path in paths {
+            body.push_str(&format!(
+                "<atem:parameter name=\"path\">{path}</atem:parameter>\n"
+            ));
+        }
+        body.push_str("</atem:invoke>\n</atem:function_calls><|eot|>");
+        body
+    }
+
+    fn muse_parallel_calls(tool: &str, paths: &[&str]) -> String {
+        let mut body = format!(" to={tool}<|message|><atem:function_calls>\n");
+        for path in paths {
+            body.push_str(&format!(
+                "<atem:invoke name=\"{tool}\">\n\
+                 <atem:parameter name=\"path\">{path}</atem:parameter>\n\
+                 </atem:invoke>\n"
+            ));
+        }
+        body.push_str("</atem:function_calls><|eot|>");
+        body
+    }
+
     #[test]
     fn happy_path_tool_call_then_answer() {
         // upholds: AGENT-1 — valid call → tool result → final, in one round.
@@ -820,10 +835,80 @@ mod tests {
         assert_eq!(run.steps, 1);
         assert_eq!(run.answer, "Based on the file, the sky is blue.");
         // the tool result was fed back into the transcript
-        assert!(run
-            .transcript
-            .iter()
-            .any(|t| t.role == Role::Tool && t.content.contains("the sky is blue")));
+        assert!(run.transcript.iter().any(|t| {
+            t.role() == Role::Tool
+                && t.content()
+                    .is_some_and(|content| content.contains("the sky is blue"))
+        }));
+    }
+
+    #[test]
+    fn muse_rejection_dispatches_nothing_then_recovers() {
+        // upholds: PROTO-1, AGENT-1 — two invocations are rejected before the
+        // tool boundary. The structured feedback reaches the next prompt; one
+        // subsequent invocation dispatches once and the run completes.
+        let tmp = tmp_with_file("note.txt", "the sky is blue");
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let malformed = muse_parallel_calls("read_file", &["note.txt", "other.txt"]);
+        let valid = muse_call("read_file", &["note.txt"]);
+        let mut model = Scripted::new(&[&malformed, &valid, "The sky is blue."]);
+        let mut agent = Agent::new(
+            &mut model,
+            &tools,
+            crate::MuseAtemCodec,
+            crate::MuseGlimmerTemplate::default(),
+            "helper",
+            5,
+        );
+        let (events, run) = agent
+            .run_with("read the note", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.steps, 2, "one rejected attempt plus one tool round");
+        assert_eq!(run.answer, "The sky is blue.");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolStarted(_)))
+                .count(),
+            1,
+            "the rejected parallel attempt never reached dispatch"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolCall(_)))
+                .count(),
+            1,
+            "only the supported call becomes tool activity"
+        );
+        assert!(run.transcript.iter().any(|turn| matches!(
+            turn,
+            Turn::AssistantToolCall { name, .. } if name == "read_file"
+        )));
+        assert!(run.transcript.iter().any(|turn| matches!(
+            turn,
+            Turn::ToolResult {
+                name,
+                content,
+                is_error: true,
+            } if name == "read_file" && content.contains("exactly one")
+        )));
+        assert!(run.transcript.iter().any(|turn| matches!(
+            turn,
+            Turn::ToolResult {
+                name,
+                content,
+                is_error: false,
+            } if name == "read_file" && content.contains("the sky is blue")
+        )));
+        drop(agent);
+        assert!(model.prompts[1].contains("tool protocol rejected"));
+        assert!(model.prompts[2].contains("the sky is blue"));
     }
 
     #[test]
@@ -849,9 +934,9 @@ mod tests {
         assert_eq!(run.stop, AgentStop::Final);
         assert_eq!(run.answer, "Done.");
         assert_eq!(agent.history().len(), 2);
-        assert_eq!(agent.history()[1].content, "Done.");
+        assert_eq!(agent.history()[1].content(), Some("Done."));
         assert!(
-            !agent.history()[1].content.contains("to="),
+            !agent.history()[1].content().unwrap().contains("to="),
             "no ATEM framing in history"
         );
     }
@@ -887,7 +972,7 @@ mod tests {
             "no Final event fired: {events:?}"
         );
         assert!(
-            !run.transcript.iter().any(|t| t.role == Role::Assistant),
+            !run.transcript.iter().any(|t| t.role() == Role::Assistant),
             "no assistant turn in the run transcript"
         );
         assert!(agent.history().is_empty(), "nothing entered history");
@@ -931,9 +1016,14 @@ mod tests {
 
         assert_eq!(run.stop, AgentStop::Final);
         assert_eq!(run.answer, "Sorry, I will just answer: 4.");
-        assert!(run.transcript.iter().any(|t| t.role == Role::Tool
-            && t.content.contains("error")
-            && t.content.contains("unknown tool")));
+        assert!(run.transcript.iter().any(|turn| matches!(
+            turn,
+            Turn::ToolResult {
+                content,
+                is_error: true,
+                ..
+            } if content.contains("unknown tool")
+        )));
     }
 
     #[test]
@@ -949,10 +1039,11 @@ mod tests {
 
         assert_eq!(run.stop, AgentStop::Final);
         assert_eq!(run.answer, "Answer: done.");
-        assert!(run
-            .transcript
-            .iter()
-            .any(|t| t.role == Role::Tool && t.content.contains("malformed tool call")));
+        assert!(run.transcript.iter().any(|t| {
+            t.role() == Role::Tool
+                && t.content()
+                    .is_some_and(|content| content.contains("malformed tool call"))
+        }));
     }
 
     #[test]
@@ -1131,11 +1222,11 @@ mod tests {
         let tool_turns: Vec<&Turn> = run
             .transcript
             .iter()
-            .filter(|t| t.role == Role::Tool)
+            .filter(|t| t.role() == Role::Tool)
             .collect();
         assert_eq!(tool_turns.len(), 2);
-        assert!(tool_turns[0].content.contains("DOWN"));
-        assert!(tool_turns[1].content.contains("restart it"));
+        assert!(tool_turns[0].content().unwrap().contains("DOWN"));
+        assert!(tool_turns[1].content().unwrap().contains("restart it"));
     }
 
     #[test]
@@ -1158,10 +1249,10 @@ mod tests {
         let tool_turns: Vec<&Turn> = run
             .transcript
             .iter()
-            .filter(|t| t.role == Role::Tool)
+            .filter(|t| t.role() == Role::Tool)
             .collect();
-        assert!(tool_turns[0].content.contains("error"));
-        assert!(!tool_turns[1].content.contains("error"));
+        assert!(tool_turns[0].content().unwrap().contains("error"));
+        assert!(!tool_turns[1].content().unwrap().contains("error"));
         assert_eq!(run.answer, "Got it: the data.");
     }
 
@@ -1191,7 +1282,7 @@ mod tests {
         assert_eq!(run2.answer, "About two million.");
 
         // History holds both completed exchanges, in order.
-        let roles: Vec<Role> = agent.history().iter().map(|t| t.role).collect();
+        let roles: Vec<Role> = agent.history().iter().map(Turn::role).collect();
         assert_eq!(
             roles,
             [Role::User, Role::Assistant, Role::User, Role::Assistant]
@@ -1404,7 +1495,7 @@ mod tests {
         // upholds: AGENT-4 — the gate's unit algebra: complete openers
         // suppress from the marker on; partial-opener tails are held, then
         // released when they diverge or the stream ends.
-        let mut gate = AnswerGate::new("<tool_call>".to_string());
+        let mut gate = AnswerGate::new("<tool_call>");
         assert_eq!(gate.push("Hello "), Some("Hello ".to_string()));
         assert_eq!(gate.push("<tool"), None); // could still become the opener
         assert_eq!(gate.push("boxes> ok"), Some("<toolboxes> ok".to_string()));
@@ -1412,7 +1503,7 @@ mod tests {
         assert_eq!(gate.push("more"), None);
         assert_eq!(gate.finish(), None);
 
-        let mut gate = AnswerGate::new("<tool_call>".to_string());
+        let mut gate = AnswerGate::new("<tool_call>");
         assert_eq!(
             gate.push("ends on a cliff <tool_ca"),
             Some("ends on a cliff ".to_string())
@@ -1428,14 +1519,8 @@ mod tests {
         let tools = Tools::new();
         let mut model = Scripted::new(&["Blue, as you said."]);
         let prior = vec![
-            Turn {
-                role: Role::User,
-                content: "My favourite colour is blue.".to_string(),
-            },
-            Turn {
-                role: Role::Assistant,
-                content: "Noted: blue.".to_string(),
-            },
+            Turn::user("My favourite colour is blue."),
+            Turn::assistant("Noted: blue."),
         ];
         let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 5)
             .with_history(prior);
@@ -1519,10 +1604,10 @@ mod tests {
         let assistant = run
             .transcript
             .iter()
-            .find(|t| t.role == Role::Assistant)
+            .find(|t| t.role() == Role::Assistant)
             .unwrap();
-        assert_eq!(assistant.content, "The answer is 4.");
-        assert!(!assistant.content.contains("<think>"));
+        assert_eq!(assistant.content(), Some("The answer is 4."));
+        assert!(!assistant.content().unwrap().contains("<think>"));
     }
 
     /// Build an even history of `n` exchanges whose turns are long enough that
@@ -1531,14 +1616,8 @@ mod tests {
         (0..n)
             .flat_map(|i| {
                 [
-                    Turn {
-                        role: Role::User,
-                        content: format!("question number {i} {}", "x".repeat(100)),
-                    },
-                    Turn {
-                        role: Role::Assistant,
-                        content: format!("answer number {i} {}", "y".repeat(100)),
-                    },
+                    Turn::user(format!("question number {i} {}", "x".repeat(100))),
+                    Turn::assistant(format!("answer number {i} {}", "y".repeat(100))),
                 ]
             })
             .collect()
@@ -1558,17 +1637,17 @@ mod tests {
         let dropped = agent.trim_history_to(200, 2);
         assert!(!dropped.is_empty(), "a too-deep history must be trimmed");
         assert_eq!(dropped.len() % 2, 0, "exchanges drop as whole pairs");
-        assert_eq!(dropped[0].role, Role::User, "oldest turn first");
+        assert_eq!(dropped[0].role(), Role::User, "oldest turn first");
         assert_eq!(
-            dropped[0].content,
-            format!("question number 0 {}", "x".repeat(100))
+            dropped[0].content(),
+            Some(format!("question number 0 {}", "x".repeat(100)).as_str())
         );
         // The newest two exchanges (4 turns) survive, alternation intact.
         assert!(agent.history().len() >= 4);
-        assert_eq!(agent.history()[0].role, Role::User);
+        assert_eq!(agent.history()[0].role(), Role::User);
         assert_eq!(
-            agent.history().last().unwrap().content,
-            format!("answer number 5 {}", "y".repeat(100)),
+            agent.history().last().unwrap().content(),
+            Some(format!("answer number 5 {}", "y".repeat(100)).as_str()),
             "the newest exchange is never dropped"
         );
         // Trimming again to the same budget is a no-op (it already fits, or
@@ -1597,17 +1676,17 @@ mod tests {
         let tools = Tools::new();
         let mut model = Scripted::new(&[]);
         let mut history = long_history(2); // [u0, a0, u1, a1]
-        history.push(Turn {
-            role: Role::User,
-            content: "stray trailing user turn".to_string(),
-        });
+        history.push(Turn::user("stray trailing user turn"));
         let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "sys", 5)
             .with_history(history);
         let dropped = agent.trim_history_to(1, 0); // force maximum dropping
         assert_eq!(dropped.len(), 4, "both clean pairs drop, oldest first");
         assert_eq!(dropped.len() % 2, 0);
         assert_eq!(agent.history().len(), 1, "only the unpaired stray remains");
-        assert_eq!(agent.history()[0].content, "stray trailing user turn");
+        assert_eq!(
+            agent.history()[0].content(),
+            Some("stray trailing user turn")
+        );
     }
 
     // End-to-end agent runs over a real, tool-trained model (Qwen2.5-Instruct,
@@ -1637,7 +1716,7 @@ mod tests {
 
     fn dump(run: &Run) {
         for turn in &run.transcript {
-            eprintln!("── {:?} ──\n{}\n", turn.role, turn.content);
+            eprintln!("── {:?} ──\n{}\n", turn.role(), turn);
         }
         eprintln!("[{} steps, {:?}]", run.steps, run.stop);
     }
@@ -1645,7 +1724,7 @@ mod tests {
     fn tool_turns(run: &Run) -> Vec<&Turn> {
         run.transcript
             .iter()
-            .filter(|t| t.role == Role::Tool)
+            .filter(|t| t.role() == Role::Tool)
             .collect()
     }
 
@@ -1687,9 +1766,11 @@ mod tests {
             assert!(run.steps >= 1, "the model should have called a tool");
             assert!(run.steps <= 4, "AGENT-1: steps stay within max_steps");
             assert!(
-                tool_turns(&run)
-                    .iter()
-                    .any(|t| t.content.contains("ZEBRA-42") && !t.content.contains("error")),
+                tool_turns(&run).iter().any(|t| {
+                    t.content().is_some_and(|content| {
+                        content.contains("ZEBRA-42") && !content.contains("error")
+                    })
+                }),
                 "the tool must have fed back the real file content"
             );
         }
@@ -1715,7 +1796,10 @@ mod tests {
             dump(&run);
             assert!(run.steps >= 1, "the model should have called a tool");
             assert!(run.steps <= 6, "AGENT-1: steps stay within max_steps");
-            let reads: String = tool_turns(&run).iter().map(|t| t.content.clone()).collect();
+            let reads: String = tool_turns(&run)
+                .iter()
+                .filter_map(|turn| turn.content())
+                .collect();
             assert!(reads.contains("DOWN"), "servers.txt content should be read");
         }
 
@@ -1757,9 +1841,11 @@ mod tests {
         assert!(run.steps >= 1, "the model should have called read_file");
         assert_eq!(run.stop, AgentStop::Final);
         assert!(
-            tool_turns(&run)
-                .iter()
-                .any(|t| t.content.contains("Rust runtime") && !t.content.contains("error")),
+            tool_turns(&run).iter().any(|t| {
+                t.content().is_some_and(|content| {
+                    content.contains("Rust runtime") && !content.contains("error")
+                })
+            }),
             "the tool must have fed back about.txt"
         );
         let answer = run.answer.to_lowercase();

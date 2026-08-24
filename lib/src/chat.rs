@@ -26,7 +26,7 @@
 use crate::completer::Completer;
 use crate::reasoning::{Reasoned, ResponseClassifier};
 use crate::template::PromptTemplate;
-use crate::transcript::{Role, Turn};
+use crate::transcript::Turn;
 use crate::{Cancel, GenOpts, StopReason};
 use anyhow::Result;
 
@@ -72,13 +72,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
 
     /// Seed a system instruction that persists across turns (and `reset`).
     pub fn with_system(mut self, system: impl Into<String>) -> ChatSession<'a, C, T> {
-        self.turns.insert(
-            0,
-            Turn {
-                role: Role::System,
-                content: system.into(),
-            },
-        );
+        self.turns.insert(0, Turn::system(system));
         self.system_len = self.turns.len();
         self
     }
@@ -94,10 +88,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
     /// the *whole* history (no stop strings — chat has no tools). This is the
     /// primitive; [`turn`](ChatSession::turn) is its sync shim.
     pub async fn turn_async(&mut self, user: &str) -> Result<&str> {
-        self.turns.push(Turn {
-            role: Role::User,
-            content: user.to_string(),
-        });
+        self.turns.push(Turn::user(user));
         let prompt = self.template.render(&self.turns);
         self.last_prompt_tokens = self.completer.count_tokens(&prompt);
         // Just await: the Completer impl owns whether this is sync compute (the
@@ -138,11 +129,12 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             self.uncommitted = answer;
             return Ok(&self.uncommitted);
         }
-        self.turns.push(Turn {
-            role: Role::Assistant,
-            content: answer,
-        });
-        Ok(&self.turns.last().expect("just pushed").content)
+        self.turns.push(Turn::assistant(answer));
+        Ok(self
+            .turns
+            .last()
+            .and_then(Turn::content)
+            .expect("just pushed an assistant text turn"))
     }
 
     /// Sync shim over [`turn_async`](ChatSession::turn_async) for non-async
@@ -173,10 +165,7 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
         cancel: &Cancel,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<&str> {
-        self.turns.push(Turn {
-            role: Role::User,
-            content: user.to_string(),
-        });
+        self.turns.push(Turn::user(user));
         let prompt = self.template.render(&self.turns);
         self.last_prompt_tokens = self.completer.count_tokens(&prompt);
         // Atomic on error (CHAT-1): roll back the user turn. Any fragments already
@@ -211,11 +200,12 @@ impl<'a, C: Completer, T: PromptTemplate> ChatSession<'a, C, T> {
             self.uncommitted = answer;
             return Ok(&self.uncommitted);
         }
-        self.turns.push(Turn {
-            role: Role::Assistant,
-            content: answer,
-        });
-        Ok(&self.turns.last().expect("just pushed").content)
+        self.turns.push(Turn::assistant(answer));
+        Ok(self
+            .turns
+            .last()
+            .and_then(Turn::content)
+            .expect("just pushed an assistant text turn"))
     }
 
     /// Sync shim over [`turn_streaming_async`](ChatSession::turn_streaming_async).
@@ -342,7 +332,7 @@ mod tests {
     use super::*;
     use crate::completer::Completion;
     use crate::template::PlainTemplate;
-    use crate::StopReason;
+    use crate::{Role, StopReason};
 
     /// A [`Completer`] that echoes back the prompt it was given (so tests can
     /// assert what history reached the model) after a canned reply, replayed
@@ -493,6 +483,7 @@ mod tests {
                 classifier.push(fragment, |channel, text| match channel {
                     crate::Channel::Reasoning => live_reasoning.push_str(text),
                     crate::Channel::Answer => live_answer.push_str(text),
+                    crate::Channel::ToolCall => {}
                 });
             }),
         )
@@ -503,6 +494,7 @@ mod tests {
         classifier.finish(|channel, text| match channel {
             crate::Channel::Reasoning => live_reasoning.push_str(text),
             crate::Channel::Answer => live_answer.push_str(text),
+            crate::Channel::ToolCall => {}
         });
         assert_eq!(answer, "The Nile.");
         assert_eq!(live_reasoning, "User wants a river. Nile is canonical.");
@@ -640,8 +632,8 @@ mod tests {
 
         // transcript = user, assistant, user, assistant
         assert_eq!(chat.history().len(), 4);
-        assert_eq!(chat.history()[0].role, Role::User);
-        assert_eq!(chat.history()[1].role, Role::Assistant);
+        assert_eq!(chat.history()[0].role(), Role::User);
+        assert_eq!(chat.history()[1].role(), Role::Assistant);
     }
 
     #[test]
@@ -670,9 +662,9 @@ mod tests {
         assert_eq!(chat.last_reasoning(), Some("recall the name"));
         // History (re-rendered into the next prompt) holds the answer only.
         let assistant = &chat.history()[1];
-        assert_eq!(assistant.role, Role::Assistant);
-        assert_eq!(assistant.content, "Your name is Ada.");
-        assert!(!assistant.content.contains("<think>"));
+        assert_eq!(assistant.role(), Role::Assistant);
+        assert_eq!(assistant.content(), Some("Your name is Ada."));
+        assert!(!assistant.content().unwrap().contains("<think>"));
     }
 
     #[test]
@@ -697,16 +689,22 @@ mod tests {
         let dropped = chat.trim_history_to(200, 2);
         assert!(!dropped.is_empty(), "a too-deep session must be trimmed");
         assert_eq!(dropped.len() % 2, 0, "exchanges drop as whole pairs");
-        assert_eq!(dropped[0].role, Role::User, "oldest turn first");
-        assert!(dropped[0].content.contains("question 0"));
+        assert_eq!(dropped[0].role(), Role::User, "oldest turn first");
+        assert!(dropped[0].content().unwrap().contains("question 0"));
         // The system prompt is never dropped and stays at the front.
-        assert_eq!(chat.history()[0].role, Role::System);
-        assert_eq!(chat.history()[0].content, "SYSTEM PROMPT");
+        assert_eq!(chat.history()[0].role(), Role::System);
+        assert_eq!(chat.history()[0].content(), Some("SYSTEM PROMPT"));
         // Alternation intact: the turn right after the system prefix is a user.
-        assert_eq!(chat.history()[1].role, Role::User);
+        assert_eq!(chat.history()[1].role(), Role::User);
         // The newest two exchanges (4 turns) survive alongside the system turn.
         assert!(chat.history().len() >= 5 && chat.history().len() < 13);
-        assert!(chat.history().last().unwrap().content.contains("answer 5"));
+        assert!(chat
+            .history()
+            .last()
+            .unwrap()
+            .content()
+            .unwrap()
+            .contains("answer 5"));
     }
 
     #[test]
@@ -731,17 +729,24 @@ mod tests {
             let dropped = chat.trim_history_to(budget, 2);
             assert_eq!(dropped.len() % 2, 0, "whole pairs only");
             for pair in dropped.chunks(2) {
-                assert_eq!(pair[0].role, Role::User);
+                assert_eq!(pair[0].role(), Role::User);
                 assert!(
-                    pair[0].content.starts_with(&format!("ask {next_oldest} ")),
+                    pair[0]
+                        .content()
+                        .unwrap()
+                        .starts_with(&format!("ask {next_oldest} ")),
                     "dropped out of order: {:?}",
-                    pair[0].content
+                    pair[0].content()
                 );
-                assert_eq!(pair[1].role, Role::Assistant);
+                assert_eq!(pair[1].role(), Role::Assistant);
                 next_oldest += 1;
             }
             total_dropped += dropped.len();
-            assert_eq!(chat.history()[0].content, "SYS", "system prompt survives");
+            assert_eq!(
+                chat.history()[0].content(),
+                Some("SYS"),
+                "system prompt survives"
+            );
         }
         assert!(total_dropped > 0, "a 30-turn run must trigger drops");
         assert!(
@@ -770,11 +775,11 @@ mod tests {
         let mut chat = ChatSession::new(&mut model, PlainTemplate).with_system("Be terse.");
         chat.turn("one").unwrap();
         assert_eq!(chat.history().len(), 3); // system, user, assistant
-        assert_eq!(chat.history()[0].role, Role::System);
+        assert_eq!(chat.history()[0].role(), Role::System);
 
         chat.reset();
         assert_eq!(chat.history().len(), 1); // only the system turn remains
-        assert_eq!(chat.history()[0].content, "Be terse.");
+        assert_eq!(chat.history()[0].content(), Some("Be terse."));
 
         // a turn after reset still carries the system prompt into the prompt.
         chat.turn("two").unwrap();

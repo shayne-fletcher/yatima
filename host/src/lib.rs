@@ -910,6 +910,9 @@ fn to_proto_channel(channel: LibChannel) -> Channel {
     match channel {
         LibChannel::Reasoning => Channel::Reasoning,
         LibChannel::Answer => Channel::Answer,
+        LibChannel::ToolCall => {
+            unreachable!("tool-call protocol material is consumed inside yatima-lib")
+        }
     }
 }
 

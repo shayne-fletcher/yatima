@@ -468,6 +468,6 @@ async fn live_managed_muse_chat() -> Result<()> {
         );
     }
     assert_eq!(history.len(), 2, "the exchange must be committed");
-    assert_eq!(history[1].content, answer);
+    assert_eq!(history[1].content(), Some(answer.as_str()));
     Ok(())
 }

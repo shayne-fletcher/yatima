@@ -11,9 +11,9 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-/// Which model-native chat format to speak. `Qwen`/`Plain` also carry a
-/// tool-call codec (so they work with the agent loop); `Gemma`/`Mistral`/`Glm`
-/// are chat-only.
+/// Which model-native chat format to speak. `Qwen`, `MuseGlimmer`, and `Plain`
+/// also carry a tool-call codec (so they work with the agent loop);
+/// `Gemma`/`Mistral`/`Glm` are chat-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatFormat {
@@ -34,9 +34,9 @@ pub enum ChatFormat {
     /// `</think>` (chat only; reasoning model).
     QwenThink,
     /// Muse Glimmer's ATEM format: `<|start|>role<|message|>…<|eot|>` turns
-    /// (text-chat subset — chat only; addressed output is classified by the
-    /// template's ATEM interpreter). Served via the llama-server backend — no
-    /// local `Arch` maps to it.
+    /// (addressed output and tool calls are classified by the template's ATEM
+    /// interpreter). Served via the llama-server backend — no local `Arch` maps
+    /// to it.
     #[serde(rename = "muse-glimmer")]
     MuseGlimmer,
     /// Minimal `<|role|>` layout + `<tool_call>{json}</tool_call>` (fallback).
@@ -95,10 +95,13 @@ impl ChatFormat {
     }
 
     /// Whether this format carries a tool-call codec, i.e. is usable by the
-    /// agent loop. Only `Qwen` and `Plain` do; the rest are chat-only. The agent
-    /// gates on this (CAPS-1).
+    /// agent loop. `Qwen`, `MuseGlimmer`, and `Plain` do; the rest are
+    /// chat-only. The agent gates on this (CAPS-1).
     pub fn supports_tools(self) -> bool {
-        matches!(self, ChatFormat::Qwen | ChatFormat::Plain)
+        matches!(
+            self,
+            ChatFormat::Qwen | ChatFormat::MuseGlimmer | ChatFormat::Plain
+        )
     }
 
     /// Whether this format's generation cue pre-seeds the reasoning opener (so a
@@ -245,7 +248,7 @@ pub fn resolve_format(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Role, Turn};
+    use crate::Turn;
 
     #[test]
     fn chat_format_round_trips_through_name() {
@@ -273,19 +276,13 @@ mod tests {
 
     #[test]
     fn chat_format_template_matches_format() {
-        let rendered = ChatFormat::Mistral.template().render(&[Turn {
-            role: Role::User,
-            content: "x".into(),
-        }]);
+        let rendered = ChatFormat::Mistral.template().render(&[Turn::user("x")]);
         assert!(rendered.contains("[INST]"));
     }
 
     #[test]
     fn muse_template_accepts_an_injected_runtime_date() {
-        let turns = [Turn {
-            role: Role::User,
-            content: "x".into(),
-        }];
+        let turns = [Turn::user("x")];
         let rendered = ChatFormat::MuseGlimmer
             .template_with_date(Some("2026-08-23".into()))
             .render(&turns);
@@ -299,9 +296,11 @@ mod tests {
     }
 
     #[test]
-    fn only_qwen_and_plain_support_tools() {
-        // upholds: CAPS-1 — chat-only formats carry no tool codec.
+    fn only_formats_with_a_codec_support_tools() {
+        // upholds: CAPS-1 — every tool-capable format has a codec; chat-only
+        // formats never claim that the agent loop can speak their protocol.
         assert!(ChatFormat::Qwen.supports_tools());
+        assert!(ChatFormat::MuseGlimmer.supports_tools());
         assert!(ChatFormat::Plain.supports_tools());
         for fmt in [
             ChatFormat::Gemma,
@@ -309,7 +308,6 @@ mod tests {
             ChatFormat::Glm,
             ChatFormat::DeepSeek,
             ChatFormat::QwenThink,
-            ChatFormat::MuseGlimmer,
         ] {
             assert!(!fmt.supports_tools());
         }
@@ -324,10 +322,7 @@ mod tests {
         // no model needed; runs every commit, for every format.
         for name in ChatFormat::NAMES {
             let fmt: ChatFormat = name.parse().unwrap();
-            let rendered = fmt.template().render(&[Turn {
-                role: Role::User,
-                content: "hi".into(),
-            }]);
+            let rendered = fmt.template().render(&[Turn::user("hi")]);
             let template_seeds_think = rendered.trim_end().ends_with("<think>");
             assert_eq!(
                 template_seeds_think,
@@ -382,10 +377,12 @@ mod tests {
             classifier.push(raw, |channel, text| match channel {
                 crate::Channel::Reasoning => reasoning.push_str(text),
                 crate::Channel::Answer => answer.push_str(text),
+                crate::Channel::ToolCall => {}
             });
             classifier.finish(|channel, text| match channel {
                 crate::Channel::Reasoning => reasoning.push_str(text),
                 crate::Channel::Answer => answer.push_str(text),
+                crate::Channel::ToolCall => {}
             });
             assert_eq!(
                 crate::Reasoned {

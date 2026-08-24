@@ -12,8 +12,7 @@
 
 use yatima_lib::{
     device, is_model_present, model_dir, models_root, split_reasoning, Channel, ChatFormat,
-    ChatMlTemplate, ChatSession, Engine, GenOpts, ModelId, ModelProfile, ReasoningSplitter, Role,
-    Turn,
+    ChatMlTemplate, ChatSession, Engine, GenOpts, ModelId, ModelProfile, ReasoningSplitter, Turn,
 };
 
 /// One coherence row: a cached model, the format to speak, a prompt, and what a
@@ -96,10 +95,7 @@ fn run_case(c: &Case) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut engine = Engine::load(&dir, device(false)?)?;
-    let prompt = c.format.template().render(&[Turn {
-        role: Role::User,
-        content: c.prompt.to_string(),
-    }]);
+    let prompt = c.format.template().render(&[Turn::user(c.prompt)]);
     let opts = GenOpts {
         max_tokens: c.max_tokens,
         ..Default::default()
@@ -189,10 +185,7 @@ fn reasoning_profiles_surface_a_reasoning_channel() -> anyhow::Result<()> {
         };
         let format = profile.format().expect("a reasoning profile pins a format");
         let mut engine = Engine::load(&dir, device(false)?)?;
-        let prompt = format.template().render(&[Turn {
-            role: Role::User,
-            content: "What is 2 + 2?".to_string(),
-        }]);
+        let prompt = format.template().render(&[Turn::user("What is 2 + 2?")]);
         // A small budget suffices: with the right (seeded) splitter, the output so
         // far is reasoning even before `</think>`; with the wrong (new) splitter
         // it would all be answer.
@@ -270,11 +263,13 @@ fn streaming_reasoning_channel_is_clean() -> anyhow::Result<()> {
         splitter.push(piece, |ch, text| match ch {
             Channel::Reasoning => reasoning.push_str(text),
             Channel::Answer => answer.push_str(text),
+            Channel::ToolCall => {}
         });
     })?;
     splitter.finish(|ch, text| match ch {
         Channel::Reasoning => reasoning.push_str(text),
         Channel::Answer => answer.push_str(text),
+        Channel::ToolCall => {}
     });
     eprintln!("--- reasoning: {reasoning:?}");
     eprintln!("--- answer:    {answer:?}");

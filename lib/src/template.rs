@@ -12,12 +12,24 @@ use crate::reasoning::{
     split_reasoning, split_seeded_reasoning, AtemInterpreter, Reasoned, ResponseClassifier,
     ATEM_EOT as MUSE_EOT, ATEM_MESSAGE as MUSE_MESSAGE, ATEM_START as MUSE_START,
 };
-use crate::transcript::{Role, Turn};
+use crate::transcript::{render_json_inline, Role, ToolArguments, Turn};
 
 /// Render a transcript into the prompt string fed to the model, ending with the
 /// cue that makes the model speak next.
 pub trait PromptTemplate {
     fn render(&self, turns: &[Turn]) -> String;
+
+    /// Compose an agent's base system instruction with model-facing tool
+    /// instructions. Most formats simply append the latter. Muse overrides
+    /// this so its reasoning directive remains ahead of tool definitions, as
+    /// required by the native template.
+    fn compose_system(&self, system: &str, tool_instructions: &str) -> String {
+        if tool_instructions.is_empty() {
+            system.to_string()
+        } else {
+            format!("{system}\n\n{tool_instructions}")
+        }
+    }
 
     /// Construct the streaming classifier for replies in this template's
     /// protocol. Marker-based formats use the default; pre-seeded marker
@@ -53,6 +65,10 @@ impl<T: PromptTemplate + ?Sized> PromptTemplate for Box<T> {
         (**self).classifier()
     }
 
+    fn compose_system(&self, system: &str, tool_instructions: &str) -> String {
+        (**self).compose_system(system, tool_instructions)
+    }
+
     fn interpret_response(&self, raw: &str) -> Reasoned {
         (**self).interpret_response(raw)
     }
@@ -67,13 +83,24 @@ impl PromptTemplate for PlainTemplate {
     fn render(&self, turns: &[Turn]) -> String {
         let mut s = String::new();
         for turn in turns {
-            let tag = match turn.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
+            let (tag, content) = match turn {
+                Turn::System(content) => ("system", content.clone()),
+                Turn::User(content) => ("user", content.clone()),
+                Turn::Assistant(content) => ("assistant", content.clone()),
+                Turn::AssistantToolCall { name, arguments } => (
+                    "assistant",
+                    format!(
+                        "<tool_call>{}</tool_call>",
+                        render_call_json(name, "args", arguments)
+                    ),
+                ),
+                Turn::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                } => ("tool", render_tool_result(name, content, *is_error)),
             };
-            s.push_str(&format!("<|{tag}|>\n{}\n", turn.content));
+            s.push_str(&format!("<|{tag}|>\n{content}\n"));
         }
         s.push_str("<|assistant|>\n");
         s
@@ -123,14 +150,29 @@ impl PromptTemplate for ChatMlThinkTemplate {
 fn render_chatml(turns: &[Turn], seed_think: bool) -> String {
     let mut s = String::new();
     for turn in turns {
-        match turn.role {
-            Role::System => block(&mut s, "system", &turn.content),
-            Role::User => block(&mut s, "user", &turn.content),
-            Role::Assistant => block(&mut s, "assistant", &turn.content),
-            Role::Tool => block(
+        match turn {
+            Turn::System(content) => block(&mut s, "system", content),
+            Turn::User(content) => block(&mut s, "user", content),
+            Turn::Assistant(content) => block(&mut s, "assistant", content),
+            Turn::AssistantToolCall { name, arguments } => block(
+                &mut s,
+                "assistant",
+                &format!(
+                    "<tool_call>\n{}\n</tool_call>",
+                    render_call_json(name, "arguments", arguments)
+                ),
+            ),
+            Turn::ToolResult {
+                name,
+                content,
+                is_error,
+            } => block(
                 &mut s,
                 "user",
-                &format!("<tool_response>\n{}\n</tool_response>", turn.content),
+                &format!(
+                    "<tool_response>\n{}\n</tool_response>",
+                    render_tool_result(name, content, *is_error)
+                ),
             ),
         }
     }
@@ -152,6 +194,26 @@ fn block(s: &mut String, role: &str, content: &str) {
     s.push('\n');
 }
 
+fn render_call_json(name: &str, arguments_key: &str, arguments: &ToolArguments) -> String {
+    let arguments = arguments.to_json_object();
+    format!(
+        "{{\"name\":{},\"{arguments_key}\":{arguments}}}",
+        serde_json::to_string(name).expect("a string always serializes")
+    )
+}
+
+fn render_tool_result(name: &str, content: &str, is_error: bool) -> String {
+    let outcome = if is_error { "error" } else { "ok" };
+    format!("[{name} {outcome}] {content}")
+}
+
+fn generic_tool_call(name: &str, arguments: &ToolArguments) -> String {
+    format!(
+        "<tool_call>{}</tool_call>",
+        render_call_json(name, "arguments", arguments)
+    )
+}
+
 /// Gemma-2's trained chat format: `<start_of_turn>{role}\n{content}<end_of_turn>`
 /// turns with `assistant`→`model`. Gemma has **no system role**, so any system
 /// text is folded into the next user turn. Emits **no `<bos>`**: Gemma's
@@ -164,16 +226,28 @@ impl PromptTemplate for GemmaTemplate {
         let mut s = String::new();
         let mut pending_system: Option<String> = None;
         for turn in turns {
-            match turn.role {
-                Role::System => pending_system = Some(turn.content.clone()),
-                Role::Assistant => gemma_turn(&mut s, "model", &turn.content),
-                Role::User | Role::Tool => {
+            match turn {
+                Turn::System(content) => pending_system = Some(content.clone()),
+                Turn::Assistant(content) => gemma_turn(&mut s, "model", content),
+                Turn::AssistantToolCall { name, arguments } => {
+                    gemma_turn(&mut s, "model", &generic_tool_call(name, arguments));
+                }
+                Turn::User(content) => {
                     let content = match pending_system.take() {
-                        Some(sys) => format!("{sys}\n\n{}", turn.content),
-                        None => turn.content.clone(),
+                        Some(sys) => format!("{sys}\n\n{content}"),
+                        None => content.clone(),
                     };
                     gemma_turn(&mut s, "user", &content);
                 }
+                Turn::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                } => gemma_turn(
+                    &mut s,
+                    "user",
+                    &render_tool_result(name, content, *is_error),
+                ),
             }
         }
         s.push_str("<start_of_turn>model\n");
@@ -200,20 +274,34 @@ impl PromptTemplate for MistralTemplate {
         let mut s = String::new();
         let mut pending_system: Option<String> = None;
         for turn in turns {
-            match turn.role {
-                Role::System => pending_system = Some(turn.content.clone()),
-                Role::Assistant => {
+            match turn {
+                Turn::System(content) => pending_system = Some(content.clone()),
+                Turn::Assistant(content) => {
                     s.push(' ');
-                    s.push_str(&turn.content);
+                    s.push_str(content);
                     s.push_str("</s>");
                 }
-                Role::User | Role::Tool => {
+                Turn::AssistantToolCall { name, arguments } => {
+                    s.push(' ');
+                    s.push_str(&generic_tool_call(name, arguments));
+                    s.push_str("</s>");
+                }
+                Turn::User(content) => {
                     let content = match pending_system.take() {
-                        Some(sys) => format!("{sys}\n\n{}", turn.content),
-                        None => turn.content.clone(),
+                        Some(sys) => format!("{sys}\n\n{content}"),
+                        None => content.clone(),
                     };
                     s.push_str("[INST] ");
                     s.push_str(&content);
+                    s.push_str("[/INST]");
+                }
+                Turn::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                } => {
+                    s.push_str("[INST] ");
+                    s.push_str(&render_tool_result(name, content, *is_error));
                     s.push_str("[/INST]");
                 }
             }
@@ -234,16 +322,23 @@ impl PromptTemplate for GlmTemplate {
     fn render(&self, turns: &[Turn]) -> String {
         let mut s = String::from("[gMASK]<sop>");
         for turn in turns {
-            let role = match turn.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "observation",
+            let (role, content) = match turn {
+                Turn::System(content) => ("system", content.clone()),
+                Turn::User(content) => ("user", content.clone()),
+                Turn::Assistant(content) => ("assistant", content.clone()),
+                Turn::AssistantToolCall { name, arguments } => {
+                    ("assistant", generic_tool_call(name, arguments))
+                }
+                Turn::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                } => ("observation", render_tool_result(name, content, *is_error)),
             };
             s.push_str("<|");
             s.push_str(role);
             s.push_str("|>\n");
-            s.push_str(&turn.content);
+            s.push_str(&content);
         }
         s.push_str("<|assistant|>\n");
         s
@@ -289,25 +384,34 @@ impl PromptTemplate for DeepSeekTemplate {
         let mut s = String::from(DS_BOS);
         // System text is hoisted to the front, raw (no wrapper).
         for turn in turns {
-            if turn.role == Role::System {
-                s.push_str(&turn.content);
+            if let Turn::System(content) = turn {
+                s.push_str(content);
             }
         }
         for turn in turns {
-            match turn.role {
-                Role::System => {}
-                Role::User => {
+            match turn {
+                Turn::System(_) => {}
+                Turn::User(content) => {
                     s.push_str(DS_USER);
-                    s.push_str(&turn.content);
+                    s.push_str(content);
                 }
-                Role::Assistant => {
+                Turn::Assistant(content) => {
                     s.push_str(DS_ASSISTANT);
-                    s.push_str(&turn.content);
+                    s.push_str(content);
                     s.push_str(DS_EOS);
                 }
-                Role::Tool => {
+                Turn::AssistantToolCall { name, arguments } => {
+                    s.push_str(DS_ASSISTANT);
+                    s.push_str(&generic_tool_call(name, arguments));
+                    s.push_str(DS_EOS);
+                }
+                Turn::ToolResult {
+                    name,
+                    content,
+                    is_error,
+                } => {
                     s.push_str(DS_TOOL_OUT_BEGIN);
-                    s.push_str(&turn.content);
+                    s.push_str(&render_tool_result(name, content, *is_error));
                     s.push_str(DS_TOOL_OUT_END);
                 }
             }
@@ -322,13 +426,12 @@ impl PromptTemplate for DeepSeekTemplate {
     }
 }
 
-/// Muse Glimmer's ATEM chat format — the **text-chat subset** (stage 3 of
-/// plans/llama-server.plan.md): `<|start|>role<|message|>content<|eot|>`
-/// turns and a bare `<|start|>assistant` cue. The full addressed-output
-/// protocol (`to=self` reasoning, `to=<tool>` invocations, `<|eom|>` joins)
-/// is the model's output format. [`AtemInterpreter`] classifies it for both
-/// live display and final transcript commit; the renderer remains responsible
-/// only for the prompt direction.
+/// Muse Glimmer's ATEM format: `<|start|>role<|message|>content<|eot|>` turns
+/// and a bare `<|start|>assistant` cue. The addressed-output protocol uses
+/// `to=self` for reasoning, `to=user` for answers, `to=<tool>` for structured
+/// invocations, and `<|eom|>` to join messages. [`AtemInterpreter`] classifies
+/// replies for live display, final transcript commit, and tool extraction; the
+/// renderer speaks the other direction from structured [`Turn`] variants.
 ///
 /// Byte-checked against the `/apply-template` oracle renders captured from
 /// the official GGUF's embedded template (`tests/fixtures/llama_server/`,
@@ -345,10 +448,10 @@ impl PromptTemplate for DeepSeekTemplate {
 ///   upstream template injects the wall-clock date here, which oracle
 ///   comparisons must inject explicitly.
 ///
-/// Emits no BOS (the oracle renders carry none). A prior assistant turn is
-/// answer-only (REASON-1) and renders as `to=user` with terminal `<|eot|>`. A
-/// `Tool` turn renders as a bare `tool` role for totality; the named-tool
-/// form is stage 4's.
+/// Emits no BOS (the oracle renders carry none). A prior assistant answer is
+/// answer-only (REASON-1) and renders as `to=user` with terminal `<|eot|>`.
+/// Tool calls and results retain their names and arguments as transcript data;
+/// rendering never recovers protocol meaning by parsing display text.
 #[derive(Default)]
 pub struct MuseGlimmerTemplate {
     /// Rendered as `Reasoning strength: {level}.`; the upstream template's
@@ -385,6 +488,7 @@ impl ReasoningStrength {
 
 const MUSE_KNOWLEDGE_CUTOFF: &str = "2026-01-04";
 const MUSE_RECIPIENTS: &str = "# Valid recipients: \"self\", \"user\".";
+const MUSE_RECIPIENTS_PREFIX: &str = "# Valid recipients:";
 
 impl MuseGlimmerTemplate {
     fn reasoning_line(&self) -> String {
@@ -422,13 +526,13 @@ fn muse_normalize_effort(text: &str) -> String {
 impl PromptTemplate for MuseGlimmerTemplate {
     fn render(&self, turns: &[Turn]) -> String {
         let mut s = String::new();
-        if !turns.iter().any(|t| t.role == Role::System) {
+        if !turns.iter().any(|turn| turn.role() == Role::System) {
             self.default_system(&mut s);
         }
         for turn in turns {
-            match turn.role {
-                Role::System => {
-                    let sys = muse_normalize_effort(&turn.content);
+            match turn {
+                Turn::System(content) => {
+                    let sys = muse_normalize_effort(content);
                     s.push_str(MUSE_START);
                     s.push_str("system");
                     s.push_str(MUSE_MESSAGE);
@@ -437,29 +541,51 @@ impl PromptTemplate for MuseGlimmerTemplate {
                         s.push_str("\n\n");
                         s.push_str(&self.reasoning_line());
                     }
-                    s.push_str("\n\n");
-                    s.push_str(MUSE_RECIPIENTS);
+                    if !sys
+                        .lines()
+                        .any(|line| line.trim_start().starts_with(MUSE_RECIPIENTS_PREFIX))
+                    {
+                        s.push_str("\n\n");
+                        s.push_str(MUSE_RECIPIENTS);
+                    }
                     s.push_str(MUSE_EOT);
                 }
-                Role::User => {
+                Turn::User(content) => {
                     s.push_str(MUSE_START);
                     s.push_str("user");
                     s.push_str(MUSE_MESSAGE);
-                    s.push_str(&turn.content);
+                    s.push_str(content);
                     s.push_str(MUSE_EOT);
                 }
-                Role::Assistant => {
+                Turn::Assistant(content) => {
                     s.push_str(MUSE_START);
                     s.push_str("assistant to=user");
                     s.push_str(MUSE_MESSAGE);
-                    s.push_str(&turn.content);
+                    s.push_str(content);
                     s.push_str(MUSE_EOT);
                 }
-                Role::Tool => {
+                Turn::AssistantToolCall { name, arguments } => {
                     s.push_str(MUSE_START);
-                    s.push_str("tool");
+                    s.push_str("assistant to=");
+                    s.push_str(name);
                     s.push_str(MUSE_MESSAGE);
-                    s.push_str(&turn.content);
+                    render_muse_call(&mut s, name, arguments);
+                    s.push_str(MUSE_EOT);
+                }
+                Turn::ToolResult {
+                    name,
+                    content,
+                    is_error: _,
+                } => {
+                    s.push_str(MUSE_START);
+                    s.push_str("tool ");
+                    s.push_str(name);
+                    s.push_str(MUSE_MESSAGE);
+                    s.push_str("<tool_output name=\"");
+                    s.push_str(name);
+                    s.push_str("\">\n");
+                    s.push_str(content);
+                    s.push_str("\n</tool_output>");
                     s.push_str(MUSE_EOT);
                 }
             }
@@ -467,6 +593,20 @@ impl PromptTemplate for MuseGlimmerTemplate {
         s.push_str(MUSE_START);
         s.push_str("assistant");
         s
+    }
+
+    fn compose_system(&self, system: &str, tool_instructions: &str) -> String {
+        if tool_instructions.is_empty() {
+            return system.to_string();
+        }
+        let mut system = muse_normalize_effort(system);
+        if !system.to_lowercase().contains("reasoning strength") {
+            system.push_str("\n\n");
+            system.push_str(&self.reasoning_line());
+        }
+        system.push_str("\n\n");
+        system.push_str(tool_instructions);
+        system
     }
 
     fn classifier(&self) -> ResponseClassifier {
@@ -478,14 +618,33 @@ impl PromptTemplate for MuseGlimmerTemplate {
     }
 }
 
+fn render_muse_call(s: &mut String, name: &str, arguments: &ToolArguments) {
+    s.push_str("<atem:function_calls>\n<atem:invoke name=\"");
+    s.push_str(name);
+    s.push_str("\">\n");
+    for (parameter, value) in arguments.iter() {
+        s.push_str("<atem:parameter name=\"");
+        s.push_str(parameter);
+        s.push_str("\">");
+        match value {
+            serde_json::Value::String(value) => s.push_str(value),
+            other => s.push_str(&render_json_inline(other)),
+        }
+        s.push_str("</atem:parameter>\n");
+    }
+    s.push_str("</atem:invoke>\n</atem:function_calls>");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn turn(role: Role, content: &str) -> Turn {
-        Turn {
-            role,
-            content: content.to_string(),
+        match role {
+            Role::System => Turn::system(content),
+            Role::User => Turn::user(content),
+            Role::Assistant => Turn::assistant(content),
+            Role::Tool => panic!("tool turns require a name and outcome"),
         }
     }
 
@@ -494,14 +653,21 @@ mod tests {
         let s = ChatMlTemplate.render(&[
             turn(Role::System, "SYS"),
             turn(Role::User, "hi"),
-            turn(Role::Assistant, "<tool_call>\n{}\n</tool_call>"),
-            turn(Role::Tool, "[read_file ok] X"),
+            Turn::assistant_tool_call(
+                "read_file",
+                ToolArguments::try_from_pairs([(
+                    "path".to_string(),
+                    serde_json::Value::String("note.txt".to_string()),
+                )])
+                .unwrap(),
+            ),
+            Turn::tool_result("read_file", "X", false),
         ]);
         assert_eq!(
             s,
             "<|im_start|>system\nSYS<|im_end|>\n\
              <|im_start|>user\nhi<|im_end|>\n\
-             <|im_start|>assistant\n<tool_call>\n{}\n</tool_call><|im_end|>\n\
+             <|im_start|>assistant\n<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"note.txt\"}}\n</tool_call><|im_end|>\n\
              <|im_start|>user\n<tool_response>\n[read_file ok] X\n</tool_response><|im_end|>\n\
              <|im_start|>assistant\n"
         );
@@ -606,6 +772,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/llama_server/oracle2-prompt.txt"
     ));
+    const ORACLE3: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llama_server/oracle3-prompt.txt"
+    ));
 
     #[test]
     fn muse_matches_the_oracle_render_byte_for_byte() {
@@ -637,6 +807,49 @@ mod tests {
             turn(Role::User, "Another?"),
         ]);
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn muse_renders_the_complete_oracle3_tool_round() {
+        // upholds: AGENT-3, REASON-1 — the working transcript preserves the
+        // structured invocation and result required by the next prompt. The
+        // official template's complete tool round is the byte-level oracle.
+        use crate::{MuseAtemCodec, ToolCallCodec, ToolSpec};
+
+        let template = MuseGlimmerTemplate {
+            reasoning_strength: ReasoningStrength::High,
+            current_date: Some("2026-08-21".to_string()),
+        };
+        let codec = MuseAtemCodec;
+        let spec = ToolSpec {
+            name: "fs.stat_file".to_string(),
+            description: "Report file metadata.".to_string(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "follow_symlinks": {"type": "boolean"}
+                },
+                "required": ["path"]
+            }),
+        };
+        let system = template.compose_system(
+            "You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-08-21.",
+            &codec.render_system(&[spec]),
+        );
+        let arguments = ToolArguments::try_from_pairs([
+            ("path".to_string(), serde_json::json!("README.md")),
+            ("follow_symlinks".to_string(), serde_json::json!(true)),
+        ])
+        .unwrap();
+        let rendered = template.render(&[
+            Turn::system(system),
+            Turn::user("How large is README.md?"),
+            Turn::assistant_tool_call("fs.stat_file", arguments),
+            Turn::tool_result("fs.stat_file", "{\"bytes\": 4096}", false),
+        ]);
+
+        assert_eq!(rendered, ORACLE3);
     }
 
     #[test]
@@ -689,16 +902,15 @@ mod tests {
     }
 
     #[test]
-    fn muse_non_user_recipients_never_reach_the_answer() {
-        // An addressed tool invocation (uninterpreted until stage 4) must not
-        // leak into answer text; conservatively it classifies as reasoning.
+    fn muse_tool_recipients_reach_neither_reasoning_nor_answer() {
+        // upholds: REASON-1 — an addressed tool invocation is retained on the
+        // machine's tool channel and never leaks into either prose bucket.
         let raw = " to=self<|message|>plan<|start|>assistant \
                    to=fs.stat_file<|message|><atem:function_calls>…</atem:function_calls>\
                    <|start|>assistant to=user<|message|>Done.";
         let r = AtemInterpreter::interpret(raw);
         assert_eq!(r.answer, "Done.");
-        let reasoning = r.reasoning.unwrap();
-        assert!(reasoning.contains("plan") && reasoning.contains("atem:function_calls"));
+        assert_eq!(r.reasoning.as_deref(), Some("plan"));
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use yatima_lib::{
     device, resolve_format, run_blocking, ChatFormat, ChatSession, Engine, GenOpts, ModelProfile,
-    PromptTemplate, Role, Sampling, Turn,
+    PromptTemplate, Sampling, Turn,
 };
 
 const SYSTEM: &str = "\
@@ -427,16 +427,7 @@ fn build_prompt_with_budget(
 
 fn rendered_chat_tokens(engine: &Engine, format: ChatFormat, user_prompt: &str) -> Result<usize> {
     let template = format.template();
-    let rendered = template.render(&[
-        Turn {
-            role: Role::System,
-            content: SYSTEM.to_string(),
-        },
-        Turn {
-            role: Role::User,
-            content: user_prompt.to_string(),
-        },
-    ]);
+    let rendered = template.render(&[Turn::system(SYSTEM), Turn::user(user_prompt)]);
     engine.token_count(&rendered)
 }
 

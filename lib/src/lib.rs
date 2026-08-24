@@ -80,7 +80,8 @@
 //!   honored but surfaced as a [`FormatMismatch`] warning, never silently
 //!   mis-rendered.
 //! - **CAPS-1** the agent/tool path is gated by host capability
-//!   ([`ChatFormat::supports_tools`]); a chat-only format cannot enter it.
+//!   ([`ChatFormat::supports_tools`]); every format that claims tool support
+//!   has a native codec, while a chat-only format cannot enter the path.
 //! - **PROFILE-1** generation-option precedence is explicit and pure
 //!   ([`ModelProfile::apply_gen_overrides`]): profile fields override a caller
 //!   base `GenOpts`, except a reasoning profile's token budget is a floor that
@@ -177,17 +178,21 @@
 //! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
 //!   name is an `is_error` result, never ambient execution (sandbox by omission).
-//! - **AGENT-3** across runs, an [`Agent`]'s session history carries only each
-//!   completed exchange's user turn and final answer — tool rounds and
-//!   reasoning are ephemeral to their run (the working-matter analogue of
-//!   REASON-1), and an interrupted run leaves history untouched. A Final
+//! - **AGENT-3** across runs, an [`Agent`]'s persistent history carries only
+//!   each completed exchange's user turn and final answer. Its per-run working
+//!   transcript additionally carries structured assistant invocations and
+//!   named tool results so the next prompt can render a complete tool round;
+//!   those tool rounds and reasoning remain ephemeral to the run (the
+//!   working-matter analogue of REASON-1), and an interrupted run leaves
+//!   history untouched. A Final
 //!   answer that looks like decode degeneration ([`looks_degenerate`], the
 //!   CHAT-2 judgment) also commits nothing (cited by
 //!   `a_degenerate_final_answer_commits_nothing`).
 //! - **AGENT-4** agent steps stream: each decode's text arrives live as
 //!   classified [`AgentEvent::Fragment`]s (reasoning vs answer — REASON-1
-//!   holds mid-stream), codec markup never reaches the answer channel (the
-//!   opener gate withholds it; the parsed call arrives as `ToolCall`), the
+//!   holds mid-stream), codec markup never reaches the answer channel (a
+//!   marker gate withholds it or the template classifier routes it internally;
+//!   the parsed call arrives as `ToolCall`), the
 //!   final step's answer fragments concatenate to the run's answer (up to
 //!   surrounding whitespace), and a fold `Break` or external [`Cancel`]
 //!   stops the decode at token granularity — `Stopped`, history untouched.
@@ -283,9 +288,10 @@
 //!   No listing yet and out-of-range numbers teach rather than fail
 //!   opaquely. Cited by the numbered-listing, page-wide-coverage,
 //!   spoken-truncation, and select-by-number tests.
-//! - **PROTO-1** a malformed/unknown tool call becomes a typed non-success
-//!   [`ToolOutcome`] and then an `is_error` [`ToolResult`] the model can recover
-//!   from, never a silent mis-execution.
+//! - **PROTO-1** a malformed, ambiguous, mismatched, duplicate, parallel, or
+//!   unknown tool call dispatches no unintended tool. It becomes a typed
+//!   non-success [`ToolOutcome`] and an `is_error` [`ToolResult`] the model can
+//!   recover from, never a truncation or silent mis-execution.
 //!
 //! Observability:
 //! - **OBS-1** `yatima-lib` emits `tracing` spans/events but never installs a
@@ -317,8 +323,11 @@
 //!   reasoning), its seeded variant (`split_seeded_reasoning`, crate-private,
 //!   used by the pre-seeded templates — a close-less reply never left the
 //!   think block), and [`AtemInterpreter`] for Muse addressed messages. Muse
-//!   streaming and final interpretation are the same state machine; arbitrary
-//!   fragment boundaries cannot change its classified output.
+//!   keeps tool-directed payloads on its internal tool channel: they enter the
+//!   agent's structured working transcript but never reasoning, answer text,
+//!   or persistent history. Streaming and final interpretation are the same
+//!   state machine; arbitrary fragment boundaries cannot change its classified
+//!   output.
 //! - **CHAT-1** a [`ChatSession`] turn is atomic: if its completion errors, the
 //!   user turn is rolled back so the transcript is unchanged. A failed turn never
 //!   poisons the session — a later turn re-renders clean history and succeeds.
@@ -364,8 +373,8 @@ pub use host::{
     VerifiedModelArtifact, REASONING_MIN_TOKENS,
 };
 pub use reasoning::{
-    split_reasoning, strip_reasoning, AtemInterpreter, Channel, Reasoned, ReasoningSplitter,
-    ResponseClassifier,
+    split_reasoning, strip_reasoning, AtemInterpreter, AtemResponse, AtemToolMessage, Channel,
+    Reasoned, ReasoningSplitter, ResponseClassifier,
 };
 pub use runtime::run_blocking;
 pub use template::{
@@ -373,12 +382,12 @@ pub use template::{
     MistralTemplate, MuseGlimmerTemplate, PlainTemplate, PromptTemplate, ReasoningStrength,
 };
 pub use tool::{
-    ImageListing, JsonToolCall, ListDir, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile,
-    ReadImage, ReadPage, ReadUrl, SendNotification, Tool, ToolCall, ToolCallCodec, ToolCallId,
-    ToolCtx, ToolEvent, ToolFailure, ToolOutcome, ToolRejection, ToolResult, ToolSpec, ToolTask,
-    Tools, WriteFile,
+    ImageListing, JsonToolCall, ListDir, MuseAtemCodec, Plot, PlotBound, PlotSeries, QwenToolCall,
+    ReadFile, ReadImage, ReadPage, ReadUrl, SendNotification, Tool, ToolCall, ToolCallCodec,
+    ToolCallId, ToolCtx, ToolEvent, ToolExtraction, ToolFailure, ToolOutcome, ToolRejection,
+    ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
 };
-pub use transcript::{Role, Turn};
+pub use transcript::{Role, ToolArguments, Turn};
 
 use anyhow::{bail, Result};
 use std::ffi::OsString;

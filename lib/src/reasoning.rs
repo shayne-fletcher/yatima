@@ -142,17 +142,17 @@ pub fn strip_reasoning(text: &str) -> String {
 
 /// Which channel a streamed span belongs to.
 ///
-/// Intentionally binary for the protocols active today. Chat displays both
-/// channels directly. The agent also emits both as live fragments, but its
-/// answer gate withholds tool-call markup before it can reach the answer
-/// channel. Muse tool recipients are conservatively reasoning until Stage 4
-/// adds their codec and event path.
+/// Chat displays reasoning and answer directly. [`ToolCall`](Channel::ToolCall)
+/// is internal protocol material: chat suppresses it and Agent converts it to
+/// typed tool activity before any host/frontend event plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     /// The model's chain-of-thought (between reasoning markers).
     Reasoning,
     /// The surfaced answer.
     Answer,
+    /// A tool-directed ATEM message. Never user-facing completion text.
+    ToolCall,
 }
 
 /// The streaming dual of [`split_reasoning`] (REASON-1): an incremental
@@ -307,10 +307,29 @@ enum AtemState {
     Rejected,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Recipient {
     User,
     Reasoning,
+    Tool(String),
+}
+
+/// One tool-directed assistant message recovered from an ATEM response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtemToolMessage {
+    pub recipient: String,
+    pub body: String,
+}
+
+/// The complete interpretation of an ATEM response. Chat consumes the
+/// `reasoned` projection; the Muse tool codec also consumes `tool_messages`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtemResponse {
+    pub reasoned: Reasoned,
+    pub tool_messages: Vec<AtemToolMessage>,
+    /// The framing machine entered its conservative rejection state. Retained
+    /// tool messages are diagnostic attempts, never executable calls.
+    pub rejected: bool,
 }
 
 /// Incrementally interprets Muse Glimmer's addressed assistant messages.
@@ -332,8 +351,9 @@ enum Recipient {
 /// EOT             = "<|eot|>" ;
 /// ```
 ///
-/// An absent recipient and `to=user` select [`Channel::Answer`]; every other
-/// recipient selects [`Channel::Reasoning`] until the tool protocol lands.
+/// An absent recipient and `to=user` select [`Channel::Answer`], `to=self`
+/// selects [`Channel::Reasoning`], and every other recipient selects the
+/// internal [`Channel::ToolCall`] stream retained for the Muse tool codec.
 /// The grammar describes complete, well-formed replies. `push` additionally
 /// handles arbitrary fragment boundaries, a plain-text fallback, and bounded
 /// partial markers and headers. At end of stream, an incomplete ATEM header or
@@ -349,6 +369,8 @@ pub struct AtemInterpreter {
     held: String,
     reasoning: String,
     answer: String,
+    tool_messages: Vec<AtemToolMessage>,
+    current_tool: Option<AtemToolMessage>,
     initial_header: bool,
     message_started: bool,
     ended: bool,
@@ -370,6 +392,8 @@ impl AtemInterpreter {
             held: String::new(),
             reasoning: String::new(),
             answer: String::new(),
+            tool_messages: Vec::new(),
+            current_tool: None,
             initial_header: true,
             message_started: false,
             ended: false,
@@ -506,7 +530,7 @@ impl AtemInterpreter {
     /// Finish the response, returning the same answer/reasoning split used by
     /// final transcript commit. Streamed output preserves whitespace; these
     /// stored spans are trimmed like [`split_reasoning`].
-    pub fn finish(mut self, mut emit: impl FnMut(Channel, &str)) -> Reasoned {
+    pub fn finish(mut self, mut emit: impl FnMut(Channel, &str)) -> AtemResponse {
         match self.state {
             AtemState::Body if !self.held.is_empty() => {
                 let partial_marker = std::mem::take(&mut self.held);
@@ -529,15 +553,27 @@ impl AtemInterpreter {
             _ => {}
         }
 
+        self.finish_tool_message();
+
         let reasoning = self.reasoning.trim().to_string();
-        Reasoned {
-            reasoning: (!reasoning.is_empty()).then_some(reasoning),
-            answer: self.answer.trim().to_string(),
+        AtemResponse {
+            reasoned: Reasoned {
+                reasoning: (!reasoning.is_empty()).then_some(reasoning),
+                answer: self.answer.trim().to_string(),
+            },
+            tool_messages: self.tool_messages,
+            rejected: self.state == AtemState::Rejected,
         }
     }
 
     /// Interpret one complete response through the incremental machine.
     pub fn interpret(raw: &str) -> Reasoned {
+        Self::interpret_full(raw).reasoned
+    }
+
+    /// Interpret one complete response, retaining tool-directed messages for
+    /// the Muse codec.
+    pub fn interpret_full(raw: &str) -> AtemResponse {
         let mut interpreter = Self::new();
         interpreter.push(raw, |_, _| {});
         interpreter.finish(|_, _| {})
@@ -547,20 +583,37 @@ impl AtemInterpreter {
         if text.is_empty() {
             return;
         }
-        let (channel, bucket) = match self.recipient {
-            Recipient::User => (Channel::Answer, &mut self.answer),
-            Recipient::Reasoning => (Channel::Reasoning, &mut self.reasoning),
-        };
-        if !self.message_started && !bucket.is_empty() {
-            bucket.push('\n');
-            emit(channel, "\n");
+        match self.recipient.clone() {
+            Recipient::User => {
+                if !self.message_started && !self.answer.is_empty() {
+                    self.answer.push('\n');
+                    emit(Channel::Answer, "\n");
+                }
+                self.answer.push_str(text);
+                emit(Channel::Answer, text);
+            }
+            Recipient::Reasoning => {
+                if !self.message_started && !self.reasoning.is_empty() {
+                    self.reasoning.push('\n');
+                    emit(Channel::Reasoning, "\n");
+                }
+                self.reasoning.push_str(text);
+                emit(Channel::Reasoning, text);
+            }
+            Recipient::Tool(recipient) => {
+                let message = self.current_tool.get_or_insert_with(|| AtemToolMessage {
+                    recipient,
+                    body: String::new(),
+                });
+                message.body.push_str(text);
+                emit(Channel::ToolCall, text);
+            }
         }
-        bucket.push_str(text);
-        emit(channel, text);
         self.message_started = true;
     }
 
     fn consume_control(&mut self, marker: &str, emit: &mut impl FnMut(Channel, &str)) {
+        self.finish_tool_message();
         self.message_started = false;
         match marker {
             ATEM_EOM => {
@@ -591,6 +644,7 @@ impl AtemInterpreter {
     }
 
     fn reject(&mut self, text: &str, emit: &mut impl FnMut(Channel, &str)) {
+        self.finish_tool_message();
         if !self.answer.is_empty() {
             if !self.reasoning.is_empty() {
                 self.reasoning.push('\n');
@@ -611,6 +665,12 @@ impl AtemInterpreter {
         }
         self.reasoning.push_str(text);
         emit(Channel::Reasoning, text);
+    }
+
+    fn finish_tool_message(&mut self) {
+        if let Some(message) = self.current_tool.take() {
+            self.tool_messages.push(message);
+        }
     }
 }
 
@@ -660,10 +720,10 @@ fn parse_atem_header(header: &str, initial: bool) -> Option<Recipient> {
         return Some(Recipient::User);
     }
     let recipient = suffix.strip_prefix(" to=")?;
-    valid_recipient(recipient).then_some(if recipient == "user" {
-        Recipient::User
-    } else {
-        Recipient::Reasoning
+    valid_recipient(recipient).then(|| match recipient {
+        "user" => Recipient::User,
+        "self" => Recipient::Reasoning,
+        tool => Recipient::Tool(tool.to_string()),
     })
 }
 
@@ -832,6 +892,7 @@ mod tests {
         let mut sink = |ch: Channel, t: &str| match ch {
             Channel::Reasoning => reasoning.push_str(t),
             Channel::Answer => answer.push_str(t),
+            Channel::ToolCall => unreachable!("marker splitters do not emit tool calls"),
         };
         for f in fragments {
             s.push(f, &mut sink);
@@ -947,18 +1008,25 @@ mod tests {
     }
 
     fn stream_atem(fragments: &[&str]) -> (String, String, Reasoned) {
+        let (reasoning, answer, _, response) = stream_atem_full(fragments);
+        (reasoning, answer, response.reasoned)
+    }
+
+    fn stream_atem_full(fragments: &[&str]) -> (String, String, String, AtemResponse) {
         let mut interpreter = AtemInterpreter::new();
         let mut reasoning = String::new();
         let mut answer = String::new();
+        let mut tool = String::new();
         let mut sink = |channel: Channel, text: &str| match channel {
             Channel::Reasoning => reasoning.push_str(text),
             Channel::Answer => answer.push_str(text),
+            Channel::ToolCall => tool.push_str(text),
         };
         for fragment in fragments {
             interpreter.push(fragment, &mut sink);
         }
-        let final_split = interpreter.finish(&mut sink);
-        (reasoning, answer, final_split)
+        let response = interpreter.finish(&mut sink);
+        (reasoning, answer, tool, response)
     }
 
     const ATEM_CANONICAL: &str = " to=self<|message|>think café<|eom|>\
@@ -966,6 +1034,11 @@ mod tests {
     const ATEM_MULTI_MESSAGE: &str = " to=self<|message|>first<|eom|>\
                                       <|start|>assistant to=self<|message|>second<|eom|>\
                                       <|start|>assistant to=user<|message|>done<|eot|>";
+    const ATEM_TOOL: &str = " to=self<|message|>inspect the file<|eom|>\
+                            <|start|>assistant to=read_file<|message|>\
+                            <atem:function_calls>\n<atem:invoke name=\"read_file\">\n\
+                            <atem:parameter name=\"path\">README.md</atem:parameter>\n\
+                            </atem:invoke>\n</atem:function_calls><|eot|>";
 
     #[test]
     fn atem_interprets_addressed_messages() {
@@ -1029,15 +1102,18 @@ mod tests {
     }
 
     #[test]
-    fn atem_routes_every_non_user_recipient_to_reasoning() {
-        // Tool payloads remain uninterpreted until stage 4, but can never leak
-        // to the user-facing answer in stage 3.
+    fn atem_routes_tool_recipients_to_the_tool_bucket() {
+        // upholds: REASON-1 — protocol payload is retained for the codec but
+        // can never emerge as reasoning or user-facing answer text.
         let raw = " to=fs.stat_file<|message|><atem:function_calls>x</atem:function_calls>\
                    <|start|>assistant to=user<|message|>Done.";
-        let (reasoning, answer, final_split) = stream_atem(&[raw]);
-        assert!(reasoning.contains("atem:function_calls"));
+        let (reasoning, answer, tool, response) = stream_atem_full(&[raw]);
+        assert_eq!(reasoning, "");
         assert_eq!(answer, "Done.");
-        assert_eq!(final_split.answer, "Done.");
+        assert!(tool.contains("atem:function_calls"));
+        assert_eq!(response.reasoned.answer, "Done.");
+        assert_eq!(response.tool_messages.len(), 1);
+        assert_eq!(response.tool_messages[0].recipient, "fs.stat_file");
     }
 
     #[test]
@@ -1142,6 +1218,26 @@ mod tests {
                 .collect();
             assert_eq!(stream_atem(&fragments), stream_atem(&[raw]));
         }
+    }
+
+    #[test]
+    fn atem_tool_messages_are_invariant_under_fragmentation() {
+        // upholds: REASON-1, PROTO-1 — the tool bucket, its recipient, and the
+        // prose projections are independent of transport chunk boundaries.
+        let expected = stream_atem_full(&[ATEM_TOOL]);
+        for split in scalar_boundaries(ATEM_TOOL) {
+            assert_eq!(
+                stream_atem_full(&[&ATEM_TOOL[..split], &ATEM_TOOL[split..]]),
+                expected,
+                "tool transcript split at byte {split}"
+            );
+        }
+        let boundaries = scalar_boundaries(ATEM_TOOL);
+        let fragments: Vec<&str> = boundaries
+            .windows(2)
+            .map(|pair| &ATEM_TOOL[pair[0]..pair[1]])
+            .collect();
+        assert_eq!(stream_atem_full(&fragments), expected);
     }
 
     proptest::proptest! {

@@ -22,7 +22,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use yatima_lib::{
     device, resolve_format, run_blocking, ChatFormat, Engine, PrefillLogits, PrefillProgress,
-    PromptTemplate, Role, Turn,
+    PromptTemplate, Turn,
 };
 
 const SYSTEM: &str = "\
@@ -71,16 +71,7 @@ async fn main() -> Result<()> {
     let model_dir = args.model.clone().unwrap_or_else(default_glm_32b_dir);
 
     let user_prompt = load_prompt(args.prompt.as_deref())?;
-    let turns = [
-        Turn {
-            role: Role::System,
-            content: SYSTEM.to_string(),
-        },
-        Turn {
-            role: Role::User,
-            content: user_prompt,
-        },
-    ];
+    let turns = [Turn::system(SYSTEM), Turn::user(user_prompt)];
 
     let dev = device(args.cpu)?;
     let mut engine = run_blocking(|| Engine::load(&model_dir, dev))
@@ -91,7 +82,7 @@ async fn main() -> Result<()> {
     let prompt = if args.raw {
         turns
             .iter()
-            .map(|t| t.content.as_str())
+            .filter_map(Turn::content)
             .collect::<Vec<_>>()
             .join("\n\n")
     } else {
