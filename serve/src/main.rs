@@ -7,8 +7,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use yatima_host::{init_stderr_logging, spawn_nonblocking, HostConfig};
-use yatima_lib::{GenOpts, ModelProfile, ModelSource, Sampling};
+use yatima_host::{
+    init_stderr_logging, resolve_host_model, spawn_nonblocking, HostConfig, HostModelChoices,
+};
+use yatima_lib::{GenOpts, Sampling};
 use yatima_serve::{validate_bind, Bridge};
 
 #[derive(Parser)]
@@ -60,62 +62,27 @@ struct Args {
     offline: bool,
 }
 
-/// Mirror of the GUI/TUI config resolution (a shared-host candidate once a
-/// third copy exists; today the duplication is the cheaper debt).
-async fn resolve(args: &Args) -> Result<HostConfig> {
-    let profile = match &args.profile {
-        Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown profile {name:?}; built-ins: {:?}",
-                ModelProfile::BUILTIN_NAMES
-            )
-        })?),
-        None => None,
-    };
-
-    let (dir, label) = match &profile {
-        Some(p) => (
-            p.to_engine_source(args.offline)?
-                .resolve_async()
-                .await?
-                .into_directory(),
-            p.name.clone(),
-        ),
-        None => {
-            let dir = ModelSource::from_args(
-                args.model.clone(),
-                args.repo.clone(),
-                args.models_dir.clone(),
-                args.offline,
-                args.gguf.clone(),
-            )?
-            .resolve_async()
-            .await?
-            .into_directory();
-            let label = dir.display().to_string();
-            (dir, label)
-        }
-    };
+/// The shared host resolver (PROFILE-2), then the serve-shaped config. The
+/// third local copy of this resolution is gone; contradictions fail here,
+/// before the bind and the host thread. Acquisition happens inside the host
+/// thread, after the listener is bound.
+fn resolve(args: &Args) -> Result<HostConfig> {
+    let resolved = resolve_host_model(HostModelChoices {
+        profile: args.profile.clone(),
+        model: args.model.clone(),
+        repo: args.repo.clone(),
+        models_dir: args.models_dir.clone(),
+        gguf: args.gguf.clone(),
+        cpu: args.cpu,
+        offline: args.offline,
+    })?;
 
     let base = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
         ..Default::default()
     };
-    let opts = match &profile {
-        Some(p) => p.apply_gen_overrides(base),
-        None => base,
-    };
-    let format = profile.as_ref().and_then(ModelProfile::format);
-
-    Ok(HostConfig {
-        dir,
-        cpu: args.cpu,
-        opts,
-        format,
-        system: args.system.clone(),
-        model_label: label,
-    })
+    Ok(resolved.into_host_config(base, args.system.clone()))
 }
 
 #[tokio::main]
@@ -126,7 +93,7 @@ async fn main() -> Result<()> {
     // calls with args, `trace` adds whole prompts).
     init_stderr_logging("serve")?;
     let bind = validate_bind(&args.bind)?; // SRV-1 before any model load
-    let config = resolve(&args).await?;
+    let config = resolve(&args)?;
 
     // Bind before loading the model so an EADDRINUSE fails fast, not after a
     // full (possibly weight-fetching) load.

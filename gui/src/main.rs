@@ -26,10 +26,10 @@ use clap::Parser;
 use eframe::egui;
 
 use yatima_host::{
-    init_file_logging, spawn_nonblocking, CancelGate, Channel, HostConfig, HostEvent, HostRequest,
-    ModelInfo, ToolNoteKind,
+    init_file_logging, resolve_host_model, spawn_nonblocking, CancelGate, Channel, HostConfig,
+    HostEvent, HostModelChoices, HostRequest, ModelInfo, ToolNoteKind,
 };
-use yatima_lib::{GenOpts, ModelProfile, ModelSource, Sampling};
+use yatima_lib::{GenOpts, Sampling};
 use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
 
 /// Interactive GUI chat over a local model.
@@ -78,56 +78,25 @@ struct Args {
 }
 
 fn resolve(args: &Args) -> Result<HostConfig> {
-    let profile = match &args.profile {
-        Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown profile {name:?}; built-ins: {:?}",
-                ModelProfile::BUILTIN_NAMES
-            )
-        })?),
-        None => None,
-    };
-
-    let (dir, label) = match &profile {
-        Some(p) => (
-            p.to_engine_source(args.offline)?
-                .resolve()?
-                .into_directory(),
-            p.name.clone(),
-        ),
-        None => {
-            let dir = ModelSource::from_args(
-                args.model.clone(),
-                args.repo.clone(),
-                args.models_dir.clone(),
-                args.offline,
-                args.gguf.clone(),
-            )?
-            .resolve()?
-            .into_directory();
-            (dir.clone(), dir.display().to_string())
-        }
-    };
+    // The shared host resolver (PROFILE-2): contradictions fail here, before
+    // any window or host thread exists. Acquisition happens inside the host
+    // thread, behind the loading state this app already renders.
+    let resolved = resolve_host_model(HostModelChoices {
+        profile: args.profile.clone(),
+        model: args.model.clone(),
+        repo: args.repo.clone(),
+        models_dir: args.models_dir.clone(),
+        gguf: args.gguf.clone(),
+        cpu: args.cpu,
+        offline: args.offline,
+    })?;
 
     let base = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
         ..Default::default()
     };
-    let opts = match &profile {
-        Some(p) => p.apply_gen_overrides(base),
-        None => base,
-    };
-    let format = profile.as_ref().and_then(ModelProfile::format);
-
-    Ok(HostConfig {
-        dir,
-        cpu: args.cpu,
-        opts,
-        format,
-        system: args.system.clone(),
-        model_label: label,
-    })
+    Ok(resolved.into_host_config(base, args.system.clone()))
 }
 
 /// Rasterize an SVG to PNG bytes at a display-friendly size: the intrinsic
@@ -1983,7 +1952,16 @@ fn main() -> Result<()> {
     // this build).
     init_file_logging("gui", &[])?;
     let cfg = resolve(&args)?;
-    let title = format!("yatima — {}", cfg.model_label);
+    // The window title is set before the host resolves the model, so an
+    // explicit source titles with the argument as given (the status rail
+    // shows the resolved facts once Ready arrives).
+    let title_label = cfg
+        .model_label
+        .clone()
+        .or_else(|| args.model.as_ref().map(|p| p.display().to_string()))
+        .or_else(|| args.repo.clone())
+        .unwrap_or_else(|| "local model".to_string());
+    let title = format!("yatima — {title_label}");
 
     eprintln!("loading model… (first run may fetch weights)");
     let native = eframe::NativeOptions {

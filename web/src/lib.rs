@@ -181,8 +181,10 @@ pub fn frame_at(frames: &[AnimationFrame], t: f64) -> (usize, Option<f64>) {
 
 /// Render a tool-note payload in this view's marker vocabulary — the same
 /// one the GUI uses, for the same reason: egui's built-in fonts lack `✓`/`✗`
-/// (tofu), while `⚙`/`⚠` survive via the emoji fallback. A kind this build
-/// doesn't know renders unmarked (the enum is `#[non_exhaustive]`).
+/// (tofu), while `⚙`/`⚠` survive via the emoji fallback. The unmarked
+/// fallback arm satisfies `#[non_exhaustive]` matching (Rust source
+/// compatibility only); a kind unknown to this build never arrives off the
+/// wire — deserialization rejects it (PROTO-2's deployment-order rule).
 pub fn tool_note_line(kind: ToolNoteKind, text: &str) -> String {
     match kind {
         ToolNoteKind::Call => format!("\n⚙ {text}\n"),
@@ -987,6 +989,7 @@ mod tests {
             sampling: "greedy".into(),
             max_tokens: 4096,
             context_length: Some(32768),
+            identity: yatima_protocol::ModelIdentity::Unverified,
         }));
         assert_eq!(t.model.as_ref().map(|m| m.label.as_str()), Some("qwen32b"));
     }

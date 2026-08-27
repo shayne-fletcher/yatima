@@ -49,7 +49,6 @@
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -65,9 +64,13 @@ use yatima_lib::{
 
 pub mod knobs;
 mod logging;
+mod resolve;
 
 pub use logging::{init_file_logging, init_stderr_logging};
-pub use yatima_protocol::{Channel, HostEvent, HostRequest, ModelInfo, StopKind, ToolNoteKind};
+pub use resolve::{resolve_host_model, HostBackendConfig, HostModelChoices, ResolvedHostModel};
+pub use yatima_protocol::{
+    Channel, HostEvent, HostRequest, ModelIdentity, ModelInfo, StartupPhase, StopKind, ToolNoteKind,
+};
 
 /// A turn identifier, monotonic per session. Lets a frontend ignore stale events.
 pub type TurnId = u64;
@@ -144,15 +147,18 @@ impl CancelGate {
     }
 }
 
-/// What the host needs to load a model (all `Send`, so it crosses into the
-/// thread; the `!Send` [`Engine`] is then *created* inside the thread — HOST-3).
+/// What the host needs to run a model (all `Send`, so it crosses into the
+/// thread; the `!Send` [`Engine`] is then *created* inside the thread —
+/// HOST-3). The backend arrives **unresolved** ([`HostBackendConfig`]):
+/// acquisition happens inside the actor as part of its owned lifecycle, so
+/// no frontend holds a resolved path it could substitute before launch.
 pub struct HostConfig {
-    pub dir: PathBuf,
-    pub cpu: bool,
+    pub backend: HostBackendConfig,
     pub opts: GenOpts,
     pub format: Option<ChatFormat>,
     pub system: Option<String>,
-    pub model_label: String,
+    /// Display label; `None` labels with the resolved model directory.
+    pub model_label: Option<String>,
 }
 
 /// The frontend-side handle to a running host.
@@ -204,15 +210,45 @@ fn actor_main(
     event_tx: UnboundedSender<HostEvent>,
     gate: CancelGate,
 ) {
-    let mut engine = match load_engine(&config) {
+    let HostConfig {
+        backend,
+        opts,
+        format: format_choice,
+        system,
+        model_label,
+    } = config;
+    // Model acquisition happens here, inside the owned lifecycle. 5a hosts
+    // only the Candle variant; the managed llama-server variant fails closed
+    // — a clear Fatal, no verification, no process work — until 5b adds
+    // `HostBackend` ownership behind this same door.
+    let (dir, cpu) = match backend {
+        HostBackendConfig::Engine { source, cpu } => match source.resolve() {
+            Ok(resolved) => (resolved.into_directory(), cpu),
+            Err(e) => {
+                let _ = event_tx.send(HostEvent::Fatal(e.to_string()));
+                return;
+            }
+        },
+        HostBackendConfig::ManagedLlamaServer { .. } => {
+            let _ = event_tx.send(HostEvent::Fatal(
+                "the managed llama-server backend is not hosted yet (stage 5b): \
+                 use `yatima chat --profile muse-glimmer` or `yatima agent \
+                 --profile muse-glimmer`"
+                    .to_string(),
+            ));
+            return;
+        }
+    };
+    let mut engine = match device(cpu).and_then(|dev| Engine::load(&dir, dev)) {
         Ok(engine) => engine,
         Err(e) => {
             let _ = event_tx.send(HostEvent::Fatal(e.to_string()));
             return;
         }
     };
-    let (format, _mismatch) = resolve_format(engine.arch(), config.format);
-    let info = build_model_info(&engine, &config, format);
+    let model_label = model_label.unwrap_or_else(|| dir.display().to_string());
+    let (format, _mismatch) = resolve_format(engine.arch(), format_choice);
+    let info = build_model_info(&engine, &model_label, cpu, &opts, format);
 
     // Tool-trained formats always carry the web tools, initially with an empty
     // origin set — hidden from the model (CAP-3a) and inert until a grant
@@ -232,8 +268,8 @@ fn actor_main(
     // (mirrors ModelInfo's device judgment) and the per-turn budget the risk
     // bound adds to the prompt depth.
     let watch = DepthWatch {
-        metal: !config.cpu,
-        max_tokens: config.opts.max_tokens,
+        metal: !cpu,
+        max_tokens: opts.max_tokens,
         context_length: engine.context_length(),
     };
 
@@ -246,8 +282,8 @@ fn actor_main(
         serve_chat(
             &mut engine,
             format,
-            config.system.clone(),
-            config.opts.clone(),
+            system,
+            opts,
             watch,
             &req_rx,
             &event_tx,
@@ -255,9 +291,7 @@ fn actor_main(
         );
         return;
     };
-    let system = config
-        .system
-        .unwrap_or_else(|| knobs::DEFAULT_AGENT_SYSTEM.to_string());
+    let system = system.unwrap_or_else(|| knobs::DEFAULT_AGENT_SYSTEM.to_string());
     match format {
         ChatFormat::Qwen => serve_agent(
             &mut engine,
@@ -265,7 +299,7 @@ fn actor_main(
             QwenToolCall,
             ChatMlTemplate,
             system,
-            config.opts,
+            opts.clone(),
             watch,
             &origins,
             &req_rx,
@@ -278,7 +312,7 @@ fn actor_main(
             JsonToolCall,
             PlainTemplate,
             system,
-            config.opts,
+            opts,
             watch,
             &origins,
             &req_rx,
@@ -292,16 +326,26 @@ fn actor_main(
 /// Snapshot what's running for the status rail — every field a pre-formatted
 /// string so the frontend is a pure view (built here, where the engine and
 /// config live).
-fn build_model_info(engine: &Engine, config: &HostConfig, format: ChatFormat) -> ModelInfo {
+fn build_model_info(
+    engine: &Engine,
+    label: &str,
+    cpu: bool,
+    opts: &GenOpts,
+    format: ChatFormat,
+) -> ModelInfo {
     ModelInfo {
-        label: config.model_label.clone(),
+        label: label.to_string(),
         arch: format!("{:?}", engine.arch()),
         backend: engine.backend(),
-        device: if config.cpu { "cpu" } else { "gpu" }.to_string(),
+        device: if cpu { "cpu" } else { "gpu" }.to_string(),
         format: format!("{format:?}"),
-        sampling: sampling_summary(config.opts.sampling),
-        max_tokens: config.opts.max_tokens,
+        sampling: sampling_summary(opts.sampling),
+        max_tokens: opts.max_tokens,
         context_length: engine.context_length(),
+        // A Candle directory load performs no digest verification; the wire
+        // says so rather than implying authenticated identity (LSRV-5's
+        // verified form arrives with the managed backend in 5b).
+        identity: ModelIdentity::Unverified,
     }
 }
 
@@ -649,11 +693,6 @@ fn web_tools(origins: &WebOrigins) -> Result<Tools> {
         Err(e) => eprintln!("plot tool unavailable: {e}"),
     }
     Ok(tools)
-}
-
-fn load_engine(config: &HostConfig) -> Result<Engine> {
-    let dev = device(config.cpu)?;
-    Engine::load(&config.dir, dev)
 }
 
 /// Read back the image an artifact tool just announced (a plot render, a

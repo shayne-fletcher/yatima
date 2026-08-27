@@ -2,8 +2,12 @@
 //! event plane delivers Started → Fragment* → Done with a coherent answer, then
 //! a cancel cuts a long turn short. YATIMA_E2E-gated; skips if uncached.
 
-use yatima_host::{spawn, Channel, HostConfig, HostEvent, HostRequest, StopKind};
-use yatima_lib::{is_model_present, model_dir, models_root, GenOpts, ModelId, Sampling};
+use yatima_host::{
+    spawn, Channel, HostBackendConfig, HostConfig, HostEvent, HostRequest, StopKind,
+};
+use yatima_lib::{
+    is_model_present, model_dir, models_root, GenOpts, ModelId, ModelSource, Sampling,
+};
 
 fn cached_dir() -> Option<std::path::PathBuf> {
     if std::env::var_os("YATIMA_E2E").is_none() {
@@ -25,8 +29,10 @@ async fn host_runs_a_turn() -> anyhow::Result<()> {
         return Ok(());
     };
     let config = HostConfig {
-        dir,
-        cpu: false,
+        backend: HostBackendConfig::Engine {
+            source: ModelSource::from_args(Some(dir), None, None, true, None)?,
+            cpu: false,
+        },
         opts: GenOpts {
             max_tokens: 32,
             sampling: Sampling::Greedy,
@@ -34,7 +40,7 @@ async fn host_runs_a_turn() -> anyhow::Result<()> {
         },
         format: None,
         system: None,
-        model_label: "Qwen/Qwen2.5-7B-Instruct".into(),
+        model_label: Some("Qwen/Qwen2.5-7B-Instruct".into()),
     };
     let (mut handle, _info) = spawn(config).await?;
     handle.req_tx.send(HostRequest::Submit {
@@ -73,8 +79,10 @@ async fn host_cancels_a_turn_in_flight() -> anyhow::Result<()> {
         return Ok(());
     };
     let config = HostConfig {
-        dir,
-        cpu: false,
+        backend: HostBackendConfig::Engine {
+            source: ModelSource::from_args(Some(dir), None, None, true, None)?,
+            cpu: false,
+        },
         opts: GenOpts {
             max_tokens: 2048, // long enough that a cancel must cut it short
             sampling: Sampling::Greedy,
@@ -82,7 +90,7 @@ async fn host_cancels_a_turn_in_flight() -> anyhow::Result<()> {
         },
         format: None,
         system: None,
-        model_label: "Qwen/Qwen2.5-7B-Instruct".into(),
+        model_label: Some("Qwen/Qwen2.5-7B-Instruct".into()),
     };
     let (mut handle, _info) = spawn(config).await?;
     handle.req_tx.send(HostRequest::Submit {

@@ -18,8 +18,8 @@ use crossterm::terminal::{
 use futures::stream::Stream;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use yatima_host::{init_file_logging, spawn, HostConfig};
-use yatima_lib::{GenOpts, ModelProfile, ModelSource, Sampling};
+use yatima_host::{init_file_logging, resolve_host_model, spawn, HostModelChoices};
+use yatima_lib::{GenOpts, Sampling};
 
 use yatima_tui::app::{run_loop, App};
 
@@ -73,60 +73,26 @@ async fn main() -> Result<()> {
     // it stays quiet unless the filter names it.
     init_file_logging("tui", &["tui_markdown"])?;
 
-    // Resolve the profile (if any) → model dir + format + gen defaults. Done
-    // before touching the terminal so an error prints normally.
-    let profile = match &args.profile {
-        Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown profile {name:?}; built-ins: {:?}",
-                ModelProfile::BUILTIN_NAMES
-            )
-        })?),
-        None => None,
-    };
-
-    let (dir, model_label) = match &profile {
-        Some(p) => (
-            p.to_engine_source(args.offline)?
-                .resolve_async()
-                .await?
-                .into_directory(),
-            p.name.clone(),
-        ),
-        None => {
-            let dir = ModelSource::from_args(
-                args.model.clone(),
-                args.repo.clone(),
-                args.models_dir.clone(),
-                args.offline,
-                args.gguf.clone(),
-            )?
-            .resolve_async()
-            .await?
-            .into_directory();
-            (dir.clone(), dir.display().to_string())
-        }
-    };
+    // Validate the profile/source choices through the shared host resolver
+    // (PROFILE-2): every contradiction fails here, before the host thread
+    // spawns and before the terminal is touched, so the error prints
+    // normally. Acquisition itself happens inside the host thread.
+    let resolved = resolve_host_model(HostModelChoices {
+        profile: args.profile.clone(),
+        model: args.model.clone(),
+        repo: args.repo.clone(),
+        models_dir: args.models_dir.clone(),
+        gguf: args.gguf.clone(),
+        cpu: args.cpu,
+        offline: args.offline,
+    })?;
 
     let base = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
         ..Default::default()
     };
-    let opts = match &profile {
-        Some(p) => p.apply_gen_overrides(base),
-        None => base,
-    };
-    let format = profile.as_ref().and_then(ModelProfile::format);
-
-    let config = HostConfig {
-        dir,
-        cpu: args.cpu,
-        opts,
-        format,
-        system: args.system.clone(),
-        model_label,
-    };
+    let config = resolved.into_host_config(base, args.system.clone());
 
     eprintln!("loading model… (first run may fetch weights)");
     let (handle, ready) = spawn(config).await?;

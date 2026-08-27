@@ -700,6 +700,7 @@ mod tests {
             sampling: "greedy".into(),
             max_tokens: 1024,
             context_length: Some(32768),
+            identity: yatima_host::ModelIdentity::Unverified,
         };
         (App::new(tx, CancelGate::new(), ready), rx)
     }

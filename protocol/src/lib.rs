@@ -23,10 +23,14 @@
 //!
 //! - **PROTO-2** every [`HostEvent`] and [`HostRequest`] variant round-trips
 //!   through serde losslessly. The enums are externally tagged (serde's
-//!   default) and `#[non_exhaustive]`, so the wire can grow variants without
-//!   breaking deserializers; no variant uses `#[serde(untagged)]`, which
-//!   would silently make wire evolution ambiguous (and does not compose with
-//!   `deny_unknown_fields`). Cited by `host_events_round_trip` /
+//!   default); no variant uses `#[serde(untagged)]`, which would silently
+//!   make wire evolution ambiguous (and does not compose with
+//!   `deny_unknown_fields`). `#[non_exhaustive]` governs Rust matching only:
+//!   downstream folds must carry a wildcard arm, so adding a variant keeps
+//!   consumer *code* compiling — but an older deserializer still **rejects
+//!   an unknown variant as an error**. The real compatibility rule is
+//!   deployment order: consumers ship at or ahead of producers (here, one
+//!   repository built in lockstep). Cited by `host_events_round_trip` /
 //!   `host_requests_round_trip`.
 //! - **WASM-1** this crate compiles for `wasm32-unknown-unknown` — the
 //!   "serde-only, WASM-clean" paragraph above is enforced, not aspirational.
@@ -67,8 +71,10 @@ pub enum StopKind {
 /// meaning, never typography (HOST-4).
 ///
 /// `#[non_exhaustive]`: consumers must carry a wildcard arm (rendering the
-/// payload unmarked is a fine fallback), so a new kind is a non-breaking
-/// addition.
+/// payload unmarked is a fine fallback), so a new kind keeps their *code*
+/// compiling — Rust source compatibility, not wire compatibility: an older
+/// deserializer still rejects an unknown kind (PROTO-2's deployment-order
+/// rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ToolNoteKind {
@@ -82,6 +88,41 @@ pub enum ToolNoteKind {
     Failure,
     /// A host warning (e.g. the tool-step budget was exhausted).
     Warning,
+}
+
+/// Which pre-`Ready` startup phase the host is in — the payload of
+/// [`HostEvent::Startup`]. 5a defines the vocabulary; the host emits phase
+/// transitions from stage 5b. Startup is loading state, not transcript: a
+/// view shows the current phase (animating elapsed time on its own clock —
+/// the wire carries no ticker) and drops it at `Ready` or `Fatal`.
+///
+/// A closed sum like [`Channel`]/[`StopKind`]: adding a phase is a reviewed
+/// protocol change that must update every exhaustive consumer and fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartupPhase {
+    /// Choosing and acquiring the exact model artifact (may fetch weights on
+    /// a first run).
+    ResolvingModel,
+    /// Hashing the artifact against a profile's pinned digest.
+    VerifyingModel,
+    /// Loading the engine, or launching and gating the managed server.
+    StartingBackend,
+}
+
+/// How the running model's identity is authenticated — the wire form of the
+/// verified/unverified distinction (LSRV-5 is registered in yatima-lib; this
+/// mirror carries its outcome, never a claim of its own). No self-report can
+/// promote [`Unverified`](ModelIdentity::Unverified) to verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelIdentity {
+    /// The artifact's SHA-256 was verified against a pinned digest before
+    /// launch. The lowercase hex digest string is preserved byte-for-byte.
+    VerifiedSha256(String),
+    /// No authenticated identity evidence exists: nothing proved which
+    /// artifact is running. A backend may still self-report a name (a Candle
+    /// directory load, an attached server's `/props`), but a self-report is
+    /// a claim, not evidence, and cannot promote this variant.
+    Unverified,
 }
 
 /// What is running, reported once the model is ready. Every field is a
@@ -106,17 +147,23 @@ pub struct ModelInfo {
     pub max_tokens: usize,
     /// The model's context window in tokens (the meter denominator), if declared.
     pub context_length: Option<usize>,
+    /// How the model's identity is authenticated (verified digest or not).
+    pub identity: ModelIdentity,
 }
 
 /// Event plane: host → frontend. A frontend's only source of transcript truth;
 /// it renders each event and never reaches past this plane to the engine.
 ///
 /// `#[non_exhaustive]`: consumers must carry a wildcard arm, so a new event
-/// (a structured tool record, a flight-recorder tick) is a non-breaking
-/// addition.
+/// (a structured tool record, a flight-recorder tick) keeps their *code*
+/// compiling — Rust source compatibility, not wire compatibility (PROTO-2's
+/// deployment-order rule).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum HostEvent {
+    /// The host is starting up: emitted once on each phase transition before
+    /// `Ready`/`Fatal`. Loading state, never transcript content.
+    Startup { phase: StartupPhase },
     /// The model loaded and is ready to serve turns (carries what's running).
     Ready(ModelInfo),
     /// A turn began.
@@ -172,7 +219,8 @@ pub enum HostEvent {
 /// user utterance — a typed URL or an explicit `/grant`).
 ///
 /// `#[non_exhaustive]`: the host must carry a wildcard arm, so a new request
-/// is a non-breaking addition.
+/// keeps its *code* compiling — Rust source compatibility, not wire
+/// compatibility (PROTO-2's deployment-order rule).
 ///
 /// [`HostRequest::Cancel`] is the wire form of a cancel; a native frontend
 /// also has the out-of-band `CancelGate` for the mid-decode path (the engine
@@ -210,6 +258,16 @@ mod tests {
             sampling: "greedy".into(),
             max_tokens: 1024,
             context_length: Some(32768),
+            identity: ModelIdentity::Unverified,
+        }
+    }
+
+    const DIGEST: &str = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e";
+
+    fn verified_model_info() -> ModelInfo {
+        ModelInfo {
+            identity: ModelIdentity::VerifiedSha256(DIGEST.into()),
+            ..model_info()
         }
     }
 
@@ -234,8 +292,24 @@ mod tests {
                 | ToolNoteKind::Warning => {}
             }
         }
+        // Every StartupPhase rides the wire (exhaustive by this match: a new
+        // phase added without a sample here is a compile error).
+        let phases = [
+            StartupPhase::ResolvingModel,
+            StartupPhase::VerifyingModel,
+            StartupPhase::StartingBackend,
+        ];
+        for phase in &phases {
+            match phase {
+                StartupPhase::ResolvingModel
+                | StartupPhase::VerifyingModel
+                | StartupPhase::StartingBackend => {}
+            }
+        }
         let mut all = vec![
             HostEvent::Ready(model_info()),
+            // Both ModelIdentity variants ride the wire inside Ready.
+            HostEvent::Ready(verified_model_info()),
             HostEvent::Started { turn_id: 1 },
             HostEvent::Fragment {
                 turn_id: 1,
@@ -274,11 +348,13 @@ mod tests {
             kind,
             text: "plot {…}".into(),
         }));
+        all.extend(phases.iter().map(|&phase| HostEvent::Startup { phase }));
         // Exhaustiveness guard: this match must name every variant, so adding
         // one without adding it to `all` above is a compile error.
         for ev in &all {
             match ev {
-                HostEvent::Ready(_)
+                HostEvent::Startup { .. }
+                | HostEvent::Ready(_)
                 | HostEvent::Started { .. }
                 | HostEvent::Fragment { .. }
                 | HostEvent::RetractAnswer { .. }
@@ -345,6 +421,33 @@ mod tests {
             let back: HostRequest = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(req, back, "round-trip mismatch for {json}");
         }
+    }
+
+    #[test]
+    fn identity_preserves_the_digest_and_startup_is_tagged() {
+        // upholds: PROTO-2 — both identity variants and the startup event
+        // take the externally tagged shape, and the verified digest string
+        // survives the round trip byte-for-byte (LSRV-5's wire form carries
+        // the digest; it must not be re-cased, re-encoded, or truncated).
+        let verified = ModelIdentity::VerifiedSha256(DIGEST.into());
+        let json = serde_json::to_string(&verified).unwrap();
+        assert_eq!(json, format!("{{\"VerifiedSha256\":\"{DIGEST}\"}}"));
+        let ModelIdentity::VerifiedSha256(digest) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected the verified variant back");
+        };
+        assert_eq!(digest.as_bytes(), DIGEST.as_bytes());
+
+        assert_eq!(
+            serde_json::to_string(&ModelIdentity::Unverified).unwrap(),
+            "\"Unverified\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HostEvent::Startup {
+                phase: StartupPhase::VerifyingModel,
+            })
+            .unwrap(),
+            "{\"Startup\":{\"phase\":\"VerifyingModel\"}}"
+        );
     }
 
     #[test]
