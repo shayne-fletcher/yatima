@@ -6,7 +6,8 @@
 //! The canonical list of the contracts this crate upholds. They are stated, not
 //! compiler-enforced; each is protected by a test that cites its id (grep the
 //! `invariant`/`law` comments in the test modules). `notes/design.md` explains
-//! them in prose. (CLI-level invariants `CLI-1`/`CLI-2` live in `yatima-cli`.)
+//! them in prose. (CLI-level invariants `CLI-1` through `CLI-4` live in
+//! `yatima-cli`.)
 //!
 //! Library layering:
 //! - **LAYER-1** dependencies point *down* the module layer DAG
@@ -88,7 +89,9 @@
 //!   never reduces a larger caller budget; an unset `prefill_chunk` defers to
 //!   the engine default.
 //! - **PROFILE-2** a [`ModelProfile`] resolves to exactly one source (`repo`
-//!   xor `dir`) before load.
+//!   xor `dir`) before load, and that source is authoritative: combining any
+//!   profile with a model-source flag (`--model`, `--repo`, `--gguf`,
+//!   `--models-dir`) is rejected at resolution, never silently ignored.
 //! - **CTX-1** the context window is discovered from model config at load
 //!   ([`Engine::context_length`], from `max_position_embeddings` /
 //!   `<arch>.context_length`) and enforced: a prompt plus `max_tokens` that
@@ -143,8 +146,9 @@
 //! - **LSRV-1** a managed llama-server child has one owner; both output pipes
 //!   are drained concurrently into bounded tails, and every explicit shutdown
 //!   or child-owning startup failure kills, reaps, and joins those drains under
-//!   a bound. In-flight completion races child death; `Drop` is only a
-//!   kill-request fallback.
+//!   a bound. A managed CLI interrupt becomes cooperative cancellation and
+//!   follows that explicit shutdown path before process exit. In-flight
+//!   completion races child death; `Drop` is only a kill-request fallback.
 //! - **LSRV-2** every llama-server endpoint is a validated HTTP loopback origin.
 //!   Managed mode constructs its own `127.0.0.1` endpoint; attached mode
 //!   accepts loopback literals or `localhost`, normalizing the latter before a

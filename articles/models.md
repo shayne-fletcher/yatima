@@ -5,6 +5,10 @@ across model families from a single engine. A CI consistency harness checks ever
 family's wiring — architecture detection, GGUF normalization, and chat-format
 mapping.
 
+The table below covers the **in-process Candle engine** only. Muse Glimmer runs
+through the managed `llama-server` backend instead — chat and agent/tools via
+`--profile muse-glimmer` — and is documented in [CLI usage](cli.md), not here.
+
 `‡` marks families that are **wired + harness-tested but not yet runtime-validated
 with weights**: loading and generation are unverified on a real model of that
 family.
@@ -34,18 +38,6 @@ calls (today: Qwen/ChatML).
 candle reads standard quant types (`Q4_0/1`, `Q5_0/1`, `Q8_0`, `Q2_K`–`Q6_K`) but
 **no i-quants** (`IQ*`). Many modern community GGUFs embed `IQ4_NL` tensors and
 will fail to load (`unknown dtype 20`); pick a standard-type or `--pure` quant.
-
-## The candle fork
-
-The manifest pins candle to a
-[fork](https://github.com/shayne-fletcher/candle): upstream 0.11.0 plus a
-workaround for a Metal backend defect that deterministically corrupts
-quantized generation once the KV cache passes depth 8,192 — a missing
-synchronization, diagnosed by bisection and worked around with targeted device
-syncs. The workaround is validated to moderate depths and the engine warns
-past its envelope; the full record, and the canary test run against pure
-upstream on every candle bump (green → the fork is dropped), live in
-[notes/metal-kv-cliff.md](../notes/metal-kv-cliff.md).
 
 A missing model is fetched on demand when the `fetch` feature is enabled;
 `--offline` never touches the network. Weights are acquired by

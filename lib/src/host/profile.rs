@@ -223,7 +223,7 @@ impl ModelProfile {
     pub fn to_engine_source(&self, offline: bool) -> Result<ModelSource> {
         if matches!(self.backend, ProfileBackend::LlamaServer(_)) {
             bail!(
-                "profile {:?} is served by a managed llama-server; supported by `yatima chat` only until stage 5",
+                "profile {:?} is served by a managed llama-server; supported by `yatima chat` and `yatima agent` until stage 5",
                 self.name
             );
         }
@@ -231,8 +231,9 @@ impl ModelProfile {
     }
 
     /// Layer this profile's set fields over a caller-built `base` (PROFILE-1:
-    /// the caller chooses the use-case base — chat keeps [`GenOpts::default`],
-    /// the agent sets `repeat_penalty = 1.0`). `prefill_chunk` is override-only:
+    /// the caller chooses the use-case base. Chat keeps [`GenOpts::default`],
+    /// and the CLI agent currently keeps the default repetition penalty because
+    /// prose answers degenerate without it. `prefill_chunk` is override-only:
     /// an unset profile leaves `base.prefill_chunk` untouched (typically `None`),
     /// so the loaded engine's device-aware default wins (PREFILL-1). Pure.
     pub fn apply_gen_overrides(&self, base: GenOpts) -> GenOpts {

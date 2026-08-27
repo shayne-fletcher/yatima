@@ -10,8 +10,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use yatima_lib::{
     verify, Agent, AgentStop, ChatMlTemplate, ChatSession, Completer, Dir, GenOpts, JsonToolCall,
     LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ModelProfile,
-    ModelSource, PlainTemplate, ProfileBackend, ReadFile, ServerGates, ServerIdentity,
-    Sha256Digest, StopReason, Tools,
+    ModelSource, MuseAtemCodec, PlainTemplate, ProfileBackend, ReadFile, ServerGates,
+    ServerIdentity, Sha256Digest, StopReason, Tools, Turn,
 };
 
 const WITHIN: Duration = Duration::from_secs(8);
@@ -469,5 +469,102 @@ async fn live_managed_muse_chat() -> Result<()> {
     }
     assert_eq!(history.len(), 2, "the exchange must be committed");
     assert_eq!(history[1].content(), Some(answer.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires llama-server on PATH and the local Muse Glimmer Q4_K_M GGUF"]
+async fn live_managed_muse_agent() -> Result<()> {
+    // upholds: LSRV-5 / AGENT-3 / PROTO-1 — the agent milestone over the real
+    // managed server: verified identity, a capability-scoped file tool, a
+    // structured ATEM tool round in the run transcript, and a framing-free
+    // final answer.
+    let profile = ModelProfile::builtin("muse-glimmer").expect("Muse profile is built in");
+    let ProfileBackend::LlamaServer(server_profile) = profile.backend.clone() else {
+        unreachable!("Muse profile must select llama-server")
+    };
+    let artifact = profile
+        .to_source(true)?
+        .resolve_async()
+        .await?
+        .into_gguf()?;
+    let verified = verify(artifact, &server_profile.expected_sha256).await?;
+    let mut spawn = LlamaServerSpawn::verified(verified, server_profile.server_gates());
+    spawn.context = Some(server_profile.context);
+    spawn.top_k = server_profile.top_k;
+    let mut server = LlamaServer::spawn(spawn).await?;
+    assert_eq!(
+        server.identity(),
+        &ServerIdentity::Verified {
+            digest: server_profile.expected_sha256
+        }
+    );
+
+    let root = TempDir::new()?;
+    std::fs::write(
+        root.path().join("README.md"),
+        "yatima is a Rust runtime for language-integrated LLM inference: local \
+         Candle engines and managed llama-server children behind one Completer.",
+    )?;
+    let tools = Tools::new().with(ReadFile::new(Dir::new(root.path())));
+
+    let format = profile.format().expect("Muse profile pins its format");
+    let opts = profile.apply_gen_overrides(GenOpts::default());
+    let mut agent = Agent::new(
+        &mut server,
+        &tools,
+        MuseAtemCodec,
+        format.template_with_date(Some("2026-08-24".into())),
+        "You are a coding assistant. Read files with the provided tools and \
+         answer concisely.",
+        4,
+    )
+    .with_opts(opts);
+    let run = match tokio::time::timeout(
+        LIVE_WITHIN,
+        agent.run_async("Read README.md and say what yatima is in two sentences."),
+    )
+    .await
+    {
+        Ok(run) => run,
+        Err(_) => Err(anyhow::anyhow!(
+            "live Muse agent run exceeded {} seconds",
+            LIVE_WITHIN.as_secs()
+        )),
+    };
+    drop(agent);
+    let shutdown = server.shutdown().await;
+    let run = run?;
+    shutdown?;
+
+    assert!(matches!(run.stop, AgentStop::Final), "stop: {:?}", run.stop);
+    assert!(
+        run.transcript.iter().any(|turn| matches!(
+            turn,
+            Turn::AssistantToolCall { name, .. } if name == "read_file"
+        )),
+        "the run must invoke read_file structurally: {:?}",
+        run.transcript
+    );
+    assert!(
+        run.transcript.iter().any(|turn| matches!(
+            turn,
+            Turn::ToolResult {
+                name,
+                is_error: false,
+                ..
+            } if name == "read_file"
+        )),
+        "the tool result must enter the transcript: {:?}",
+        run.transcript
+    );
+    assert!(!run.answer.trim().is_empty());
+    for framing in ["<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "atem:"] {
+        assert!(
+            !run.answer.contains(framing),
+            "answer leaked {framing}: {}",
+            run.answer
+        );
+    }
     Ok(())
 }

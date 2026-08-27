@@ -18,7 +18,23 @@ cargo run -p yatima-cli --release -- chat --profile muse-glimmer
 
 The first run downloads the 16.8 GB model when the `fetch` feature is enabled; later runs use the cache. Startup prints the file being verified before hashing it, then reports the verified digest, canonical path, and compatible `llama-server` build. The profile also pins the 131072-token context, one server slot, Muse sampling recipe, prompt format, and the rules that separate reasoning from answer text.
 
-Use `/reset` to clear the model conversation and `/exit` to leave. Up and Down recall prompts entered during the current run. On exit or a chat error, Yatima kills and reaps the managed server process.
+Use `/reset` to clear the model conversation and `/exit` to leave. Up and Down recall prompts entered during the current run. On ordinary exit, an error, or Ctrl-C during a managed turn, Yatima stops and reaps the server process before exiting. An interrupted command returns status 130.
+
+The same profile drives the agent: one command acquires and verifies the model, owns the server, runs the tool loop, and reaps the child. Ctrl-C cooperatively cancels the current model request, then waits for that reap instead of abandoning the server.
+
+```bash
+cargo run -p yatima-cli --release -- agent --profile muse-glimmer --root . \
+  --prompt "Read README.md and say what yatima is in two sentences."
+```
+
+The agent speaks Muse's native ATEM tool protocol: the model addresses the capability-scoped `read_file` tool directly, and the invocation and its result enter the run transcript structurally. On a terminal, classified reasoning, answer fragments, and concise tool status appear live on stderr; the final framing-free answer remains the only stdout payload for scripts. `chat` and `agent` share one backend resolution, so `--profile`, `--backend`, and `--server-url` mean the same thing in both, and the Candle-only flags (`--cpu`, `--prefill-chunk`) are rejected with the llama-server backend in either subcommand.
+
+The ignored real-binary acceptance should be run in release mode; an unoptimized SHA-256 pass over the 17 GB model is needlessly slow:
+
+```bash
+cargo test --release -p yatima-cli --test live_muse_agent \
+  live_cli_managed_muse_agent -- --ignored --exact --nocapture
+```
 
 ## Agent with capability-scoped tools
 

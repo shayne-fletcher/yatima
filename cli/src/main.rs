@@ -6,9 +6,13 @@
 //! - **CLI-2** `--offline` never fetches; an absent model is a clear error.
 //! - **CLI-3** the CLI owns tracing subscriber setup and initializes it
 //!   idempotently; `yatima-lib` only emits events.
+//! - **CLI-4** an interactive agent renders classified `AgentEvent` fragments
+//!   and tool status live on stderr while stdout remains the final answer for
+//!   pipelines; a terminal never prints that final answer twice.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
@@ -18,12 +22,11 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use tracing_subscriber::EnvFilter;
 use yatima_lib::{
-    device, model_dir, models_root, resolve_format, run_blocking, verify, Agent, Channel,
-    ChatFormat, ChatMlTemplate, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall,
+    device, model_dir, models_root, resolve_format, run_blocking, verify, Agent, AgentEvent,
+    Cancel, Channel, ChatFormat, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall,
     ListDir, LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerProfile,
-    LlamaServerSpawn, ModelId, ModelProfile, ModelSource, PlainTemplate, ProfileBackend,
-    PromptTemplate, QwenToolCall, ReadFile, ReadPage, Sampling, ServerIdentity, ToolCallCodec,
-    Tools, WebOrigins,
+    LlamaServerSpawn, ModelId, ModelProfile, ModelSource, ProfileBackend, PromptTemplate,
+    QwenToolCall, ReadFile, ReadPage, Sampling, ServerIdentity, ToolCallCodec, Tools, WebOrigins,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -98,6 +101,19 @@ struct GenerateArgs {
 
 #[derive(clap::Args)]
 struct AgentArgs {
+    /// Inference backend. Omit to use the profile's backend, or Candle when no
+    /// profile selects another backend.
+    #[arg(long, value_enum)]
+    backend: Option<BackendArg>,
+    /// Base URL of a running llama-server (e.g. `http://127.0.0.1:8080`), for
+    /// `--backend llama-server`.
+    #[arg(long)]
+    server_url: Option<String>,
+    /// A built-in model profile: sets the model, chat format, and generation
+    /// defaults. Verified profiles reject model-source and conflicting format
+    /// overrides; `--max-tokens` raises (never lowers) their budget.
+    #[arg(long)]
+    profile: Option<String>,
     /// Explicit model directory.
     #[arg(long)]
     model: Option<PathBuf>,
@@ -229,9 +245,31 @@ const DEFAULT_AGENT_SYSTEM: &str =
     "You are a helpful assistant. You can read files under the working directory \
      using the provided tools. Call a tool when it helps, then answer.";
 
+#[derive(Debug)]
+struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     init_tracing();
+    match run_cli().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.downcast_ref::<Interrupted>().is_some() => ExitCode::from(130),
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ModelsDir { repo } => {
@@ -288,6 +326,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
         None => base,
     };
     let current_date = Local::now().format("%Y-%m-%d").to_string();
+    let cancel = Cancel::new();
 
     match chat_backend_config(&args, profile.as_ref())? {
         ChatBackendConfig::Attached { url, format } => {
@@ -308,6 +347,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
                 opts,
                 args.system,
                 args.prompt,
+                &cancel,
             )
             .await;
         }
@@ -315,6 +355,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
             format,
             llama_server_profile,
         } => {
+            let interrupt = ManagedInterrupt::new(cancel.clone());
             let resolved = match &profile {
                 Some(profile) => profile.to_source(args.offline)?.resolve_async().await?,
                 None => {
@@ -329,43 +370,24 @@ async fn chat(args: ChatArgs) -> Result<()> {
                     .await?
                 }
             };
-            let artifact = resolved.into_gguf()?;
-            let spawn = match llama_server_profile {
-                Some(server_profile) => {
-                    eprintln!("verifying {} (sha256)...", artifact.path().display());
-                    let verified = with_wait_timer(
-                        "verifying sha256",
-                        verify(artifact, &server_profile.expected_sha256),
-                    )
-                    .await?;
-                    let mut spawn =
-                        LlamaServerSpawn::verified(verified, server_profile.server_gates());
-                    spawn.context = Some(server_profile.context);
-                    spawn.top_k = server_profile.top_k;
-                    spawn
-                }
-                None => LlamaServerSpawn::new(artifact),
-            };
+            if cancel.is_cancelled() {
+                return Err(Interrupted.into());
+            }
             let mut server =
-                with_wait_timer("starting llama-server", LlamaServer::spawn(spawn)).await?;
-            eprintln!("{}", managed_server_banner(format, &server));
+                launch_managed_server(resolved, llama_server_profile.as_ref(), format, &cancel)
+                    .await?;
             let chat = run_chat(
                 &mut server,
                 format.template_with_date(Some(current_date)),
                 opts,
                 args.system,
                 args.prompt,
+                &cancel,
             )
             .await;
-            let shutdown = server.shutdown().await;
-            return match (chat, shutdown) {
-                (Ok(()), Ok(_)) => Ok(()),
-                (Ok(()), Err(error)) => Err(error).context("shut down managed llama-server"),
-                (Err(error), Ok(_)) => Err(error),
-                (Err(error), Err(shutdown)) => Err(error).context(format!(
-                    "managed llama-server also failed to shut down: {shutdown:#}"
-                )),
-            };
+            let result = finish_managed_run(server, chat, &cancel).await;
+            drop(interrupt);
+            return result;
         }
         ChatBackendConfig::Engine => {}
     }
@@ -408,6 +430,7 @@ async fn chat(args: ChatArgs) -> Result<()> {
         opts,
         args.system,
         args.prompt,
+        &cancel,
     )
     .await
 }
@@ -425,45 +448,135 @@ enum ChatBackendConfig {
     },
 }
 
-/// Resolve the three backend modes before model acquisition or process work.
-/// Attached mode owns no model source; managed mode owns one; the Candle
-/// engine rejects server-only flags. Pure, so the matrix is unit-testable.
+/// The backend-relevant flags a subcommand feeds [`backend_config`]: one pure
+/// resolver owns the mode matrix for both `chat` and `agent`, so the two
+/// commands cannot drift into separate policies.
+struct BackendFlags {
+    backend: Option<BackendArg>,
+    server_url: Option<String>,
+    format: Option<ChatFormat>,
+    has_model: bool,
+    has_repo: bool,
+    has_models_dir: bool,
+    has_gguf: bool,
+    cpu: bool,
+    has_prefill_chunk: bool,
+}
+
+impl ChatArgs {
+    fn backend_flags(&self) -> BackendFlags {
+        BackendFlags {
+            backend: self.backend,
+            server_url: self.server_url.clone(),
+            format: self.format,
+            has_model: self.model.is_some(),
+            has_repo: self.repo.is_some(),
+            has_models_dir: self.models_dir.is_some(),
+            has_gguf: self.gguf.is_some(),
+            cpu: self.cpu,
+            has_prefill_chunk: self.prefill_chunk.is_some(),
+        }
+    }
+}
+
+impl AgentArgs {
+    fn backend_flags(&self) -> BackendFlags {
+        BackendFlags {
+            backend: self.backend,
+            server_url: self.server_url.clone(),
+            format: self.format,
+            has_model: self.model.is_some(),
+            has_repo: self.repo.is_some(),
+            has_models_dir: self.models_dir.is_some(),
+            has_gguf: self.gguf.is_some(),
+            cpu: self.cpu,
+            has_prefill_chunk: self.prefill_chunk.is_some(),
+        }
+    }
+}
+
+/// The `chat` entry to the shared resolver (kept so the matrix tests read at
+/// the subcommand's own seam).
 fn chat_backend_config(
     args: &ChatArgs,
     profile: Option<&ModelProfile>,
 ) -> Result<ChatBackendConfig> {
+    backend_config(&args.backend_flags(), profile)
+}
+
+/// The `agent` entry to the shared resolver — the same policy, not a second one.
+fn agent_backend_config(
+    args: &AgentArgs,
+    profile: Option<&ModelProfile>,
+) -> Result<ChatBackendConfig> {
+    backend_config(&args.backend_flags(), profile)
+}
+
+/// Resolve the three backend modes before model acquisition or process work.
+/// Attached mode owns no model source; managed mode owns one; the Candle
+/// engine rejects server-only flags, and the llama-server modes reject
+/// Candle-only flags (`--cpu`, `--prefill-chunk`) rather than silently
+/// ignoring them. Every profile's pinned source is authoritative, so any
+/// model-source flag beside a profile is a rejected contradiction, never
+/// silently ignored (PROFILE-2). Pure, so the matrix is unit-testable.
+fn backend_config(
+    flags: &BackendFlags,
+    profile: Option<&ModelProfile>,
+) -> Result<ChatBackendConfig> {
+    if let Some(profile) = profile {
+        let mut overrides = Vec::new();
+        if flags.has_model {
+            overrides.push("--model");
+        }
+        if flags.has_repo {
+            overrides.push("--repo");
+        }
+        if flags.has_gguf {
+            overrides.push("--gguf");
+        }
+        if flags.has_models_dir {
+            overrides.push("--models-dir");
+        }
+        if !overrides.is_empty() {
+            bail!(
+                "profile {:?} rejects model-source overrides: {}",
+                profile.name,
+                overrides.join(", ")
+            );
+        }
+    }
+    let config = backend_mode(flags, profile)?;
+    if !matches!(config, ChatBackendConfig::Engine) {
+        let mut rejected = Vec::new();
+        if flags.cpu {
+            rejected.push("--cpu");
+        }
+        if flags.has_prefill_chunk {
+            rejected.push("--prefill-chunk");
+        }
+        if !rejected.is_empty() {
+            bail!(
+                "Candle-only flags are not valid with the llama-server backend: {}",
+                rejected.join(", ")
+            );
+        }
+    }
+    Ok(config)
+}
+
+fn backend_mode(flags: &BackendFlags, profile: Option<&ModelProfile>) -> Result<ChatBackendConfig> {
     if let Some(profile) = profile {
         if let ProfileBackend::LlamaServer(server) = &profile.backend {
-            if args.backend == Some(BackendArg::Engine) {
+            if flags.backend == Some(BackendArg::Engine) {
                 bail!(
                     "profile {:?} requires managed llama-server and cannot use --backend engine",
                     profile.name
                 );
             }
-            if args.server_url.is_some() {
+            if flags.server_url.is_some() {
                 bail!(
                     "profile {:?} requires a verified managed llama-server and cannot attach with --server-url",
                     profile.name
-                );
-            }
-            let mut substitutions = Vec::new();
-            if args.model.is_some() {
-                substitutions.push("--model");
-            }
-            if args.repo.is_some() {
-                substitutions.push("--repo");
-            }
-            if args.gguf.is_some() {
-                substitutions.push("--gguf");
-            }
-            if args.models_dir.is_some() {
-                substitutions.push("--models-dir");
-            }
-            if !substitutions.is_empty() {
-                bail!(
-                    "verified profile {:?} rejects model-source overrides: {}",
-                    profile.name,
-                    substitutions.join(", ")
                 );
             }
             let format = profile.format.ok_or_else(|| {
@@ -472,7 +585,7 @@ fn chat_backend_config(
                     profile.name
                 )
             })?;
-            if let Some(explicit) = args.format {
+            if let Some(explicit) = flags.format {
                 if explicit != format {
                     bail!(
                         "profile {:?} pins --format {}; cannot use {}",
@@ -489,27 +602,27 @@ fn chat_backend_config(
         }
     }
 
-    let backend = args.backend.unwrap_or(BackendArg::Engine);
+    let backend = flags.backend.unwrap_or(BackendArg::Engine);
     if backend == BackendArg::Engine {
-        if args.server_url.is_some() {
+        if flags.server_url.is_some() {
             bail!("--server-url requires --backend llama-server");
         }
         return Ok(ChatBackendConfig::Engine);
     }
 
-    if let Some(url) = args.server_url.clone() {
+    if let Some(url) = flags.server_url.clone() {
         if profile.is_some()
-            || args.model.is_some()
-            || args.repo.is_some()
-            || args.models_dir.is_some()
-            || args.gguf.is_some()
+            || flags.has_model
+            || flags.has_repo
+            || flags.has_models_dir
+            || flags.has_gguf
         {
             bail!(
                 "--profile/--model/--repo/--models-dir/--gguf are not used with an attached \
                  llama-server: the attached server owns the model"
             );
         }
-        let format = args.format.ok_or_else(|| {
+        let format = flags.format.ok_or_else(|| {
             anyhow::anyhow!(
                 "an attached llama-server requires --format: there is no local model to infer it"
             )
@@ -517,11 +630,11 @@ fn chat_backend_config(
         return Ok(ChatBackendConfig::Attached { url, format });
     }
 
-    let format = args
+    let format = flags
         .format
         .or_else(|| profile.and_then(ModelProfile::format))
         .ok_or_else(|| anyhow::anyhow!("managed llama-server requires --format or a profile"))?;
-    if profile.is_none() && args.model.is_none() && args.repo.is_none() {
+    if profile.is_none() && !flags.has_model && !flags.has_repo {
         bail!("managed llama-server requires --profile, --model, or --repo");
     }
     Ok(ChatBackendConfig::Managed {
@@ -569,6 +682,99 @@ fn waiting_line(label: &str, seconds: u64) -> String {
     format!("{label} — you have been waiting {seconds}s")
 }
 
+/// Verify (when a profile pins a digest) and launch one managed llama-server —
+/// the single composition `chat` and `agent` share, so no caller can omit
+/// verification, the compatibility gates, or the pinned context and top_k
+/// (LSRV-5). Prints the wait timers and the identity banner.
+async fn launch_managed_server(
+    resolved: yatima_lib::ResolvedModel,
+    server_profile: Option<&LlamaServerProfile>,
+    format: ChatFormat,
+    cancel: &Cancel,
+) -> Result<LlamaServer> {
+    if cancel.is_cancelled() {
+        return Err(Interrupted.into());
+    }
+    let artifact = resolved.into_gguf()?;
+    let spawn = match server_profile {
+        Some(server_profile) => {
+            eprintln!("verifying {} (sha256)...", artifact.path().display());
+            let verified = with_wait_timer(
+                "verifying sha256",
+                verify(artifact, &server_profile.expected_sha256),
+            )
+            .await?;
+            // Hashing runs in the existing blocking island and cannot be
+            // interrupted partway through. Do not launch a child after an
+            // interrupt received while it was in progress.
+            if cancel.is_cancelled() {
+                return Err(Interrupted.into());
+            }
+            let mut spawn = LlamaServerSpawn::verified(verified, server_profile.server_gates());
+            spawn.context = Some(server_profile.context);
+            spawn.top_k = server_profile.top_k;
+            spawn
+        }
+        None => LlamaServerSpawn::new(artifact),
+    };
+    if cancel.is_cancelled() {
+        return Err(Interrupted.into());
+    }
+    let server = with_wait_timer("starting llama-server", LlamaServer::spawn(spawn)).await?;
+    eprintln!("{}", managed_server_banner(format, &server));
+    Ok(server)
+}
+
+/// One signal listener for the lifetime of a managed command. It translates
+/// Ctrl-C into the same cooperative cancellation primitive used by chat,
+/// agent, and llama-server transport instead of letting the process exit
+/// before its owned child is reaped.
+struct ManagedInterrupt {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ManagedInterrupt {
+    fn new(cancel: Cancel) -> Self {
+        let task = tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    eprintln!("interrupt received; stopping managed command");
+                    cancel.cancel();
+                }
+                Err(error) => eprintln!("warning: cannot listen for Ctrl-C: {error}"),
+            }
+        });
+        Self { task }
+    }
+}
+
+impl Drop for ManagedInterrupt {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Preserve the command result while making explicit child shutdown the only
+/// normal exit from a managed run. An interrupt exits with status 130 only
+/// after shutdown has reaped the child and joined its output drains.
+async fn finish_managed_run(server: LlamaServer, run: Result<()>, cancel: &Cancel) -> Result<()> {
+    let interrupted = cancel.is_cancelled();
+    let shutdown = server.shutdown().await;
+    if interrupted {
+        shutdown.context("shut down managed llama-server after interrupt")?;
+        eprintln!("managed llama-server stopped");
+        return Err(Interrupted.into());
+    }
+    match (run, shutdown) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Ok(()), Err(error)) => Err(error).context("shut down managed llama-server"),
+        (Err(error), Ok(_)) => Err(error),
+        (Err(error), Err(shutdown)) => Err(error).context(format!(
+            "managed llama-server also failed to shut down: {shutdown:#}"
+        )),
+    }
+}
+
 fn managed_server_banner(format: ChatFormat, server: &LlamaServer) -> String {
     format_managed_server_banner(
         format,
@@ -611,6 +817,7 @@ async fn run_chat<C: Completer>(
     opts: GenOpts,
     system: Option<String>,
     prompt: Option<String>,
+    cancel: &Cancel,
 ) -> Result<()> {
     let mut session = ChatSession::new(completer, template).with_opts(opts);
     if let Some(sys) = system {
@@ -618,9 +825,14 @@ async fn run_chat<C: Completer>(
     }
     match prompt {
         Some(prompt) => {
-            println!("{}", session.turn_async(&prompt).await?);
+            let answer = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(Interrupted.into()),
+                result = session.turn_async(&prompt) => result?,
+            };
+            println!("{answer}");
         }
-        None => chat_repl(session).await?,
+        None => chat_repl(session, cancel).await?,
     }
     Ok(())
 }
@@ -635,6 +847,7 @@ async fn run_chat<C: Completer>(
 /// leaves input recall intact.
 async fn chat_repl<C: Completer, T: PromptTemplate>(
     mut session: ChatSession<'_, C, T>,
+    cancel: &Cancel,
 ) -> Result<()> {
     let stdin = std::io::stdin();
     let mut editor = if stdin.is_terminal() {
@@ -695,7 +908,7 @@ async fn chat_repl<C: Completer, T: PromptTemplate>(
         let mut classifier = session.classifier();
         let mut current: Option<Channel> = None;
         session
-            .turn_streaming_async(line, &mut |piece| {
+            .turn_streaming_cancellable_async(line, cancel, &mut |piece| {
                 classifier.push(piece, |ch, text| {
                     write_channel(&mut stdout, ch, text, &mut current, color)
                 });
@@ -706,6 +919,9 @@ async fn chat_repl<C: Completer, T: PromptTemplate>(
             let _ = stdout.write_all(b"\x1b[0m"); // ensure dim is cleared
         }
         println!();
+        if cancel.is_cancelled() {
+            return Err(Interrupted.into());
+        }
     }
     Ok(())
 }
@@ -750,25 +966,22 @@ fn agent_tools(root: &std::path::Path, web_origin: Option<&str>) -> Result<Tools
     Ok(tools)
 }
 
-async fn agent(args: AgentArgs) -> Result<()> {
-    let dir = ModelSource::from_args(
-        args.model,
-        args.repo,
-        args.models_dir,
-        args.offline,
-        args.gguf,
-    )?
-    .resolve_async()
-    .await?
-    .into_directory();
-
-    let root = match args.root {
-        Some(r) => r,
-        None => std::env::current_dir()?,
+async fn agent(mut args: AgentArgs) -> Result<()> {
+    // The same profile lookup, generation layering, and backend matrix as
+    // `chat` (one policy, two subcommands). PROFILE-1 layers the profile's
+    // recipe — including top_p and the reasoning budget floor — over the CLI
+    // base; the shared resolver rejects contradictory or Candle-only flags.
+    let profile = match &args.profile {
+        Some(name) => Some(ModelProfile::builtin(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown profile {name:?}; built-ins: {:?}",
+                ModelProfile::BUILTIN_NAMES
+            )
+        })?),
+        None => None,
     };
-    let tools = agent_tools(&root, args.web_origin.as_deref())?;
 
-    let opts = GenOpts {
+    let base = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::from_temperature(args.temperature, args.seed),
         prefill_chunk: args.prefill_chunk,
@@ -777,53 +990,216 @@ async fn agent(args: AgentArgs) -> Result<()> {
         // punctuation, but the tolerant tool-call parser recovers those.
         ..Default::default()
     };
+    let opts = match &profile {
+        Some(p) => p.apply_gen_overrides(base),
+        None => base,
+    };
+    let current_date = Local::now().format("%Y-%m-%d").to_string();
+    let cancel = Cancel::new();
 
-    let dev = device(args.cpu)?;
-    let mut engine = run_blocking(|| Engine::load(&dir, dev))?;
-    eprintln!(
-        "loaded {} [{}]; tools rooted at {}",
-        dir.display(),
-        engine.backend(),
-        root.display()
-    );
+    // Resolve the backend before any field moves out of `args` (the resolver
+    // borrows the whole struct).
+    let config = agent_backend_config(&args, profile.as_ref())?;
 
+    let root = match args.root.take() {
+        Some(r) => r,
+        None => std::env::current_dir()?,
+    };
+    let tools = agent_tools(&root, args.web_origin.as_deref())?;
     let system = args
         .system
+        .take()
         .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM.to_string());
 
-    // Infer the format from the model unless overridden (FMT-1/FMT-2), then
-    // pick the codec/template pair. Chat-only formats can't enter the tool loop
-    // (CAPS-1): the match's fallthrough rejects them.
-    let (format, mismatch) = resolve_format(engine.arch(), args.format);
-    if let Some(m) = mismatch {
-        eprintln!("warning: {m}");
-    }
-    match format {
-        ChatFormat::Qwen => {
-            run_agent(
-                &mut engine,
+    match config {
+        ChatBackendConfig::Attached { url, format } => {
+            let config = LlamaServerConfig::new(url)?;
+            let mut completer = LlamaServerCompleter::new(config)?;
+            let props = completer.introspect().await?;
+            eprintln!(
+                "attached llama-server [{}]; unverified: {} ({}, {} ctx, {} slot); \
+                 tools rooted at {}",
+                format.name(),
+                props.model_self_report,
+                props.build,
+                props.n_ctx,
+                props.total_slots,
+                root.display(),
+            );
+            run_agent_for_format(
+                &mut completer,
+                format,
                 &tools,
-                QwenToolCall,
-                ChatMlTemplate,
                 system,
                 args.max_steps,
                 opts,
                 &args.prompt,
                 args.verbose,
+                current_date,
+                &cancel,
+            )
+            .await
+        }
+        ChatBackendConfig::Managed {
+            format,
+            llama_server_profile,
+        } => {
+            let interrupt = ManagedInterrupt::new(cancel.clone());
+            let resolved = match &profile {
+                Some(profile) => profile.to_source(args.offline)?.resolve_async().await?,
+                None => {
+                    ModelSource::from_args(
+                        args.model,
+                        args.repo,
+                        args.models_dir,
+                        args.offline,
+                        args.gguf,
+                    )?
+                    .resolve_async()
+                    .await?
+                }
+            };
+            if cancel.is_cancelled() {
+                return Err(Interrupted.into());
+            }
+            let mut server =
+                launch_managed_server(resolved, llama_server_profile.as_ref(), format, &cancel)
+                    .await?;
+            eprintln!("tools rooted at {}", root.display());
+            let run = run_agent_for_format(
+                &mut server,
+                format,
+                &tools,
+                system,
+                args.max_steps,
+                opts,
+                &args.prompt,
+                args.verbose,
+                current_date,
+                &cancel,
+            )
+            .await;
+            let result = finish_managed_run(server, run, &cancel).await;
+            drop(interrupt);
+            result
+        }
+        ChatBackendConfig::Engine => {
+            let dir = match &profile {
+                Some(p) => p.to_engine_source(args.offline)?.resolve_async().await?,
+                None => {
+                    ModelSource::from_args(
+                        args.model,
+                        args.repo,
+                        args.models_dir,
+                        args.offline,
+                        args.gguf,
+                    )?
+                    .resolve_async()
+                    .await?
+                }
+            }
+            .into_directory();
+
+            let dev = device(args.cpu)?;
+            let mut engine = run_blocking(|| Engine::load(&dir, dev))?;
+            eprintln!(
+                "loaded {} [{}]; tools rooted at {}",
+                dir.display(),
+                engine.backend(),
+                root.display()
+            );
+
+            // Infer the format from the model unless overridden (FMT-1/FMT-2).
+            let explicit = args
+                .format
+                .or_else(|| profile.as_ref().and_then(ModelProfile::format));
+            let (format, mismatch) = resolve_format(engine.arch(), explicit);
+            if let Some(m) = mismatch {
+                eprintln!("warning: {m}");
+            }
+            if format == ChatFormat::MuseGlimmer {
+                bail!(
+                    "Muse Glimmer does not run on the Candle engine; \
+                     use --profile muse-glimmer (managed llama-server)"
+                );
+            }
+            run_agent_for_format(
+                &mut engine,
+                format,
+                &tools,
+                system,
+                args.max_steps,
+                opts,
+                &args.prompt,
+                args.verbose,
+                current_date,
+                &cancel,
+            )
+            .await
+        }
+    }
+}
+
+/// Dispatch the agent run by format: each arm pairs the format's codec with
+/// its runtime-dated template (CAPS-1 — chat-only formats cannot enter the
+/// tool loop; the fallthrough rejects them).
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_for_format<C: Completer>(
+    completer: &mut C,
+    format: ChatFormat,
+    tools: &Tools,
+    system: String,
+    max_steps: usize,
+    opts: GenOpts,
+    prompt: &str,
+    verbose: bool,
+    current_date: String,
+    cancel: &Cancel,
+) -> Result<()> {
+    let template = format.template_with_date(Some(current_date));
+    match format {
+        ChatFormat::Qwen => {
+            run_agent(
+                completer,
+                tools,
+                QwenToolCall,
+                template,
+                system,
+                max_steps,
+                opts,
+                prompt,
+                verbose,
+                cancel,
             )
             .await
         }
         ChatFormat::Plain => {
             run_agent(
-                &mut engine,
-                &tools,
+                completer,
+                tools,
                 JsonToolCall,
-                PlainTemplate,
+                template,
                 system,
-                args.max_steps,
+                max_steps,
                 opts,
-                &args.prompt,
-                args.verbose,
+                prompt,
+                verbose,
+                cancel,
+            )
+            .await
+        }
+        ChatFormat::MuseGlimmer => {
+            run_agent(
+                completer,
+                tools,
+                yatima_lib::MuseAtemCodec,
+                template,
+                system,
+                max_steps,
+                opts,
+                prompt,
+                verbose,
+                cancel,
             )
             .await
         }
@@ -832,6 +1208,96 @@ async fn agent(args: AgentArgs) -> Result<()> {
              or --format qwen for the agent"
         ),
     }
+}
+
+/// Terminal-only projection of the agent event stream. stderr carries live
+/// working state; stdout remains available for the final answer (CLI-4).
+struct AgentDisplay<W> {
+    out: W,
+    enabled: bool,
+    color: bool,
+    current_channel: Option<Channel>,
+    needs_newline: bool,
+    current_tool: Option<String>,
+    streamed_answer: bool,
+}
+
+impl<W: Write> AgentDisplay<W> {
+    fn new(out: W, enabled: bool, color: bool) -> Self {
+        Self {
+            out,
+            enabled,
+            color,
+            current_channel: None,
+            needs_newline: false,
+            current_tool: None,
+            streamed_answer: false,
+        }
+    }
+
+    fn observe(&mut self, event: AgentEvent) {
+        if !self.enabled {
+            return;
+        }
+        match event {
+            AgentEvent::Fragment { channel, text } => {
+                if channel == Channel::Answer && !text.is_empty() {
+                    self.streamed_answer = true;
+                }
+                write_channel(
+                    &mut self.out,
+                    channel,
+                    &text,
+                    &mut self.current_channel,
+                    self.color,
+                );
+                if !text.is_empty() {
+                    self.needs_newline = !text.ends_with('\n');
+                }
+            }
+            AgentEvent::ToolCall(call) => {
+                self.end_fragments();
+                let _ = writeln!(self.out, "[tool: {}]", call.name);
+                self.current_tool = Some(call.name);
+            }
+            AgentEvent::ToolProgress(message) => {
+                self.end_fragments();
+                let name = self.current_tool.as_deref().unwrap_or("tool");
+                let _ = writeln!(self.out, "[{name}: {message}]");
+            }
+            AgentEvent::ToolOutcome(outcome) => {
+                self.end_fragments();
+                let name = self.current_tool.take().unwrap_or_else(|| "tool".into());
+                let _ = writeln!(self.out, "[{name}: {}]", outcome.kind());
+            }
+            AgentEvent::ToolArtifact(path) => {
+                self.end_fragments();
+                let _ = writeln!(self.out, "[artifact: {}]", path.display());
+            }
+            AgentEvent::Reasoning(_) | AgentEvent::Final(_) => self.end_fragments(),
+            AgentEvent::ToolStarted(_) => {}
+        }
+    }
+
+    fn end_fragments(&mut self) {
+        if self.color && self.current_channel.is_some() {
+            let _ = self.out.write_all(b"\x1b[0m");
+        }
+        if self.needs_newline {
+            let _ = writeln!(self.out);
+        }
+        self.current_channel = None;
+        self.needs_newline = false;
+    }
+
+    fn finish(&mut self) {
+        self.end_fragments();
+        let _ = self.out.flush();
+    }
+}
+
+fn print_final_answer(stdout_is_terminal: bool, streamed_answer: bool) -> bool {
+    !(stdout_is_terminal && streamed_answer)
 }
 
 /// Build an agent for a given codec/template pair, run it, and print the answer
@@ -848,16 +1314,31 @@ async fn run_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     opts: GenOpts,
     prompt: &str,
     verbose: bool,
+    cancel: &Cancel,
 ) -> Result<()> {
     let mut agent = Agent::new(engine, tools, codec, template, system, max_steps).with_opts(opts);
-    let run = agent.run_async(prompt).await?;
+    let stderr = std::io::stderr();
+    let live = stderr.is_terminal();
+    let display = AgentDisplay::new(stderr, live, live);
+    let (mut display, run) = agent
+        .run_with_cancellable_async(prompt, cancel, display, |mut display, event| {
+            display.observe(event);
+            Ok(std::ops::ControlFlow::Continue(display))
+        })
+        .await?;
+    display.finish();
+    if cancel.is_cancelled() {
+        return Err(Interrupted.into());
+    }
 
     if verbose {
         for turn in &run.transcript {
             eprintln!("── {:?} ──\n{turn}\n", turn.role());
         }
     }
-    println!("{}", run.answer);
+    if print_final_answer(std::io::stdout().is_terminal(), display.streamed_answer) {
+        println!("{}", run.answer);
+    }
     eprintln!("[{} steps, {:?}]", run.steps, run.stop);
     Ok(())
 }
@@ -1311,6 +1792,216 @@ mod tests {
     fn agent_requires_a_prompt() {
         // clap rejects a missing required --prompt before any work happens.
         assert!(Cli::try_parse_from(["yatima", "agent", "--repo", "org/name"]).is_err());
+    }
+
+    fn agent_args(argv: &[&str]) -> AgentArgs {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Command::Agent(args) = cli.command else {
+            panic!("expected the agent subcommand");
+        };
+        args
+    }
+
+    #[test]
+    fn agent_muse_profile_selects_managed_llama_server() {
+        // The agent resolves backends through the same core as chat: the Muse
+        // profile structurally selects managed llama-server, format pinned.
+        let args = agent_args(&[
+            "yatima",
+            "agent",
+            "--profile",
+            "muse-glimmer",
+            "--prompt",
+            "hi",
+        ]);
+        assert_eq!(args.profile.as_deref(), Some("muse-glimmer"));
+        let profile = ModelProfile::builtin("muse-glimmer").unwrap();
+        assert!(matches!(
+            agent_backend_config(&args, Some(&profile)).unwrap(),
+            ChatBackendConfig::Managed {
+                format: ChatFormat::MuseGlimmer,
+                llama_server_profile: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn agent_parses_an_attached_llama_server() {
+        let args = agent_args(&[
+            "yatima",
+            "agent",
+            "--backend",
+            "llama-server",
+            "--server-url",
+            "http://127.0.0.1:8080",
+            "--format",
+            "muse-glimmer",
+            "--prompt",
+            "hi",
+        ]);
+        assert_eq!(
+            agent_backend_config(&args, None).unwrap(),
+            ChatBackendConfig::Attached {
+                url: "http://127.0.0.1:8080".into(),
+                format: ChatFormat::MuseGlimmer,
+            }
+        );
+    }
+
+    /// Resolve either subcommand's argv through its shared-core wrapper.
+    fn resolve_backend_for(
+        argv: &[&str],
+        profile: Option<&ModelProfile>,
+    ) -> Result<ChatBackendConfig> {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Chat(args) => chat_backend_config(&args, profile),
+            Command::Agent(args) => agent_backend_config(&args, profile),
+            _ => panic!("expected the chat or agent subcommand"),
+        }
+    }
+
+    fn resolve_backend(argv: &[&str]) -> Result<ChatBackendConfig> {
+        resolve_backend_for(argv, None)
+    }
+
+    #[test]
+    fn every_profile_rejects_model_source_overrides() {
+        // upholds: PROFILE-2 — a profile's pinned source is authoritative in
+        // both subcommands and on every backend; a model-source flag beside a
+        // profile is a rejected contradiction, not silently ignored.
+        let ordinary = ModelProfile::builtin("kimi-dev").unwrap();
+        assert!(matches!(ordinary.backend, ProfileBackend::Engine));
+        for subcommand in ["chat", "agent"] {
+            for override_args in [
+                &["--model", "/tmp/model"][..],
+                &["--repo", "someone/else"][..],
+                &["--gguf", "another.gguf"][..],
+                &["--models-dir", "/tmp/models"][..],
+            ] {
+                let mut argv = vec!["yatima", subcommand, "--profile", "kimi-dev"];
+                argv.extend_from_slice(override_args);
+                if subcommand == "agent" {
+                    argv.extend_from_slice(&["--prompt", "hi"]);
+                }
+                let error = resolve_backend_for(&argv, Some(&ordinary))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("rejects model-source overrides"),
+                    "{subcommand} {override_args:?}: {error}"
+                );
+                assert!(
+                    error.contains(override_args[0]),
+                    "{subcommand} {override_args:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn candle_only_flags_are_rejected_by_every_llama_server_mode() {
+        // The full matrix: {chat, agent} × {attached, managed} × {--cpu,
+        // --prefill-chunk}. One shared resolver rejects them all by name.
+        let attached = &[
+            "--backend",
+            "llama-server",
+            "--server-url",
+            "http://127.0.0.1:8080",
+            "--format",
+            "qwen",
+        ][..];
+        let managed = &[
+            "--backend",
+            "llama-server",
+            "--repo",
+            "org/name",
+            "--format",
+            "qwen",
+        ][..];
+        for subcommand in ["chat", "agent"] {
+            for mode in [attached, managed] {
+                for flag in [&["--cpu"][..], &["--prefill-chunk", "64"][..]] {
+                    let mut argv = vec!["yatima", subcommand];
+                    argv.extend_from_slice(mode);
+                    argv.extend_from_slice(flag);
+                    if subcommand == "agent" {
+                        argv.extend_from_slice(&["--prompt", "hi"]);
+                    }
+                    let error = resolve_backend(&argv).unwrap_err().to_string();
+                    assert!(
+                        error.contains("Candle-only"),
+                        "{subcommand} {flag:?}: {error}"
+                    );
+                    assert!(error.contains(flag[0]), "{subcommand} {flag:?}: {error}");
+                }
+            }
+        }
+        // Positive control: the engine backend keeps its own flags.
+        assert_eq!(
+            resolve_backend(&["yatima", "chat", "--repo", "org/name", "--cpu"]).unwrap(),
+            ChatBackendConfig::Engine
+        );
+        assert_eq!(
+            resolve_backend(&[
+                "yatima",
+                "agent",
+                "--repo",
+                "org/name",
+                "--prompt",
+                "hi",
+                "--cpu",
+                "--prefill-chunk",
+                "64",
+            ])
+            .unwrap(),
+            ChatBackendConfig::Engine
+        );
+    }
+
+    #[test]
+    fn cli_agent_display_projects_live_events_without_protocol_markup() {
+        // upholds: CLI-4 / AGENT-4 — classified working state goes to the
+        // terminal projection incrementally; the typed tool event, not ATEM or
+        // marker text, supplies tool status.
+        let mut bytes = Vec::new();
+        let streamed_answer;
+        {
+            let mut display = AgentDisplay::new(&mut bytes, true, false);
+            display.observe(AgentEvent::Fragment {
+                channel: Channel::Reasoning,
+                text: "Thinking".into(),
+            });
+            display.observe(AgentEvent::Reasoning("Thinking".into()));
+            display.observe(AgentEvent::ToolCall(yatima_lib::ToolCall {
+                name: "read_file".into(),
+                args: Default::default(),
+            }));
+            display.observe(AgentEvent::ToolOutcome(yatima_lib::ToolOutcome::success(
+                "contents",
+            )));
+            display.observe(AgentEvent::Fragment {
+                channel: Channel::Answer,
+                text: "Done.".into(),
+            });
+            display.observe(AgentEvent::Final("Done.".into()));
+            display.finish();
+            streamed_answer = display.streamed_answer;
+        }
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "Thinking\n[tool: read_file]\n[read_file: success]\nDone.\n"
+        );
+        assert!(streamed_answer);
+    }
+
+    #[test]
+    fn final_answer_is_not_duplicated_on_a_terminal() {
+        // upholds: CLI-4 — stdout remains populated for a pipeline, while an
+        // interactive terminal does not repeat an answer already shown live.
+        assert!(!print_final_answer(true, true));
+        assert!(print_final_answer(true, false));
+        assert!(print_final_answer(false, true));
+        assert!(print_final_answer(false, false));
     }
 
     #[test]
