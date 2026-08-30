@@ -52,11 +52,14 @@
 //!   [`StreamLease`] whose `Drop` restores it, so a WebSocket upgrade that
 //!   fails after the stream is claimed, or a session that panics, cannot
 //!   strand it — which would leave nothing to preempt and force every later
-//!   connection to the 409 fallback. And a session is always able to end:
+//!   connection to the 409 fallback. The closing edge observes that return
+//!   before `serve_until` completes; Axum's server future alone is not that
+//!   ownership proof. And a session is always able to end:
 //!   the outbound send is capped ([`SEND_STALL_CAP`]) and the peer is pinged
 //!   on an idle timer ([`KEEPALIVE_INTERVAL`]) so a half-open client that
 //!   stopped answering — even while the host is idle and no send is
 //!   attempted — is reaped rather than holding the one stream forever.
+//!   Cited by `close_signal_recovers_the_lease_and_drains_under_the_bound`.
 //!
 //! Mid-decode cancellation rides the out-of-band gate, not the request
 //! queue: a wire [`HostRequest::Cancel`] maps to [`CancelGate::cancel`],
@@ -134,6 +137,8 @@ pub struct Bridge {
     req_tx: Sender<HostRequest>,
     cancel: CancelGate,
     event_rx: Mutex<Option<EventStream>>,
+    /// Wakes the closing edge once a live session has returned its stream.
+    stream_returned: tokio::sync::Notify,
     /// The takeover signal (SRV-3): a new connection bumps it; the live
     /// session watches it and yields the stream. A counter, not a flag, so
     /// every bump is an edge no matter when the session subscribed.
@@ -163,6 +168,7 @@ impl Bridge {
                 rx: client.event_rx,
                 pending: None,
             })),
+            stream_returned: tokio::sync::Notify::new(),
             preempt: tokio::sync::watch::channel(0).0,
             closing: tokio::sync::watch::channel(false).0,
             send_stall_cap,
@@ -201,6 +207,19 @@ impl Bridge {
     /// cap plus slack.
     fn takeover_deadline(&self) -> Duration {
         self.send_stall_cap + TAKEOVER_SLACK
+    }
+
+    /// Wait until no WebSocket session holds the event stream. `notify_one`
+    /// stores a permit when the return lands before the await, so the check
+    /// and wait cannot lose that edge.
+    async fn wait_for_stream(&self) {
+        loop {
+            let returned = self.stream_returned.notified();
+            if self.event_rx.lock().expect("event stream lock").is_some() {
+                return;
+            }
+            returned.await;
+        }
     }
 
     /// The serve router: the WebSocket route plus, when a client bundle
@@ -253,6 +272,7 @@ impl Drop for StreamLease {
     fn drop(&mut self) {
         if let Some(stream) = self.stream.take() {
             *self.bridge.event_rx.lock().expect("event stream lock") = Some(stream);
+            self.bridge.stream_returned.notify_one();
             tracing::info!("client session ended; event stream returned");
         }
     }
@@ -530,24 +550,48 @@ pub async fn serve_until(
         let _ = closed_tx.send(());
     };
     let server = std::future::IntoFuture::into_future(
-        axum::serve(listener, bridge.router(static_dir)).with_graceful_shutdown(graceful),
+        axum::serve(listener, Arc::clone(&bridge).router(static_dir))
+            .with_graceful_shutdown(graceful),
     );
     tokio::pin!(server);
-    tokio::select! {
+    let (served, deadline) = tokio::select! {
         // A spontaneous server error (or a drain completing before we even
-        // observe the signal) — the caller still closes the bridge and
-        // consumes the owner behind us.
-        result = &mut server => result.map_err(|e| anyhow::anyhow!("serve: {e}")),
+        // observe the signal) starts the same bounded closing edge here.
+        result = &mut server => {
+            bridge.close();
+            (
+                result.map_err(|e| anyhow::anyhow!("serve: {e}")),
+                tokio::time::Instant::now() + drain_bound,
+            )
+        }
         _ = closed_rx => {
             // The signal fired: the remaining drain gets the bound, started
             // now — not at serve start, so a long-lived healthy server is
             // never killed by its own drain arithmetic.
-            match tokio::time::timeout(drain_bound, server).await {
+            let deadline = tokio::time::Instant::now() + drain_bound;
+            let served = match tokio::time::timeout_at(deadline, server).await {
                 Ok(result) => result.map_err(|e| anyhow::anyhow!("serve: {e}")),
                 Err(_) => Err(anyhow::anyhow!(
                     "server drain exceeded {drain_bound:?} after the close signal"
                 )),
-            }
+            };
+            (served, deadline)
+        }
+    };
+
+    // Axum's server future may finish before an upgraded WebSocket task has
+    // dropped its lease. Returning here would let the caller shut down the
+    // backend while a detached session still held the event stream. Observe
+    // the ownership fact explicitly, under the same closing deadline.
+    let returned = tokio::time::timeout_at(deadline, bridge.wait_for_stream())
+        .await
+        .map_err(|_| anyhow::anyhow!("event stream lease did not return during server drain"));
+    match (served, returned) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(served), Ok(())) => Err(served),
+        (Ok(()), Err(returned)) => Err(returned),
+        (Err(served), Err(returned)) => {
+            Err(served.context(format!("stream recovery also failed: {returned:#}")))
         }
     }
 }
