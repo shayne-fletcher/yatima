@@ -70,12 +70,6 @@ struct Args {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
-    /// Enable the decorative animations — the splash draw-on and the living
-    /// avatar (aurora shimmer, blinking, the always-on repaint they need).
-    /// Off by default: they were built to prove egui's capabilities and are
-    /// delightful in a demo, distracting in a workday. Togglable in /stats.
-    #[arg(long)]
-    whimsy: bool,
 }
 
 fn resolve(args: &Args) -> Result<HostConfig> {
@@ -171,13 +165,20 @@ enum Turn {
         answer: String,
         /// The chain-of-thought (and tool notes) streaming in alongside it.
         reasoning: String,
+        /// Artifacts received mid-turn (decoded images, and their decode
+        /// errors): the turn owns them so they land AFTER the entry that
+        /// cites them, never above its reasoning fold. Lifecycle: flushed
+        /// into the transcript by settle (after the entry) and by the
+        /// Error/Fatal disarms; a Ctrl+L clear discards the whole live
+        /// mirror, buffered artifacts included, deliberately.
+        artifacts: Vec<Msg>,
     },
 }
 
 /// Where the backend is in its lifecycle — one sum, so the view cannot be
 /// loading and ready (or ready and failed) at once, and `Ready(ModelInfo)`
 /// is the single source for label, capabilities, stats, context limit, and
-/// verified identity. Drives the status line, splash, and input gating.
+/// verified identity. Drives the status line and input gating.
 enum Backend {
     /// Pre-`Ready`: the host's current startup phase (`None` until the
     /// first `Startup` event) and when loading began on egui's clock.
@@ -217,7 +218,7 @@ impl Backend {
     }
 }
 
-/// The splash caption / status vocabulary for a loading backend: exactly
+/// The status vocabulary for a loading backend: exactly
 /// the host-reported phase, no invented progress.
 fn phase_caption(phase: Option<StartupPhase>) -> &'static str {
     match phase {
@@ -232,7 +233,7 @@ fn phase_caption(phase: Option<StartupPhase>) -> &'static str {
 /// event-driven repaints: only `Loading` asks for one (a second — matching
 /// `fmt_clock`'s resolution — so the startup elapsed display ticks through
 /// silent phases like digest verification). Ready and Failed request
-/// nothing: their motion stays event-driven or whimsy-gated.
+/// nothing: their motion stays event-driven.
 fn loading_repaint_after(backend: &Backend) -> Option<std::time::Duration> {
     match backend {
         Backend::Loading { .. } => Some(std::time::Duration::from_secs(1)),
@@ -266,18 +267,12 @@ struct GuiApp {
     /// A handle to the egui context, for uploading image artifacts as textures
     /// off the render path (in `drain_events`).
     ctx: egui::Context,
-    /// When the splash animation began (engine time), so the sigil draws on
-    /// once. Reset to `None` on submit so it replays on a return to the splash.
-    splash_anim_start: Option<f32>,
-    /// Set by a clear (Ctrl+L / `/cls`): the splash is a welcome, shown before
-    /// the first exchange only — a cleared pane stays empty.
-    splash_retired: bool,
     /// Whether the `/stats` panel (state + controls) is open.
     show_stats: bool,
     input: String,
     transcript: Vec<Msg>,
     /// The turn in flight with its streaming buffers — drives the gate, the
-    /// stop path, the avatar, and the live render (via `in_flight`).
+    /// stop path, and the live render (via `in_flight`).
     turn: Turn,
     /// Whether to surface reasoning. Off by default — the answer is what matters;
     /// the chain-of-thought is opt-in via `/stats`.
@@ -285,14 +280,11 @@ struct GuiApp {
     /// The backend lifecycle sum: loading (with the host's reported phase),
     /// ready (the one `ModelInfo` source), or failed.
     backend: Backend,
-    /// Opacity applied to image artifacts and the logo splash (live slider).
+    /// Opacity applied to image artifacts (live slider).
     opacity: f32,
     /// Set when the model becomes ready, so the next frame hands focus to the
     /// input — the box activates the moment loading finishes.
     focus_input: bool,
-    /// Engine time until which the avatar registers surprise (e.g. an artifact
-    /// just popped in). `0.0` = not surprised.
-    surprise_until: f32,
     /// `/help` overlay: whether it's showing, and when its drop began.
     help_open: bool,
     help_start: f32,
@@ -300,16 +292,8 @@ struct GuiApp {
     /// token, and the count of streamed tokens (reasoning + answer).
     turn_start: Option<f32>,
     gen_tokens: usize,
-    /// Context tokens used (last rendered prompt), for the meter / ticker.
+    /// Context tokens used (last rendered prompt), for the /stats meter.
     context_used: Option<usize>,
-    /// Whether the idle status ticker scrolls (off by default — keeps the bar
-    /// calm; opt in via `/stats`).
-    show_ticker: bool,
-    /// Engine time a `/do-a-barrel-roll` began (the avatar spins once). Secret.
-    roll_start: Option<f32>,
-    /// When `strawberry fields` mode began (reality dissolves into drifting
-    /// particles), or `None` when off. Esc recovers reality. Secret.
-    strawberry_start: Option<f32>,
     /// Parse/image cache for the markdown viewer (egui_commonmark).
     md_cache: egui_commonmark::CommonMarkCache,
     /// Artifacts received this session, by wire name (`img-<hash>.png`),
@@ -326,11 +310,6 @@ struct GuiApp {
     /// The unfinished input stashed when navigation began; Down past the
     /// newest entry restores it.
     draft: String,
-    /// Decorative motion — splash draw-on, avatar life, the continuous
-    /// repaint they need. Off by default (`--whimsy` / a `/stats` toggle):
-    /// built to prove egui, kept for demos, silenced for work. The avatar
-    /// itself stays as a static status glyph; its expressions are state.
-    whimsy: bool,
 }
 
 /// Put Source Code Pro at the head of both font families, keeping egui's
@@ -362,7 +341,7 @@ impl GuiApp {
     /// Build the app over the movable client planes. The backend thread's
     /// one `HostOwner` lives in `main`, never here (HOST-3): every ordinary
     /// window return reaches its awaited, joined shutdown.
-    fn new(cc: &eframe::CreationContext<'_>, client: HostClient, whimsy: bool) -> GuiApp {
+    fn new(cc: &eframe::CreationContext<'_>, client: HostClient) -> GuiApp {
         let ctx = cc.egui_ctx.clone();
         install_fonts(&ctx);
         // The host's event channel is a tokio receiver with no egui handle; a
@@ -390,8 +369,6 @@ impl GuiApp {
             cancel: client.cancel,
             next_turn_id: 0,
             ctx,
-            splash_anim_start: None,
-            splash_retired: false,
             show_stats: false,
             input: String::new(),
             transcript: Vec::new(),
@@ -403,167 +380,22 @@ impl GuiApp {
             },
             opacity: 0.85,
             focus_input: false,
-            surprise_until: 0.0,
             help_open: false,
             help_start: 0.0,
             turn_start: None,
             gen_tokens: 0,
             context_used: None,
-            show_ticker: false,
-            roll_start: None,
-            strawberry_start: None,
             md_cache: egui_commonmark::CommonMarkCache::default(),
             artifact_paths: std::collections::HashMap::new(),
             prompt_history: Vec::new(),
             history_nav: None,
             draft: String::new(),
-            whimsy,
         }
     }
 
     /// The tint applied to images at the current opacity.
     fn image_tint(&self) -> egui::Color32 {
         egui::Color32::from_white_alpha((self.opacity.clamp(0.0, 1.0) * 255.0).round() as u8)
-    }
-
-    /// The welcome splash shown while the transcript is empty: the sigil drawn
-    /// on stroke by stroke as built-in vector graphics (no raster), shimmering
-    /// through the aurora palette, then the wordmark and a status caption. After
-    /// it plays and holds, the whole mark *recedes* — shrinking and docking to
-    /// the top-left, ceding the stage to the prompt. A failed load shows the
-    /// same mark, static, dim, and centered (status bar has the why).
-    fn show_splash(&mut self, ui: &mut egui::Ui) {
-        let t = ui.input(|i| i.time) as f32;
-        let start = *self.splash_anim_start.get_or_insert(t);
-        let failed = matches!(self.backend, Backend::Failed(_));
-
-        // The sigil shimmers through the aurora ramp; a failed load is dim and
-        // fully drawn (no animation, no shimmer, no recede). Without whimsy
-        // the mark is static too — fully drawn at a fixed aurora phase; the
-        // draw-on/recede choreography is opt-in (`--whimsy`).
-        let (color, animate) = if failed {
-            (egui::Color32::from_gray(90), false)
-        } else if !self.whimsy {
-            let a = aurora_at(0.0);
-            (egui::Color32::from_rgb(a.r(), a.g(), a.b()), false)
-        } else {
-            let a = aurora_at(t * 0.35);
-            (egui::Color32::from_rgb(a.r(), a.g(), a.b()), true)
-        };
-        let elapsed = if animate { t - start } else { 99.0 };
-        let recede = if animate {
-            smoothstep(time_ease(elapsed, 4.5, 6.2))
-        } else {
-            0.0
-        };
-
-        let panel = ui.max_rect();
-        let painter = ui.painter().clone();
-        let lerp = |a: f32, b: f32, s: f32| a + (b - a) * s;
-
-        // Size the big (centered) mark so the whole composition fits the panel
-        // with a margin. Below the center it overhangs by ~1.513 r + 32 (the
-        // wordmark at 0.27 r cap height, then the caption); above, by r. Width
-        // needs ~2.05 r (the sigil diameter, a touch wider than the wordmark).
-        let margin = 16.0;
-        let r_by_w = (panel.width() - 2.0 * margin) / 2.05;
-        let r_by_h = (panel.height() - 32.0 - 2.0 * margin) / 2.513;
-        let big_r = r_by_w.min(r_by_h).clamp(1.0, 160.0);
-        let small_r = big_r * 0.30;
-        let r = lerp(big_r, small_r, recede);
-        let stroke_w = (r * 0.015).max(1.0);
-
-        // Big: vertically centered (offset for the below-center overhang). Small:
-        // docked to the top-left corner.
-        let big_c = egui::pos2(
-            panel.center().x,
-            panel.center().y - (0.513 * big_r + 32.0) / 2.0,
-        );
-        let small_c = egui::pos2(panel.left() + 18.0 + small_r, panel.top() + 18.0 + small_r);
-        let center = egui::pos2(
-            lerp(big_c.x, small_c.x, recede),
-            lerp(big_c.y, small_c.y, recede),
-        );
-        draw_sigil(&painter, center, r, elapsed, color, stroke_w);
-
-        // Wordmark below the mark, scaled with it: centered when large, then
-        // left-aligned under the mark as it recedes.
-        let cap_h = r * 0.27;
-        let wm_y = center.y + r + cap_h * 0.9;
-        let wm_x = lerp(panel.center().x, center.x - r, recede);
-        let align = lerp(0.5, 0.0, recede);
-        draw_wordmark(
-            &painter,
-            egui::pos2(wm_x, wm_y),
-            cap_h,
-            color,
-            stroke_w * 0.9,
-            elapsed,
-            align,
-        );
-
-        // Status caption, centered under the wordmark; it fades as we recede.
-        let cap_fade = 1.0 - recede;
-        let caption = match &self.backend {
-            Backend::Loading { phase, .. } => phase_caption(*phase),
-            Backend::Failed(_) => "",
-            Backend::Ready(_) => "ready",
-        };
-        if !caption.is_empty() && cap_fade > 0.01 {
-            painter.text(
-                egui::pos2(panel.center().x, wm_y + cap_h + 16.0),
-                egui::Align2::CENTER_TOP,
-                caption,
-                egui::FontId::proportional(14.0),
-                with_alpha(color, (170.0 * cap_fade) as u8),
-            );
-        }
-
-        // System-status rail: once the mark has receded to the corner, the freed
-        // space to its right reports what's running. Fades in with the recede.
-        if recede > 0.01 {
-            if let Some(info) = self.backend.ready() {
-                let x = small_c.x + small_r + 28.0;
-                let mut y = panel.top() + 20.0;
-                let val = with_alpha(color, (recede * 230.0) as u8);
-                let key = with_alpha(color, (recede * 110.0) as u8);
-                let font = egui::FontId::monospace(12.0);
-                let mut rows: Vec<(&str, String)> = vec![
-                    ("model", info.label.clone()),
-                    ("arch", info.arch.clone()),
-                    ("device", info.device.clone()),
-                    ("format", info.format.clone()),
-                    ("sampling", info.sampling.clone()),
-                    ("max tokens", info.max_tokens.to_string()),
-                ];
-                // Verified identity earns a row; Unverified claims nothing
-                // (LSRV-5's display projection).
-                if let Some(identity) = compact_identity(&info.identity) {
-                    rows.push(("identity", identity));
-                }
-                for (k, v) in rows {
-                    painter.text(
-                        egui::pos2(x, y),
-                        egui::Align2::LEFT_TOP,
-                        k,
-                        font.clone(),
-                        key,
-                    );
-                    painter.text(
-                        egui::pos2(x + 92.0, y),
-                        egui::Align2::LEFT_TOP,
-                        v,
-                        font.clone(),
-                        val,
-                    );
-                    y += 18.0;
-                }
-            }
-        }
-
-        if animate {
-            ui.ctx().request_repaint(); // drive the draw-on, recede, and shimmer
-        }
     }
 
     /// The `/help` overlay: a dimmed scrim over which the help lines drop in
@@ -577,12 +409,17 @@ impl GuiApp {
         ));
         p.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
 
-        let acc = aurora_at(now * 0.35);
-        let color = egui::Color32::from_rgb(acc.r(), acc.g(), acc.b());
         let font = egui::FontId::monospace(14.0);
         let line_h = 22.0;
 
         let lines: Vec<&str> = HELP_TEXT.lines().collect();
+        // The drop finishes 0.6s after the last line starts; the dismiss hint
+        // fades for 0.4s more. Past `anim_end` the overlay is a still image:
+        // the accent freezes there and no further frames are requested.
+        let settled = self.help_start + lines.len() as f32 * 0.10 + 0.6;
+        let anim_end = settled + 0.4;
+        let acc = aurora_at(now.min(anim_end) * 0.35);
+        let color = egui::Color32::from_rgb(acc.r(), acc.g(), acc.b());
         let block_h = lines.len() as f32 * line_h;
         let rest_top = screen.bottom() - 96.0 - block_h;
         let x = screen.center().x - 235.0;
@@ -606,7 +443,6 @@ impl GuiApp {
         }
 
         // A dismiss hint, faded in once the stack has landed.
-        let settled = self.help_start + lines.len() as f32 * 0.10 + 0.6;
         let hint = ((now - settled) / 0.4).clamp(0.0, 1.0);
         if hint > 0.0 {
             p.text(
@@ -621,91 +457,41 @@ impl GuiApp {
         if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.any_click()) {
             self.help_open = false;
         }
-        ui.ctx().request_repaint();
-    }
-
-    /// 🍓 Strawberry fields: reality dissolves into a drift of twinkling
-    /// particles. Esc recovers reality. A foreground overlay; the UI is still
-    /// there, just behind the haze.
-    fn draw_strawberry(&mut self, ui: &mut egui::Ui, now: f32) {
-        let Some(start) = self.strawberry_start else {
-            return;
-        };
-        let screen = ui.ctx().content_rect();
-        let p = ui.ctx().layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("strawberry"),
-        ));
-        // Dissolve in over ~1.2s: the haze deepens and the particles bloom.
-        let dissolve = smoothstep(time_ease(now, start, start + 1.2));
-        p.rect_filled(
-            screen,
-            0.0,
-            egui::Color32::from_black_alpha((dissolve * 225.0) as u8),
-        );
-
-        let count = 170;
-        for i in 0..count {
-            let fi = i as f32;
-            let ph = hash01(fi * 3.1) * std::f32::consts::TAU;
-            let spd = 0.15 + hash01(fi * 0.7) * 0.5;
-            let bx = hash01(fi * 1.3);
-            let by = hash01(fi * 2.7 + 1.1);
-            let x = (bx + 0.07 * (now * spd + ph).sin()).rem_euclid(1.0);
-            // a slow upward drift, wrapping — the field is forever
-            let y = (by - now * 0.02 * spd + 0.05 * (now * spd * 1.3 + ph).cos()).rem_euclid(1.0);
-            let pos = egui::pos2(
-                screen.left() + x * screen.width(),
-                screen.top() + y * screen.height(),
-            );
-            let r = (1.5 + hash01(fi * 5.0) * 3.5) * dissolve;
-            let twinkle = 0.45 + 0.55 * (now * 1.3 + ph).sin();
-            let col = aurora_at(now * 0.25 + fi * 0.11);
-            p.circle_filled(pos, r, with_alpha(col, (dissolve * twinkle * 210.0) as u8));
+        if now < anim_end {
+            ui.ctx().request_repaint();
         }
-
-        // A faint way back, once the haze has settled.
-        let hint = smoothstep(time_ease(now, start + 1.4, start + 2.2));
-        if hint > 0.0 {
-            p.text(
-                egui::pos2(screen.center().x, screen.bottom() - 40.0),
-                egui::Align2::CENTER_BOTTOM,
-                "esc to return",
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_white_alpha((hint * 110.0) as u8),
-            );
-        }
-
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.strawberry_start = None; // …living is easy with eyes closed
-        }
-        ui.ctx().request_repaint();
     }
 
     fn in_flight(&self) -> bool {
         matches!(self.turn, Turn::Live { .. })
     }
 
-    /// Settle the streaming turn: commit its answer (display-polished) if it
-    /// carried text, then disarm — the one `Live → Idle` edge, shared by a
-    /// clean `Done` and by `cancel_turn`. Committed text is display-polished:
-    /// local image links drop (the artifact is already inline as a texture)
-    /// and inline LaTeX prettifies. The host's session is truth; this is the
-    /// UI mirror.
+    /// Settle the streaming turn: commit an entry when either answer or
+    /// reasoning survived, place its artifacts after it, then disarm — the one
+    /// `Live → Idle` edge shared by a clean `Done` and `cancel_turn`. Committed
+    /// text is display-polished: local image links drop (the artifact is already
+    /// inline as a texture) and inline LaTeX prettifies. The host's session is
+    /// truth; this is the UI mirror.
     fn settle(&mut self) {
         if let Turn::Live {
-            answer, reasoning, ..
+            answer,
+            reasoning,
+            artifacts,
+            ..
         } = std::mem::take(&mut self.turn)
         {
-            let reasoning = reasoning.trim();
-            // Plain scripts: egui's fonts lack the Unicode super/subscript
-            // blocks (e⁻ˣ would be tofu).
-            let answer = prettify_math_plain_scripts(&tame_markdown_images(&answer));
-            if !answer.trim().is_empty() {
-                let reasoning =
-                    (!reasoning.is_empty()).then(|| prettify_math_plain_scripts(reasoning));
-                self.transcript.push(Msg::Assistant { answer, reasoning });
-            }
+            self.transcript
+                .extend(settled_msgs(&answer, &reasoning, artifacts));
+        }
+    }
+
+    /// Flush a live turn's artifacts without committing its text — the
+    /// error/fatal disarms: the partial prose is discarded as before, but
+    /// the artifacts were real fetches and always land.
+    fn flush_turn_artifacts(&mut self) {
+        if let Turn::Live { artifacts, .. } = &mut self.turn {
+            let artifacts = std::mem::take(artifacts);
+            self.transcript.extend(artifacts);
         }
     }
 
@@ -723,39 +509,17 @@ impl GuiApp {
         }
     }
 
-    /// The idle ticker content: uptime and context usage.
-    fn ticker_text(&self, now: f32) -> String {
-        let mut parts = vec![format!("uptime {}", fmt_uptime(now))];
-        let cap = self.backend.ready().and_then(|i| i.context_length);
-        match (self.context_used, cap) {
-            (Some(u), Some(c)) => {
-                parts.push(format!(
-                    "context {}/{} ({}%)",
-                    k(u),
-                    k(c),
-                    u * 100 / c.max(1)
-                ));
-            }
-            (None, Some(c)) => parts.push(format!("context –/{}", k(c))),
-            (Some(u), None) => parts.push(format!("context {}", k(u))),
-            _ => {}
-        }
-        parts.join("      ·      ")
-    }
-
-    /// Clear the screen (Ctrl+L / `/cls`): drop the transcript and any in-flight
-    /// stream, and dismiss the help. The session/model stays, and the pane goes
-    /// *empty* — the splash is a welcome, not a screensaver; it never returns
-    /// after the session has begun.
+    /// Clear the screen (Ctrl+L / `/cls`): drop the transcript — buffered
+    /// live-turn freight included, deliberately — and any in-flight stream,
+    /// and dismiss the help. The session/model stays; the pane goes empty.
     fn clear(&mut self) {
         self.transcript.clear();
         self.turn = Turn::Idle;
         self.help_open = false;
-        self.splash_retired = true;
     }
 
-    /// Fold host events into the UI mirror. `now` is the engine clock, used to
-    /// stamp transient reactions (e.g. the avatar's surprise).
+    /// Fold host events into the UI mirror. `now` is the egui clock used to
+    /// start the live turn's elapsed-time and token-rate display.
     fn drain_events(&mut self, now: f32) {
         while let Ok(ev) = self.ev_rx.try_recv() {
             match ev {
@@ -767,9 +531,11 @@ impl GuiApp {
                         self.focus_input = true; // activate the input on transition
                     }
                     if matches!(&ev, HostEvent::Fatal(_)) {
-                        // The turn disarms whole. (The old three-field shape
+                        // The turn disarms whole (the old three-field shape
                         // cleared the buffers here but left the in-flight id
-                        // set — drift the sum type cannot express.)
+                        // set — drift the sum type cannot express), and its
+                        // artifacts land first: fetches survive the loss.
+                        self.flush_turn_artifacts();
                         self.turn = Turn::Idle;
                     }
                     self.backend.fold(&ev);
@@ -845,22 +611,28 @@ impl GuiApp {
                     } else {
                         decode_texture(&self.ctx, &bytes)
                     };
-                    match decoded {
-                        Ok(tex) => {
-                            self.transcript.push(Msg::Image(tex));
-                            self.surprise_until = now + 1.4; // an artifact! oh!
-                        }
-                        Err(e) => self
-                            .transcript
-                            .push(Msg::Error(format!("image decode: {e}"))),
+                    let msg = match decoded {
+                        Ok(tex) => Msg::Image(tex),
+                        Err(e) => Msg::Error(format!("image decode: {e}")),
+                    };
+                    // Mid-turn artifacts ride the turn and land after the
+                    // entry that cites them (see Turn::Live::artifacts); an
+                    // artifact outside any turn still posts directly.
+                    match &mut self.turn {
+                        Turn::Live { artifacts, .. } => artifacts.push(msg),
+                        Turn::Idle => self.transcript.push(msg),
                     }
                 }
-                // Only commit a reply if the answer carried text (a fully-
-                // retracted turn streams none) — `settle`, the one
-                // `Live → Idle` edge. A Done after a local stop lands on an
-                // idle mirror and is a no-op.
+                // Commit any surviving answer or reasoning, followed by the
+                // turn's artifacts — `settle`, the one `Live → Idle` edge. A
+                // Done after a local stop lands on an idle mirror and is a
+                // no-op.
                 HostEvent::Done { .. } => self.settle(),
                 HostEvent::Error { message, .. } => {
+                    // The partial prose is discarded as before, but the
+                    // turn's artifacts were real fetches: they land, then
+                    // the error explains the ending.
+                    self.flush_turn_artifacts();
                     self.turn = Turn::Idle;
                     self.transcript.push(Msg::Error(message));
                 }
@@ -873,6 +645,11 @@ impl GuiApp {
     /// is already in flight (single-in-flight, as in the TUI).
     fn submit(&mut self, now: f32) {
         let prompt = self.input.trim().to_string();
+        match submit_action(&prompt, self.backend.ready().is_some(), self.in_flight()) {
+            // The line stays in the box: nothing typed is lost to a gate.
+            SubmitAction::Refused => return,
+            SubmitAction::Command | SubmitAction::Prompt => {}
+        }
         self.help_open = false; // any submit dismisses the help overlay
         if !prompt.is_empty() && self.prompt_history.last() != Some(&prompt) {
             self.prompt_history.push(prompt.clone());
@@ -896,16 +673,6 @@ impl GuiApp {
         }
         if prompt == "/cls" {
             self.clear();
-            self.input.clear();
-            return;
-        }
-        if prompt == "/do-a-barrel-roll" {
-            self.roll_start = Some(now); // 🦊
-            self.input.clear();
-            return;
-        }
-        if prompt == "/strawberry-fields" {
-            self.strawberry_start = Some(now); // 🍓 let me take you down…
             self.input.clear();
             return;
         }
@@ -953,9 +720,7 @@ impl GuiApp {
             self.input.clear();
             return;
         }
-        if prompt.is_empty() || self.in_flight() || self.backend.ready().is_none() {
-            return;
-        }
+
         // Auto-grant: a URL in the *user's own message* is authorization for
         // its origin (CAP-3) — granted before the turn runs, so the model can
         // act on it immediately. URLs from any other source never pass here.
@@ -971,13 +736,13 @@ impl GuiApp {
             id: turn_id,
             answer: String::new(),
             reasoning: String::new(),
+            artifacts: Vec::new(),
         };
         let _ = self.req_tx.send(HostRequest::Submit {
             turn_id,
             text: prompt,
         });
         self.input.clear();
-        self.splash_anim_start = None; // replay the draw-on if we return to it
     }
 }
 
@@ -1008,39 +773,6 @@ impl eframe::App for GuiApp {
         }
 
         egui::Panel::top("status").show(ui, |ui| {
-            let t = ui.input(|i| i.time) as f32;
-            // Without whimsy the avatar freezes into a status glyph: fixed
-            // aurora phase, no blink/warp, and — the part that matters for a
-            // workday — no always-on repaint below.
-            let t_anim = if self.whimsy { t } else { 0.0 };
-            let acc = aurora_at(t_anim * 0.35);
-            let face_col = egui::Color32::from_rgb(acc.r(), acc.g(), acc.b());
-            // yatima's mood follows her state: surprised when an artifact just
-            // landed, asleep while loading, sad on failure; mid-turn she thinks
-            // hard while reasoning and talks once the answer flows; else calm.
-            let answering = matches!(&self.turn, Turn::Live { answer, .. } if !answer.is_empty());
-            let expr = if t < self.surprise_until {
-                Face::Surprised
-            } else if matches!(self.backend, Backend::Loading { .. }) {
-                Face::Sleeping
-            } else if matches!(self.backend, Backend::Failed(_)) {
-                Face::Sad
-            } else if self.in_flight() {
-                if answering {
-                    Face::Talking
-                } else {
-                    // A brief thinking-hard burst at the start of reasoning, then
-                    // settle to calm — the strain shouldn't hold for a long span.
-                    let bursting = self.turn_start.is_none_or(|s| now - s < 1.3);
-                    if bursting {
-                        Face::Thinking
-                    } else {
-                        Face::Idle
-                    }
-                }
-            } else {
-                Face::Idle
-            };
             // Identity at rest; a live readout during a turn — phase + elapsed
             // while thinking, then tokens + tok/s + elapsed once answering.
             let (text, color) = match &self.backend {
@@ -1083,76 +815,18 @@ impl eframe::App for GuiApp {
                 }
             };
             ui.horizontal(|ui| {
-                let (frect, _) =
-                    ui.allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::hover());
-                // Barrel roll: one full turn over ~0.8s when triggered, then
-                // cleared — a lingering Some would pin the repaint gate on.
-                let roll = match self.roll_start {
-                    Some(s) => {
-                        let p = (now - s) / 0.8;
-                        if p < 1.0 {
-                            p * std::f32::consts::TAU
-                        } else {
-                            self.roll_start = None;
-                            0.0
-                        }
-                    }
-                    None => 0.0,
-                };
-                let (warp_x, warp_y) = if self.whimsy {
-                    (warp_at(t, 14.0), warp_at(t + 9.0, 19.0))
-                } else {
-                    (0.0, 0.0)
-                };
-                draw_face(
-                    &ui.painter_at(frect),
-                    frect,
-                    expr,
-                    t_anim,
-                    face_col,
-                    warp_x, // horizontal-axis teleport
-                    warp_y, // vertical-axis teleport (offset cadence)
-                    roll,
-                );
                 ui.colored_label(color, text);
-                // An idle, opt-in status ticker scrolls in the space between the
-                // identity and /stats — uptime and context usage, drifting by.
-                let idle = self.backend.ready().is_some() && !self.in_flight();
-                if self.show_ticker && idle {
-                    let avail = ui.available_width() - 56.0; // leave room for /stats
-                    if avail > 70.0 {
-                        let (trect, _) = ui.allocate_exact_size(
-                            egui::vec2(avail, ui.available_height()),
-                            egui::Sense::hover(),
-                        );
-                        let content = self.ticker_text(t);
-                        // Whimsy tints the ticker with the live aurora; the
-                        // frozen phase-0 aurora at this alpha is pale mint —
-                        // invisible on a light theme — so plain weak text
-                        // ink otherwise.
-                        let ink = if self.whimsy {
-                            with_alpha(face_col, 90)
-                        } else {
-                            ui.visuals().weak_text_color()
-                        };
-                        draw_ticker(&ui.painter_at(trect), trect, &content, t, ink);
-                    }
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("/stats");
+                    if ui.small_button("/stats").clicked() {
+                        self.show_stats = !self.show_stats;
+                    }
                 });
             });
-            // Whimsy keeps the avatar breathing/blinking (a continuous
-            // repaint); a triggered barrel roll or live ticker also needs
-            // frames. Otherwise repaints come only from real events.
-            let idle = self.backend.ready().is_some() && !self.in_flight();
-            if self.whimsy || self.roll_start.is_some() || (self.show_ticker && idle) {
-                ui.ctx().request_repaint();
-            }
         });
 
-        // `/stats` (alias `/control`): a right rail of state + controls, usable
-        // during a chat (the splash has its own receding rail).
+        // `/stats` (alias `/control`): a right rail of state + controls,
+        // usable during a chat — and mid-turn, via the always-active rail
+        // button or the command (app-plane, not a turn).
         if self.show_stats {
             egui::Panel::right("stats").show(ui, |ui| {
                 ui.add_space(8.0);
@@ -1205,8 +879,6 @@ impl eframe::App for GuiApp {
                 ui.label(egui::RichText::new("controls").strong());
                 ui.add_space(4.0);
                 ui.checkbox(&mut self.show_reasoning, "show reasoning");
-                ui.checkbox(&mut self.show_ticker, "status ticker");
-                ui.checkbox(&mut self.whimsy, "whimsy (splash + avatar life)");
                 ui.add(
                     egui::Slider::new(&mut self.opacity, 0.0..=1.0)
                         .text("image opacity")
@@ -1217,7 +889,6 @@ impl eframe::App for GuiApp {
 
         egui::Panel::bottom("input").show(ui, |ui| {
             ui.add_space(4.0);
-            let ready = self.backend.ready().is_some() && !self.in_flight();
             ui.horizontal(|ui| {
                 let send = if self.in_flight() {
                     if ui.button("stop").clicked() {
@@ -1225,10 +896,13 @@ impl eframe::App for GuiApp {
                     }
                     false
                 } else {
-                    ui.add_enabled(ready, egui::Button::new("send")).clicked()
+                    ui.button("send").clicked()
                 };
-                let edit = ui.add_enabled(
-                    ready,
+                // Always enabled: app-plane commands run mid-turn and
+                // mid-load; `submit_action` refuses a model prompt that the
+                // single-in-flight or readiness gate forbids, leaving the
+                // typed line in place.
+                let edit = ui.add(
                     egui::TextEdit::singleline(&mut self.input)
                         .hint_text("message — /help for commands")
                         .desired_width(f32::INFINITY),
@@ -1314,7 +988,10 @@ impl eframe::App for GuiApp {
                 if send || entered {
                     self.submit(now);
                     edit.request_focus();
-                } else if ready && (self.focus_input || nothing_focused) {
+                } else if self.backend.ready().is_some()
+                    && !self.in_flight()
+                    && (self.focus_input || nothing_focused)
+                {
                     edit.request_focus();
                     if self.focus_input {
                         // Place the cursor at the end so the field is genuinely in
@@ -1334,12 +1011,6 @@ impl eframe::App for GuiApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Empty transcript (loading / pre-first-message): an animated
-            // splash — unless a clear retired it (a cleared pane stays empty).
-            if self.transcript.is_empty() && !self.in_flight() && !self.splash_retired {
-                self.show_splash(ui);
-                return;
-            }
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
@@ -1378,9 +1049,6 @@ impl eframe::App for GuiApp {
 
         if self.help_open {
             self.draw_help(ui, now);
-        }
-        if self.strawberry_start.is_some() {
-            self.draw_strawberry(ui, now);
         }
 
         // Keep redrawing while a turn streams (the runner also pokes us per
@@ -1509,24 +1177,6 @@ fn fmt_clock(secs: f32) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-/// Format uptime as `H:MM:SS` (dropping the hours when zero).
-fn fmt_uptime(secs: f32) -> String {
-    let s = secs.max(0.0) as u32;
-    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{sec:02}")
-    } else {
-        format!("{m}:{sec:02}")
-    }
-}
-
-/// A cheap deterministic hash to `[0,1)` — pseudo-random scatter without an RNG
-/// (used to place the strawberry-fields particles).
-fn hash01(n: f32) -> f32 {
-    let x = (n * 127.1).sin() * 43758.547;
-    x - x.floor()
-}
-
 /// Compact token count: `2.1k`, `32.0k`, or the bare number under 1000.
 fn k(n: usize) -> String {
     if n >= 1000 {
@@ -1534,24 +1184,6 @@ fn k(n: usize) -> String {
     } else {
         n.to_string()
     }
-}
-
-/// A scrolling marquee within `rect` (already clipped): the text drifts left and
-/// loops seamlessly. Drives the idle status ticker.
-fn draw_ticker(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    text: &str,
-    t: f32,
-    color: egui::Color32,
-) {
-    let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), color);
-    let tw = galley.size().x.max(1.0);
-    let period = tw + 90.0; // text plus a gap before it repeats
-    let off = (t * 32.0).rem_euclid(period);
-    let y = rect.center().y - galley.size().y / 2.0;
-    painter.galley(egui::pos2(rect.left() - off, y), galley.clone(), color);
-    painter.galley(egui::pos2(rect.left() - off + period, y), galley, color);
 }
 
 /// `color` with its alpha replaced (it keeps the RGB, takes a new opacity).
@@ -1575,397 +1207,6 @@ fn ease_out_bounce(x: f32) -> f32 {
     } else {
         let x = x - 2.625 / d1;
         n1 * x * x + 0.984375
-    }
-}
-
-/// Hermite smoothstep on a clamped `[0,1]` input — eases the draw-on so strokes
-/// arrive and depart gently rather than linearly.
-fn smoothstep(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
-}
-
-/// Map an `elapsed` time to `[0,1]` over the window `[t0, t1]` — the raw phase
-/// of one animation step before easing.
-fn time_ease(elapsed: f32, t0: f32, t1: f32) -> f32 {
-    ((elapsed - t0) / (t1 - t0)).clamp(0.0, 1.0)
-}
-
-/// The shortest angular distance between two angles (degrees).
-fn ang_dist(a: f32, b: f32) -> f32 {
-    (((a - b) + 540.0) % 360.0 - 180.0).abs()
-}
-
-/// Draw a circular arc (degrees in egui's y-down frame: 0=right, 90=bottom,
-/// 270=top) from `a0` to `a1`, revealed up to fraction `reveal` of its length,
-/// leaving any angular `gaps` (center, half-width in degrees) unstroked. The
-/// building block of the broken ring.
-#[allow(clippy::too_many_arguments)]
-fn draw_arc(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    r: f32,
-    a0: f32,
-    a1: f32,
-    reveal: f32,
-    gaps: &[(f32, f32)],
-    stroke: egui::Stroke,
-) {
-    let segments = 180;
-    let (a0, a1) = (a0.to_radians(), a1.to_radians());
-    let mut prev: Option<egui::Pos2> = None;
-    for i in 0..=segments {
-        let f = i as f32 / segments as f32;
-        if f > reveal {
-            break;
-        }
-        let ang = a0 + (a1 - a0) * f;
-        let deg = ang.to_degrees().rem_euclid(360.0);
-        if gaps.iter().any(|(c, half)| ang_dist(deg, *c) < *half) {
-            prev = None;
-            continue;
-        }
-        let pt = center + egui::vec2(ang.cos(), ang.sin()) * r;
-        if let Some(pp) = prev {
-            painter.line_segment([pp, pt], stroke);
-        }
-        prev = Some(pt);
-    }
-}
-
-/// Draw the yatima sigil — the tree rune inside its broken ring — as vector
-/// geometry with egui's painter, revealed stroke by stroke over `elapsed`
-/// seconds: ring sweeps in, the stem descends (broken by a vertical ellipsis),
-/// the branches fork, the nodes pop. `center`/`r` place and size the ring (in
-/// pixels); coordinates are normalized to the ring radius. This is built-in
-/// graphics — drawn live on the GPU, not a raster — so it can animate and
-/// shimmer with the aurora `color`.
-fn draw_sigil(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    r: f32,
-    elapsed: f32,
-    color: egui::Color32,
-    stroke_w: f32,
-) {
-    let stroke = egui::Stroke::new(stroke_w, color);
-    let p = |nx: f32, ny: f32| center + egui::vec2(nx, ny) * r;
-
-    // Broken ring: two arcs — a long one (lower-right around the bottom and
-    // left up to the crown, with a dash-dot break in the lower left) and a short
-    // one down the upper right — leaving the signature gaps at the crown and at
-    // ~4 o'clock. Drawn progressively along each arc.
-    let ring_t = smoothstep(time_ease(elapsed, 0.0, 0.9));
-    draw_arc(
-        painter,
-        center,
-        r,
-        50.0,
-        262.0,
-        ring_t,
-        &[(152.0, 7.0)],
-        stroke,
-    );
-    draw_arc(painter, center, r, -80.0, 10.0, ring_t, &[], stroke);
-    // The lone dot sitting inside the lower-left break.
-    let break_dot = smoothstep(time_ease(elapsed, 0.5, 0.9));
-    if break_dot > 0.0 {
-        let a = 152f32.to_radians();
-        painter.circle_filled(
-            center + egui::vec2(a.cos(), a.sin()) * r,
-            stroke_w * break_dot,
-            color,
-        );
-    }
-
-    // Central stem, drawn crown -> root, but BROKEN in the upper section by a
-    // vertical ellipsis: the three dots sit on the line itself, replacing a
-    // segment, rather than floating beside it.
-    let crown = p(0.0, -1.0);
-    let root = p(0.0, 1.0);
-    let gap_top = -0.57; // stem stops here above the dots
-    let gap_bot = -0.27; // stem resumes here below the dots
-
-    let upper_t = smoothstep(time_ease(elapsed, 0.6, 0.9));
-    let top_b = p(0.0, gap_top);
-    painter.line_segment([crown, crown + (top_b - crown) * upper_t], stroke);
-
-    let dot_ys = [-0.50f32, -0.42, -0.34];
-    for (k, dy) in dot_ys.iter().enumerate() {
-        let t0 = 0.9 + k as f32 * 0.12;
-        let dot_t = smoothstep(time_ease(elapsed, t0, t0 + 0.3));
-        if dot_t > 0.0 {
-            painter.circle_filled(p(0.0, *dy), stroke_w * 1.1 * dot_t, color);
-        }
-    }
-
-    let lower_t = smoothstep(time_ease(elapsed, 0.95, 1.6));
-    let bot_a = p(0.0, gap_bot);
-    painter.line_segment([bot_a, bot_a + (root - bot_a) * lower_t], stroke);
-
-    // The two branches fork upward and outward.
-    let branch_t = smoothstep(time_ease(elapsed, 1.1, 1.7));
-    let fork = p(0.0, 0.08);
-    let left = p(-0.46, -0.30);
-    let right = p(0.46, -0.30);
-    painter.line_segment([fork, fork + (left - fork) * branch_t], stroke);
-    painter.line_segment([fork, fork + (right - fork) * branch_t], stroke);
-
-    // Open-circle nodes pop in after the line each terminates.
-    let node_r = r * 0.05;
-    let nodes = [(crown, 0.7f32), (root, 1.3), (left, 1.5), (right, 1.5)];
-    for (pos, t0) in nodes {
-        let node_t = smoothstep(time_ease(elapsed, t0, t0 + 0.35));
-        if node_t > 0.0 {
-            painter.circle_stroke(pos, node_r * node_t, stroke);
-        }
-    }
-}
-
-/// Draw the "YATIMA" wordmark as vector strokes in the thin geometric face of
-/// the logo — chevron `A`s, a pointed `M`, no serifs — squat and widely tracked.
-/// `anchor.y` is the vertical center; `align` places it horizontally (0.5 =
-/// centered on `anchor.x`, 0.0 = left edge at `anchor.x`). Letter geometry is
-/// normalized to cap height (y down, 0 = top); letters fade in left to right.
-#[allow(clippy::too_many_arguments)]
-fn draw_wordmark(
-    painter: &egui::Painter,
-    anchor: egui::Pos2,
-    cap_h: f32,
-    color: egui::Color32,
-    stroke_w: f32,
-    elapsed: f32,
-    align: f32,
-) {
-    // (advance width, polylines) per glyph, widths and points in cap heights.
-    type Glyph = (f32, &'static [&'static [(f32, f32)]]);
-    let letters: [Glyph; 6] = [
-        // Y
-        (
-            0.62,
-            &[
-                &[(0.0, 0.0), (0.31, 0.5)],
-                &[(0.62, 0.0), (0.31, 0.5)],
-                &[(0.31, 0.5), (0.31, 1.0)],
-            ],
-        ),
-        // A — a clean chevron, no crossbar
-        (0.62, &[&[(0.0, 1.0), (0.31, 0.0), (0.62, 1.0)]]),
-        // T
-        (
-            0.58,
-            &[&[(0.0, 0.0), (0.58, 0.0)], &[(0.29, 0.0), (0.29, 1.0)]],
-        ),
-        // I
-        (0.10, &[&[(0.05, 0.0), (0.05, 1.0)]]),
-        // M — pointed top corners, a V dipping to mid height
-        (
-            0.74,
-            &[&[
-                (0.0, 1.0),
-                (0.0, 0.0),
-                (0.37, 0.62),
-                (0.74, 0.0),
-                (0.74, 1.0),
-            ]],
-        ),
-        // A
-        (0.62, &[&[(0.0, 1.0), (0.31, 0.0), (0.62, 1.0)]]),
-    ];
-    let track = 0.62; // inter-letter gap, in cap heights (spaced out)
-    let xw = 1.22; // horizontal widen, so the squat letters don't read cramped
-
-    let total: f32 =
-        letters.iter().map(|(w, _)| w * xw).sum::<f32>() + track * (letters.len() - 1) as f32;
-    let mut x = anchor.x - total * cap_h * align;
-    let top = anchor.y - cap_h / 2.0;
-
-    for (i, (w, polylines)) in letters.iter().enumerate() {
-        let appear = smoothstep(time_ease(
-            elapsed,
-            2.0 + i as f32 * 0.1,
-            2.45 + i as f32 * 0.1,
-        ));
-        if appear > 0.0 {
-            let stroke = egui::Stroke::new(stroke_w, with_alpha(color, (appear * 235.0) as u8));
-            for poly in *polylines {
-                for seg in poly.windows(2) {
-                    let a = egui::pos2(x + seg[0].0 * cap_h * xw, top + seg[0].1 * cap_h);
-                    let b = egui::pos2(x + seg[1].0 * cap_h * xw, top + seg[1].1 * cap_h);
-                    painter.line_segment([a, b], stroke);
-                }
-            }
-        }
-        x += (w * xw + track) * cap_h;
-    }
-}
-
-/// yatima's moods — a tiny, coarse set for v1. Refined (thinking vs explaining)
-/// once the reasoning channel lands.
-#[derive(Clone, Copy)]
-enum Face {
-    Sleeping,
-    Idle,
-    Thinking,
-    Talking,
-    Sad,
-    Surprised,
-}
-
-/// yatima's avatar — a rounded screen-head with glowing eyes (and a mouth) that
-/// shape-shift to express state. Minimal and cute: the emotion is all in the
-/// eyes and mouth. The gaze wanders, and she periodically *warps* on each axis:
-/// `warp` is a horizontal scale (collapse to a vertical sliver) and `warp_y` a
-/// vertical one (collapse to a horizontal sliver) — the teleport flourishes.
-/// Geometry is center-relative so both scales apply uniformly. Built-in vectors.
-#[allow(clippy::too_many_arguments)]
-fn draw_face(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    expr: Face,
-    t: f32,
-    color: egui::Color32,
-    warp: f32,
-    warp_y: f32,
-    roll: f32,
-) {
-    let line = (rect.width() * 0.055).max(1.0);
-    let stroke = egui::Stroke::new(line, color);
-    let full = rect.shrink(rect.width() * 0.08);
-    let cx = full.center().x;
-    let cy = full.center().y;
-    let (sx, sy) = (warp, warp_y);
-    let h2 = full.height();
-    let (rs, rc) = (roll.sin(), roll.cos());
-    let rolling = roll.abs() > 1e-4;
-
-    // Center-relative point: scale by (sx, sy) then rotate by `roll` about the
-    // center. So the teleports collapse the face and a barrel roll spins it.
-    let pt = |dx: f32, dy: f32| {
-        let (px, py) = (dx * sx, dy * sy);
-        egui::pos2(cx + px * rc - py * rs, cy + px * rs + py * rc)
-    };
-
-    // Head: a rounded screen at rest; a crisp rotated square while rolling.
-    if rolling {
-        let (hw, hh) = (full.width() * 0.5, full.height() * 0.5);
-        let c = [pt(-hw, -hh), pt(hw, -hh), pt(hw, hh), pt(-hw, hh)];
-        for i in 0..4 {
-            painter.line_segment([c[i], c[(i + 1) % 4]], stroke);
-        }
-    } else {
-        let head = egui::Rect::from_center_size(
-            full.center(),
-            egui::vec2(full.width() * sx, full.height() * sy),
-        );
-        painter.rect_stroke(head, full.width() * 0.30, stroke, egui::StrokeKind::Inside);
-    }
-
-    let pill = |dx: f32, dy: f32, w: f32, h: f32| {
-        if rolling {
-            let (hw, hh) = (w * 0.5, h * 0.5);
-            let pts = vec![
-                pt(dx - hw, dy - hh),
-                pt(dx + hw, dy - hh),
-                pt(dx + hw, dy + hh),
-                pt(dx - hw, dy + hh),
-            ];
-            painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-        } else {
-            let r = egui::Rect::from_center_size(
-                pt(dx, dy),
-                egui::vec2((w * sx).max(line * 0.5), (h * sy).max(line * 0.5)),
-            );
-            painter.rect_filled(r, (w * sx) * 0.5, color);
-        }
-    };
-    // `dip > 0` smiles (corners up), `dip < 0` frowns.
-    let mouth = |dy: f32, width: f32, dip: f32| {
-        let n = 10;
-        let mut prev: Option<egui::Pos2> = None;
-        for i in 0..=n {
-            let f = i as f32 / n as f32;
-            let u = 2.0 * f - 1.0;
-            let p = pt(-width / 2.0 + width * f, dy + dip * (1.0 - u * u));
-            if let Some(pp) = prev {
-                painter.line_segment([pp, p], stroke);
-            }
-            prev = Some(p);
-        }
-    };
-
-    let ex = full.width() * 0.22; // eye x offset
-    let ew = full.width() * 0.15; // eye width
-
-    let bp = t.rem_euclid(3.0);
-    let blink = if bp < 0.14 {
-        ((bp / 0.14) - 0.5).abs() * 2.0
-    } else {
-        1.0
-    };
-
-    // Wandering gaze (left/right + up/down) — lively idle, subtle talking.
-    let gaze = match expr {
-        Face::Idle => 1.0,
-        Face::Talking => 0.35,
-        _ => 0.0,
-    };
-    let lx = (t * 0.7).sin() * (t * 0.31).cos() * ew * 0.5 * gaze;
-    let ly = (t * 0.5).cos() * (t * 0.23).sin() * h2 * 0.07 * gaze;
-
-    match expr {
-        Face::Sleeping => {
-            pill(-ex, 0.0, ew * 1.3, line);
-            pill(ex, 0.0, ew * 1.3, line);
-        }
-        Face::Idle => {
-            let h = ew * 1.5 * blink;
-            pill(-ex + lx, -h2 * 0.04 + ly, ew, h);
-            pill(ex + lx, -h2 * 0.04 + ly, ew, h);
-            mouth(h2 * 0.20, ew * 2.0, h2 * 0.05);
-        }
-        Face::Thinking => {
-            // A soft, cute ponder: round eyes glancing up and slowly to the
-            // side, with a tiny neutral mouth. No strain.
-            let glance = (t * 1.1).sin() * ew * 0.35;
-            let edy = -h2 * 0.10; // looking up
-            let h = ew * 1.4 * blink;
-            pill(-ex + glance, edy, ew, h);
-            pill(ex + glance, edy, ew, h);
-            pill(0.0, h2 * 0.20, ew * 0.5, line); // tiny mouth dot
-        }
-        Face::Talking => {
-            let pulse = 1.0 + 0.10 * (t * 6.0).sin();
-            let h = ew * 1.5 * pulse * blink;
-            pill(-ex + lx, -h2 * 0.05 + ly, ew, h);
-            pill(ex + lx, -h2 * 0.05 + ly, ew, h);
-            let open = (h2 * 0.10 * (0.5 + 0.5 * (t * 9.0).sin())).max(line);
-            pill(0.0, h2 * 0.20, ew * 1.5, open); // animated talking mouth
-        }
-        Face::Sad => {
-            pill(-ex, h2 * 0.02, ew, ew * 1.2);
-            pill(ex, h2 * 0.02, ew, ew * 1.2);
-            mouth(h2 * 0.26, ew * 1.9, -h2 * 0.05);
-        }
-        Face::Surprised => {
-            // Wide round eyes raised high, and a small "o" of a mouth.
-            pill(-ex, -h2 * 0.08, ew * 1.35, ew * 2.1);
-            pill(ex, -h2 * 0.08, ew * 1.35, ew * 2.1);
-            painter.circle_stroke(pt(0.0, h2 * 0.22), full.width() * 0.09 * sx.min(sy), stroke);
-        }
-    }
-}
-
-/// The teleport flourish: every `period` seconds yatima warps — collapsing to a
-/// vertical sliver and snapping back over a short window. Returns a horizontal
-/// scale in `[~0.05, 1]` for [`draw_face`].
-fn warp_at(t: f32, period: f32) -> f32 {
-    let wp = t.rem_euclid(period);
-    if wp < 0.5 {
-        let v = (2.0 * (wp / 0.5) - 1.0).abs(); // 1 at the ends, 0 at the middle
-        0.05 + 0.95 * v
-    } else {
-        1.0
     }
 }
 
@@ -2010,7 +1251,7 @@ fn render_msg(
         }
         Msg::Assistant { answer, reasoning } => {
             speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
-            if show_reasoning {
+            if reveals_reasoning(show_reasoning, answer) {
                 if let Some(r) = reasoning {
                     ui.label(egui::RichText::new(r).weak().italics());
                     ui.add_space(4.0);
@@ -2040,6 +1281,64 @@ fn render_msg(
         }
     }
     ui.add_space(8.0);
+}
+
+/// What a submitted line is (pure; witnessed). App-plane commands are UI
+/// actions, not turns: they execute whenever the app runs — mid-turn and
+/// mid-load included (the single-in-flight law governs model prompts, not
+/// controls). A model prompt additionally requires a ready backend and no
+/// turn in flight. Unknown "/"-prefixed text remains a prompt, as ever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitAction {
+    Command,
+    Prompt,
+    Refused,
+}
+
+fn submit_action(input: &str, ready: bool, in_flight: bool) -> SubmitAction {
+    const COMMANDS: [&str; 8] = [
+        "/quit", "/stats", "/control", "/help", "/cls", "/about", "/reset", "/grants",
+    ];
+    let is_command =
+        COMMANDS.contains(&input) || input.starts_with("/grant ") || input.starts_with("/revoke ");
+    if is_command {
+        SubmitAction::Command
+    } else if !input.is_empty() && ready && !in_flight {
+        SubmitAction::Prompt
+    } else {
+        SubmitAction::Refused
+    }
+}
+
+/// Whether an entry's reasoning fold shows (pure; witnessed): the global
+/// toggle — or unconditionally for a no-answer entry, whose retained
+/// reasoning (and the host's warning inside it) IS the content: an entry
+/// that reads as a bare "yatima" label would repeat the vanishing this
+/// retention exists to end.
+fn reveals_reasoning(show_reasoning: bool, answer: &str) -> bool {
+    show_reasoning || answer.trim().is_empty()
+}
+
+/// The settle projection (pure; witnessed): what a finished turn commits,
+/// in order. The entry lands whenever ANY text survived — answer or
+/// reasoning — so a reasoning-only ending (NoAnswer, an exhausted tool
+/// budget: exactly the cases the host explains with warning notes that ride
+/// the reasoning fold) is evidence in the transcript, never a silent vanish.
+/// The turn's artifacts follow the entry — adjacent to the text that cites
+/// them, below it, unconditionally: a turn with pictures and no words still
+/// shows its pictures.
+fn settled_msgs(answer: &str, reasoning: &str, artifacts: Vec<Msg>) -> Vec<Msg> {
+    let mut out = Vec::new();
+    let reasoning = reasoning.trim();
+    // Plain scripts: egui's fonts lack the Unicode super/subscript
+    // blocks (e⁻ˣ would be tofu).
+    let answer = prettify_math_plain_scripts(&tame_markdown_images(answer));
+    if !answer.trim().is_empty() || !reasoning.is_empty() {
+        let reasoning = (!reasoning.is_empty()).then(|| prettify_math_plain_scripts(reasoning));
+        out.push(Msg::Assistant { answer, reasoning });
+    }
+    out.extend(artifacts);
+    out
 }
 
 /// Decode PNG bytes and upload them as an egui texture.
@@ -2082,7 +1381,6 @@ async fn main() -> Result<()> {
             .with_inner_size([580.0, 410.0]),
         ..Default::default()
     };
-    let whimsy = args.whimsy;
     // `run_native` blocks for the window's whole life and must stay on the
     // process main thread (macOS AppKit) — never `spawn_blocking`.
     // `block_in_place` tells the multi-thread runtime without moving
@@ -2091,7 +1389,7 @@ async fn main() -> Result<()> {
         eframe::run_native(
             &title,
             native,
-            Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, client, whimsy)))),
+            Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, client)))),
         )
         .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
     });
@@ -2228,7 +1526,7 @@ mod tests {
     fn only_loading_schedules_the_clock_repaint() {
         // upholds: the startup elapsed display ticks through silent backend
         // phases (a 1 s cadence, matching fmt_clock's resolution), while
-        // Ready and Failed stay on the event-driven/whimsy repaint policy.
+        // Ready and Failed stay on the event-driven repaint policy.
         let loading = Backend::Loading {
             phase: Some(StartupPhase::VerifyingModel),
             since: 0.0,
@@ -2245,6 +1543,104 @@ mod tests {
             loading_repaint_after(&Backend::Failed("gate failed".into())),
             None
         );
+    }
+
+    /// A real (headless) texture: egui's Context works without a backend,
+    /// so the artifact stand-ins in these witnesses are actual `Msg::Image`s.
+    fn test_texture() -> egui::TextureHandle {
+        let ctx = egui::Context::default();
+        ctx.load_texture(
+            "test-artifact",
+            egui::ColorImage::example(),
+            egui::TextureOptions::default(),
+        )
+    }
+
+    #[test]
+    fn settle_places_artifacts_after_the_entry_that_cites_them() {
+        // upholds: the placement fix (observed live ×3, 2026-08-30) — the
+        // committed entry first, the turn's artifacts after it, never above
+        // the reasoning fold.
+        let msgs = settled_msgs(
+            "here is the triangle:",
+            "fetch it first",
+            vec![Msg::Image(test_texture())],
+        );
+        assert_eq!(msgs.len(), 2);
+        assert!(
+            matches!(&msgs[0], Msg::Assistant { answer, .. } if answer.contains("triangle")),
+            "the entry leads"
+        );
+        assert!(matches!(&msgs[1], Msg::Image(_)), "its artifact follows");
+    }
+
+    #[test]
+    fn reasoning_only_turns_commit_instead_of_vanishing() {
+        // upholds: the empty-answer swallow fix — a NoAnswer/MaxSteps ending
+        // carries the host's explanatory warning in its reasoning fold; the
+        // entry must land as evidence, never silently vanish.
+        let msgs = settled_msgs("", "…\n⚠ tool-step budget exhausted (6)\n", Vec::new());
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(&msgs[0], Msg::Assistant { answer, reasoning: Some(r) }
+                if answer.trim().is_empty() && r.contains("budget exhausted")),
+            "the reasoning (and its warning) survives"
+        );
+    }
+
+    #[test]
+    fn commands_run_mid_turn_prompts_wait_their_turn() {
+        // upholds: the submit classification — app-plane commands execute
+        // while a turn is live or the backend still loading; model prompts
+        // require ready-and-idle; and enabling commands never admits a
+        // second model prompt.
+        assert_eq!(submit_action("/stats", true, true), SubmitAction::Command);
+        assert_eq!(submit_action("/stats", false, false), SubmitAction::Command);
+        assert_eq!(
+            submit_action("/grant https://a.example", true, true),
+            SubmitAction::Command
+        );
+        assert_eq!(
+            submit_action("summarize the page", true, true),
+            SubmitAction::Refused,
+            "a live turn admits no second prompt"
+        );
+        assert_eq!(
+            submit_action("summarize the page", false, false),
+            SubmitAction::Refused,
+            "a loading backend admits no prompt"
+        );
+        assert_eq!(
+            submit_action("summarize the page", true, false),
+            SubmitAction::Prompt
+        );
+        assert_eq!(submit_action("", true, false), SubmitAction::Refused);
+        assert_eq!(
+            submit_action("/unknown-thing", true, false),
+            SubmitAction::Prompt,
+            "unknown slash text remains a prompt, as ever"
+        );
+    }
+
+    #[test]
+    fn no_answer_entries_reveal_their_reasoning_regardless_of_the_toggle() {
+        // upholds: a retained reasoning-only ending must be VISIBLE by
+        // default, not merely stored — the toggle governs ordinary answered
+        // turns only.
+        assert!(reveals_reasoning(false, ""));
+        assert!(reveals_reasoning(false, "   "));
+        assert!(!reveals_reasoning(false, "an ordinary answer"));
+        assert!(reveals_reasoning(true, "an ordinary answer"));
+    }
+
+    #[test]
+    fn artifacts_survive_even_a_wordless_turn() {
+        // A turn with pictures and no words still shows its pictures; a turn
+        // with nothing at all still commits nothing.
+        let msgs = settled_msgs("", "", vec![Msg::Image(test_texture())]);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], Msg::Image(_)));
+        assert!(settled_msgs("", "", Vec::new()).is_empty());
     }
 
     #[test]

@@ -2,9 +2,12 @@
 //! across the TUI and GUI; they live here now, so a change is made once and
 //! every frontend (and yatima-serve) inherits it.
 
-/// Tool rounds per turn before the agent gives up (AGENT-1); mirrors the CLI's
-/// `--max-steps` default.
-pub const AGENT_MAX_STEPS: usize = 6;
+/// Tool rounds per turn before the agent gives up (AGENT-1 supplies the
+/// termination law; this is only the bound). Temporarily raised from 6 for
+/// multi-step image/research errands; revisit when search and grant
+/// ergonomics improve. The CLI's `--max-steps` remains separately
+/// configurable.
+pub const AGENT_MAX_STEPS: usize = 12;
 
 /// How long [`crate::HostOwner::shutdown`] waits for the actor's epilogue
 /// before handing the join obligation to a background reaper. Sized to the
