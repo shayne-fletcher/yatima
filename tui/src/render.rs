@@ -16,7 +16,8 @@ use syntect::parsing::SyntaxSet;
 use yatima_host::StopKind;
 use yatima_text::{prettify_math, user_label};
 
-use crate::app::{scroll_y, App, Entry};
+use crate::app::{scroll_y, App, Entry, Loading};
+use yatima_host::StartupPhase;
 
 // Aurora — northern-lights greens, teals, blues and violets shimmering to pink,
 // over the 256-color cube (not 24-bit RGB, so it renders in Apple Terminal,
@@ -133,20 +134,72 @@ fn activity_spans(
 /// Draw the whole UI for one frame.
 pub fn ui(frame: &mut Frame, app: &App) {
     // The input box grows with the prompt (Alt+Enter adds lines), capped so it
-    // never crowds out the transcript; +2 for the borders.
-    let input_rows = (app.input.lines().len().clamp(1, 8) + 2) as u16;
+    // never crowds out the transcript; +2 for the borders. While loading, the
+    // input area is a single activity line (same shell, no new vocabulary).
+    let input_rows = if app.loading.is_some() {
+        3
+    } else {
+        (app.input.lines().len().clamp(1, 8) + 2) as u16
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),             // transcript
-            Constraint::Length(input_rows), // input
+            Constraint::Length(input_rows), // input / startup activity
             Constraint::Length(1),          // status
         ])
         .split(frame.area());
 
     render_transcript(frame, chunks[0], app);
-    render_input(frame, chunks[1], app);
+    match &app.loading {
+        Some(loading) => render_startup(frame, chunks[1], app, loading),
+        None => render_input(frame, chunks[1], app),
+    }
     render_status(frame, chunks[2], app);
+}
+
+/// The pre-`Ready` activity line, in the ordinary input frame: the orbit
+/// glyph (the existing "working, not hung" vocabulary) and exactly the phase
+/// the host reported, with elapsed time on this view's clock. No progress
+/// bars, no percentages — nothing moves without host state behind it.
+fn render_startup(frame: &mut Frame, area: Rect, app: &App, loading: &Loading) {
+    let elapsed = loading.since.elapsed();
+    let spans = vec![
+        Span::styled(
+            orbit_glyph(elapsed),
+            Style::default()
+                .fg(aurora_now(elapsed))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            startup_text(loading.phase, elapsed),
+            Style::default().fg(Color::Indexed(51)), // steady aurora cyan
+        ),
+    ];
+    // The same bordered frame the input box uses; the armed-quit hint
+    // outranks the activity line here too.
+    let title: Line = if app.quit_armed {
+        Line::from(Span::styled(
+            "press ^C again to quit",
+            Style::default().fg(Color::Yellow),
+        ))
+    } else {
+        Line::from("starting up")
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+/// The text trailing the startup glyph (pure; testable): the exact host
+/// phase and elapsed `m:ss`.
+fn startup_text(phase: StartupPhase, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let name = match phase {
+        StartupPhase::ResolvingModel => "resolving model",
+        StartupPhase::VerifyingModel => "verifying model",
+        StartupPhase::StartingBackend => "starting backend",
+    };
+    format!(" {name} · {}:{:02}", secs / 60, secs % 60)
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
@@ -623,10 +676,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     // While a turn is in flight, the input box title carries the live activity
     // indicator (a breathing colored glyph + stats) — unmistakably working,
     // never apparently hung. An armed quit outranks it: the confirm hint must
-    // be seen for the second Ctrl+C/Ctrl+D to mean anything.
+    // be seen for the second Ctrl+C to mean anything.
     let title: Line = if app.quit_armed {
         Line::from(Span::styled(
-            "press ^C or ^D again to quit",
+            "press ^C again to quit",
             Style::default().fg(Color::Yellow),
         ))
     } else {
@@ -655,11 +708,25 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "^C^C quit · /reset · ^R reasoning · ^G editor · PgUp/PgDn"
     };
+    if app.loading.is_some() {
+        let status = Line::from(Span::styled(
+            format!(
+                "{}  ·  identity pending  ·  ^C^C quit",
+                app.status.model_label
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(Paragraph::new(status), area);
+        return;
+    }
     let mut parts = vec![
         app.status.model_label.clone(),
         format!("[{}]", app.status.backend),
         format!("fmt:{}", app.status.format),
     ];
+    if let Some(identity) = &app.status.identity {
+        parts.push(identity.clone());
+    }
     if let Some(ctx) = context_label(app.status.prompt_tokens, app.status.context_length) {
         parts.push(ctx);
     }
@@ -725,6 +792,24 @@ mod tests {
         // ignored while the decode winds down to the next token boundary.
         let t = activity_text(true, true, Duration::from_secs(3), 40);
         assert!(t.contains("cancelling…"), "cancel shows in the indicator");
+    }
+
+    #[test]
+    fn startup_line_names_the_exact_phase_and_elapsed() {
+        // The activity line carries only host state: the exact phase and
+        // elapsed time — no percentages, no invented progress.
+        assert_eq!(
+            startup_text(StartupPhase::ResolvingModel, Duration::from_secs(3)),
+            " resolving model · 0:03"
+        );
+        assert_eq!(
+            startup_text(StartupPhase::VerifyingModel, Duration::from_secs(27)),
+            " verifying model · 0:27"
+        );
+        assert_eq!(
+            startup_text(StartupPhase::StartingBackend, Duration::from_secs(61)),
+            " starting backend · 1:01"
+        );
     }
 
     #[test]

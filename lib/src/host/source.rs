@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -192,14 +192,57 @@ impl VerifiedModelArtifact {
     }
 }
 
+/// The marker context a cancelled verification carries: an owner that flips
+/// its monotone [`Cancel`](crate::Cancel) mid-hash gets this within one read
+/// chunk, distinguishable by downcast from a genuine hashing failure.
+#[derive(Debug)]
+pub struct VerifyCancelled;
+
+impl std::fmt::Display for VerifyCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SHA-256 verification cancelled")
+    }
+}
+
+impl std::error::Error for VerifyCancelled {}
+
 /// Hash the exact canonical GGUF selected by resolution and refine it to a
 /// verified artifact only when every byte matches `expected` (LSRV-5).
 pub async fn verify(
     artifact: GgufArtifact,
     expected: &Sha256Digest,
 ) -> Result<VerifiedModelArtifact> {
+    verify_hash(artifact, expected, None).await
+}
+
+/// [`verify`] with a cancel observed between read chunks: a 17 GB hash is a
+/// long blocking island, and an owner shutting down must not wait out the
+/// whole of it. Cancellation yields an error carrying [`VerifyCancelled`].
+pub async fn verify_cancellable(
+    artifact: GgufArtifact,
+    expected: &Sha256Digest,
+    cancel: &crate::Cancel,
+) -> Result<VerifiedModelArtifact> {
+    verify_hash(artifact, expected, Some(cancel.clone())).await
+}
+
+/// Sync shim over [`verify_cancellable`] (RT-1; the narrow lifecycle shim a
+/// plain-thread host uses).
+pub fn verify_cancellable_sync(
+    artifact: GgufArtifact,
+    expected: &Sha256Digest,
+    cancel: &crate::Cancel,
+) -> Result<VerifiedModelArtifact> {
+    crate::runtime::block_on(verify_cancellable(artifact, expected, cancel))
+}
+
+async fn verify_hash(
+    artifact: GgufArtifact,
+    expected: &Sha256Digest,
+    cancel: Option<crate::Cancel>,
+) -> Result<VerifiedModelArtifact> {
     let path = artifact.path().to_path_buf();
-    let actual = crate::run_blocking(|| sha256_file(&path))?;
+    let actual = crate::run_blocking(move || sha256_file(&path, cancel.as_ref()))?;
     if actual != *expected {
         bail!(
             "SHA-256 mismatch for {}: expected {expected}, found {actual}",
@@ -212,12 +255,39 @@ pub async fn verify(
     })
 }
 
-fn sha256_file(path: &Path) -> Result<Sha256Digest> {
+/// Sync shim over [`verify`], bridged through the one runtime (RT-1) — one of
+/// the three narrow lifecycle shims a plain-thread host uses (with
+/// [`crate::LlamaServer::spawn_sync`] and
+/// [`crate::LlamaServer::shutdown_sync`]); no general executor handle is
+/// exposed. This variant carries no cancel and hashes to completion; an
+/// owner that must answer a shutdown mid-hash uses
+/// [`verify_cancellable_sync`], whose cancel is observed between chunks.
+pub fn verify_sync(
+    artifact: GgufArtifact,
+    expected: &Sha256Digest,
+) -> Result<VerifiedModelArtifact> {
+    crate::runtime::block_on(verify(artifact, expected))
+}
+
+fn sha256_file(path: &Path, cancel: Option<&crate::Cancel>) -> Result<Sha256Digest> {
+    use std::io::Read;
     let file = File::open(path).with_context(|| format!("open {} for SHA-256", path.display()))?;
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut hasher = Sha256::new();
-    io::copy(&mut reader, &mut hasher)
-        .with_context(|| format!("read {} for SHA-256", path.display()))?;
+    let mut chunk = vec![0u8; 1024 * 1024];
+    loop {
+        if cancel.is_some_and(crate::Cancel::is_cancelled) {
+            return Err(anyhow::Error::new(VerifyCancelled)
+                .context(format!("hash {} for SHA-256", path.display())));
+        }
+        let read = reader
+            .read(&mut chunk)
+            .with_context(|| format!("read {} for SHA-256", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
     Ok(Sha256Digest(hasher.finalize().into()))
 }
 

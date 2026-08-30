@@ -32,10 +32,13 @@ swappable dependency.
   `yatima-host`). Its `PROTO-2` law: every variant round-trips losslessly, the
   enums are externally tagged and `#[non_exhaustive]`, and no variant is
   `untagged` (which would make wire evolution ambiguous).
-- **`yatima-host`** — the engine-facing host every frontend shares. A dedicated
-  **engine thread** owns the `Engine` *and* the `ChatSession`/`Agent` (the one
-  authoritative history) for its whole life (`HOST-3`) and calls the sync
-  decode shims — local decode is `!Send` on the blocking island (CMP-1/RT-2), so
+- **`yatima-host`** — the backend-facing host every frontend shares. A dedicated
+  **backend thread** owns the backend — the `!Send` Candle `Engine` or a
+  managed llama-server child — *and* the `ChatSession`/`Agent` (the one
+  authoritative history) for its whole life, ending in a single
+  backend-consuming epilogue that reaps and joins a managed child (`HOST-3`);
+  it calls the sync decode shims and the three narrow lifecycle shims —
+  local decode is `!Send` on the blocking island (CMP-1/RT-2), so
   it cannot run in a `tokio::spawn`. It serves chat-only formats as a plain
   streaming session and tool-trained formats as a sessionful agent from turn
   one, with the web toolset, the CAP-3 grant wording, the budget knobs

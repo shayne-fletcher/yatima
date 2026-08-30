@@ -76,6 +76,16 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         cpu: args.cpu,
         offline: args.offline,
     })?;
+    // 5c gives serve its graceful signal path (Ctrl-C reaching the owner's
+    // joined shutdown). Until then ordinary operator termination would never
+    // reach the shutdown call after `axum::serve` — an orphaned child — so
+    // the profile is refused here.
+    if resolved.is_managed_llama_server() {
+        anyhow::bail!(
+            "managed llama-server profiles reach serve in stage 5c; \
+             until then use yatima-tui or the CLI (--profile muse-glimmer)"
+        );
+    }
 
     let base = GenOpts {
         max_tokens: args.max_tokens,
@@ -100,8 +110,11 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
 
     eprintln!("loading model… (first run may fetch weights)");
-    let handle = spawn_nonblocking(config)?;
-    let bridge = Bridge::new(handle);
+    // The bridge gets only the movable client planes; this main retains the
+    // one owner and shuts it down (joined) when the server loop ends. The
+    // graceful-shutdown signal wiring is stage 5c.
+    let (client, owner) = spawn_nonblocking(config)?;
+    let bridge = Bridge::new(client);
 
     eprintln!(
         "serving on http://{bind}/ (ws at /ws{})",
@@ -111,6 +124,18 @@ async fn main() -> Result<()> {
             "; no client bundle"
         }
     );
-    axum::serve(listener, bridge.router(args.static_dir)).await?;
-    Ok(())
+    // The owner is consumed on every exit, including a server error: a
+    // failed serve must not skip the joined shutdown that reaps a managed
+    // child (HOST-3); both failures are reported if both occur.
+    let served = axum::serve(listener, bridge.router(args.static_dir))
+        .await
+        .map_err(anyhow::Error::from);
+    let joined = owner.shutdown().await;
+    match (served, joined) {
+        (Ok(()), joined) => joined,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(shutdown)) => {
+            Err(error.context(format!("owner shutdown also failed: {shutdown:#}")))
+        }
+    }
 }

@@ -29,10 +29,11 @@ own output — grants nothing: there is no code path from content to authority.
 `/reset` clears the conversation but keeps grants; capability is not
 conversation.
 
-The first grant switches the session from the plain chat path to the
-tool-calling agent, carrying the conversation across invisibly. On chat-only
-formats (e.g. the reasoning profiles), grants are refused with a clear
-message — tool calling needs a tool-trained format (`qwen` or `plain`).
+On a tool-capable format the sessionful agent serves from turn one; the
+web tools stay hidden while no origin is granted (CAP-3a), so a grant simply
+surfaces them mid-session — it mints authority, it is not a mode switch. On
+chat-only formats (e.g. the reasoning profiles), grants are refused with a
+clear message — tool calling needs a tool-capable format.
 
 ## What a tool turn looks like (AGENT-4)
 
@@ -78,7 +79,7 @@ when it doesn't.
 | Ctrl+R | expand/collapse completed turns' reasoning |
 | ↑ / ↓ | recall prior prompts (shell-style) |
 | PgUp / PgDn | scroll the transcript |
-| Ctrl+C / Ctrl+D | quit |
+| Ctrl+C twice | quit (Ctrl+D stays an editing key: delete-char) |
 | `/reset` | clear the conversation (grants survive) |
 | `/grant <origin>` · `/grants` · `/revoke <origin>` | manage web authority |
 

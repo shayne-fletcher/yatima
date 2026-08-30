@@ -1,7 +1,7 @@
 //! The serve bridge: yatima's event/request planes over one WebSocket.
 //!
 //! `yatima-serve` is the third frontend — except it draws nothing. It owns
-//! a [`yatima_host::HostHandle`] exactly as the GUI does, and bridges the
+//! a [`yatima_host::HostClient`] exactly as the GUI does, and bridges the
 //! two planes to a browser: every [`HostEvent`] goes out as one JSON text
 //! frame; every inbound text frame is a [`HostRequest`]. The browser client
 //! (`web/`, a wasm32 build over yatima-protocol) is a *viewer* in the same
@@ -84,7 +84,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use tokio::sync::mpsc::UnboundedReceiver;
-use yatima_host::{CancelGate, HostHandle};
+use yatima_host::{CancelGate, HostClient};
 use yatima_protocol::{HostEvent, HostRequest};
 
 /// Parse and validate a bind address under SRV-1: explicit and specific.
@@ -143,20 +143,20 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(handle: HostHandle) -> Arc<Bridge> {
-        Bridge::with_timing(handle, SEND_STALL_CAP, KEEPALIVE_INTERVAL)
+    pub fn new(client: HostClient) -> Arc<Bridge> {
+        Bridge::with_timing(client, SEND_STALL_CAP, KEEPALIVE_INTERVAL)
     }
 
     fn with_timing(
-        handle: HostHandle,
+        client: HostClient,
         send_stall_cap: Duration,
         keepalive_interval: Duration,
     ) -> Arc<Bridge> {
         Arc::new(Bridge {
-            req_tx: handle.req_tx,
-            cancel: handle.cancel,
+            req_tx: client.req_tx,
+            cancel: client.cancel,
             event_rx: Mutex::new(Some(EventStream {
-                rx: handle.event_rx,
+                rx: client.event_rx,
                 pending: None,
             })),
             preempt: tokio::sync::watch::channel(0).0,
@@ -538,7 +538,7 @@ mod tests {
         CancelGate,
     );
 
-    /// A fake host: hand-built channels shaped like a `HostHandle`.
+    /// A fake host: hand-built channels shaped like a `HostClient`.
     fn fake_host() -> FakeHost {
         fake_host_timed(SEND_STALL_CAP, KEEPALIVE_INTERVAL)
     }
@@ -550,7 +550,7 @@ mod tests {
         let (req_tx, req_rx) = std::sync::mpsc::channel();
         let cancel = CancelGate::new();
         let bridge = Bridge::with_timing(
-            HostHandle {
+            HostClient {
                 req_tx,
                 event_rx,
                 cancel: cancel.clone(),

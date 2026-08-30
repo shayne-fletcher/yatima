@@ -11,6 +11,6 @@ mod llama_server;
 mod sse;
 
 pub use llama_server::{
-    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ServerGates,
-    ServerIdentity, ServerProps,
+    ChildCleanupFailed, LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn,
+    ServerGates, ServerIdentity, ServerProps,
 };

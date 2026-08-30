@@ -384,6 +384,33 @@ async fn agent_tool_round_composes_over_the_http_completer() -> Result<()> {
 }
 
 #[tokio::test]
+async fn verify_cancellable_stops_between_chunks() {
+    // upholds: LSRV-5 — the cancellable hash: a flipped monotone cancel is
+    // observed between read chunks (here before the first), yielding the
+    // typed VerifyCancelled outcome instead of a digest; an un-flipped
+    // cancel changes nothing (the digest still refines the artifact).
+    let (_directory, gguf) = artifact("cancel-hash").await;
+    let cancel = yatima_lib::Cancel::new();
+    cancel.cancel();
+    let error = yatima_lib::verify_cancellable(gguf, &digest(STUB_BYTES), &cancel)
+        .await
+        .expect_err("a pre-flipped cancel must stop the hash");
+    assert!(
+        error
+            .downcast_ref::<yatima_lib::VerifyCancelled>()
+            .is_some(),
+        "{error:#}"
+    );
+
+    let (_directory, gguf) = artifact("cancel-hash-live").await;
+    let verified =
+        yatima_lib::verify_cancellable(gguf, &digest(STUB_BYTES), &yatima_lib::Cancel::new())
+            .await
+            .expect("an un-flipped cancel verifies normally");
+    assert_eq!(*verified.digest(), digest(STUB_BYTES));
+}
+
+#[tokio::test]
 #[ignore = "requires llama-server on PATH and the local Qwen2.5-32B Q4_K_M GGUF"]
 async fn live_managed_qwen_chat() -> Result<()> {
     // Live LSRV-1 composition proof; deliberately not part of the offline gate.

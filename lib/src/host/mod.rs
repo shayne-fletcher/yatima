@@ -15,5 +15,6 @@ mod source;
 pub use format::{caps_for, resolve_format, Caps, ChatFormat, FormatMismatch};
 pub use profile::{LlamaServerProfile, ModelProfile, ProfileBackend, REASONING_MIN_TOKENS};
 pub use source::{
-    verify, GgufArtifact, ModelSource, ResolvedModel, Sha256Digest, VerifiedModelArtifact,
+    verify, verify_cancellable, verify_cancellable_sync, verify_sync, GgufArtifact, ModelSource,
+    ResolvedModel, Sha256Digest, VerifiedModelArtifact, VerifyCancelled,
 };

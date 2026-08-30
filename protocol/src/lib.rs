@@ -133,11 +133,18 @@ pub enum ModelIdentity {
 pub struct ModelInfo {
     /// The model's display label (a profile name or the model directory).
     pub label: String,
-    /// The detected architecture, formatted (e.g. `Qwen2`).
+    /// What is loaded, formatted: a detected engine architecture (e.g.
+    /// `Qwen2`) — or, for a managed server, the launched artifact's file
+    /// stem (the server exposes no architecture to detect; the artifact is
+    /// the verified identity's carrier).
     pub arch: String,
-    /// The engine's backend/dtype label (e.g. `metal/BF16`).
+    /// The runtime label: the engine's backend/dtype (e.g. `metal/BF16`) —
+    /// or, for a managed server, its gate-checked build (e.g.
+    /// `b10520-cd644c395`).
     pub backend: String,
-    /// Where decode runs, coarsely: `cpu` or `gpu`.
+    /// Where decode runs, coarsely: `cpu`, `gpu`, or `external` (a managed
+    /// server process owns its own device placement; this host does not
+    /// guess it).
     pub device: String,
     /// The resolved chat format, formatted (e.g. `Qwen`).
     pub format: String,
@@ -210,7 +217,10 @@ pub enum HostEvent {
     Done { turn_id: u64, stop: StopKind },
     /// The turn failed.
     Error { turn_id: u64, message: String },
-    /// The model could not be loaded; the session never starts.
+    /// The session is over and cannot recover: the model could not be
+    /// loaded (startup failure — no session ever starts), or the running
+    /// backend was irrecoverably lost (e.g. a managed server process died;
+    /// the failed turn's `Error` precedes this).
     Fatal(String),
 }
 

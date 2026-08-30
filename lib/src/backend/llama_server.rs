@@ -571,6 +571,41 @@ impl LlamaServerSpawn {
     }
 }
 
+/// The outcome of a failure-path cleanup: prose for the error text, and the
+/// verdict for the caller's downcast.
+struct CleanupNote {
+    note: String,
+    failed: bool,
+}
+
+impl CleanupNote {
+    /// Attach this cleanup's verdict to `error`: the note is context prose,
+    /// and a failed cleanup additionally carries the typed
+    /// [`ChildCleanupFailed`] marker.
+    fn stamp(self, error: anyhow::Error) -> anyhow::Error {
+        if self.failed {
+            error.context(ChildCleanupFailed)
+        } else {
+            error
+        }
+    }
+}
+
+/// The typed marker a spawn or completion failure carries when its own
+/// cleanup — kill, reap, or drain join — also failed: the child's end is
+/// unproven, and an owner's joined-success witness must report that rather
+/// than bless it (LSRV-1). Downcast with `error.downcast_ref`.
+#[derive(Debug)]
+pub struct ChildCleanupFailed;
+
+impl std::fmt::Display for ChildCleanupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("managed llama-server cleanup failed; the child's end is unproven")
+    }
+}
+
+impl std::error::Error for ChildCleanupFailed {}
+
 /// A managed llama-server child and its HTTP completer. The child handle has
 /// one owner; only the bounded diagnostic tails are shared with drain tasks.
 pub struct LlamaServer {
@@ -601,27 +636,38 @@ impl LlamaServer {
                 Err(StartupWait::EarlyExit(status)) => {
                     let cleanup = server.cleanup().await;
                     let diagnostics = server.diagnostics();
-                    early_failures.push(format!(
-                        "attempt {attempt} exited during startup ({status}); {cleanup}; \
-                         diagnostics:\n{diagnostics}"
-                    ));
+                    let note = format!(
+                        "attempt {attempt} exited during startup ({status}); {}; \
+                         diagnostics:\n{diagnostics}",
+                        cleanup.note
+                    );
+                    if cleanup.failed {
+                        // Retrying past an unproven reap would stack
+                        // unaccounted children: stop and say so, typed.
+                        return Err(cleanup.stamp(anyhow::anyhow!(note)));
+                    }
+                    early_failures.push(note);
                     continue;
                 }
                 Err(StartupWait::Timeout) => {
                     let cleanup = server.cleanup().await;
                     let diagnostics = server.diagnostics();
-                    bail!(
-                        "managed llama-server readiness timed out after {:?}; {cleanup}; \
+                    let error = anyhow::anyhow!(
+                        "managed llama-server readiness timed out after {:?}; {}; \
                          diagnostics:\n{diagnostics}",
-                        spec.readiness_timeout
+                        spec.readiness_timeout,
+                        cleanup.note
                     );
+                    return Err(cleanup.stamp(error));
                 }
                 Err(StartupWait::Io(error)) => {
                     let cleanup = server.cleanup().await;
                     let diagnostics = server.diagnostics();
-                    return Err(error).context(format!(
-                        "managed llama-server readiness failed; {cleanup}; diagnostics:\n{diagnostics}"
+                    let error = error.context(format!(
+                        "managed llama-server readiness failed; {}; diagnostics:\n{diagnostics}",
+                        cleanup.note
                     ));
+                    return Err(cleanup.stamp(error));
                 }
             }
 
@@ -645,10 +691,12 @@ impl LlamaServer {
                         if let Err(error) = gates.check(&props) {
                             let cleanup = server.cleanup().await;
                             let diagnostics = server.diagnostics();
-                            return Err(error).context(format!(
-                                "managed llama-server verification gate failed; {cleanup}; \
-                                 diagnostics:\n{diagnostics}"
+                            let error = error.context(format!(
+                                "managed llama-server verification gate failed; {}; \
+                                 diagnostics:\n{diagnostics}",
+                                cleanup.note
                             ));
+                            return Err(cleanup.stamp(error));
                         }
                     }
                     server.identity = Some(spec.identity.server_identity(&props));
@@ -658,10 +706,12 @@ impl LlamaServer {
                 Introspection::Props(Err(error)) => {
                     let cleanup = server.cleanup().await;
                     let diagnostics = server.diagnostics();
-                    return Err(error).context(format!(
-                        "managed llama-server introspection failed; {cleanup}; \
-                         diagnostics:\n{diagnostics}"
+                    let error = error.context(format!(
+                        "managed llama-server introspection failed; {}; \
+                         diagnostics:\n{diagnostics}",
+                        cleanup.note
                     ));
+                    return Err(cleanup.stamp(error));
                 }
                 Introspection::Child(status) => {
                     let status = match status {
@@ -670,18 +720,22 @@ impl LlamaServer {
                     };
                     let cleanup = server.cleanup().await;
                     let diagnostics = server.diagnostics();
-                    bail!(
-                        "managed llama-server exited during introspection ({status}); {cleanup}; \
-                         diagnostics:\n{diagnostics}"
+                    let error = anyhow::anyhow!(
+                        "managed llama-server exited during introspection ({status}); {}; \
+                         diagnostics:\n{diagnostics}",
+                        cleanup.note
                     );
+                    return Err(cleanup.stamp(error));
                 }
                 Introspection::Deadline => {
                     let cleanup = server.cleanup().await;
                     let diagnostics = server.diagnostics();
-                    bail!(
+                    let error = anyhow::anyhow!(
                         "managed llama-server introspection exceeded the startup deadline; \
-                         {cleanup}; diagnostics:\n{diagnostics}"
+                         {}; diagnostics:\n{diagnostics}",
+                        cleanup.note
                     );
+                    return Err(cleanup.stamp(error));
                 }
             }
         }
@@ -784,6 +838,30 @@ impl LlamaServer {
         self.cleanup_result().await
     }
 
+    /// Sync shim over [`spawn`](LlamaServer::spawn), bridged through the one
+    /// runtime (RT-1) for a plain-thread owner (the host's backend thread).
+    /// One of the three narrow lifecycle shims; no general executor handle is
+    /// exposed.
+    pub fn spawn_sync(spec: LlamaServerSpawn) -> Result<LlamaServer> {
+        crate::runtime::block_on(LlamaServer::spawn(spec))
+    }
+
+    /// Sync shim over [`shutdown`](LlamaServer::shutdown) (RT-1; see
+    /// [`spawn_sync`](LlamaServer::spawn_sync)).
+    pub fn shutdown_sync(self) -> Result<ExitStatus> {
+        crate::runtime::block_on(self.shutdown())
+    }
+
+    /// Whether the child has already exited (non-blocking `try_wait`): the
+    /// honest fatal-loss probe for an owner whose turn just failed — a dead
+    /// child distinguishes backend loss from a recoverable turn error.
+    /// `Ok(None)` means observed-still-running; a probe *failure* is its own
+    /// outcome — an owner that cannot observe its child holds no evidence of
+    /// a healthy backend, and must not conflate the two.
+    pub fn exited(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
     pub fn diagnostics(&self) -> String {
         format!(
             "stdout:\n{}\nstderr:\n{}",
@@ -808,12 +886,20 @@ impl LlamaServer {
             .expect("LlamaServer::spawn returns only after identity is established")
     }
 
-    async fn cleanup(&mut self) -> String {
+    /// Best-effort cleanup for a failure path: the human-facing note for
+    /// the error text, plus the typed verdict — a failed cleanup must reach
+    /// the caller as [`ChildCleanupFailed`], never only as prose (an owner
+    /// cannot downcast a sentence).
+    async fn cleanup(&mut self) -> CleanupNote {
         match self.cleanup_result().await {
-            Ok(status) => {
-                format!("cleanup reaped child ({status}) and joined stdout/stderr drains")
-            }
-            Err(error) => format!("cleanup failed: {error:#}"),
+            Ok(status) => CleanupNote {
+                note: format!("cleanup reaped child ({status}) and joined stdout/stderr drains"),
+                failed: false,
+            },
+            Err(error) => CleanupNote {
+                note: format!("cleanup failed: {error:#}"),
+                failed: true,
+            },
         }
     }
 
@@ -883,25 +969,41 @@ impl LlamaServer {
     }
 
     async fn child_death_error(&mut self, status: std::io::Result<ExitStatus>) -> anyhow::Error {
-        let (status, cleanup_note) = match status {
+        // The cleanup verdict must survive as the typed marker, not only as
+        // prose: this error reaches an owner whose later epilogue will find
+        // the drain handles already consumed here and trivially succeed — if
+        // the verdict were text alone, an unproven cleanup would end up
+        // blessed (LSRV-1).
+        let (status, cleanup) = match status {
             Ok(status) => {
                 let drains = tokio::time::timeout(CLEANUP_TIMEOUT, self.join_drains()).await;
-                let note = match drains {
-                    Ok(Ok(())) => "stdout/stderr drains joined".to_string(),
-                    Ok(Err(error)) => format!("drain join failed: {error:#}"),
-                    Err(_) => "drain join timed out".to_string(),
+                let cleanup = match drains {
+                    Ok(Ok(())) => CleanupNote {
+                        note: "stdout/stderr drains joined".to_string(),
+                        failed: false,
+                    },
+                    Ok(Err(error)) => CleanupNote {
+                        note: format!("drain join failed: {error:#}"),
+                        failed: true,
+                    },
+                    Err(_) => CleanupNote {
+                        note: "drain join timed out".to_string(),
+                        failed: true,
+                    },
                 };
-                (status.to_string(), note)
+                (status.to_string(), cleanup)
             }
             Err(error) => {
                 let cleanup = self.cleanup().await;
                 (format!("wait failed: {error}"), cleanup)
             }
         };
-        anyhow::anyhow!(
-            "managed llama-server died during completion ({status}); {cleanup_note}; diagnostics:\n{}",
+        let error = anyhow::anyhow!(
+            "managed llama-server died during completion ({status}); {}; diagnostics:\n{}",
+            cleanup.note,
             self.diagnostics()
-        )
+        );
+        cleanup.stamp(error)
     }
 
     async fn reconcile_completion(&mut self, result: Result<Completion>) -> Result<Completion> {

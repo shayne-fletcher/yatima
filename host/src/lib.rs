@@ -2,12 +2,14 @@
 //!
 //! Local decode is `!Send` and runs on the runtime's blocking island (CMP-1 /
 //! RT-2), so it cannot live in a `tokio::spawn`. A dedicated **OS thread** owns
-//! the [`Engine`] *and* the [`ChatSession`]/[`Agent`] — the one authoritative
+//! the backend — the `!Send` Candle [`Engine`] or a managed llama-server
+//! child — *and* the [`ChatSession`]/[`Agent`] — the one authoritative
 //! prompt history — for its whole life (HOST-3), and, being a plain thread (not
 //! a runtime worker), calls the public **sync** decode shims directly; RT-1 is
-//! not violated. The TUI, GUI, and coming yatima-serve are thin views over this
-//! host; they differ only in how they draw a [`HostEvent`] and where a
-//! [`HostRequest`] comes from.
+//! not violated (the managed lifecycle uses the lib's three narrow sync
+//! shims — verify, spawn, shutdown — never a general executor). The TUI,
+//! GUI, and yatima-serve are thin views over this host; they differ only in
+//! how they draw a [`HostEvent`] and where a [`HostRequest`] comes from.
 //!
 //! Two planes connect the host to a frontend, plus one out-of-band control:
 //!
@@ -32,19 +34,30 @@
 //!   CAP-3's user-facing contract is single-sourced ([`report_grant`],
 //!   [`report_revoke`], [`report_grants`], [`refuse_grant`]; cited by
 //!   `grant_wording_is_single_sourced` / `chat_only_reports_name_no_authority`).
-//! - **HOST-3** one engine thread owns the `!Send` engine and session for the
-//!   whole run; the `!Send` types are created inside the thread and never
-//!   cross a thread boundary.
+//! - **HOST-3** one backend thread owns the backend — the `!Send` Candle
+//!   engine (created inside the thread, never crossing a thread boundary) or
+//!   the managed llama-server child — and the session, for the whole run.
+//!   Every post-construction exit converges on the thread's single
+//!   backend-consuming epilogue: a managed child is explicitly killed,
+//!   reaped, and its drains joined (LSRV-1 at the host boundary) before the
+//!   thread ends; [`HostOwner::shutdown`] is the joined-success witness and
+//!   `Drop` only a request fallback. Cited by the hermetic lifecycle battery
+//!   in `tests/managed_lifecycle.rs`.
 //! - **HOST-4** tool activity crosses the wire as `(kind, payload)` —
 //!   [`ToolNoteKind`] carries the semantics, and this crate emits no marker
 //!   glyphs or note indentation; the vocabulary a note renders under is view
 //!   policy (cited by `notes_carry_kind_not_typography`).
-//! - **HOST-5** the host keeps every rendered prompt under the depth budget:
-//!   between turns it trims the committed history (COMPACT-1) back under a
-//!   low-water mark ([`compaction_low_water`] = the depth ceiling less the
-//!   reply and one run's within-run tool growth), and compaction is always
-//!   visible — history is never edited silently. The ceiling tightens to the
-//!   Metal KV validated depth on a Metal run (CTX-2). Wording single-sourced
+//! - **HOST-5** the host keeps every rendered prompt under the depth budget
+//!   — scoped to backends that expose a tokenizer: between turns it trims
+//!   the committed history (COMPACT-1) back under a low-water mark
+//!   ([`compaction_low_water`] = the depth ceiling less the reply and one
+//!   run's within-run tool growth), and compaction is always visible —
+//!   history is never edited silently. The ceiling tightens to the Metal KV
+//!   validated depth on a Metal run (CTX-2; a Candle-engine envelope, never
+//!   applied to a managed server). A backend that cannot count tokens
+//!   reports no prompt depth, emits no `Context` event, and never trims —
+//!   no estimate is presented as evidence (`/tokenize` is the recorded debt
+//!   that restores exact metering for llama-server). Wording single-sourced
 //!   in [`compaction_note`]; cited by the arithmetic/wording/trigger tests.
 
 use std::collections::BTreeSet;
@@ -52,14 +65,16 @@ use std::ops::ControlFlow;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use chrono::Local;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use yatima_lib::{
-    device, looks_degenerate, metal_kv_depth_risk, resolve_format, Agent, AgentEvent, AgentStop,
-    Cancel, Channel as LibChannel, ChatFormat, ChatMlTemplate, ChatSession, Engine, GenOpts,
-    ImageListing, JsonToolCall, KvDepthRisk, PlainTemplate, Plot, PlotSandbox, PromptTemplate,
-    QwenToolCall, ReadImage, ReadPage, ReadUrl, ReasoningSplitter, Sampling, StopReason,
-    ToolCallCodec, ToolOutcome, Tools, WebOrigins, METAL_KV_VALIDATED,
+    device, looks_degenerate, metal_kv_depth_risk, resolve_format, verify_cancellable_sync, Agent,
+    AgentEvent, AgentStop, Cancel, Channel as LibChannel, ChatFormat, ChatSession,
+    ChildCleanupFailed, Completer, Engine, GenOpts, ImageListing, JsonToolCall, KvDepthRisk,
+    LlamaServer, LlamaServerSpawn, ModelSource, MuseAtemCodec, Plot, PlotSandbox, PromptTemplate,
+    QwenToolCall, ReadImage, ReadPage, ReadUrl, Sampling, ServerIdentity, StopReason,
+    ToolCallCodec, ToolOutcome, Tools, VerifyCancelled, WebOrigins, METAL_KV_VALIDATED,
 };
 
 pub mod knobs;
@@ -126,6 +141,17 @@ impl CancelGate {
         }
     }
 
+    /// Cancel whatever turn is armed right now, whichever id it carries —
+    /// the owner's shutdown path: a mid-decode turn must end promptly without
+    /// the owner knowing its id. A disarmed gate is a no-op.
+    pub fn cancel_armed(&self) {
+        if let Ok(state) = self.0.lock() {
+            if let Some((_, cancel)) = state.armed.as_ref() {
+                cancel.cancel();
+            }
+        }
+    }
+
     /// Cancel `turn_id`. If it is the one in flight, flip it now. Otherwise it
     /// is either a queued turn not yet armed (remember it — [`arm`] applies it
     /// when the turn starts) or a stale id for a finished turn (harmless: a
@@ -153,199 +179,669 @@ impl CancelGate {
 /// acquisition happens inside the actor as part of its owned lifecycle, so
 /// no frontend holds a resolved path it could substitute before launch.
 pub struct HostConfig {
-    pub backend: HostBackendConfig,
-    pub opts: GenOpts,
-    pub format: Option<ChatFormat>,
-    pub system: Option<String>,
+    pub(crate) backend: HostBackendConfig,
+    pub(crate) opts: GenOpts,
+    pub(crate) format: Option<ChatFormat>,
+    pub(crate) system: Option<String>,
     /// Display label; `None` labels with the resolved model directory.
-    pub model_label: Option<String>,
+    pub(crate) model_label: Option<String>,
+    /// Test/diagnostic wiring only (see [`HostConfig::with_managed_launcher`]).
+    pub(crate) managed_launcher: Option<ManagedLauncher>,
 }
 
-/// The frontend-side handle to a running host.
-pub struct HostHandle {
+/// Test/diagnostic override for the managed child: which binary to launch
+/// and how long to wait for readiness. Never set by the shared resolver.
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedLauncher {
+    pub(crate) binary: std::path::PathBuf,
+    pub(crate) readiness_timeout: std::time::Duration,
+}
+
+impl HostConfig {
+    /// A profile-less Candle engine session — the explicit-source path
+    /// (CLI-1 chose exactly one source). Profile-driven configs go through
+    /// [`resolve_host_model`] + [`ResolvedHostModel::into_host_config`],
+    /// which layer the profile's recipe (PROFILE-1) and cannot be
+    /// recombined field-by-field: this type is opaque so the invalid states
+    /// the resolver removed cannot be reconstructed (PROFILE-2).
+    pub fn engine(
+        source: ModelSource,
+        cpu: bool,
+        opts: GenOpts,
+        format: Option<ChatFormat>,
+        system: Option<String>,
+        model_label: Option<String>,
+    ) -> HostConfig {
+        HostConfig {
+            backend: HostBackendConfig::Engine { source, cpu },
+            opts,
+            format,
+            system,
+            model_label,
+            managed_launcher: None,
+        }
+    }
+
+    /// A managed llama-server session, valid by construction: only a
+    /// profile that pins the llama-server backend and a chat format can
+    /// build one, its source is the profile's own (PROFILE-2), and its
+    /// generation options are the profile's recipe layered over `base`
+    /// (PROFILE-1) — a mismatched format or an undercut recipe cannot be
+    /// assembled.
+    pub fn managed(
+        profile: &yatima_lib::ModelProfile,
+        offline: bool,
+        base: GenOpts,
+        system: Option<String>,
+    ) -> Result<HostConfig> {
+        let yatima_lib::ProfileBackend::LlamaServer(server) = &profile.backend else {
+            anyhow::bail!(
+                "profile {:?} does not pin the llama-server backend",
+                profile.name
+            );
+        };
+        let Some(format) = profile.format() else {
+            anyhow::bail!(
+                "managed profile {:?} does not pin a chat format",
+                profile.name
+            );
+        };
+        Ok(HostConfig {
+            backend: HostBackendConfig::ManagedLlamaServer {
+                source: profile.to_source(offline)?,
+                profile: server.clone(),
+            },
+            opts: profile.apply_gen_overrides(base),
+            format: Some(format),
+            system,
+            model_label: Some(profile.name.clone()),
+            managed_launcher: None,
+        })
+    }
+
+    /// The display label, when the resolution carried one (a profile name).
+    /// Read-only: observation cannot reconstruct the invalid states this
+    /// type's opacity removed.
+    pub fn model_label(&self) -> Option<&str> {
+        self.model_label.as_deref()
+    }
+
+    /// Test/diagnostic wiring only: launch `binary` as the managed server
+    /// (instead of `llama-server` from `PATH`) and wait `readiness_timeout`
+    /// for it. The hermetic battery points this at the protocol stub; the
+    /// shared resolver never sets it.
+    #[doc(hidden)]
+    pub fn with_managed_launcher(
+        mut self,
+        binary: std::path::PathBuf,
+        readiness_timeout: std::time::Duration,
+    ) -> HostConfig {
+        self.managed_launcher = Some(ManagedLauncher {
+            binary,
+            readiness_timeout,
+        });
+        self
+    }
+}
+
+/// The movable frontend planes of a running host: the request sender, the
+/// event receiver, and the turn-cancel gate. Views may move this freely (the
+/// GUI's event pump, serve's bridge); thread ownership stays behind
+/// [`HostOwner`].
+pub struct HostClient {
     pub req_tx: Sender<HostRequest>,
     pub event_rx: UnboundedReceiver<HostEvent>,
     pub cancel: CancelGate,
 }
 
-/// Launch the host thread and return its handle at once. The thread loads the
-/// model and sends [`HostEvent::Ready`] (or [`HostEvent::Fatal`]) as its first
-/// event; nothing here waits for it. This is the shape a GUI wants (it renders
-/// a loading state and drains events on its own clock).
-pub fn spawn_nonblocking(config: HostConfig) -> Result<HostHandle> {
-    let (req_tx, req_rx) = std::sync::mpsc::channel::<HostRequest>();
-    let (event_tx, event_rx) = unbounded_channel::<HostEvent>();
-    let gate = CancelGate::new();
-    let actor_gate = gate.clone();
-    std::thread::Builder::new()
-        .name("yatima-engine".into())
-        .spawn(move || actor_main(config, req_rx, event_tx, actor_gate))?;
-    Ok(HostHandle {
-        req_tx,
-        event_rx,
-        cancel: gate,
-    })
+/// The one owner of the backend thread: lifecycle cancellation, a shutdown
+/// path of its own, the actor-epilogue completion signal, and the OS
+/// `JoinHandle`. Exactly one exists per host; [`shutdown`](HostOwner::shutdown)
+/// consumes it. Dropping it without shutdown only *requests* shutdown — the
+/// fallback is never the joined-success witness (HOST-3 / LSRV-1).
+pub struct HostOwner {
+    req_tx: Sender<HostRequest>,
+    lifecycle: Cancel,
+    cancel: CancelGate,
+    done_rx: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Launch the host and wait for the model to load, returning the handle and
-/// what's running — or an error if the load failed (surfaced *before* the
-/// caller touches its screen; the TUI prints it as a plain stderr line). The
-/// blocking shape a terminal frontend wants; the first event is consumed here.
-pub async fn spawn(config: HostConfig) -> Result<(HostHandle, ModelInfo)> {
-    let mut handle = spawn_nonblocking(config)?;
-    match handle.event_rx.recv().await {
-        Some(HostEvent::Ready(info)) => Ok((handle, info)),
-        Some(HostEvent::Fatal(message)) => Err(anyhow::anyhow!(message)),
-        _ => Err(anyhow::anyhow!(
-            "engine thread exited before reporting readiness"
-        )),
+impl HostOwner {
+    /// Shut the host down and prove it finished: flip the lifecycle cancel
+    /// (startup observes it between phases and inside the hash), cancel any
+    /// armed turn ([`CancelGate::cancel_armed`] — token-level, so a
+    /// mid-decode turn ends promptly), request shutdown on the wire, await
+    /// the actor's epilogue under [`knobs::SHUTDOWN_WITHIN`], join the OS
+    /// thread, and only then report the epilogue's own result — a failed
+    /// kill/reap/drain-join is an error here, never blessed (HOST-3 /
+    /// LSRV-1: this is the joined-success witness, so it must not lie).
+    ///
+    /// If the bound elapses (the actor is inside phase-unbounded work — a
+    /// model fetch has no finite bound), ownership is not silently dropped:
+    /// the join obligation transfers to a background reaper task that
+    /// awaits the epilogue and joins the thread whenever it finishes,
+    /// logging the outcome — and the returned error says so.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.lifecycle.cancel();
+        self.cancel.cancel_armed();
+        let _ = self.req_tx.send(HostRequest::Shutdown);
+        let done_rx = self.done_rx.take().expect("shutdown consumes the owner");
+        let thread = self.thread.take().expect("shutdown consumes the owner");
+        await_epilogue(done_rx, thread, knobs::SHUTDOWN_WITHIN).await
     }
 }
 
-/// The actor's body: load, report readiness, then serve requests until
-/// shutdown. Owns the engine and the session/agent for the whole run (HOST-3).
+/// The owner's wait: epilogue result under `within`, then the thread join,
+/// then the epilogue's own verdict. On timeout the join obligation is
+/// handed to a background reaper (never dropped), and the error names the
+/// transfer. Factored from [`HostOwner::shutdown`] so the timeout path has
+/// a hermetic witness.
+async fn await_epilogue(
+    mut done_rx: tokio::sync::oneshot::Receiver<Result<()>>,
+    thread: std::thread::JoinHandle<()>,
+    within: std::time::Duration,
+) -> Result<()> {
+    match tokio::time::timeout(within, &mut done_rx).await {
+        Ok(signal) => {
+            tokio::task::spawn_blocking(move || thread.join())
+                .await
+                .context("join the backend thread")?
+                .map_err(|panic| anyhow::anyhow!("backend thread panicked: {panic:?}"))?;
+            match signal {
+                // The epilogue's own result: a failed managed kill/reap/
+                // drain-join surfaces here, after the join.
+                Ok(epilogue) => epilogue,
+                // Sender dropped without a value: the actor was torn down
+                // some other way; the join above already surfaced a panic.
+                Err(_) => Ok(()),
+            }
+        }
+        Err(_) => {
+            spawn_reaper(done_rx, thread);
+            anyhow::bail!(
+                "host actor did not finish within {within:?} (it is inside \
+                 phase-unbounded work, e.g. a model fetch); the join obligation \
+                 was handed to a background reaper thread — the actor's own \
+                 epilogue still reaps its child when the work completes"
+            )
+        }
+    }
+}
+
+/// Hand the actor's join obligation to a dedicated **OS thread** — never a
+/// tokio task, which the frontend's runtime would abort at teardown, and
+/// never dropped: the reaper blocks on the completion signal (a tokio
+/// oneshot supports a sync `blocking_recv` off-runtime), joins the actor
+/// thread, and logs both verdicts. Process exit remains the outer bound —
+/// no user-space reaper survives it — but within the process the actor is
+/// always joined by someone. Returns the reaper's own handle for the
+/// hermetic witness; production detaches it (the reaper holds everything it
+/// needs).
+fn spawn_reaper(
+    done_rx: tokio::sync::oneshot::Receiver<Result<()>>,
+    thread: std::thread::JoinHandle<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("yatima-backend-reaper".into())
+        .spawn(move || {
+            let epilogue = done_rx.blocking_recv();
+            let joined = thread.join();
+            tracing::warn!(
+                "backend thread finished after the shutdown bound: epilogue {:?}, join {:?}",
+                epilogue.map(|r| r.map_err(|e| format!("{e:#}"))),
+                joined.as_ref().map_err(|p| format!("{p:?}"))
+            );
+        })
+        .expect("spawn the backend reaper thread")
+}
+
+impl Drop for HostOwner {
+    /// Fallback only: request shutdown and cancel work so an abandoned host
+    /// winds down (the actor's own epilogue still reaps its child), but
+    /// nothing here waits or joins — that proof requires
+    /// [`shutdown`](HostOwner::shutdown).
+    fn drop(&mut self) {
+        if self.done_rx.is_some() {
+            self.lifecycle.cancel();
+            self.cancel.cancel_armed();
+            let _ = self.req_tx.send(HostRequest::Shutdown);
+        }
+    }
+}
+
+/// Launch the backend thread and return the movable client planes and the one
+/// owner at once. The thread resolves, verifies (when the profile pins a
+/// digest), and starts its backend, reporting each transition as
+/// [`HostEvent::Startup`] and then [`HostEvent::Ready`] (or
+/// [`HostEvent::Fatal`]); nothing here waits for any of it.
+pub fn spawn_nonblocking(config: HostConfig) -> Result<(HostClient, HostOwner)> {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<HostRequest>();
+    let (event_tx, event_rx) = unbounded_channel::<HostEvent>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+    let gate = CancelGate::new();
+    let lifecycle = Cancel::new();
+    let actor_gate = gate.clone();
+    let actor_lifecycle = lifecycle.clone();
+    let thread = std::thread::Builder::new()
+        .name("yatima-backend".into())
+        .spawn(move || {
+            let epilogue = actor_main(config, req_rx, event_tx, actor_gate, actor_lifecycle);
+            // Signalled after the epilogue, carrying its result: the owner's
+            // await, then its thread join, observe a finished actor — and a
+            // failed reap is reported, never blessed (HOST-3 / LSRV-1).
+            let _ = done_tx.send(epilogue);
+        })?;
+    Ok((
+        HostClient {
+            req_tx: req_tx.clone(),
+            event_rx,
+            cancel: gate.clone(),
+        },
+        HostOwner {
+            req_tx,
+            lifecycle,
+            cancel: gate,
+            done_rx: Some(done_rx),
+            thread: Some(thread),
+        },
+    ))
+}
+
+/// Launch the host and wait for readiness, returning the planes, the owner,
+/// and what's running — or an error if startup failed (surfaced *before* the
+/// caller touches its screen). Startup phase events are consumed here; a
+/// frontend that displays them uses [`spawn_nonblocking`] instead.
+pub async fn spawn(config: HostConfig) -> Result<(HostClient, HostOwner, ModelInfo)> {
+    let (mut client, owner) = spawn_nonblocking(config)?;
+    loop {
+        match client.event_rx.recv().await {
+            Some(HostEvent::Startup { .. }) => continue,
+            Some(HostEvent::Ready(info)) => return Ok((client, owner, info)),
+            Some(HostEvent::Fatal(message)) => {
+                let joined = owner.shutdown().await;
+                return Err(match joined {
+                    Ok(()) => anyhow::anyhow!(message),
+                    Err(join_error) => anyhow::anyhow!(message).context(join_error),
+                });
+            }
+            _ => {
+                let _ = owner.shutdown().await;
+                anyhow::bail!("backend thread exited before reporting readiness");
+            }
+        }
+    }
+}
+
+/// The actor's body: build the backend (reporting startup phases), report
+/// readiness, serve requests until an exit condition, then run the **one
+/// backend-consuming epilogue** — every post-construction exit converges
+/// there, so a managed child is always explicitly killed, reaped, and its
+/// drains joined before the thread ends (HOST-3 / LSRV-1).
 fn actor_main(
     config: HostConfig,
     req_rx: Receiver<HostRequest>,
     event_tx: UnboundedSender<HostEvent>,
     gate: CancelGate,
-) {
+    lifecycle: Cancel,
+) -> Result<()> {
     let HostConfig {
         backend,
         opts,
         format: format_choice,
         system,
         model_label,
+        managed_launcher,
     } = config;
-    // Model acquisition happens here, inside the owned lifecycle. 5a hosts
-    // only the Candle variant; the managed llama-server variant fails closed
-    // — a clear Fatal, no verification, no process work — until 5b adds
-    // `HostBackend` ownership behind this same door.
-    let (dir, cpu) = match backend {
-        HostBackendConfig::Engine { source, cpu } => match source.resolve() {
-            Ok(resolved) => (resolved.into_directory(), cpu),
-            Err(e) => {
-                let _ = event_tx.send(HostEvent::Fatal(e.to_string()));
-                return;
-            }
-        },
-        HostBackendConfig::ManagedLlamaServer { .. } => {
-            let _ = event_tx.send(HostEvent::Fatal(
-                "the managed llama-server backend is not hosted yet (stage 5b): \
-                 use `yatima chat --profile muse-glimmer` or `yatima agent \
-                 --profile muse-glimmer`"
-                    .to_string(),
-            ));
-            return;
-        }
-    };
-    let mut engine = match device(cpu).and_then(|dev| Engine::load(&dir, dev)) {
-        Ok(engine) => engine,
+    let built = match build_backend(
+        backend,
+        format_choice,
+        managed_launcher,
+        &lifecycle,
+        &event_tx,
+    ) {
+        Ok(Some(built)) => built,
+        // Lifecycle cancelled during startup: a requested exit, not a
+        // failure — every child-owning cancellation branch reaped before
+        // returning, or propagated its failure as a CleanupFailed error.
+        Ok(None) => return Ok(()),
         Err(e) => {
-            let _ = event_tx.send(HostEvent::Fatal(e.to_string()));
-            return;
+            // The actor's return value is its *ownership* verdict, not its
+            // startup verdict: a startup failure that self-cleaned (the lib
+            // reaps before erroring) is reported on the event plane; only an
+            // unproven cleanup — the lib's typed ChildCleanupFailed marker,
+            // stamped on any spawn failure whose own kill/reap/drain-join
+            // also failed, or on this actor's cancelled-after-spawn reap —
+            // may fail the owner's joined shutdown.
+            let cleanup_debt = e.downcast_ref::<ChildCleanupFailed>().is_some();
+            if !lifecycle.is_cancelled() {
+                let _ = event_tx.send(HostEvent::Fatal(format!("{e:#}")));
+            }
+            return if cleanup_debt { Err(e) } else { Ok(()) };
         }
     };
-    let model_label = model_label.unwrap_or_else(|| dir.display().to_string());
-    let (format, _mismatch) = resolve_format(engine.arch(), format_choice);
-    let info = build_model_info(&engine, &model_label, cpu, &opts, format);
+    let (mut backend, facts) = built;
 
-    // Tool-trained formats always carry the web tools, initially with an empty
-    // origin set — hidden from the model (CAP-3a) and inert until a grant
-    // arrives (sandbox by omission; CAP-3: grants come only from the user, via
-    // the frontend). Chat-only formats get none.
-    let tool_trained = matches!(format, ChatFormat::Qwen | ChatFormat::Plain);
-    let origins = WebOrigins::new();
-    // Client construction cannot practically fail; degrade to empty tools (the
-    // model simply never sees web tools) rather than dying.
-    let tools = tool_trained.then(|| web_tools(&origins).unwrap_or_default());
-
-    if event_tx.send(HostEvent::Ready(info)).is_err() {
-        return; // the frontend gave up during load.
-    }
-
-    // What the CTX-2 surface needs per turn: whether decode runs on Metal
-    // (mirrors ModelInfo's device judgment) and the per-turn budget the risk
-    // bound adds to the prompt depth.
-    let watch = DepthWatch {
-        metal: !cpu,
-        max_tokens: opts.max_tokens,
-        context_length: engine.context_length(),
-    };
-
-    // Tool-trained formats serve the sessionful agent from turn one: the web
-    // tools hide themselves while the origin set is empty (CAP-3a), so pre-grant
-    // the model sees exactly the no-authority tools (plot), and a grant simply
-    // surfaces the web tools mid-session — /grant mints authority, it is not a
-    // mode switch. Chat-only formats stay on the plain chat path forever.
-    let Some(tools) = tools else {
-        serve_chat(
-            &mut engine,
-            format,
-            system,
-            opts,
-            watch,
-            &req_rx,
-            &event_tx,
-            &gate,
-        );
-        return;
-    };
-    let system = system.unwrap_or_else(|| knobs::DEFAULT_AGENT_SYSTEM.to_string());
-    match format {
-        ChatFormat::Qwen => serve_agent(
-            &mut engine,
-            &tools,
-            QwenToolCall,
-            ChatMlTemplate,
-            system,
-            opts.clone(),
-            watch,
-            &origins,
-            &req_rx,
-            &event_tx,
-            &gate,
-        ),
-        ChatFormat::Plain => serve_agent(
-            &mut engine,
-            &tools,
-            JsonToolCall,
-            PlainTemplate,
-            system,
-            opts,
-            watch,
-            &origins,
-            &req_rx,
-            &event_tx,
-            &gate,
-        ),
-        _ => unreachable!("the agent path is only taken on tool-trained formats"),
-    }
-}
-
-/// Snapshot what's running for the status rail — every field a pre-formatted
-/// string so the frontend is a pure view (built here, where the engine and
-/// config live).
-fn build_model_info(
-    engine: &Engine,
-    label: &str,
-    cpu: bool,
-    opts: &GenOpts,
-    format: ChatFormat,
-) -> ModelInfo {
-    ModelInfo {
-        label: label.to_string(),
-        arch: format!("{:?}", engine.arch()),
-        backend: engine.backend(),
-        device: if cpu { "cpu" } else { "gpu" }.to_string(),
+    let label = model_label.unwrap_or(facts.default_label);
+    let format = facts.format;
+    let info = ModelInfo {
+        label,
+        arch: facts.arch,
+        backend: facts.backend,
+        device: facts.device,
         format: format!("{format:?}"),
         sampling: sampling_summary(opts.sampling),
         max_tokens: opts.max_tokens,
-        context_length: engine.context_length(),
-        // A Candle directory load performs no digest verification; the wire
-        // says so rather than implying authenticated identity (LSRV-5's
-        // verified form arrives with the managed backend in 5b).
-        identity: ModelIdentity::Unverified,
+        context_length: facts.context_length,
+        identity: facts.identity,
+    };
+    // The CTX-2 / HOST-5 surface is scoped to the tokenizing engine: a
+    // managed server counts no tokens, so its watch never sees a depth and
+    // never warns or trims (no estimate stands in — HOST-5).
+    let watch = DepthWatch {
+        metal: facts.engine_on_metal,
+        max_tokens: opts.max_tokens,
+        context_length: facts.watch_context,
+    };
+    // Muse's template carries the runtime date; chosen once at host startup
+    // so every turn of the session renders the same prompt bytes.
+    let current_date = Local::now().format("%Y-%m-%d").to_string();
+
+    let served = if event_tx.send(HostEvent::Ready(info)).is_ok() {
+        serve_session(
+            &mut backend,
+            format,
+            current_date,
+            system,
+            opts,
+            watch,
+            &req_rx,
+            &event_tx,
+            &gate,
+        )
+    } else {
+        Ok(())
+    };
+    // The one epilogue. Its verdict joins any debt the serve loop carried
+    // out (a mid-completion child death whose drain-join failed consumed
+    // the handles — the epilogue cannot re-prove that cleanup): both reach
+    // the owner through the completion signal and fail
+    // `HostOwner::shutdown` — the joined-success witness must never report
+    // success over an unproven reap (HOST-3 / LSRV-1).
+    let disposed = backend.dispose().context("backend epilogue");
+    match (served, disposed) {
+        (Ok(()), disposed) => disposed,
+        (Err(debt), Ok(())) => Err(debt),
+        (Err(debt), Err(disposed)) => {
+            Err(debt.context(format!("backend epilogue also failed: {disposed:#}")))
+        }
+    }
+}
+
+/// The backend the actor thread owns for the whole run (HOST-3): the `!Send`
+/// Candle [`Engine`] (created in-thread) or a managed [`LlamaServer`] child.
+/// [`Completer`] by delegation, so every serve loop is backend-independent;
+/// consumed only by [`dispose`](HostBackend::dispose) — the epilogue.
+enum HostBackend {
+    // Both boxed for variant-size parity (clippy::large_enum_variant): each
+    // is a large value, and the enum is created once per session.
+    Engine(Box<Engine>),
+    LlamaServer(Box<LlamaServer>),
+}
+
+/// The marker context a turn error carries when the managed child is found
+/// dead ([`LlamaServer::exited`]): the serve loop downcasts to distinguish
+/// fatal backend loss (exit through the epilogue) from a recoverable turn
+/// error (session continues).
+#[derive(Debug)]
+struct BackendLost(String);
+
+impl std::fmt::Display for BackendLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Classify a child probe after a failed completion: `Some(message)` is
+/// fatal backend loss (the serve loop exits through the epilogue), `None`
+/// leaves the error recoverable. An exited child is loss; a probe *failure*
+/// is also loss — inability to observe the child is not evidence of a
+/// healthy backend (pure, witnessed by unit test).
+fn probe_verdict(probe: std::io::Result<Option<std::process::ExitStatus>>) -> Option<String> {
+    match probe {
+        Ok(Some(status)) => Some(format!("managed llama-server exited ({status})")),
+        Ok(None) => None,
+        Err(error) => Some(format!(
+            "cannot observe the managed llama-server child (try_wait failed: {error}); \
+             treating the backend as lost"
+        )),
+    }
+}
+
+impl HostBackend {
+    /// The one backend-consuming epilogue: a managed child is explicitly
+    /// killed, reaped, and its output drains joined (LSRV-1, through the
+    /// narrow RT-1 shutdown shim); the engine drops in-thread. `Drop` never
+    /// substitutes for this.
+    fn dispose(self) -> Result<()> {
+        match self {
+            Self::Engine(_) => Ok(()),
+            Self::LlamaServer(server) => (*server).shutdown_sync().map(|_| ()),
+        }
+    }
+}
+
+impl Completer for HostBackend {
+    async fn complete(
+        &mut self,
+        prompt: &str,
+        opts: &GenOpts,
+        stops: &[String],
+    ) -> Result<yatima_lib::Completion> {
+        match self {
+            Self::Engine(engine) => engine.complete(prompt, opts, stops).await,
+            Self::LlamaServer(server) => server.complete(prompt, opts, stops).await,
+        }
+    }
+
+    fn count_tokens(&self, text: &str) -> Option<usize> {
+        match self {
+            Self::Engine(engine) => engine.count_tokens(text),
+            // No tokenizer: no prompt depth is ever reported, so no Context
+            // event, no depth warning, and no compaction claim (HOST-5 is
+            // scoped to tokenizing backends; /tokenize is the recorded debt).
+            Self::LlamaServer(_) => None,
+        }
+    }
+
+    async fn complete_streaming(
+        &mut self,
+        prompt: &str,
+        opts: &GenOpts,
+        stops: &[String],
+        cancel: &Cancel,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<yatima_lib::Completion> {
+        match self {
+            Self::Engine(engine) => {
+                engine
+                    .complete_streaming(prompt, opts, stops, cancel, on_token)
+                    .await
+            }
+            Self::LlamaServer(server) => {
+                let outcome = server
+                    .complete_streaming(prompt, opts, stops, cancel, on_token)
+                    .await;
+                match outcome {
+                    Err(error) => {
+                        // A dying child's socket error can precede its
+                        // reapability by a few milliseconds; probe briefly
+                        // (bounded) so loss is not misread as recoverable.
+                        let mut probe = server.exited();
+                        for _ in 0..3 {
+                            if !matches!(probe, Ok(None)) {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            probe = server.exited();
+                        }
+                        match probe_verdict(probe) {
+                            // The child is gone — or cannot even be observed
+                            // (an owner without observation holds no evidence
+                            // of a healthy backend): mark the error so the
+                            // serve loop exits through the epilogue instead
+                            // of retrying a backend it cannot account for.
+                            Some(loss) => Err(error.context(BackendLost(loss))),
+                            None => Err(error),
+                        }
+                    }
+                    ok => ok,
+                }
+            }
+        }
+    }
+}
+
+/// Backend construction facts the actor needs after the backend exists —
+/// every display field preformatted here, where the evidence lives.
+struct BackendFacts {
+    default_label: String,
+    arch: String,
+    /// The resolved chat format: inferred from the engine's architecture
+    /// (FMT-1/FMT-2), or the managed profile's pin (a server exposes no
+    /// architecture to infer from).
+    format: ChatFormat,
+    backend: String,
+    device: String,
+    context_length: Option<usize>,
+    identity: ModelIdentity,
+    /// Whether the *engine* decodes on Metal (drives the CTX-2 KV-depth
+    /// warning — a Candle-specific envelope, never applied to a server).
+    engine_on_metal: bool,
+    /// The depth ceiling the HOST-5 watch enforces; `None` for a backend
+    /// whose prompt depth is never known (no tokenizer — nothing to enforce,
+    /// nothing to estimate).
+    watch_context: Option<usize>,
+}
+
+/// Build the configured backend inside the actor thread, reporting each
+/// startup phase transition (PROTO-2's vocabulary) and observing the
+/// lifecycle cancel between phases and *inside* the hash (checked between
+/// read chunks — a shutdown mid-hash is answered within one chunk, never
+/// after the whole file). `Ok(None)` is a cancelled startup; a cancel
+/// observed after the child launched reaps it before returning, and a
+/// failed reap is the typed ownership debt the owner reports (LSRV-1).
+fn build_backend(
+    config: HostBackendConfig,
+    format_choice: Option<ChatFormat>,
+    managed_launcher: Option<ManagedLauncher>,
+    lifecycle: &Cancel,
+    event_tx: &UnboundedSender<HostEvent>,
+) -> Result<Option<(HostBackend, BackendFacts)>> {
+    let phase = |phase: StartupPhase| {
+        let _ = event_tx.send(HostEvent::Startup { phase });
+    };
+    match config {
+        HostBackendConfig::Engine { source, cpu } => {
+            phase(StartupPhase::ResolvingModel);
+            let dir = source.resolve()?.into_directory();
+            if lifecycle.is_cancelled() {
+                return Ok(None);
+            }
+            phase(StartupPhase::StartingBackend);
+            let engine = Engine::load(&dir, device(cpu)?)?;
+            if lifecycle.is_cancelled() {
+                return Ok(None);
+            }
+            let (format, _mismatch) = resolve_format(engine.arch(), format_choice);
+            let facts = BackendFacts {
+                default_label: dir.display().to_string(),
+                arch: format!("{:?}", engine.arch()),
+                format,
+                backend: engine.backend(),
+                device: if cpu { "cpu" } else { "gpu" }.to_string(),
+                context_length: engine.context_length(),
+                // A directory load verifies no digest: no authenticated
+                // identity evidence exists (LSRV-5's verified form is the
+                // managed path's).
+                identity: ModelIdentity::Unverified,
+                engine_on_metal: !cpu,
+                watch_context: engine.context_length(),
+            };
+            Ok(Some((HostBackend::Engine(Box::new(engine)), facts)))
+        }
+        HostBackendConfig::ManagedLlamaServer { source, profile } => {
+            // No engine architecture exists to infer a format from, so the
+            // profile's pin is the only source (the resolver guarantees it).
+            // Reject a hand-built config without one before any resolution,
+            // hashing, or child-owning work.
+            let Some(format) = format_choice else {
+                anyhow::bail!("a managed llama-server backend requires a pinned chat format");
+            };
+            phase(StartupPhase::ResolvingModel);
+            let artifact = source.resolve()?.into_gguf()?;
+            if lifecycle.is_cancelled() {
+                return Ok(None);
+            }
+            phase(StartupPhase::VerifyingModel);
+            // The hash observes the lifecycle cancel between chunks: an
+            // owner shutting down mid-hash is answered within one chunk,
+            // never after the whole 17 GB (the real Muse hash exceeds any
+            // polite shutdown bound).
+            let verified =
+                match verify_cancellable_sync(artifact, &profile.expected_sha256, lifecycle) {
+                    Ok(verified) => verified,
+                    Err(error) if error.downcast_ref::<VerifyCancelled>().is_some() => {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+            if lifecycle.is_cancelled() {
+                // Cancelled in the gap after hashing: still before launch.
+                return Ok(None);
+            }
+            phase(StartupPhase::StartingBackend);
+            let mut spec = LlamaServerSpawn::verified(verified, profile.server_gates());
+            spec.context = Some(profile.context);
+            spec.top_k = profile.top_k;
+            if let Some(launcher) = managed_launcher {
+                spec.binary = launcher.binary;
+                spec.readiness_timeout = launcher.readiness_timeout;
+            }
+            let server = LlamaServer::spawn_sync(spec)?;
+            if lifecycle.is_cancelled() {
+                // Cancelled after launch: the child must still be reaped
+                // before this thread gives up on it (LSRV-1) — and a failed
+                // reap is an ownership debt the owner's shutdown reports.
+                server.shutdown_sync().context(ChildCleanupFailed)?;
+                return Ok(None);
+            }
+            let identity = match server.identity() {
+                ServerIdentity::Verified { digest } => {
+                    ModelIdentity::VerifiedSha256(digest.to_string())
+                }
+                // Unreachable for a verified spawn, but stated rather than
+                // assumed: identity never exceeds its evidence (LSRV-5).
+                _ => ModelIdentity::Unverified,
+            };
+            let arch = server
+                .launched_artifact()
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "gguf".to_string());
+            let facts = BackendFacts {
+                default_label: server.launched_artifact().display().to_string(),
+                arch,
+                format,
+                backend: server.props().build.clone(),
+                device: "external".to_string(),
+                context_length: Some(server.props().n_ctx as usize),
+                identity,
+                engine_on_metal: false,
+                watch_context: None,
+            };
+            Ok(Some((HostBackend::LlamaServer(Box::new(server)), facts)))
+        }
     }
 }
 
@@ -480,41 +976,128 @@ fn note_degenerate_answer(event_tx: &UnboundedSender<HostEvent>, answer: &str) {
     }
 }
 
-/// The chat serve loop for chat-only formats: the plain streaming
-/// [`ChatSession`]. Grants are always refused here (CAPS-1 — a chat-only format
-/// cannot enter the tool path); tool-trained formats never enter this loop.
+/// Serve the whole session over any backend: [`ChatFormat::supports_tools`]
+/// is the one tool-eligibility decision (CAPS-1) — a tool-trained format
+/// pairs its native codec with its dated template and serves the sessionful
+/// agent; every other format serves plain chat. The web tools start with an
+/// empty origin set — hidden from the model (CAP-3a) and inert until a user
+/// grant arrives (CAP-3).
 #[allow(clippy::too_many_arguments)]
-fn serve_chat(
-    engine: &mut Engine,
+fn serve_session<C: Completer>(
+    completer: &mut C,
     format: ChatFormat,
+    current_date: String,
     system: Option<String>,
     opts: GenOpts,
     watch: DepthWatch,
     req_rx: &Receiver<HostRequest>,
     event_tx: &UnboundedSender<HostEvent>,
     gate: &CancelGate,
-) {
-    let template = format.template();
-    let mut session = ChatSession::new(engine, template).with_opts(opts);
+) -> Result<()> {
+    if !format.supports_tools() {
+        return serve_chat(
+            completer,
+            format,
+            current_date,
+            system,
+            opts,
+            watch,
+            req_rx,
+            event_tx,
+            gate,
+        );
+    }
+    let origins = WebOrigins::new();
+    // Client construction cannot practically fail; degrade to empty tools
+    // (the model simply never sees web tools) rather than dying.
+    let tools = web_tools(&origins).unwrap_or_default();
+    let system = system.unwrap_or_else(|| knobs::DEFAULT_AGENT_SYSTEM.to_string());
+    let template = format.template_with_date(Some(current_date));
+    match format {
+        ChatFormat::Qwen => serve_agent(
+            completer,
+            &tools,
+            QwenToolCall,
+            template,
+            system,
+            opts,
+            watch,
+            &origins,
+            req_rx,
+            event_tx,
+            gate,
+        ),
+        ChatFormat::Plain => serve_agent(
+            completer,
+            &tools,
+            JsonToolCall,
+            template,
+            system,
+            opts,
+            watch,
+            &origins,
+            req_rx,
+            event_tx,
+            gate,
+        ),
+        ChatFormat::MuseGlimmer => serve_agent(
+            completer,
+            &tools,
+            MuseAtemCodec,
+            template,
+            system,
+            opts,
+            watch,
+            &origins,
+            req_rx,
+            event_tx,
+            gate,
+        ),
+        // supports_tools() names exactly the codec-backed formats; a format
+        // it admits without an arm here is a compile-time review failure,
+        // caught by the caps_for/supports_tools witnesses (CAPS-1).
+        other => unreachable!("supports_tools admitted {other:?} without a codec"),
+    }
+}
+
+/// The chat serve loop for chat-only formats: the plain streaming
+/// [`ChatSession`]. Grants are always refused here (CAPS-1 — a chat-only format
+/// cannot enter the tool path); tool-trained formats never enter this loop.
+#[allow(clippy::too_many_arguments)]
+fn serve_chat<C: Completer>(
+    completer: &mut C,
+    format: ChatFormat,
+    current_date: String,
+    system: Option<String>,
+    opts: GenOpts,
+    watch: DepthWatch,
+    req_rx: &Receiver<HostRequest>,
+    event_tx: &UnboundedSender<HostEvent>,
+    gate: &CancelGate,
+) -> Result<()> {
+    let template = format.template_with_date(Some(current_date));
+    let mut session = ChatSession::new(completer, template).with_opts(opts);
     if let Some(system) = system {
         session = session.with_system(system);
     }
 
     while let Ok(req) = req_rx.recv() {
+        // A vanished event plane means no frontend can ever see another
+        // event: exit through the epilogue rather than serving the void.
+        if event_tx.is_closed() {
+            return Ok(());
+        }
         match req {
             HostRequest::Submit { turn_id, text } => {
                 let cancel = Cancel::new();
                 gate.arm(turn_id, cancel.clone());
-                run_turn(
-                    &mut session,
-                    event_tx,
-                    format,
-                    turn_id,
-                    &text,
-                    &cancel,
-                    watch,
-                );
+                let outcome = run_turn(&mut session, event_tx, turn_id, &text, &cancel, watch);
                 gate.disarm();
+                if let ControlFlow::Break(debt) = outcome {
+                    // Fatal backend loss: converge on the epilogue, carrying
+                    // any unproven-cleanup debt to the actor's verdict.
+                    return debt.map_or(Ok(()), Err);
+                }
                 // Between turns, keep the next prompt under the depth budget
                 // (HOST-5) — never mid-run.
                 compact_after_turn(event_tx, watch, session.last_prompt_tokens(), |budget| {
@@ -528,18 +1111,20 @@ fn serve_chat(
             HostRequest::Grant { origin } => refuse_grant(event_tx, format, &origin),
             HostRequest::Revoke { origin } => report_revoke(event_tx, None, &origin),
             HostRequest::ListGrants => report_grants(event_tx, None),
-            HostRequest::Shutdown => return,
+            HostRequest::Shutdown => return Ok(()),
             _ => {} // a future request variant this host predates: ignore it.
         }
     }
+    // Request disconnect: every sender is gone — a requested end, no debt.
+    Ok(())
 }
 
 /// The agent serve loop: one sessionful [`Agent`] (AGENT-3) serves every turn,
 /// seeded with the chat phase's history. Later grants/revokes mutate the shared
 /// origin set in place — the specs re-render each run (CAP-3a).
 #[allow(clippy::too_many_arguments)]
-fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
-    engine: &mut Engine,
+fn serve_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
+    completer: &mut C,
     tools: &Tools,
     codec: K,
     template: T,
@@ -550,9 +1135,9 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
     req_rx: &Receiver<HostRequest>,
     event_tx: &UnboundedSender<HostEvent>,
     gate: &CancelGate,
-) {
+) -> Result<()> {
     let mut agent = Agent::new(
-        engine,
+        completer,
         tools,
         codec,
         template,
@@ -562,12 +1147,22 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
     .with_opts(opts);
 
     while let Ok(req) = req_rx.recv() {
+        // A vanished event plane means no frontend can ever see another
+        // event: exit through the epilogue rather than serving the void.
+        if event_tx.is_closed() {
+            return Ok(());
+        }
         match req {
             HostRequest::Submit { turn_id, text } => {
                 let cancel = Cancel::new();
                 gate.arm(turn_id, cancel.clone());
-                run_agent_turn(&mut agent, event_tx, turn_id, &text, &cancel, watch);
+                let outcome = run_agent_turn(&mut agent, event_tx, turn_id, &text, &cancel, watch);
                 gate.disarm();
+                if let ControlFlow::Break(debt) = outcome {
+                    // Fatal backend loss: converge on the epilogue, carrying
+                    // any unproven-cleanup debt to the actor's verdict.
+                    return debt.map_or(Ok(()), Err);
+                }
                 // Between turns, keep the next prompt under the depth budget
                 // (HOST-5) — never mid-run.
                 compact_after_turn(event_tx, watch, agent.last_prompt_tokens(), |budget| {
@@ -581,10 +1176,12 @@ fn serve_agent<K: ToolCallCodec, T: PromptTemplate>(
             HostRequest::Grant { origin } => report_grant(event_tx, origins, &origin),
             HostRequest::Revoke { origin } => report_revoke(event_tx, Some(origins), &origin),
             HostRequest::ListGrants => report_grants(event_tx, Some(origins)),
-            HostRequest::Shutdown => return,
+            HostRequest::Shutdown => return Ok(()),
             _ => {} // a future request variant this host predates: ignore it.
         }
     }
+    // Request disconnect: every sender is gone — a requested end, no debt.
+    Ok(())
 }
 
 /// Grant an origin and report it (both the first-grant "web tools enabled"
@@ -616,7 +1213,7 @@ fn refuse_grant(event_tx: &UnboundedSender<HostEvent>, format: ChatFormat, origi
         origins: vec![],
         message: format!(
             "cannot grant {origin}: the {format} format is chat-only \
-             (tool calling needs qwen or plain)"
+             (tool calling needs a tool-capable format)"
         ),
     });
 }
@@ -712,49 +1309,51 @@ fn read_artifact(path: &std::path::Path) -> Result<(Vec<u8>, String)> {
     Ok((bytes, name))
 }
 
-/// Run one chat turn: stream `turn_streaming`'s raw fragments through a
-/// [`ReasoningSplitter`] (so each emitted [`HostEvent::Fragment`] is already
-/// classified), report the prompt-token count for the meter, then `Done`/`Error`.
-#[allow(clippy::too_many_arguments)]
-fn run_turn(
-    session: &mut ChatSession<'_, Engine, Box<dyn PromptTemplate>>,
+/// Run one chat turn: stream `turn_streaming`'s raw fragments through the
+/// session template's own [`ResponseClassifier`] (REASON-1: each emitted
+/// [`HostEvent::Fragment`] is already classified — marker-split for marker
+/// formats, the ATEM machine for Muse), report the prompt-token count for
+/// the meter when the backend can count, then `Done`/`Error`.
+/// `Break` = fatal backend loss: the caller exits through the epilogue,
+/// carrying any unproven-cleanup debt to the actor's verdict.
+fn run_turn<C: Completer>(
+    session: &mut ChatSession<'_, C, Box<dyn PromptTemplate>>,
     event_tx: &UnboundedSender<HostEvent>,
-    format: ChatFormat,
     turn_id: TurnId,
     user: &str,
     cancel: &Cancel,
     watch: DepthWatch,
-) {
+) -> ControlFlow<Option<anyhow::Error>> {
     let _ = event_tx.send(HostEvent::Started { turn_id });
 
-    let mut splitter = if format.pre_seeds_reasoning() {
-        ReasoningSplitter::seeded()
-    } else {
-        ReasoningSplitter::new()
-    };
+    let mut classifier = session.classifier();
 
     let outcome = {
         let mut on_token = |frag: &str| {
-            splitter.push(frag, |channel, text| {
-                let _ = event_tx.send(HostEvent::Fragment {
-                    turn_id,
-                    channel: to_proto_channel(channel),
-                    text: text.to_string(),
-                });
+            classifier.push(frag, |channel, text| {
+                if let Some(channel) = to_proto_channel(channel) {
+                    let _ = event_tx.send(HostEvent::Fragment {
+                        turn_id,
+                        channel,
+                        text: text.to_string(),
+                    });
+                }
             });
         };
         session
             .turn_streaming_cancellable(user, cancel, &mut on_token)
             .map(|answer| answer.to_string())
     };
-    // `on_token` is dropped at the block end, releasing `splitter` so the tail
-    // can be flushed.
-    splitter.finish(|channel, text| {
-        let _ = event_tx.send(HostEvent::Fragment {
-            turn_id,
-            channel: to_proto_channel(channel),
-            text: text.to_string(),
-        });
+    // `on_token` is dropped at the block end, releasing the classifier so the
+    // tail can be flushed.
+    classifier.finish(|channel, text| {
+        if let Some(channel) = to_proto_channel(channel) {
+            let _ = event_tx.send(HostEvent::Fragment {
+                turn_id,
+                channel,
+                text: text.to_string(),
+            });
+        }
     });
 
     match outcome {
@@ -773,13 +1372,43 @@ fn run_turn(
                 turn_id,
                 stop: to_proto_stop(stop),
             });
+            ControlFlow::Continue(())
         }
-        Err(e) => {
-            let _ = event_tx.send(HostEvent::Error {
-                turn_id,
-                message: e.to_string(),
-            });
+        Err(e) => report_turn_error(event_tx, turn_id, e),
+    }
+}
+
+/// Report a failed turn: always an [`HostEvent::Error`] for the turn; when
+/// the error carries the [`BackendLost`] marker (the managed child is dead),
+/// also a [`HostEvent::Fatal`] and `Break`, so the serve loop exits through
+/// the backend-consuming epilogue instead of retrying a dead backend. Any
+/// other failure is recoverable: the session stands and the next submit is
+/// served.
+///
+/// A lost backend whose error chain also carries the lib's typed
+/// [`ChildCleanupFailed`] — the mid-completion death path consumed the
+/// drain handles, so the later epilogue cannot re-prove the cleanup —
+/// breaks with the error itself as **ownership debt**: the serve loop
+/// returns it to the actor, whose final verdict fails
+/// [`HostOwner::shutdown`] rather than blessing an unproven reap (LSRV-1 /
+/// HOST-3).
+fn report_turn_error(
+    event_tx: &UnboundedSender<HostEvent>,
+    turn_id: TurnId,
+    error: anyhow::Error,
+) -> ControlFlow<Option<anyhow::Error>> {
+    let lost = error.downcast_ref::<BackendLost>().map(|l| l.0.clone());
+    let _ = event_tx.send(HostEvent::Error {
+        turn_id,
+        message: format!("{error:#}"),
+    });
+    match lost {
+        Some(message) => {
+            let _ = event_tx.send(HostEvent::Fatal(message));
+            let debt = error.downcast_ref::<ChildCleanupFailed>().is_some();
+            ControlFlow::Break(debt.then_some(error))
         }
+        None => ControlFlow::Continue(()),
     }
 }
 
@@ -791,22 +1420,24 @@ fn run_turn(
 /// pane ([`HostEvent::RetractAnswer`]) and replays it as reasoning, ahead of
 /// the [`ToolNoteKind::Call`] activity line. A successful plot/read_image
 /// ships its bytes as [`HostEvent::Image`].
-fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
-    agent: &mut Agent<'_, Engine, K, T>,
+fn run_agent_turn<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
+    agent: &mut Agent<'_, C, K, T>,
     event_tx: &UnboundedSender<HostEvent>,
     turn_id: TurnId,
     user: &str,
     cancel: &Cancel,
     watch: DepthWatch,
-) {
+) -> ControlFlow<Option<anyhow::Error>> {
     let _ = event_tx.send(HostEvent::Started { turn_id });
 
     let fragment = |channel: LibChannel, text: String| {
-        let _ = event_tx.send(HostEvent::Fragment {
-            turn_id,
-            channel: to_proto_channel(channel),
-            text,
-        });
+        if let Some(channel) = to_proto_channel(channel) {
+            let _ = event_tx.send(HostEvent::Fragment {
+                turn_id,
+                channel,
+                text,
+            });
+        }
     };
     let note = |kind: ToolNoteKind, text: String| {
         let _ = event_tx.send(HostEvent::ToolNote {
@@ -932,26 +1563,27 @@ fn run_agent_turn<K: ToolCallCodec, T: PromptTemplate>(
                 turn_id,
                 stop: to_proto_stop(stop),
             });
+            ControlFlow::Continue(())
         }
-        Err(e) => {
-            let _ = event_tx.send(HostEvent::Error {
-                turn_id,
-                message: e.to_string(),
-            });
-        }
+        Err(e) => report_turn_error(event_tx, turn_id, e),
     }
 }
 
 /// Convert a yatima-lib channel to its wire mirror. A free function, not a
 /// `From` impl: both types are foreign to this crate, so the orphan rule forbids
 /// the trait impl here (and yatima-protocol may not depend on the lib).
-fn to_proto_channel(channel: LibChannel) -> Channel {
+///
+/// `ToolCall` has no wire mirror and never panics: in the agent, tool
+/// material becomes typed [`AgentEvent`] activity (surfaced as
+/// [`HostEvent::ToolNote`]); in a *chat* stream — where a Muse reply may
+/// still address a tool nobody advertised — the fragment is protocol
+/// material, not prose, and is deliberately consumed before the wire
+/// (REASON-1: framing never surfaces as reasoning or answer text).
+fn to_proto_channel(channel: LibChannel) -> Option<Channel> {
     match channel {
-        LibChannel::Reasoning => Channel::Reasoning,
-        LibChannel::Answer => Channel::Answer,
-        LibChannel::ToolCall => {
-            unreachable!("tool-call protocol material is consumed inside yatima-lib")
-        }
+        LibChannel::Reasoning => Some(Channel::Reasoning),
+        LibChannel::Answer => Some(Channel::Answer),
+        LibChannel::ToolCall => None,
     }
 }
 
@@ -984,13 +1616,153 @@ mod tests {
     #[test]
     fn lib_types_map_to_wire_mirrors() {
         // The two free conversions cover every variant (a new one that isn't
-        // handled fails to compile — the matches are exhaustive).
-        assert_eq!(to_proto_channel(LibChannel::Answer), Channel::Answer);
-        assert_eq!(to_proto_channel(LibChannel::Reasoning), Channel::Reasoning);
+        // handled fails to compile — the matches are exhaustive). ToolCall
+        // deliberately has no wire mirror and no panic: tool material is
+        // consumed or projected as typed activity before conversion
+        // (REASON-1; the retired `unreachable!` arm was a stage-5 landmine).
+        assert_eq!(to_proto_channel(LibChannel::Answer), Some(Channel::Answer));
+        assert_eq!(
+            to_proto_channel(LibChannel::Reasoning),
+            Some(Channel::Reasoning)
+        );
+        assert_eq!(to_proto_channel(LibChannel::ToolCall), None);
         assert_eq!(to_proto_stop(StopReason::Eos), StopKind::Eos);
         assert_eq!(to_proto_stop(StopReason::MaxTokens), StopKind::MaxTokens);
         assert_eq!(to_proto_stop(StopReason::Stopped), StopKind::Stopped);
         assert_eq!(to_proto_stop(StopReason::Repetition), StopKind::Repetition);
+    }
+
+    #[test]
+    fn probe_verdict_treats_unobservable_children_as_lost() {
+        // upholds: LSRV-1 (host boundary) — an exited child is loss, a
+        // running child is not, and a probe FAILURE is also loss: an owner
+        // that cannot observe its child holds no evidence of a healthy
+        // backend and must not keep retrying it.
+        use std::os::unix::process::ExitStatusExt;
+        let exited = std::process::ExitStatus::from_raw(9);
+        assert!(probe_verdict(Ok(Some(exited)))
+            .expect("exited is loss")
+            .contains("exited"));
+        assert_eq!(probe_verdict(Ok(None)), None, "running is recoverable");
+        let failure = std::io::Error::other("no such process table");
+        assert!(probe_verdict(Err(failure))
+            .expect("unobservable is loss")
+            .contains("cannot observe"));
+    }
+
+    #[tokio::test]
+    async fn await_epilogue_propagates_the_epilogue_verdict_after_join() {
+        // upholds: HOST-3 / LSRV-1 — the joined-success witness must not
+        // lie: a failed epilogue fails the wait even though the join
+        // succeeded, and a clean epilogue passes.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = tx.send(Err(anyhow::anyhow!("drain join failed")));
+        });
+        let error = await_epilogue(rx, thread, std::time::Duration::from_secs(5))
+            .await
+            .expect_err("a failed epilogue must fail the wait");
+        assert!(format!("{error:#}").contains("drain join failed"));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = tx.send(Ok(()));
+        });
+        await_epilogue(rx, thread, std::time::Duration::from_secs(5))
+            .await
+            .expect("a clean epilogue passes");
+    }
+
+    #[test]
+    fn reaper_thread_joins_the_actor_without_any_runtime() {
+        // upholds: HOST-3 — the reaper is an OS thread, not a tokio task: a
+        // frontend runtime's teardown cannot abort it. Proven by running the
+        // whole transfer with NO runtime anywhere — the reaper's own join
+        // completing is the witness that the late actor was joined, not
+        // detached.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let actor = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = tx.send(Ok(()));
+        });
+        let reaper = spawn_reaper(rx, actor);
+        reaper
+            .join()
+            .expect("the reaper joined the late actor and exited cleanly");
+    }
+
+    #[tokio::test]
+    async fn await_epilogue_timeout_transfers_the_join_to_the_reaper() {
+        // upholds: HOST-3 — when the bound elapses the error names the
+        // transfer; the reaper mechanism itself is witnessed runtime-free
+        // above. The runtime this test creates then dies immediately — with
+        // an OS-thread reaper that is safe, which is the blocker this
+        // replaces (a tokio-spawned reaper died with it).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = tx.send(Ok(()));
+        });
+        let error = await_epilogue(rx, thread, std::time::Duration::from_millis(50))
+            .await
+            .expect_err("the bound elapsed");
+        assert!(format!("{error:#}").contains("reaper"), "{error:#}");
+    }
+
+    #[test]
+    fn managed_config_is_valid_by_construction() {
+        // upholds: PROFILE-1 / PROFILE-2 (host boundary) — only a profile
+        // pinning the llama-server backend and a chat format can build a
+        // managed config; its options are the profile's recipe layered over
+        // the base and its format is the pin — a mismatched format or an
+        // undercut recipe cannot be assembled field-by-field.
+        let profile = yatima_lib::ModelProfile::builtin("muse-glimmer").unwrap();
+        let config = HostConfig::managed(&profile, true, GenOpts::default(), None).unwrap();
+        assert_eq!(config.format, Some(ChatFormat::MuseGlimmer));
+        assert_eq!(config.model_label.as_deref(), Some("muse-glimmer"));
+        let layered = profile.apply_gen_overrides(GenOpts::default());
+        assert_eq!(config.opts.max_tokens, layered.max_tokens);
+        assert_eq!(config.opts.sampling, layered.sampling);
+        assert!(config.managed_launcher.is_none(), "never set by default");
+
+        let engine_profile = yatima_lib::ModelProfile::builtin("kimi-dev").unwrap();
+        let Err(error) = HostConfig::managed(&engine_profile, true, GenOpts::default(), None)
+        else {
+            panic!("an engine profile must not build a managed config");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("does not pin the llama-server backend"),
+            "{error:#}"
+        );
+
+        let mut formatless = profile.clone();
+        formatless.format = None;
+        let Err(error) = HostConfig::managed(&formatless, true, GenOpts::default(), None) else {
+            panic!("a format-less profile must not build a managed config");
+        };
+        assert!(
+            error.to_string().contains("does not pin a chat format"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn cancel_armed_flips_only_the_armed_turn() {
+        // The owner's shutdown path: whatever turn is armed cancels without
+        // the owner knowing its id; a disarmed gate is a no-op, and early
+        // cancels for queued turns are untouched.
+        let gate = CancelGate::new();
+        gate.cancel_armed(); // disarmed: nothing to flip, nothing to panic.
+        let cancel = Cancel::new();
+        gate.arm(3, cancel.clone());
+        gate.cancel_armed();
+        assert!(cancel.is_cancelled());
+        gate.disarm();
+        let next = Cancel::new();
+        gate.arm(4, next.clone());
+        assert!(!next.is_cancelled(), "a later turn must not inherit it");
     }
 
     #[test]

@@ -2,9 +2,7 @@
 //! event plane delivers Started → Fragment* → Done with a coherent answer, then
 //! a cancel cuts a long turn short. YATIMA_E2E-gated; skips if uncached.
 
-use yatima_host::{
-    spawn, Channel, HostBackendConfig, HostConfig, HostEvent, HostRequest, StopKind,
-};
+use yatima_host::{spawn, Channel, HostConfig, HostEvent, HostRequest, StopKind};
 use yatima_lib::{
     is_model_present, model_dir, models_root, GenOpts, ModelId, ModelSource, Sampling,
 };
@@ -28,22 +26,20 @@ async fn host_runs_a_turn() -> anyhow::Result<()> {
     let Some(dir) = cached_dir() else {
         return Ok(());
     };
-    let config = HostConfig {
-        backend: HostBackendConfig::Engine {
-            source: ModelSource::from_args(Some(dir), None, None, true, None)?,
-            cpu: false,
-        },
-        opts: GenOpts {
+    let config = HostConfig::engine(
+        ModelSource::from_args(Some(dir), None, None, true, None)?,
+        false,
+        GenOpts {
             max_tokens: 32,
             sampling: Sampling::Greedy,
             ..Default::default()
         },
-        format: None,
-        system: None,
-        model_label: Some("Qwen/Qwen2.5-7B-Instruct".into()),
-    };
-    let (mut handle, _info) = spawn(config).await?;
-    handle.req_tx.send(HostRequest::Submit {
+        None,
+        None,
+        Some("Qwen/Qwen2.5-7B-Instruct".into()),
+    );
+    let (mut client, owner, _info) = spawn(config).await?;
+    client.req_tx.send(HostRequest::Submit {
         turn_id: 0,
         text: "What is 2 + 2? Reply with only the number.".into(),
     })?;
@@ -51,7 +47,7 @@ async fn host_runs_a_turn() -> anyhow::Result<()> {
     let mut answer = String::new();
     let mut started = false;
     loop {
-        match handle.event_rx.recv().await.expect("event") {
+        match client.event_rx.recv().await.expect("event") {
             HostEvent::Started { .. } => started = true,
             HostEvent::Fragment {
                 channel: Channel::Answer,
@@ -63,7 +59,7 @@ async fn host_runs_a_turn() -> anyhow::Result<()> {
             _ => {}
         }
     }
-    handle.req_tx.send(HostRequest::Shutdown)?;
+    owner.shutdown().await?;
     eprintln!("host answer: {answer:?}");
     assert!(started, "expected a Started event");
     assert!(answer.contains('4'), "expected 4, got {answer:?}");
@@ -78,36 +74,34 @@ async fn host_cancels_a_turn_in_flight() -> anyhow::Result<()> {
     let Some(dir) = cached_dir() else {
         return Ok(());
     };
-    let config = HostConfig {
-        backend: HostBackendConfig::Engine {
-            source: ModelSource::from_args(Some(dir), None, None, true, None)?,
-            cpu: false,
-        },
-        opts: GenOpts {
+    let config = HostConfig::engine(
+        ModelSource::from_args(Some(dir), None, None, true, None)?,
+        false,
+        GenOpts {
             max_tokens: 2048, // long enough that a cancel must cut it short
             sampling: Sampling::Greedy,
             ..Default::default()
         },
-        format: None,
-        system: None,
-        model_label: Some("Qwen/Qwen2.5-7B-Instruct".into()),
-    };
-    let (mut handle, _info) = spawn(config).await?;
-    handle.req_tx.send(HostRequest::Submit {
+        None,
+        None,
+        Some("Qwen/Qwen2.5-7B-Instruct".into()),
+    );
+    let (mut client, owner, _info) = spawn(config).await?;
+    client.req_tx.send(HostRequest::Submit {
         turn_id: 0,
         text: "Write a long, detailed essay about the history of computing.".into(),
     })?;
 
     let stop = loop {
-        match handle.event_rx.recv().await.expect("event") {
+        match client.event_rx.recv().await.expect("event") {
             // First token → cancel the in-flight turn through the gate.
-            HostEvent::Fragment { .. } => handle.cancel.cancel(0),
+            HostEvent::Fragment { .. } => client.cancel.cancel(0),
             HostEvent::Done { stop, .. } => break stop,
             HostEvent::Error { message, .. } => panic!("engine error: {message}"),
             _ => {}
         }
     };
-    handle.req_tx.send(HostRequest::Shutdown)?;
+    owner.shutdown().await?;
     assert_eq!(
         stop,
         StopKind::Stopped,

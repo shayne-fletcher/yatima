@@ -22,10 +22,14 @@ fetch = ["yatima-lib/fetch"]
 yatima-lib = { path = "../lib" }
 yatima-protocol = { path = "../protocol" }
 anyhow = "1"
-# The event plane is a tokio unbounded channel the async UI loop selects on;
-# `sync` is the only feature needed (decode is sync on a plain OS thread, not
-# a runtime worker — CMP-1 / RT-2).
-tokio = { version = "1", features = ["sync"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tracing = "0.1"
+# The event plane is a tokio unbounded channel the async UI loop selects on.
+# Decode stays sync on a plain OS thread (CMP-1 / RT-2); `time` bounds the
+# owner's shutdown await and `rt` hosts its thread join on the blocking pool
+# — no runtime is created here (RT-1: the caller's, or the lib's, runtime
+# drives the async surface).
+tokio = { version = "1", features = ["sync", "time", "rt"] }
 # File logging behind $YATIMA_LOG (OBS-1: the lib emits tracing, the host
 # installs the subscriber). The frontend owns the screen, so logs go to a
 # per-host file under ~/.cache/yatima, never stdout/stderr.
@@ -33,4 +37,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 yatima-lib = { path = "../lib", features = ["fetch"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process"] }
+sha2 = "0.10"
+tempfile = "3"

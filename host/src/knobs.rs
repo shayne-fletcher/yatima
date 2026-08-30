@@ -6,6 +6,16 @@
 /// `--max-steps` default.
 pub const AGENT_MAX_STEPS: usize = 6;
 
+/// How long [`crate::HostOwner::shutdown`] waits for the actor's epilogue
+/// before handing the join obligation to a background reaper. Sized to the
+/// longest *bounded* startup leg it may have to wait out: managed readiness
+/// (180 s in the lib) plus the bounded cleanup (10 s) plus margin. The hash
+/// observes the cancel between chunks (seconds, not the whole file), and a
+/// cancelled decode ends at the next token; only phase-unbounded work — a
+/// model fetch has no finite bound — legitimately exceeds this, which is
+/// exactly the case the reaper transfer exists for.
+pub const SHUTDOWN_WITHIN: std::time::Duration = std::time::Duration::from_secs(240);
+
 /// The base system prompt for tool-enabled sessions when `--system` is absent.
 pub const DEFAULT_AGENT_SYSTEM: &str =
     "You are a helpful assistant. Call a tool when it helps, then answer. \

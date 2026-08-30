@@ -90,6 +90,16 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         cpu: args.cpu,
         offline: args.offline,
     })?;
+    // 5c gives the GUI its joined exit (owner retained outside
+    // `eframe::run_native`, shutdown awaited after the window returns).
+    // Until then a managed child would ride only the Drop-request fallback
+    // at window close — an unproven reap — so the profile is refused here.
+    if resolved.is_managed_llama_server() {
+        anyhow::bail!(
+            "managed llama-server profiles reach the GUI in stage 5c; \
+             until then use yatima-tui or the CLI (--profile muse-glimmer)"
+        );
+    }
 
     let base = GenOpts {
         max_tokens: args.max_tokens,
@@ -183,6 +193,9 @@ enum Status {
 
 struct GuiApp {
     req_tx: Sender<HostRequest>,
+    /// The backend thread's one owner (HOST-3). Held so dropping the app at
+    /// window close requests shutdown; the awaited, joined exit is 5c.
+    _host_owner: yatima_host::HostOwner,
     /// The host's events, forwarded from its channel by a pump thread that also
     /// wakes egui on each one (the host has no egui handle of its own).
     ev_rx: Receiver<HostEvent>,
@@ -290,16 +303,22 @@ impl GuiApp {
     fn new(cc: &eframe::CreationContext<'_>, cfg: HostConfig, whimsy: bool) -> GuiApp {
         let ctx = cc.egui_ctx.clone();
         install_fonts(&ctx);
-        // The host loads the model on its own thread; Ready (or Fatal) arrives
-        // as the first event. A thread-spawn failure here is catastrophic and
-        // unrecoverable — there is no engine to talk to.
-        let handle = spawn_nonblocking(cfg).expect("spawn engine host");
+        // The host builds its backend on its own thread; Startup phase
+        // events precede Ready (or Fatal). This app still folds only
+        // Ready/Fatal — startup-phase presentation is 5c. A thread-spawn
+        // failure here is catastrophic and unrecoverable — there is no
+        // backend to talk to.
+        // 5b holds the owner in the app so its Drop requests shutdown when
+        // the window closes; the joined exit (owner retained outside
+        // `eframe::run_native`, shutdown awaited after the window returns)
+        // is stage 5c's GUI leg.
+        let (client, owner) = spawn_nonblocking(cfg).expect("spawn engine host");
         // The host's event channel is a tokio receiver with no egui handle; a
         // pump thread forwards each event to the UI's std channel and wakes
         // egui, reproducing the old runner's per-event repaint.
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<HostEvent>();
         let pump_ctx = ctx.clone();
-        let mut host_events = handle.event_rx;
+        let mut host_events = client.event_rx;
         thread::spawn(move || {
             while let Some(ev) = host_events.blocking_recv() {
                 if ev_tx.send(ev).is_err() {
@@ -309,9 +328,10 @@ impl GuiApp {
             }
         });
         GuiApp {
-            req_tx: handle.req_tx,
+            req_tx: client.req_tx,
             ev_rx,
-            cancel: handle.cancel,
+            cancel: client.cancel,
+            _host_owner: owner,
             next_turn_id: 0,
             ctx,
             splash_anim_start: None,
@@ -1956,8 +1976,8 @@ fn main() -> Result<()> {
     // explicit source titles with the argument as given (the status rail
     // shows the resolved facts once Ready arrives).
     let title_label = cfg
-        .model_label
-        .clone()
+        .model_label()
+        .map(str::to_string)
         .or_else(|| args.model.as_ref().map(|p| p.display().to_string()))
         .or_else(|| args.repo.clone())
         .unwrap_or_else(|| "local model".to_string());

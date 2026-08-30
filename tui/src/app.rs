@@ -19,7 +19,8 @@ use ratatui::Terminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui_textarea::{CursorMove, Input, TextArea};
 use yatima_host::{
-    CancelGate, Channel, HostEvent, HostRequest, ModelInfo, StopKind, ToolNoteKind, TurnId,
+    CancelGate, Channel, HostEvent, HostRequest, ModelIdentity, ModelInfo, StartupPhase, StopKind,
+    ToolNoteKind, TurnId,
 };
 
 use crate::render;
@@ -56,6 +57,10 @@ pub struct Status {
     pub model_label: String,
     pub backend: String,
     pub format: String,
+    /// Compact verified identity for the rail (e.g. `verified:4cc57c0f`), or
+    /// `None` when no authenticated evidence exists — nothing is shown rather
+    /// than a claim (LSRV-5's wire form, displayed).
+    pub identity: Option<String>,
     /// The model's context window (meter denominator), if declared.
     pub context_length: Option<usize>,
     /// Tokens in the most recent prompt (meter numerator), once a turn completes.
@@ -98,6 +103,14 @@ pub enum Intent {
     ToggleReasoning,
 }
 
+/// The pre-`Ready` loading state: the host's current startup phase and the
+/// one clock elapsed time is measured on. Rendered inside the ordinary shell
+/// — the input area becomes a single activity line until `Ready`.
+pub struct Loading {
+    pub phase: StartupPhase,
+    pub since: Instant,
+}
+
 /// The UI render model.
 pub struct App {
     pub req_tx: Sender<HostRequest>,
@@ -129,14 +142,33 @@ pub struct App {
     /// choreography the compose needs.
     compose_requested: bool,
     pub should_quit: bool,
-    /// A first Ctrl+C/Ctrl+D armed the quit; the next confirms, any other key
-    /// stands down. Render shows the confirm hint while armed.
+    /// A first Ctrl+C armed the quit; the next confirms, any other key
+    /// stands down. Render shows the confirm hint while armed. (Ctrl+D is
+    /// deliberately NOT a quit key: it is emacs delete-char and flows to the
+    /// editor — an editing reflex must never be bound to the most
+    /// destructive action in the app.)
     pub quit_armed: bool,
+    /// `Some` until [`HostEvent::Ready`]: the startup phase the activity line
+    /// renders. Input is disabled while set (quit still works — a hung
+    /// startup must be abortable; the owner's shutdown cancels it).
+    pub loading: Option<Loading>,
+    /// A [`HostEvent::Fatal`] message: the loop exits and main reports it as
+    /// the ordinary error after restoring the terminal.
+    pub fatal: Option<String>,
     next_turn_id: TurnId,
 }
 
 impl App {
     pub fn new(req_tx: Sender<HostRequest>, cancel: CancelGate, ready: ModelInfo) -> App {
+        let mut app = App::loading(req_tx, cancel, ready.label.clone());
+        app.apply_ready(ready);
+        app
+    }
+
+    /// An app in its pre-`Ready` loading state (the host was spawned
+    /// nonblocking; startup phases stream in as events). `label` seeds the
+    /// status rail until [`HostEvent::Ready`] carries the real facts.
+    pub fn loading(req_tx: Sender<HostRequest>, cancel: CancelGate, label: String) -> App {
         App {
             req_tx,
             cancel,
@@ -148,16 +180,22 @@ impl App {
             scroll_back: 0,
             in_flight: None,
             status: Status {
-                model_label: ready.label,
-                backend: ready.backend,
-                format: ready.format,
-                context_length: ready.context_length,
+                model_label: label,
+                backend: String::new(),
+                format: String::new(),
+                identity: None,
+                context_length: None,
                 prompt_tokens: None,
                 grants: Vec::new(),
             },
             reasoning_expanded: false,
             compose_requested: false,
             should_quit: false,
+            loading: Some(Loading {
+                phase: StartupPhase::ResolvingModel,
+                since: Instant::now(),
+            }),
+            fatal: None,
             quit_armed: false,
             next_turn_id: 0,
         }
@@ -172,7 +210,6 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Char('c') if ctrl => Intent::Quit,
-            KeyCode::Char('d') if ctrl => Intent::Quit,
             KeyCode::Char('r') if ctrl => Intent::ToggleReasoning,
             KeyCode::Char('g') if ctrl => Intent::Compose,
             KeyCode::Esc => Intent::Cancel,
@@ -200,7 +237,13 @@ impl App {
 
     /// Apply an intent's effect.
     pub fn apply(&mut self, intent: Intent) {
-        // Quitting takes a confirmation: the first Ctrl+C/Ctrl+D arms it (the
+        // Until Ready, the only live control is quit (a hung startup must be
+        // abortable); everything else waits for the model.
+        if self.loading.is_some() && !matches!(intent, Intent::Quit) {
+            self.quit_armed = false;
+            return;
+        }
+        // Quitting takes a confirmation: the first Ctrl+C arms it (the
         // input box shows the hint), the next confirms, and any other key
         // stands down — a stray reflex never tears the session down.
         if !matches!(intent, Intent::Quit) {
@@ -404,9 +447,34 @@ impl App {
             .is_some_and(|f| f.turn_id == turn_id)
     }
 
-    /// Fold a host event into the render mirror (the only event entry point).
+    /// Fold the `Ready` facts into the status rail and leave loading.
+    fn apply_ready(&mut self, ready: ModelInfo) {
+        self.loading = None;
+        self.status.model_label = ready.label;
+        self.status.backend = ready.backend;
+        self.status.format = ready.format;
+        self.status.identity = compact_identity(&ready.identity);
+        self.status.context_length = ready.context_length;
+    }
+
     pub fn on_engine_event(&mut self, event: HostEvent) {
         match event {
+            // Startup is loading state, never transcript: the activity line
+            // shows exactly the phase the host reported (elapsed time is this
+            // view's own clock).
+            HostEvent::Startup { phase } => {
+                if let Some(loading) = self.loading.as_mut() {
+                    loading.phase = phase;
+                }
+            }
+            // Ready switches directly to the normal interface — no flourish.
+            HostEvent::Ready(info) => self.apply_ready(info),
+            // Fatal ends the session: main restores the terminal, then
+            // reports this as the ordinary error.
+            HostEvent::Fatal(message) => {
+                self.fatal = Some(message);
+                self.should_quit = true;
+            }
             HostEvent::Started { turn_id } if self.is_current(turn_id) => {
                 self.push_entry(Entry::Assistant {
                     reasoning: String::new(),
@@ -503,6 +571,21 @@ impl App {
         if let Some(Entry::Assistant { stop: s, .. }) = self.transcript.last_mut() {
             *s = Some(stop);
         }
+    }
+}
+
+/// The status rail's compact identity: the digest's first eight hex chars
+/// under a `verified:` prefix — display, not evidence (the full digest is
+/// the wire's). `None` (nothing shown) when identity is unauthenticated.
+pub fn compact_identity(identity: &ModelIdentity) -> Option<String> {
+    match identity {
+        ModelIdentity::VerifiedSha256(digest) => {
+            let prefix: String = digest.chars().take(8).collect();
+            Some(format!("verified:{prefix}"))
+        }
+        // A closed sum (like Channel/StopKind): a future identity kind is a
+        // reviewed protocol change and must decide its display here.
+        ModelIdentity::Unverified => None,
     }
 }
 
@@ -617,7 +700,12 @@ where
         }
     }
     let _ = app.req_tx.send(HostRequest::Shutdown);
-    Ok(())
+    // A Fatal ends the loop; main restores the terminal first, then reports
+    // this as the ordinary error (and still joins the owner).
+    match app.fatal.take() {
+        Some(message) => Err(anyhow::anyhow!(message)),
+        None => Ok(()),
+    }
 }
 
 /// Suspend the TUI, run `$VISUAL`/`$EDITOR` on a temp file seeded with the
@@ -752,7 +840,7 @@ mod tests {
 
     #[test]
     fn quit_takes_two_presses() {
-        // A stray Ctrl+C/Ctrl+D must not tear the session down: the first
+        // A stray Ctrl+C must not tear the session down: the first
         // press arms (render shows the confirm hint), the second confirms,
         // and any other key stands down.
         let (mut app, _rx) = test_app();
@@ -1136,6 +1224,107 @@ mod tests {
         assert_eq!(app.input_text(), "line one\nline two");
         assert!(app.in_flight.is_none(), "Alt+Enter must not submit");
         assert!(rx.try_recv().is_err(), "no turn submitted");
+    }
+
+    #[test]
+    fn ctrl_d_is_an_editing_key_never_quit() {
+        // Ctrl+D is emacs delete-char: it must classify as Edit (flowing to
+        // the textarea, which deletes the char under the cursor) and must
+        // never arm or confirm a quit — an editing reflex bound to the most
+        // destructive action killed real sessions (observed 2026-08-29).
+        let intent = App::classify(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(intent, Intent::Edit(_)),
+            "Ctrl+D must reach the editor"
+        );
+
+        let (mut app, _rx) = test_app();
+        app.set_input("abc");
+        app.input.move_cursor(CursorMove::Head);
+        app.apply(intent);
+        assert_eq!(app.input_text(), "bc", "delete-char under the cursor");
+        assert!(!app.should_quit && !app.quit_armed);
+
+        // Even mid-arm, Ctrl+D stands the quit down instead of confirming.
+        app.apply(Intent::Quit);
+        assert!(app.quit_armed);
+        app.apply(App::classify(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!app.should_quit, "Ctrl+D must never confirm a quit");
+        assert!(!app.quit_armed, "an edit stands the armed quit down");
+    }
+
+    #[test]
+    fn loading_folds_phases_and_ready_switches_to_the_normal_interface() {
+        // upholds: TUI leg of stage 5b — startup is loading state: phases
+        // update the activity line's source of truth, Ready fills the rail
+        // (including the compact verified identity) and clears loading with
+        // no flourish.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::loading(tx, CancelGate::new(), "muse-glimmer".into());
+        assert!(app.loading.is_some());
+        app.on_engine_event(HostEvent::Startup {
+            phase: StartupPhase::VerifyingModel,
+        });
+        assert!(matches!(
+            app.loading.as_ref().unwrap().phase,
+            StartupPhase::VerifyingModel
+        ));
+        app.on_engine_event(HostEvent::Ready(ModelInfo {
+            label: "muse-glimmer".into(),
+            arch: "Muse-Glimmer-30B".into(),
+            backend: "b10520".into(),
+            device: "external".into(),
+            format: "MuseGlimmer".into(),
+            sampling: "temp 1.00 · top-p 0.95 · seed 0".into(),
+            max_tokens: 4096,
+            context_length: Some(131072),
+            identity: ModelIdentity::VerifiedSha256(
+                "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e".into(),
+            ),
+        }));
+        assert!(app.loading.is_none(), "Ready leaves loading");
+        assert_eq!(app.status.identity.as_deref(), Some("verified:4cc57c0f"));
+        assert_eq!(app.status.backend, "b10520");
+    }
+
+    #[test]
+    fn loading_disables_everything_but_quit() {
+        // Input is disabled until Ready; quit stays live so a hung startup
+        // is abortable (the owner's shutdown cancels it).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::loading(tx, CancelGate::new(), "muse-glimmer".into());
+        app.apply(Intent::Edit(KeyEvent::from(KeyCode::Char('x')).into()));
+        app.apply(Intent::Submit);
+        assert!(rx.try_recv().is_err(), "no request may leave a loading app");
+        app.apply(Intent::Quit);
+        app.apply(Intent::Quit);
+        assert!(app.should_quit, "quit must work during loading");
+    }
+
+    #[test]
+    fn fatal_records_the_error_and_quits() {
+        // A Fatal ends the loop; run_loop returns it so main restores the
+        // terminal first and prints the ordinary error.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::loading(tx, CancelGate::new(), "muse-glimmer".into());
+        app.on_engine_event(HostEvent::Fatal("SHA-256 mismatch".into()));
+        assert!(app.should_quit);
+        assert_eq!(app.fatal.as_deref(), Some("SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn identity_compacts_only_verified_evidence() {
+        assert_eq!(
+            compact_identity(&ModelIdentity::VerifiedSha256(
+                "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e".into()
+            ))
+            .as_deref(),
+            Some("verified:4cc57c0f")
+        );
+        assert_eq!(compact_identity(&ModelIdentity::Unverified), None);
     }
 
     #[test]

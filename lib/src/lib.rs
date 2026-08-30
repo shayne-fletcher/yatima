@@ -149,6 +149,10 @@
 //!   a bound. A managed CLI interrupt becomes cooperative cancellation and
 //!   follows that explicit shutdown path before process exit. In-flight
 //!   completion races child death; `Drop` is only a kill-request fallback.
+//!   The host's backend thread is such an owner: its single epilogue reaps
+//!   and joins on every post-construction exit — explicit shutdown, fatal
+//!   child loss, a vanished event plane, cancelled startup — witnessed by
+//!   yatima-host's hermetic lifecycle battery (HOST-3 there).
 //! - **LSRV-2** every llama-server endpoint is a validated HTTP loopback origin.
 //!   Managed mode constructs its own `127.0.0.1` endpoint; attached mode
 //!   accepts loopback literals or `localhost`, normalizing the latter before a
@@ -171,7 +175,10 @@
 //!   supplies the child process's `-m` pathname. [`LlamaServerSpawn::verified`]
 //!   inseparably carries build-floor, embedded-template-digest, context, and slot
 //!   [`ServerGates`], which run after introspection and before a server value can
-//!   serve a completion. Digest failure spawns nothing; gate failure reaps and
+//!   serve a completion. The host's managed path is a launched-path witness of
+//!   the same construction: only [`verify_sync`]'s refined artifact reaches its
+//!   spawn, and its `Ready` reports the digest as the wire's verified identity
+//!   (yatima-host's battery). Digest failure spawns nothing; gate failure reaps and
 //!   joins the child. Ordinary managed and attached sessions remain
 //!   [`ServerIdentity::Unverified`]. Generated text and `/props` self-reports
 //!   are never identity evidence. The trust boundary is the local process and
@@ -351,6 +358,8 @@ mod expr;
 mod host;
 mod reasoning;
 mod runtime;
+#[doc(hidden)]
+pub mod stub;
 mod template;
 mod token_output_stream;
 mod tool;
@@ -358,8 +367,8 @@ mod transcript;
 
 pub use agent::{Agent, AgentEvent, AgentStop, Run};
 pub use backend::{
-    LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn, ServerGates,
-    ServerIdentity, ServerProps,
+    ChildCleanupFailed, LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn,
+    ServerGates, ServerIdentity, ServerProps,
 };
 pub use cancel::Cancel;
 pub use capability::{origins_in, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir};
@@ -372,9 +381,10 @@ pub use engine::{
     PrefillLogits, PrefillProgress, Sampling, StopReason, TokenLogit, METAL_KV_VALIDATED,
 };
 pub use host::{
-    caps_for, resolve_format, verify, Caps, ChatFormat, FormatMismatch, GgufArtifact,
-    LlamaServerProfile, ModelProfile, ModelSource, ProfileBackend, ResolvedModel, Sha256Digest,
-    VerifiedModelArtifact, REASONING_MIN_TOKENS,
+    caps_for, resolve_format, verify, verify_cancellable, verify_cancellable_sync, verify_sync,
+    Caps, ChatFormat, FormatMismatch, GgufArtifact, LlamaServerProfile, ModelProfile, ModelSource,
+    ProfileBackend, ResolvedModel, Sha256Digest, VerifiedModelArtifact, VerifyCancelled,
+    REASONING_MIN_TOKENS,
 };
 pub use reasoning::{
     split_reasoning, strip_reasoning, AtemInterpreter, AtemResponse, AtemToolMessage, Channel,

@@ -36,11 +36,12 @@ pub enum HostBackendConfig {
         /// Force CPU instead of the GPU (a Candle-only choice).
         cpu: bool,
     },
-    /// A managed llama-server child, to be launched under the profile's
-    /// pinned digest, compatibility gates, context, and sampling. Nothing
-    /// here is verified yet — verification is 5b's launch-time work. 5a
-    /// carries the configuration only; today's actor fails closed on this
-    /// variant with no verification or process work.
+    /// A managed llama-server child, launched by the backend thread under
+    /// the profile's pinned digest, compatibility gates, context, and
+    /// sampling: the actor resolves the exact artifact, verifies it
+    /// (cancellably), spawns only the verified path, and owns the child to
+    /// its reaped end (HOST-3 / LSRV-1/5). Nothing here is verified at
+    /// configuration time — verification is the launch-time act.
     ManagedLlamaServer {
         source: ModelSource,
         profile: LlamaServerProfile,
@@ -117,6 +118,14 @@ impl ResolvedHostModel {
         }
     }
 
+    /// Whether this resolution selected the managed llama-server backend.
+    /// Frontends without a joined managed exit (the GUI and serve, until
+    /// stage 5c) use this to refuse the profile up front rather than launch
+    /// a child their exit path cannot prove reaped.
+    pub fn is_managed_llama_server(&self) -> bool {
+        matches!(self.backend, HostBackendConfig::ManagedLlamaServer { .. })
+    }
+
     /// The one composition every frontend uses: the validated backend, the
     /// profile-layered generation options (PROFILE-1), and the pinned format
     /// become the host configuration in a single consuming step.
@@ -129,6 +138,7 @@ impl ResolvedHostModel {
             format,
             system,
             model_label: self.label,
+            managed_launcher: None,
         }
     }
 }
@@ -365,6 +375,24 @@ mod tests {
         .to_string();
         assert!(error.contains("unknown profile"), "{error}");
         assert!(error.contains("built-ins"), "{error}");
+    }
+
+    #[test]
+    fn managed_selection_is_queryable_for_frontends_without_joined_exits() {
+        // The GUI and serve refuse the managed profile until 5c gives them
+        // joined exits; this is the query they gate on.
+        let muse = resolve_host_model(HostModelChoices {
+            profile: Some("muse-glimmer".into()),
+            ..HostModelChoices::default()
+        })
+        .unwrap();
+        assert!(muse.is_managed_llama_server());
+        let engine = resolve_host_model(HostModelChoices {
+            profile: Some("kimi-dev".into()),
+            ..HostModelChoices::default()
+        })
+        .unwrap();
+        assert!(!engine.is_managed_llama_server());
     }
 
     #[test]
