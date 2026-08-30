@@ -13,6 +13,11 @@ metal = ["yatima-host/metal"]
 fetch = ["yatima-host/fetch"]
 
 [dependencies]
+# The async main that owns HostOwner::shutdown after the window returns
+# (5c.1): multi-thread flavor is required — run_native sits inside
+# block_in_place, which is invalid on a current-thread runtime. No backend
+# dependency enters this crate.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # The engine-facing host (the actor, the protocol, file logging). The GUI is a
 # thin view over it (HOST-1); the runner half it used to carry now lives there.
 yatima-host = { path = "../host" }

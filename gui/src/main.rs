@@ -26,8 +26,9 @@ use clap::Parser;
 use eframe::egui;
 
 use yatima_host::{
-    init_file_logging, resolve_host_model, spawn_nonblocking, CancelGate, Channel, HostConfig,
-    HostEvent, HostModelChoices, HostRequest, ModelInfo, ToolNoteKind,
+    init_file_logging, resolve_host_model, spawn_nonblocking, CancelGate, Channel, HostClient,
+    HostConfig, HostEvent, HostModelChoices, HostRequest, ModelIdentity, ModelInfo, StartupPhase,
+    ToolNoteKind,
 };
 use yatima_lib::{GenOpts, Sampling};
 use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
@@ -90,17 +91,6 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         cpu: args.cpu,
         offline: args.offline,
     })?;
-    // 5c gives the GUI its joined exit (owner retained outside
-    // `eframe::run_native`, shutdown awaited after the window returns).
-    // Until then a managed child would ride only the Drop-request fallback
-    // at window close — an unproven reap — so the profile is refused here.
-    if resolved.is_managed_llama_server() {
-        anyhow::bail!(
-            "managed llama-server profiles reach the GUI in stage 5c; \
-             until then use yatima-tui or the CLI (--profile muse-glimmer)"
-        );
-    }
-
     let base = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
@@ -184,18 +174,87 @@ enum Turn {
     },
 }
 
-/// Where the session is in its lifecycle (drives the status line / input gating).
-enum Status {
-    Loading,
-    Ready(String),
+/// Where the backend is in its lifecycle — one sum, so the view cannot be
+/// loading and ready (or ready and failed) at once, and `Ready(ModelInfo)`
+/// is the single source for label, capabilities, stats, context limit, and
+/// verified identity. Drives the status line, splash, and input gating.
+enum Backend {
+    /// Pre-`Ready`: the host's current startup phase (`None` until the
+    /// first `Startup` event) and when loading began on egui's clock.
+    Loading {
+        phase: Option<StartupPhase>,
+        since: f32,
+    },
+    Ready(ModelInfo),
     Failed(String),
+}
+
+impl Backend {
+    /// The pure lifecycle fold (witnessed): `Startup` records the phase
+    /// while loading and is ignored once `Ready` or `Failed` — the stale
+    /// guard that matters at serve's at-least-once reconnect seam; `Ready`
+    /// and `Fatal` replace the state atomically. Non-lifecycle events leave
+    /// the state untouched.
+    fn fold(&mut self, event: &HostEvent) {
+        match event {
+            HostEvent::Startup { phase } => {
+                if let Backend::Loading { phase: current, .. } = self {
+                    *current = Some(*phase);
+                }
+            }
+            HostEvent::Ready(info) => *self = Backend::Ready(info.clone()),
+            HostEvent::Fatal(message) => *self = Backend::Failed(message.clone()),
+            _ => {}
+        }
+    }
+
+    /// The one source of ready-session facts, or `None` while loading/failed.
+    fn ready(&self) -> Option<&ModelInfo> {
+        match self {
+            Backend::Ready(info) => Some(info),
+            _ => None,
+        }
+    }
+}
+
+/// The splash caption / status vocabulary for a loading backend: exactly
+/// the host-reported phase, no invented progress.
+fn phase_caption(phase: Option<StartupPhase>) -> &'static str {
+    match phase {
+        None => "loading\u{2026}",
+        Some(StartupPhase::ResolvingModel) => "resolving model\u{2026}",
+        Some(StartupPhase::VerifyingModel) => "verifying model\u{2026}",
+        Some(StartupPhase::StartingBackend) => "starting backend\u{2026}",
+    }
+}
+
+/// The repaint cadence a backend state needs from the frame loop, beyond
+/// event-driven repaints: only `Loading` asks for one (a second — matching
+/// `fmt_clock`'s resolution — so the startup elapsed display ticks through
+/// silent phases like digest verification). Ready and Failed request
+/// nothing: their motion stays event-driven or whimsy-gated.
+fn loading_repaint_after(backend: &Backend) -> Option<std::time::Duration> {
+    match backend {
+        Backend::Loading { .. } => Some(std::time::Duration::from_secs(1)),
+        Backend::Ready(_) | Backend::Failed(_) => None,
+    }
+}
+
+/// The compact verified identity (`verified:` + first eight digest hex
+/// chars) — display, not evidence; `Unverified` makes no claim at all
+/// (LSRV-5's display projection).
+fn compact_identity(identity: &ModelIdentity) -> Option<String> {
+    match identity {
+        ModelIdentity::VerifiedSha256(digest) => {
+            let prefix: String = digest.chars().take(8).collect();
+            Some(format!("verified:{prefix}"))
+        }
+        ModelIdentity::Unverified => None,
+    }
 }
 
 struct GuiApp {
     req_tx: Sender<HostRequest>,
-    /// The backend thread's one owner (HOST-3). Held so dropping the app at
-    /// window close requests shutdown; the awaited, joined exit is 5c.
-    _host_owner: yatima_host::HostOwner,
     /// The host's events, forwarded from its channel by a pump thread that also
     /// wakes egui on each one (the host has no egui handle of its own).
     ev_rx: Receiver<HostEvent>,
@@ -213,8 +272,6 @@ struct GuiApp {
     /// Set by a clear (Ctrl+L / `/cls`): the splash is a welcome, shown before
     /// the first exchange only — a cleared pane stays empty.
     splash_retired: bool,
-    /// What's running, for the status rail (set once the model is ready).
-    info: Option<ModelInfo>,
     /// Whether the `/stats` panel (state + controls) is open.
     show_stats: bool,
     input: String,
@@ -225,7 +282,9 @@ struct GuiApp {
     /// Whether to surface reasoning. Off by default — the answer is what matters;
     /// the chain-of-thought is opt-in via `/stats`.
     show_reasoning: bool,
-    status: Status,
+    /// The backend lifecycle sum: loading (with the host's reported phase),
+    /// ready (the one `ModelInfo` source), or failed.
+    backend: Backend,
     /// Opacity applied to image artifacts and the logo splash (live slider).
     opacity: f32,
     /// Set when the model becomes ready, so the next frame hands focus to the
@@ -300,22 +359,20 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 impl GuiApp {
-    fn new(cc: &eframe::CreationContext<'_>, cfg: HostConfig, whimsy: bool) -> GuiApp {
+    /// Build the app over the movable client planes. The backend thread's
+    /// one `HostOwner` lives in `main`, never here (HOST-3): every ordinary
+    /// window return reaches its awaited, joined shutdown.
+    fn new(cc: &eframe::CreationContext<'_>, client: HostClient, whimsy: bool) -> GuiApp {
         let ctx = cc.egui_ctx.clone();
         install_fonts(&ctx);
-        // The host builds its backend on its own thread; Startup phase
-        // events precede Ready (or Fatal). This app still folds only
-        // Ready/Fatal — startup-phase presentation is 5c. A thread-spawn
-        // failure here is catastrophic and unrecoverable — there is no
-        // backend to talk to.
-        // 5b holds the owner in the app so its Drop requests shutdown when
-        // the window closes; the joined exit (owner retained outside
-        // `eframe::run_native`, shutdown awaited after the window returns)
-        // is stage 5c's GUI leg.
-        let (client, owner) = spawn_nonblocking(cfg).expect("spawn engine host");
         // The host's event channel is a tokio receiver with no egui handle; a
         // pump thread forwards each event to the UI's std channel and wakes
-        // egui, reproducing the old runner's per-event repaint.
+        // egui, reproducing the old runner's per-event repaint. Deliberately
+        // detached: it owns only the receiver and forwarding handles — never
+        // child ownership — and self-terminates when the app side closes
+        // (send fails) or owner shutdown closes the host event plane
+        // (blocking_recv returns None), so detachment cannot keep a backend
+        // alive.
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<HostEvent>();
         let pump_ctx = ctx.clone();
         let mut host_events = client.event_rx;
@@ -331,18 +388,19 @@ impl GuiApp {
             req_tx: client.req_tx,
             ev_rx,
             cancel: client.cancel,
-            _host_owner: owner,
             next_turn_id: 0,
             ctx,
             splash_anim_start: None,
             splash_retired: false,
-            info: None,
             show_stats: false,
             input: String::new(),
             transcript: Vec::new(),
             turn: Turn::Idle,
             show_reasoning: false,
-            status: Status::Loading,
+            backend: Backend::Loading {
+                phase: None,
+                since: 0.0,
+            },
             opacity: 0.85,
             focus_input: false,
             surprise_until: 0.0,
@@ -377,7 +435,7 @@ impl GuiApp {
     fn show_splash(&mut self, ui: &mut egui::Ui) {
         let t = ui.input(|i| i.time) as f32;
         let start = *self.splash_anim_start.get_or_insert(t);
-        let failed = matches!(self.status, Status::Failed(_));
+        let failed = matches!(self.backend, Backend::Failed(_));
 
         // The sigil shimmers through the aurora ramp; a failed load is dim and
         // fully drawn (no animation, no shimmer, no recede). Without whimsy
@@ -446,10 +504,10 @@ impl GuiApp {
 
         // Status caption, centered under the wordmark; it fades as we recede.
         let cap_fade = 1.0 - recede;
-        let caption = match self.status {
-            Status::Loading => "loading\u{2026}",
-            Status::Failed(_) => "",
-            _ => "ready",
+        let caption = match &self.backend {
+            Backend::Loading { phase, .. } => phase_caption(*phase),
+            Backend::Failed(_) => "",
+            Backend::Ready(_) => "ready",
         };
         if !caption.is_empty() && cap_fade > 0.01 {
             painter.text(
@@ -464,13 +522,13 @@ impl GuiApp {
         // System-status rail: once the mark has receded to the corner, the freed
         // space to its right reports what's running. Fades in with the recede.
         if recede > 0.01 {
-            if let Some(info) = &self.info {
+            if let Some(info) = self.backend.ready() {
                 let x = small_c.x + small_r + 28.0;
                 let mut y = panel.top() + 20.0;
                 let val = with_alpha(color, (recede * 230.0) as u8);
                 let key = with_alpha(color, (recede * 110.0) as u8);
                 let font = egui::FontId::monospace(12.0);
-                let rows: [(&str, String); 6] = [
+                let mut rows: Vec<(&str, String)> = vec![
                     ("model", info.label.clone()),
                     ("arch", info.arch.clone()),
                     ("device", info.device.clone()),
@@ -478,6 +536,11 @@ impl GuiApp {
                     ("sampling", info.sampling.clone()),
                     ("max tokens", info.max_tokens.to_string()),
                 ];
+                // Verified identity earns a row; Unverified claims nothing
+                // (LSRV-5's display projection).
+                if let Some(identity) = compact_identity(&info.identity) {
+                    rows.push(("identity", identity));
+                }
                 for (k, v) in rows {
                     painter.text(
                         egui::pos2(x, y),
@@ -663,7 +726,7 @@ impl GuiApp {
     /// The idle ticker content: uptime and context usage.
     fn ticker_text(&self, now: f32) -> String {
         let mut parts = vec![format!("uptime {}", fmt_uptime(now))];
-        let cap = self.info.as_ref().and_then(|i| i.context_length);
+        let cap = self.backend.ready().and_then(|i| i.context_length);
         match (self.context_used, cap) {
             (Some(u), Some(c)) => {
                 parts.push(format!(
@@ -696,10 +759,20 @@ impl GuiApp {
     fn drain_events(&mut self, now: f32) {
         while let Ok(ev) = self.ev_rx.try_recv() {
             match ev {
-                HostEvent::Ready(info) => {
-                    self.status = Status::Ready(info.label.clone());
-                    self.info = Some(info);
-                    self.focus_input = true; // activate the input on transition
+                // The lifecycle events fold through the pure sum (witnessed);
+                // only the view side-effects live here: input focus on Ready,
+                // settling a live turn on Fatal.
+                HostEvent::Startup { .. } | HostEvent::Ready(_) | HostEvent::Fatal(_) => {
+                    if matches!(&ev, HostEvent::Ready(_)) {
+                        self.focus_input = true; // activate the input on transition
+                    }
+                    if matches!(&ev, HostEvent::Fatal(_)) {
+                        // The turn disarms whole. (The old three-field shape
+                        // cleared the buffers here but left the in-flight id
+                        // set — drift the sum type cannot express.)
+                        self.turn = Turn::Idle;
+                    }
+                    self.backend.fold(&ev);
                 }
                 // The buffer is armed in `submit`; Started needs no action here.
                 HostEvent::Started { .. } => {}
@@ -791,13 +864,6 @@ impl GuiApp {
                     self.turn = Turn::Idle;
                     self.transcript.push(Msg::Error(message));
                 }
-                HostEvent::Fatal(message) => {
-                    // The turn disarms whole. (The old three-field shape
-                    // cleared the buffers here but left the in-flight id
-                    // set — drift the sum type cannot express.)
-                    self.turn = Turn::Idle;
-                    self.status = Status::Failed(message);
-                }
                 _ => {} // a future event variant this UI predates.
             }
         }
@@ -844,7 +910,7 @@ impl GuiApp {
             return;
         }
         if prompt == "/about" {
-            let about = match &self.info {
+            let about = match self.backend.ready() {
                 Some(i) => format!(
                     "yatima — a local-LLM runtime; this is her GPU frontend \
                      (egui · wgpu/Metal).\nrunning {} · {} · {}.",
@@ -887,7 +953,7 @@ impl GuiApp {
             self.input.clear();
             return;
         }
-        if prompt.is_empty() || self.in_flight() || !matches!(self.status, Status::Ready(_)) {
+        if prompt.is_empty() || self.in_flight() || self.backend.ready().is_none() {
             return;
         }
         // Auto-grant: a URL in the *user's own message* is authorization for
@@ -922,6 +988,15 @@ impl eframe::App for GuiApp {
         let now = ui.input(|i| i.time) as f32;
         self.drain_events(now);
 
+        // The loading clock must tick while the backend is quiet: the pump
+        // repaints only per event, and digest verification is a long silent
+        // phase — without this, elapsed freezes until the next Startup event.
+        // Second resolution matches fmt_clock; Ready/Failed keep the existing
+        // event-driven and opt-in-animation policy (witnessed pure below).
+        if let Some(after) = loading_repaint_after(&self.backend) {
+            ui.ctx().request_repaint_after(after);
+        }
+
         // Ctrl+L clears the screen, emacs-style (same as `/cls`).
         if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::L)) {
             self.clear();
@@ -946,9 +1021,9 @@ impl eframe::App for GuiApp {
             let answering = matches!(&self.turn, Turn::Live { answer, .. } if !answer.is_empty());
             let expr = if t < self.surprise_until {
                 Face::Surprised
-            } else if matches!(self.status, Status::Loading) {
+            } else if matches!(self.backend, Backend::Loading { .. }) {
                 Face::Sleeping
-            } else if matches!(self.status, Status::Failed(_)) {
+            } else if matches!(self.backend, Backend::Failed(_)) {
                 Face::Sad
             } else if self.in_flight() {
                 if answering {
@@ -968,11 +1043,21 @@ impl eframe::App for GuiApp {
             };
             // Identity at rest; a live readout during a turn — phase + elapsed
             // while thinking, then tokens + tok/s + elapsed once answering.
-            let (text, color) = match &self.status {
-                Status::Loading => ("loading model…".to_string(), egui::Color32::GRAY),
-                Status::Failed(msg) => (format!("failed: {msg}"), egui::Color32::LIGHT_RED),
-                Status::Ready(label) => {
-                    let base = format!("yatima · {label}");
+            let (text, color) = match &self.backend {
+                Backend::Loading { phase, since } => (
+                    format!(
+                        "{} · {}",
+                        phase_caption(*phase).trim_end_matches('\u{2026}'),
+                        fmt_clock(now - since)
+                    ),
+                    egui::Color32::GRAY,
+                ),
+                Backend::Failed(msg) => (format!("failed: {msg}"), egui::Color32::LIGHT_RED),
+                Backend::Ready(info) => {
+                    let base = match compact_identity(&info.identity) {
+                        Some(identity) => format!("yatima · {} · {identity}", info.label),
+                        None => format!("yatima · {}", info.label),
+                    };
                     let text = if self.in_flight() {
                         let elapsed = self.turn_start.map(|s| now - s).unwrap_or(0.0);
                         let clock = fmt_clock(elapsed);
@@ -1032,7 +1117,7 @@ impl eframe::App for GuiApp {
                 ui.colored_label(color, text);
                 // An idle, opt-in status ticker scrolls in the space between the
                 // identity and /stats — uptime and context usage, drifting by.
-                let idle = matches!(self.status, Status::Ready(_)) && !self.in_flight();
+                let idle = self.backend.ready().is_some() && !self.in_flight();
                 if self.show_ticker && idle {
                     let avail = ui.available_width() - 56.0; // leave room for /stats
                     if avail > 70.0 {
@@ -1060,7 +1145,7 @@ impl eframe::App for GuiApp {
             // Whimsy keeps the avatar breathing/blinking (a continuous
             // repaint); a triggered barrel roll or live ticker also needs
             // frames. Otherwise repaints come only from real events.
-            let idle = matches!(self.status, Status::Ready(_)) && !self.in_flight();
+            let idle = self.backend.ready().is_some() && !self.in_flight();
             if self.whimsy || self.roll_start.is_some() || (self.show_ticker && idle) {
                 ui.ctx().request_repaint();
             }
@@ -1080,7 +1165,7 @@ impl eframe::App for GuiApp {
                     });
                 });
                 ui.add_space(4.0);
-                match &self.info {
+                match self.backend.ready() {
                     Some(info) => {
                         egui::Grid::new("stats_grid")
                             .num_columns(2)
@@ -1132,7 +1217,7 @@ impl eframe::App for GuiApp {
 
         egui::Panel::bottom("input").show(ui, |ui| {
             ui.add_space(4.0);
-            let ready = matches!(self.status, Status::Ready(_)) && !self.in_flight();
+            let ready = self.backend.ready().is_some() && !self.in_flight();
             ui.horizontal(|ui| {
                 let send = if self.in_flight() {
                     if ui.button("stop").clicked() {
@@ -1965,7 +2050,8 @@ fn decode_texture(ctx: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHand
     Ok(ctx.load_texture("artifact", color, egui::TextureOptions::default()))
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
     // Logs go to ~/.cache/yatima/gui.log (the window belongs to egui); no
     // crate-specific quiets are needed here (the TUI's tui_markdown is not in
@@ -1983,6 +2069,11 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "local model".to_string());
     let title = format!("yatima — {title_label}");
 
+    // The backend spawns before the window and its one owner stays here in
+    // `main` (HOST-3): every ordinary `run_native` return reaches the
+    // awaited, joined shutdown below — never only the Drop-request fallback.
+    let (client, owner) = spawn_nonblocking(cfg)?;
+
     eprintln!("loading model… (first run may fetch weights)");
     let native = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -1992,12 +2083,34 @@ fn main() -> Result<()> {
         ..Default::default()
     };
     let whimsy = args.whimsy;
-    eframe::run_native(
-        &title,
-        native,
-        Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, cfg, whimsy)))),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+    // `run_native` blocks for the window's whole life and must stay on the
+    // process main thread (macOS AppKit) — never `spawn_blocking`.
+    // `block_in_place` tells the multi-thread runtime without moving
+    // threads; the flavor above is load-bearing (invalid on current-thread).
+    let session = tokio::task::block_in_place(|| {
+        eframe::run_native(
+            &title,
+            native,
+            Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, client, whimsy)))),
+        )
+        .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+    });
+    let joined = owner.shutdown().await;
+    combined_outcome(session, joined)
+}
+
+/// Fold the window's outcome with the owner's joined shutdown: the eframe
+/// error stays primary, and a shutdown failure is never discarded — appended
+/// as context when both fail, standing alone when only it fails
+/// (HOST-3 / LSRV-1 at this frontend's boundary; witnessed).
+fn combined_outcome(session: Result<()>, joined: Result<()>) -> Result<()> {
+    match (session, joined) {
+        (Ok(()), joined) => joined.map_err(|e| e.context("shut down the backend owner")),
+        (Err(session), Ok(())) => Err(session),
+        (Err(session), Err(joined)) => {
+            Err(session.context(format!("backend owner shutdown also failed: {joined:#}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2016,6 +2129,187 @@ mod tests {
         let img = image::load_from_memory(&png).unwrap();
         // 20x10 at the 4x upscale clamp → 80x40.
         assert_eq!((img.width(), img.height()), (80, 40));
+    }
+
+    fn muse_info(identity: ModelIdentity) -> ModelInfo {
+        ModelInfo {
+            label: "muse-glimmer".into(),
+            arch: "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M".into(),
+            backend: "b10520-cd644c395".into(),
+            device: "external".into(),
+            format: "MuseGlimmer".into(),
+            sampling: "temp 1.00 · top-p 0.95 · seed 0".into(),
+            max_tokens: 4096,
+            context_length: Some(131072),
+            identity,
+        }
+    }
+
+    #[test]
+    fn lifecycle_fold_records_phases_then_ready_then_ignores_stale_startup() {
+        // upholds: the 5c.1 lifecycle contract — loading records each host
+        // phase in order, Ready(ModelInfo) replaces loading atomically and
+        // carries the exact info, and a stale Startup after Ready (serve's
+        // at-least-once reconnect seam) or after Fatal changes nothing.
+        let mut backend = Backend::Loading {
+            phase: None,
+            since: 0.0,
+        };
+        for phase in [
+            StartupPhase::ResolvingModel,
+            StartupPhase::VerifyingModel,
+            StartupPhase::StartingBackend,
+        ] {
+            backend.fold(&HostEvent::Startup { phase });
+            assert!(
+                matches!(&backend, Backend::Loading { phase: Some(p), .. } if *p == phase),
+                "each phase is recorded"
+            );
+        }
+        let digest = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e";
+        let info = muse_info(ModelIdentity::VerifiedSha256(digest.into()));
+        backend.fold(&HostEvent::Ready(info.clone()));
+        assert_eq!(
+            backend.ready(),
+            Some(&info),
+            "Ready carries the exact ModelInfo"
+        );
+
+        backend.fold(&HostEvent::Startup {
+            phase: StartupPhase::ResolvingModel,
+        });
+        assert_eq!(
+            backend.ready(),
+            Some(&info),
+            "stale Startup after Ready is ignored"
+        );
+
+        backend.fold(&HostEvent::Fatal("gate failed".into()));
+        assert!(matches!(&backend, Backend::Failed(m) if m == "gate failed"));
+        backend.fold(&HostEvent::Startup {
+            phase: StartupPhase::VerifyingModel,
+        });
+        assert!(
+            matches!(&backend, Backend::Failed(_)),
+            "stale Startup after Fatal is ignored"
+        );
+    }
+
+    #[test]
+    fn compact_identity_projects_only_verified_evidence() {
+        // upholds: LSRV-5 (display projection) — the eight-char prefix only
+        // for VerifiedSha256; Unverified makes no claim at all.
+        let digest = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e";
+        assert_eq!(
+            compact_identity(&ModelIdentity::VerifiedSha256(digest.into())).as_deref(),
+            Some("verified:4cc57c0f")
+        );
+        assert_eq!(compact_identity(&ModelIdentity::Unverified), None);
+    }
+
+    #[test]
+    fn phase_captions_name_exactly_the_host_phases() {
+        assert_eq!(phase_caption(None), "loading\u{2026}");
+        assert_eq!(
+            phase_caption(Some(StartupPhase::ResolvingModel)),
+            "resolving model\u{2026}"
+        );
+        assert_eq!(
+            phase_caption(Some(StartupPhase::VerifyingModel)),
+            "verifying model\u{2026}"
+        );
+        assert_eq!(
+            phase_caption(Some(StartupPhase::StartingBackend)),
+            "starting backend\u{2026}"
+        );
+    }
+
+    #[test]
+    fn only_loading_schedules_the_clock_repaint() {
+        // upholds: the startup elapsed display ticks through silent backend
+        // phases (a 1 s cadence, matching fmt_clock's resolution), while
+        // Ready and Failed stay on the event-driven/whimsy repaint policy.
+        let loading = Backend::Loading {
+            phase: Some(StartupPhase::VerifyingModel),
+            since: 0.0,
+        };
+        assert_eq!(
+            loading_repaint_after(&loading),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            loading_repaint_after(&Backend::Ready(muse_info(ModelIdentity::Unverified))),
+            None
+        );
+        assert_eq!(
+            loading_repaint_after(&Backend::Failed("gate failed".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn combined_outcome_never_loses_a_failure() {
+        // upholds: HOST-3 / LSRV-1 (frontend composition) — eframe failure
+        // primary, shutdown failure appended, either alone reported.
+        assert!(combined_outcome(Ok(()), Ok(())).is_ok());
+        let only_shutdown =
+            combined_outcome(Ok(()), Err(anyhow::anyhow!("reap failed"))).unwrap_err();
+        assert!(format!("{only_shutdown:#}").contains("reap failed"));
+        let only_session = combined_outcome(Err(anyhow::anyhow!("wgpu died")), Ok(())).unwrap_err();
+        assert!(format!("{only_session:#}").contains("wgpu died"));
+        let both = combined_outcome(
+            Err(anyhow::anyhow!("wgpu died")),
+            Err(anyhow::anyhow!("reap failed")),
+        )
+        .unwrap_err();
+        let text = format!("{both:#}");
+        assert!(
+            text.contains("wgpu died") && text.contains("reap failed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn ownership_audit_owner_in_main_never_in_the_app() {
+        // upholds: HOST-3 (frontend audit) — `GuiApp` holds no `HostOwner`,
+        // `main` spawns exactly one and every ordinary window return reaches
+        // the awaited joined shutdown; `run_native` rides `block_in_place`,
+        // never `spawn_blocking`. Needles are split so this test never
+        // matches its own source.
+        let src = include_str!("main.rs");
+        let struct_start = src.find("struct GuiApp {").expect("app struct");
+        let struct_end = src[struct_start..]
+            .find("\nimpl GuiApp")
+            .map(|i| struct_start + i)
+            .expect("app impl follows the struct");
+        let app_struct = &src[struct_start..struct_end];
+        let owner_ty = format!("Host{}", "Owner");
+        assert!(
+            !app_struct.contains(&owner_ty),
+            "the app must not hold the owner"
+        );
+
+        let spawn_call = format!("= {}(", "spawn_nonblocking");
+        assert_eq!(
+            src.matches(&spawn_call).count(),
+            1,
+            "exactly one spawn site (in main)"
+        );
+        let shutdown_call = format!("owner.{}().await", "shutdown");
+        assert_eq!(
+            src.matches(&shutdown_call).count(),
+            1,
+            "main awaits the joined shutdown once"
+        );
+        let bip = format!("block_{}", "in_place");
+        assert!(src.contains(&bip), "run_native rides block_in_place");
+        // The call form specifically: the design comments rightly *mention*
+        // the prohibition, and mentions are not violations.
+        let forbidden = format!("spawn_{}(", "blocking");
+        assert!(
+            !src.contains(&forbidden),
+            "run_native must never move off the main thread"
+        );
     }
 
     #[test]
