@@ -7,10 +7,13 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
 use yatima_host::{
     init_stderr_logging, resolve_host_model, spawn_nonblocking, HostConfig, HostModelChoices,
 };
+
 use yatima_lib::{GenOpts, Sampling};
+use yatima_serve::{combined_outcome, serve_until};
 use yatima_serve::{validate_bind, Bridge};
 
 #[derive(Parser)]
@@ -76,17 +79,6 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         cpu: args.cpu,
         offline: args.offline,
     })?;
-    // 5c gives serve its graceful signal path (Ctrl-C reaching the owner's
-    // joined shutdown). Until then ordinary operator termination would never
-    // reach the shutdown call after `axum::serve` — an orphaned child — so
-    // the profile is refused here.
-    if resolved.is_managed_llama_server() {
-        anyhow::bail!(
-            "managed llama-server profiles reach serve in stage 5c; \
-             until then use yatima-tui or the CLI (--profile muse-glimmer)"
-        );
-    }
-
     let base = GenOpts {
         max_tokens: args.max_tokens,
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
@@ -124,18 +116,45 @@ async fn main() -> Result<()> {
             "; no client bundle"
         }
     );
-    // The owner is consumed on every exit, including a server error: a
-    // failed serve must not skip the joined shutdown that reaps a managed
-    // child (HOST-3); both failures are reported if both occur.
-    let served = axum::serve(listener, bridge.router(args.static_dir))
-        .await
-        .map_err(anyhow::Error::from);
+    // The closing edge, end to end: the signal (Ctrl-C or SIGTERM) stops
+    // acceptance and closes live sessions under the drain bound inside
+    // `serve_until`; the bridge close is re-flipped here so a *spontaneous*
+    // server error takes the same tail (idempotent — a second flip is a
+    // no-op); then, sequentially, the owner's joined shutdown. No `?` may
+    // bypass either step, and both failures are reported if both occur
+    // (serving primary).
+    let served = serve_until(
+        listener,
+        Arc::clone(&bridge),
+        args.static_dir,
+        shutdown_signal(),
+    )
+    .await;
+    bridge.close();
     let joined = owner.shutdown().await;
-    match (served, joined) {
-        (Ok(()), joined) => joined,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(shutdown)) => {
-            Err(error.context(format!("owner shutdown also failed: {shutdown:#}")))
+    combined_outcome(served, joined)
+}
+
+/// Resolves when the operator asks serve to stop: Ctrl-C, or SIGTERM where
+/// the platform has it. Production's injectable-shutdown supplier for
+/// [`serve_until`].
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
         }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
 }

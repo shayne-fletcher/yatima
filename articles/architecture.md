@@ -1,23 +1,10 @@
 # Architecture
 
-`generate_with` is the primitive: an effectful fold over decoded text fragments.
-`chat` adds native prompt templates and transcript memory. `agent` adds a
-tool-call protocol, capability-scoped async tools, and typed outcomes — and is
-itself a fold, one level up: over turns instead of tokens.
+The `Completer` trait is the model-facing boundary. The in-process Candle `Engine` and the HTTP `LlamaServerCompleter` both implement it. `chat` adds prompt templates and transcript memory; `agent` adds capability-scoped tools and typed outcomes.
 
-Generation itself remains synchronous and compute-bound: token `n + 1` depends on
-token `n`, and the current `Engine` owns mutable model state. Async belongs at the
-effect and UX boundaries: tool calls, the TUI engine actor, future service/Python
-wrappers. The TUI runs decode on a dedicated engine thread behind a three-plane
-protocol (request / event / control), so the UI loop never blocks on decode and a
-turn is cancellable in flight.
+Candle generation is synchronous and compute-bound: each token depends on the previous token, and the `Engine` owns mutable model state. The llama-server implementation waits asynchronously on a supervised local process. `yatima-host` gives both the same execution shape: one dedicated backend thread owns the selected backend and the authoritative session, while frontends exchange requests, events, and cancellation signals with it.
 
-Every frontend is a viewer over the same host: `yatima-host` owns the engine
-thread and speaks `yatima-protocol` (events out, requests in), so the TUI, the
-GUI, and — over one WebSocket via `yatima-serve` — a browser running the
-`yatima-web` wasm client all render the same event stream. The serve/web data
-path, from a submit on a phone to a textured chart, is walked through in
-[the browser viewer](browser-viewer.md).
+The TUI, native GUI, and browser are views over that host. They render the same `HostEvent` stream and never own a second model session. The browser reaches it through one WebSocket provided by `yatima-serve`; [the browser viewer](browser-viewer.md) follows that path from startup through shutdown.
 
 ## Streaming agent steps (AGENT-4)
 

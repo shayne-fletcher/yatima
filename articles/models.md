@@ -5,9 +5,7 @@ across model families from a single engine. A CI consistency harness checks ever
 family's wiring — architecture detection, GGUF normalization, and chat-format
 mapping.
 
-The table below covers the **in-process Candle engine** only. Muse Glimmer runs
-through the managed `llama-server` backend instead — chat and agent/tools via
-`--profile muse-glimmer` — and is documented in [CLI usage](cli.md), not here.
+The table below covers the **in-process Candle engine** only. Muse Glimmer runs through the verified managed `llama-server` backend instead. Its chat and ATEM tool path is available through the CLI, TUI, native GUI, and browser viewer with `--profile muse-glimmer`; see [CLI usage](cli.md) and [the browser viewer](browser-viewer.md).
 
 `‡` marks families that are **wired + harness-tested but not yet runtime-validated
 with weights**: loading and generation are unverified on a real model of that

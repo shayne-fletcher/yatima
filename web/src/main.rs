@@ -242,18 +242,16 @@ mod app {
         }
 
         fn status_line(&self) -> String {
-            if let Some(fatal) = &self.transcript.fatal {
+            if let Some(fatal) = self.transcript.fatal() {
                 return format!("failed: {fatal}");
             }
             if self.dropped {
                 return "disconnected".into();
             }
             let mut parts = Vec::new();
-            parts.push(match (&self.transcript.model, self.connected) {
-                (Some(info), _) => info.label.clone(),
-                (None, true) => "loading…".into(),
-                (None, false) => "connecting…".into(),
-            });
+            // Connecting vs the named startup phase vs ready-with-identity:
+            // the pure, witnessed projection in the lib decides.
+            parts.push(self.transcript.backend_status(self.connected));
             if let Some(tokens) = self.transcript.prompt_tokens {
                 parts.push(format!("ctx {tokens} tok"));
             }
@@ -328,7 +326,9 @@ mod app {
             });
 
             egui::Panel::bottom("input").show(ui, |ui| {
-                let can_submit = self.connected && self.transcript.fatal.is_none();
+                // WEB-2's pre-ready gate: connected AND Ready — an open
+                // socket alone (a reloaded pre-replay client) stays disabled.
+                let can_submit = self.transcript.can_submit(self.connected);
                 ui.horizontal(|ui| {
                     let edit = ui.add_enabled(
                         can_submit,

@@ -74,7 +74,9 @@
 //! wire's (**HOST-4**): egui's fonts lack `✓`/`✗`, so `tool_note_line` spells
 //! `ok`/`failed:` and keeps `⚙`/`⚠`.
 
-use yatima_protocol::{Channel, HostEvent, HostRequest, ModelInfo, ToolNoteKind};
+use yatima_protocol::{
+    Channel, HostEvent, HostRequest, ModelIdentity, ModelInfo, StartupPhase, ToolNoteKind,
+};
 use yatima_text::{prettify_math_plain_scripts, strip_markdown_images};
 
 /// One committed transcript entry (the streaming turn lives in [`Turn::Live`]
@@ -263,6 +265,22 @@ pub enum Turn {
     },
 }
 
+/// The backend lifecycle sum behind [`Transcript`]'s accessors. `Default`
+/// is loading-with-no-phase — exactly what a late or reloaded client that
+/// missed `Ready` honestly is until replay-on-connect exists
+/// (plans/web-replay.plan.md): unready, input disabled, no invented truth.
+enum BackendState {
+    Loading(Option<StartupPhase>),
+    Ready(ModelInfo),
+    Failed(String),
+}
+
+impl Default for BackendState {
+    fn default() -> Self {
+        BackendState::Loading(None)
+    }
+}
+
 /// The UI mirror the app renders: committed entries plus the turn in flight.
 /// Fold every [`HostEvent`] through [`Transcript::fold`]; the host's session
 /// is truth, this is a view of it.
@@ -272,12 +290,14 @@ pub struct Transcript {
     /// The turn in flight with its streaming buffers — drives the spinner,
     /// the stop button, and the submit gate (via [`Transcript::in_flight`]).
     turn: Turn,
-    /// What's running (set by `Ready`; the status line shows the label).
-    pub model: Option<ModelInfo>,
+    /// The backend lifecycle as one private sum: the view cannot be loading
+    /// and ready, or ready and failed, at once. Read through the narrow
+    /// accessors ([`model`](Transcript::model),
+    /// [`startup_phase`](Transcript::startup_phase),
+    /// [`fatal`](Transcript::fatal)).
+    backend: BackendState,
     /// The most recent prompt token count (`Context`), for the status line.
     pub prompt_tokens: Option<usize>,
-    /// A fatal load error: the session never starts.
-    pub fatal: Option<String>,
     /// The grant suggestion's lifecycle (WEB-7): offered by a refusal,
     /// sent by the user's tap, cleared by the landing report.
     suggestion: GrantSuggestion,
@@ -410,7 +430,15 @@ impl Transcript {
     /// the socket is the tape between them.
     pub fn fold(&mut self, ev: HostEvent) {
         match ev {
-            HostEvent::Ready(info) => self.model = Some(info),
+            // Lifecycle: Startup updates only a loading state (a stale one
+            // after Ready or Failed — serve's at-least-once reconnect seam —
+            // is ignored); Ready and Fatal replace the state atomically.
+            HostEvent::Startup { phase } => {
+                if let BackendState::Loading(current) = &mut self.backend {
+                    *current = Some(phase);
+                }
+            }
+            HostEvent::Ready(info) => self.backend = BackendState::Ready(info),
             HostEvent::Started { turn_id } => match &mut self.turn {
                 // Usually armed by push_user; arm here too so a client that
                 // attaches mid-turn (serve's reconnect resumes the stream)
@@ -557,10 +585,82 @@ impl Transcript {
                 // left the in-flight id set — the drift WEB-4 exists to
                 // guard against, latent here until the fields became one.)
                 self.turn = Turn::Idle;
-                self.fatal = Some(message);
+                self.backend = BackendState::Failed(message);
             }
             _ => {} // a future event variant this view predates
         }
+    }
+
+    /// What's running — `Some` only once `Ready` arrived (WEB-1: the mirror
+    /// holds no truth of its own).
+    pub fn model(&self) -> Option<&ModelInfo> {
+        match &self.backend {
+            BackendState::Ready(info) => Some(info),
+            _ => None,
+        }
+    }
+
+    /// The host's reported startup phase — `Some` only while loading with a
+    /// phase already announced.
+    pub fn startup_phase(&self) -> Option<StartupPhase> {
+        match &self.backend {
+            BackendState::Loading(phase) => *phase,
+            _ => None,
+        }
+    }
+
+    /// The fatal load/loss message, if the session is over.
+    pub fn fatal(&self) -> Option<&str> {
+        match &self.backend {
+            BackendState::Failed(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    /// WEB-2's pre-ready gate: input is enabled only with a live socket AND
+    /// a ready backend — never merely an open socket (a late or reloaded
+    /// client without replay honestly stays disabled).
+    pub fn can_submit(&self, connected: bool) -> bool {
+        connected && self.model().is_some()
+    }
+
+    /// The backend half of the status line (pure; witnessed): connecting
+    /// (no socket) is distinguished from backend startup (socket up, the
+    /// named phase), from ready (label, plus compact verified identity only
+    /// for `VerifiedSha256`), from failed.
+    pub fn backend_status(&self, connected: bool) -> String {
+        match (&self.backend, connected) {
+            (BackendState::Failed(message), _) => format!("failed: {message}"),
+            (_, false) => "connecting\u{2026}".into(),
+            (BackendState::Loading(phase), true) => phase_label(*phase).into(),
+            (BackendState::Ready(info), true) => match compact_identity(&info.identity) {
+                Some(identity) => format!("{} · {identity}", info.label),
+                None => info.label.clone(),
+            },
+        }
+    }
+}
+
+/// The loading vocabulary: exactly the host's phase, no invented progress.
+pub fn phase_label(phase: Option<StartupPhase>) -> &'static str {
+    match phase {
+        None => "loading\u{2026}",
+        Some(StartupPhase::ResolvingModel) => "resolving model\u{2026}",
+        Some(StartupPhase::VerifyingModel) => "verifying model\u{2026}",
+        Some(StartupPhase::StartingBackend) => "starting backend\u{2026}",
+    }
+}
+
+/// The compact verified identity (`verified:` + first eight digest hex
+/// chars) — display, not evidence; `Unverified` makes no claim at all
+/// (LSRV-5's display projection).
+pub fn compact_identity(identity: &ModelIdentity) -> Option<String> {
+    match identity {
+        ModelIdentity::VerifiedSha256(digest) => {
+            let prefix: String = digest.chars().take(8).collect();
+            Some(format!("verified:{prefix}"))
+        }
+        ModelIdentity::Unverified => None,
     }
 }
 
@@ -815,7 +915,7 @@ mod tests {
         t.fold(HostEvent::Fatal("engine lost".into()));
         assert!(t.in_flight().is_none(), "no spinner over a dead session");
         assert!(t.streaming_answer().is_none(), "no live buffer either");
-        assert_eq!(t.fatal.as_deref(), Some("engine lost"));
+        assert_eq!(t.fatal(), Some("engine lost"));
     }
 
     #[test]
@@ -975,11 +1075,126 @@ mod tests {
         );
     }
 
+    fn muse_info(identity: ModelIdentity) -> ModelInfo {
+        ModelInfo {
+            label: "muse-glimmer".into(),
+            arch: "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M".into(),
+            backend: "b10520-cd644c395".into(),
+            device: "external".into(),
+            format: "MuseGlimmer".into(),
+            sampling: "temp 1.00 · top-p 0.95 · seed 0".into(),
+            max_tokens: 4096,
+            context_length: Some(131072),
+            identity,
+        }
+    }
+
+    #[test]
+    fn lifecycle_folds_phases_ready_fatal_and_rejects_stale_startup() {
+        // upholds: WEB-1 — the lifecycle is one sum folded from events:
+        // initial state is loading with no phase (exactly what a reloaded
+        // pre-replay client honestly is), each Startup records its phase,
+        // Ready replaces loading atomically with the whole ModelInfo, a
+        // stale Startup after Ready or after Fatal changes nothing.
+        let mut t = Transcript::default();
+        assert!(t.model().is_none());
+        assert_eq!(t.startup_phase(), None);
+        assert_eq!(t.fatal(), None);
+
+        for phase in [
+            StartupPhase::ResolvingModel,
+            StartupPhase::VerifyingModel,
+            StartupPhase::StartingBackend,
+        ] {
+            t.fold(HostEvent::Startup { phase });
+            assert_eq!(t.startup_phase(), Some(phase));
+        }
+        let digest = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e";
+        let info = muse_info(ModelIdentity::VerifiedSha256(digest.into()));
+        t.fold(HostEvent::Ready(info.clone()));
+        assert_eq!(t.model(), Some(&info), "Ready carries the exact ModelInfo");
+        assert_eq!(t.startup_phase(), None, "no phase once ready");
+
+        t.fold(HostEvent::Startup {
+            phase: StartupPhase::ResolvingModel,
+        });
+        assert_eq!(t.model(), Some(&info), "stale Startup after Ready ignored");
+
+        t.fold(HostEvent::Fatal("backend lost".into()));
+        assert_eq!(t.fatal(), Some("backend lost"));
+        assert!(t.model().is_none(), "failed is not ready");
+        t.fold(HostEvent::Startup {
+            phase: StartupPhase::VerifyingModel,
+        });
+        assert_eq!(
+            t.fatal(),
+            Some("backend lost"),
+            "stale Startup after Fatal ignored"
+        );
+    }
+
+    #[test]
+    fn input_gates_on_connected_and_ready_never_socket_alone() {
+        // upholds: WEB-2 (pre-ready gate) — no socket: disabled; socket but
+        // loading: disabled (the reloaded pre-replay client stays honestly
+        // unready); socket and ready: enabled; failed: disabled.
+        let mut t = Transcript::default();
+        assert!(!t.can_submit(false));
+        assert!(
+            !t.can_submit(true),
+            "an open socket alone must not enable input"
+        );
+        t.fold(HostEvent::Ready(muse_info(ModelIdentity::Unverified)));
+        assert!(
+            !t.can_submit(false),
+            "ready without a socket is still unusable"
+        );
+        assert!(t.can_submit(true));
+        t.fold(HostEvent::Fatal("gone".into()));
+        assert!(!t.can_submit(true));
+    }
+
+    #[test]
+    fn backend_status_names_phases_and_projects_only_verified_identity() {
+        // upholds: WEB-1 / LSRV-5 (display projection) — connecting vs the
+        // named startup phase vs ready (verified:<8> only for
+        // VerifiedSha256; Unverified claims nothing) vs failed.
+        let mut t = Transcript::default();
+        assert_eq!(t.backend_status(false), "connecting\u{2026}");
+        assert_eq!(t.backend_status(true), "loading\u{2026}");
+        t.fold(HostEvent::Startup {
+            phase: StartupPhase::VerifyingModel,
+        });
+        assert_eq!(t.backend_status(true), "verifying model\u{2026}");
+        assert_eq!(
+            t.backend_status(false),
+            "connecting\u{2026}",
+            "no socket wins"
+        );
+
+        let digest = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e";
+        t.fold(HostEvent::Ready(muse_info(ModelIdentity::VerifiedSha256(
+            digest.into(),
+        ))));
+        assert_eq!(t.backend_status(true), "muse-glimmer · verified:4cc57c0f");
+
+        let mut unverified = Transcript::default();
+        unverified.fold(HostEvent::Ready(muse_info(ModelIdentity::Unverified)));
+        assert_eq!(
+            unverified.backend_status(true),
+            "muse-glimmer",
+            "Unverified makes no claim"
+        );
+
+        t.fold(HostEvent::Fatal("digest mismatch".into()));
+        assert_eq!(t.backend_status(true), "failed: digest mismatch");
+    }
+
     #[test]
     fn ready_sets_the_model() {
         // upholds: WEB-1 — the mirror folds a Ready event into the model.
         let mut t = Transcript::default();
-        assert!(t.model.is_none());
+        assert!(t.model().is_none());
         t.fold(HostEvent::Ready(ModelInfo {
             label: "qwen32b".into(),
             arch: "Qwen2".into(),
@@ -991,7 +1206,7 @@ mod tests {
             context_length: Some(32768),
             identity: yatima_protocol::ModelIdentity::Unverified,
         }));
-        assert_eq!(t.model.as_ref().map(|m| m.label.as_str()), Some("qwen32b"));
+        assert_eq!(t.model().map(|m| m.label.as_str()), Some("qwen32b"));
     }
 
     #[test]
@@ -1124,7 +1339,7 @@ mod tests {
         assert!(t.in_flight().is_none());
         assert!(matches!(t.entries.last(), Some(Entry::Error(m)) if m == "boom"));
         t.fold(HostEvent::Fatal("no model".into()));
-        assert_eq!(t.fatal.as_deref(), Some("no model"));
+        assert_eq!(t.fatal(), Some("no model"));
     }
 
     #[test]

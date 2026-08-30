@@ -42,7 +42,7 @@ Managed mode requires `llama-server` on `PATH`. Yatima verifies the model, start
 
 - Run local models through Candle or llama.cpp behind one `Completer` interface.
 - Use Yatima through the CLI, TUI, native egui app, browser viewer, or embedded in Rust.
-- Chat and run capability-scoped tools. CLI chat and agent also support Muse Glimmer's native ATEM protocol.
+- Chat and run capability-scoped tools. Muse Glimmer's native ATEM protocol works through the CLI, TUI, native GUI, and browser viewer.
 - Give tools explicit authority such as a directory or a set of web origins.
 - Stream reasoning, answers, and tool status without leaking protocol markup.
 

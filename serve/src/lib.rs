@@ -138,6 +138,10 @@ pub struct Bridge {
     /// session watches it and yields the stream. A counter, not a flag, so
     /// every bump is an edge no matter when the session subscribed.
     preempt: tokio::sync::watch::Sender<u64>,
+    /// The closing edge: flipped once (idempotently) when serve begins
+    /// shutting down. Every live session observes it and returns its lease;
+    /// new upgrades are refused. One signal, not a second request protocol.
+    closing: tokio::sync::watch::Sender<bool>,
     send_stall_cap: Duration,
     keepalive_interval: Duration,
 }
@@ -160,9 +164,34 @@ impl Bridge {
                 pending: None,
             })),
             preempt: tokio::sync::watch::channel(0).0,
+            closing: tokio::sync::watch::channel(false).0,
             send_stall_cap,
             keepalive_interval,
         })
+    }
+
+    /// Begin the closing edge (idempotent and durable): every live session
+    /// observes the flip at its next select wake and returns its stream
+    /// lease; upgrades arriving after it are refused. `send_if_modified`,
+    /// not `send`: a plain `send` with zero receivers discards the value
+    /// (tokio watch semantics), so an idle close would silently not close
+    /// and a handler racing in later would subscribe to `false` — this form
+    /// records the value receiver-less and notifies exactly once, so a
+    /// second close (the spontaneous-error path re-flipping) is a true
+    /// no-op.
+    pub fn close(&self) {
+        self.closing.send_if_modified(|closed| {
+            if *closed {
+                false
+            } else {
+                *closed = true;
+                true
+            }
+        });
+    }
+
+    fn is_closing(&self) -> bool {
+        *self.closing.borrow()
     }
 
     /// How long a takeover may wait for the live session to yield before
@@ -233,6 +262,10 @@ async fn ws_upgrade(
     State(bridge): State<Arc<Bridge>>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // A closing bridge accepts no new sessions: the drain must converge.
+    if bridge.is_closing() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "serve is shutting down").into_response();
+    }
     // SRV-3: lease the event stream before upgrading. If a session holds
     // it, preempt: signal, then poll for the yield — bumping the signal
     // each round, because a session mid-send subscribes to edges and a
@@ -302,6 +335,13 @@ const TAKEOVER_SLACK: Duration = Duration::from_secs(5);
 /// stream can always come back.
 async fn client_session(mut lease: StreamLease, mut socket: WebSocket) {
     let bridge = Arc::clone(&lease.bridge);
+    // Subscribe to the closing edge before serving; if the bridge closed
+    // between upgrade and here, return at once (the lease's Drop restores
+    // the stream either way).
+    let mut closing = bridge.closing.subscribe();
+    if *closing.borrow_and_update() {
+        return;
+    }
     // Subscribe to the takeover signal before serving: bumps from before
     // this session's tenure are marked seen (they targeted a predecessor);
     // a newcomer re-bumps every poll round, so none are missed for long.
@@ -342,6 +382,13 @@ async fn client_session(mut lease: StreamLease, mut socket: WebSocket) {
         // last-pulled event is carried forward regardless of who wins.
         tokio::select! {
             biased;
+            // The closing edge outranks everything: serve is ending, so the
+            // session returns its lease at the next wake — instantly when
+            // parked, at worst after one capped send.
+            _ = closing.changed() => {
+                tracing::info!("bridge closing; session ends and returns the stream");
+                return;
+            }
             _ = preempt.changed() => {
                 tracing::info!("preempted by a new client; yielding the stream (SRV-3)");
                 return;
@@ -453,6 +500,72 @@ async fn send_ping(socket: &mut WebSocket, cap: Duration) -> SendOutcome {
     match tokio::time::timeout(cap, socket.send(Message::Ping(Vec::new().into()))).await {
         Ok(Ok(())) => SendOutcome::Sent,
         _ => SendOutcome::PeerGone,
+    }
+}
+
+/// Serve until `shutdown` resolves or the server errors, then run the whole
+/// closing edge: flip the bridge's close signal (every live session returns
+/// its lease; new upgrades are refused), let axum's graceful drain finish,
+/// and bound that drain — the same arithmetic as the takeover deadline (one
+/// worst-case capped send plus slack), because that is exactly how long a
+/// live session can take to observe the flip. The owner's joined shutdown is
+/// the caller's *sequential* next step, never overlapped with the drain.
+/// Injectable `shutdown` keeps this hermetically testable (production
+/// supplies Ctrl-C/SIGTERM; tests a oneshot).
+pub async fn serve_until(
+    listener: tokio::net::TcpListener,
+    bridge: Arc<Bridge>,
+    static_dir: Option<PathBuf>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let drain_bound = bridge.takeover_deadline();
+    let close_bridge = Arc::clone(&bridge);
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful = async move {
+        shutdown.await;
+        // Close sessions first: an upgraded WebSocket is an open connection
+        // axum's drain waits on, so without this flip the drain would wait
+        // on the client's mercy instead of our bound.
+        close_bridge.close();
+        let _ = closed_tx.send(());
+    };
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, bridge.router(static_dir)).with_graceful_shutdown(graceful),
+    );
+    tokio::pin!(server);
+    tokio::select! {
+        // A spontaneous server error (or a drain completing before we even
+        // observe the signal) — the caller still closes the bridge and
+        // consumes the owner behind us.
+        result = &mut server => result.map_err(|e| anyhow::anyhow!("serve: {e}")),
+        _ = closed_rx => {
+            // The signal fired: the remaining drain gets the bound, started
+            // now — not at serve start, so a long-lived healthy server is
+            // never killed by its own drain arithmetic.
+            match tokio::time::timeout(drain_bound, server).await {
+                Ok(result) => result.map_err(|e| anyhow::anyhow!("serve: {e}")),
+                Err(_) => Err(anyhow::anyhow!(
+                    "server drain exceeded {drain_bound:?} after the close signal"
+                )),
+            }
+        }
+    }
+}
+
+/// Fold the serving outcome with the owner's joined shutdown: serving stays
+/// primary, and a shutdown failure is never discarded — appended as context
+/// when both fail, standing alone otherwise (HOST-3 / LSRV-1 at this
+/// frontend's boundary; witnessed).
+pub fn combined_outcome(
+    served: anyhow::Result<()>,
+    joined: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match (served, joined) {
+        (Ok(()), joined) => joined.map_err(|e| e.context("shut down the backend owner")),
+        (Err(served), Ok(())) => Err(served),
+        (Err(served), Err(joined)) => {
+            Err(served.context(format!("backend owner shutdown also failed: {joined:#}")))
+        }
     }
 }
 
@@ -581,6 +694,176 @@ mod tests {
 
     fn ws_url(addr: SocketAddr) -> String {
         format!("ws://{addr}/ws")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_signal_recovers_the_lease_and_drains_under_the_bound() {
+        // upholds: SRV-3 / HOST-3 (frontend boundary) — with a WebSocket
+        // open, an injected shutdown makes the live session return its lease
+        // and lets the graceful drain complete inside the declared bound; no
+        // task is left holding the event stream. (The 503 refusal of late
+        // upgrades is `idle_close_is_durable_and_refuses_late_upgrades`.)
+        let (bridge, event_tx, _req_rx, _gate) = fake_host();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_until(
+            listener,
+            Arc::clone(&bridge),
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let (mut ws, _) = within(
+            "client handshake",
+            tokio_tungstenite::connect_async(ws_url(addr)),
+        )
+        .await
+        .unwrap();
+        // Prove the session is live (it holds the lease) before closing.
+        event_tx.send(HostEvent::Note("live".into())).unwrap();
+        let frame = within("first event frame", ws.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame.to_text().unwrap().contains("live"));
+        assert!(
+            bridge.event_rx.lock().unwrap().is_none(),
+            "the session holds the lease"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        within("server drains under its bound", server)
+            .await
+            .expect("serve task")
+            .expect("graceful drain succeeds");
+        assert!(
+            bridge.event_rx.lock().unwrap().is_some(),
+            "the lease returned on close (SRV-3)"
+        );
+        // The socket ends from the server side. Like the takeover path, the
+        // drain owes no polite WS close handshake — the client may see a
+        // clean end, a Close frame, or a reset; what it must never see is
+        // another data frame.
+        let end = within("socket end", ws.next()).await;
+        assert!(
+            !matches!(&end, Some(Ok(m)) if m.is_text() || m.is_binary()),
+            "no data frame after the close: {end:?}"
+        );
+        // (The 503 refusal of a late upgrade on a still-listening router is
+        // witnessed separately in `idle_close_is_durable_and_refuses_late_upgrades`
+        // — after `serve_until` returns, the listener here is simply gone.)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_close_is_durable_and_refuses_late_upgrades() {
+        // upholds: the closing edge is durable with ZERO subscribers — a
+        // plain watch `send` would discard the value and a handler racing in
+        // after an idle close would subscribe to `false` and serve on. The
+        // flip must persist for later observers, be idempotent, and make a
+        // still-listening router answer a subsequent upgrade with 503.
+        let (bridge, _event_tx, _req_rx, _gate) = fake_host();
+        bridge.close(); // no session, no subscriber
+        assert!(bridge.is_closing(), "the close is recorded receiver-less");
+        bridge.close(); // idempotent: a second flip is a no-op
+        assert!(bridge.is_closing());
+        // A subscriber arriving after the idle close sees it immediately.
+        assert!(
+            *bridge.closing.subscribe().borrow(),
+            "a later subscriber observes the earlier close"
+        );
+
+        let addr = serve_on_ephemeral(Arc::clone(&bridge)).await;
+        let late = within(
+            "late upgrade against the closing bridge",
+            tokio_tungstenite::connect_async(ws_url(addr)),
+        )
+        .await;
+        match late {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(
+                    response.status(),
+                    503,
+                    "ws_upgrade's closing branch answers"
+                );
+            }
+            other => panic!("expected the 503 closing refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn combined_outcome_never_loses_either_failure() {
+        // upholds: HOST-3 (frontend boundary) — the exit combiner's four
+        // quadrants: serving stays primary and an owner-shutdown failure is
+        // never lost. (This is deliberately only the pure combiner: the
+        // binary's spontaneous-error tail — re-flip the idempotent close,
+        // then the sequential owner shutdown — is source-audited in main and
+        // its close durability witnessed in
+        // `idle_close_is_durable_and_refuses_late_upgrades`; no machinery is
+        // added just to manufacture an axum accept error.)
+        let served: anyhow::Result<()> = Err(anyhow::anyhow!("accept failed"));
+        let joined: anyhow::Result<()> = Err(anyhow::anyhow!("reap failed"));
+        let both = combined_outcome(served, joined).unwrap_err();
+        let text = format!("{both:#}");
+        assert!(
+            text.contains("accept failed") && text.contains("reap failed"),
+            "{text}"
+        );
+        let only_joined =
+            combined_outcome(Ok(()), Err(anyhow::anyhow!("reap failed"))).unwrap_err();
+        assert!(format!("{only_joined:#}").contains("reap failed"));
+        let only_served =
+            combined_outcome(Err(anyhow::anyhow!("accept failed")), Ok(())).unwrap_err();
+        assert!(format!("{only_served:#}").contains("accept failed"));
+        assert!(combined_outcome(Ok(()), Ok(())).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_and_verified_ready_cross_the_socket_unchanged() {
+        // upholds: SRV-2 / PROTO-2 / LSRV-5 — Startup{VerifyingModel} and a
+        // verified Ready cross as the externally tagged protocol values,
+        // digest byte-for-byte.
+        let (bridge, event_tx, _req_rx, _gate) = fake_host();
+        let addr = serve_on_ephemeral(bridge).await;
+        let (mut ws, _) = within(
+            "client handshake",
+            tokio_tungstenite::connect_async(ws_url(addr)),
+        )
+        .await
+        .unwrap();
+
+        let digest = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e";
+        let ready = HostEvent::Ready(yatima_protocol::ModelInfo {
+            label: "muse-glimmer".into(),
+            arch: "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M".into(),
+            backend: "b10520-cd644c395".into(),
+            device: "external".into(),
+            format: "MuseGlimmer".into(),
+            sampling: "temp 1.00 · top-p 0.95 · seed 0".into(),
+            max_tokens: 4096,
+            context_length: Some(131072),
+            identity: yatima_protocol::ModelIdentity::VerifiedSha256(digest.into()),
+        });
+        event_tx
+            .send(HostEvent::Startup {
+                phase: yatima_protocol::StartupPhase::VerifyingModel,
+            })
+            .unwrap();
+        event_tx.send(ready.clone()).unwrap();
+
+        let startup_frame = within("startup frame", ws.next()).await.unwrap().unwrap();
+        let startup_text = startup_frame.to_text().unwrap();
+        assert_eq!(
+            startup_text, r#"{"Startup":{"phase":"VerifyingModel"}}"#,
+            "externally tagged, exactly the protocol value"
+        );
+        let ready_frame = within("ready frame", ws.next()).await.unwrap().unwrap();
+        let ready_text = ready_frame.to_text().unwrap();
+        assert!(ready_text.contains(digest), "digest byte-for-byte");
+        let decoded: HostEvent = serde_json::from_str(ready_text).unwrap();
+        assert_eq!(decoded, ready, "the value survives the wire unchanged");
     }
 
     #[tokio::test(flavor = "multi_thread")]

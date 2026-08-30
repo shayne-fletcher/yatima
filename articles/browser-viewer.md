@@ -1,24 +1,19 @@
 # The browser viewer
 
-`yatima-serve` bridges a session to any browser on your tailnet;
-`yatima-web` is the wasm client it hands that browser. Together they are
-the vision's rung 2: the event plane over a WebSocket, every client a
-viewer.
+`yatima-serve` runs the native host and bridges its protocol to a browser. `yatima-web` is the WASM client served to that browser. The browser is a view of the host session, not a second model runtime.
 
 ```bash
-# build the client bundle once (web/ is wasm32-only, its own workspace;
-# release is the one to hand a phone — 4.8 MB against 21 MB debug)
+# Build the WASM client.
 cd web && trunk build --release
-# serve a model on the tailnet, handing out the bundle at /
-cargo run -p yatima-serve --release --features metal -- \
-  --profile qwen32b --bind 100.x.y.z:8787 --static-dir web/dist
+cd ..
+
+# Verify Muse, start llama-server, and serve the browser client.
+cargo run -p yatima-serve --release -- \
+  --profile muse-glimmer --offline \
+  --bind 127.0.0.1:8787 --static-dir web/dist
 ```
 
-Open `http://100.x.y.z:8787/` on the phone: the page loads the wasm app,
-the app opens one WebSocket back to `/ws` on the same origin, and the
-session streams. There is no default bind, and the unspecified addresses
-are refused (SRV-1) — exposure beyond the tailnet is a decision nobody
-makes by accident.
+Open `http://127.0.0.1:8787/`. The page loads the WASM app, which opens one WebSocket back to `/ws` on the same origin. To use another device, bind to that machine's specific tailnet address instead. There is no default bind, and wildcard addresses are refused (`SRV-1`), so network exposure must be explicit.
 
 ## One fold, one unfold
 
@@ -32,12 +27,9 @@ across disconnects.
 
 ## The nouns, host side (`yatima-serve`)
 
-serve draws nothing. It owns a `yatima_host::HostHandle` exactly as the
-GUI does and carries the host's two planes to the browser:
+The `yatima-serve` binary draws nothing. Its `main` function retains the one `HostOwner`, while `Bridge` receives only the movable fields of `HostClient`. That split lets the bridge carry browser traffic without giving a socket task ownership of the backend or its managed child.
 
-- **`Bridge`** — the shared state behind the router: the host's request
-  sender, its `CancelGate`, the one event stream, and the takeover
-  signal (a watch counter — see preemption below).
+- **`Bridge`** — the shared state behind the router: the host's request sender, its `CancelGate`, the one event stream, the takeover signal, and the closing signal.
 - **`EventStream`** — the host's event receiver plus a one-deep **carry
   slot** (`pending`): the last event a session *attempted* to send. A
   buffered `socket.send` is not proof the peer read the frame, so on
@@ -47,11 +39,9 @@ GUI does and carries the host's two planes to the browser:
   restores the stream to the bridge, so a failed upgrade or a panicking
   session cannot strand it: one holder at every instant, enforced by
   ownership rather than discipline.
-- **The two planes** — requests flow browser → host over a
-  `std::sync::mpsc` sender; events flow host → browser over a
-  `tokio::sync::mpsc` receiver. A wire `Cancel` bypasses the request
-  queue (unserviced while the engine decodes) and trips the
-  `CancelGate` directly, so stop works mid-decode.
+- **The host connection** — requests flow from browser to host over a `std::sync::mpsc` sender, events flow back over a `tokio::sync::mpsc` receiver, and cancellation uses the out-of-band `CancelGate`. A wire `Cancel` bypasses the request queue, which is not serviced while a model turn runs, so stop can take effect during generation.
+
+On Ctrl-C or SIGTERM, `Bridge::close` refuses new WebSocket upgrades and asks a live session to return its `StreamLease`. Axum drains under a bound; only then does `main` consume `HostOwner::shutdown()` and wait for the backend thread and any managed `llama-server` child. A server error follows the same close-and-join path.
 
 ## The nouns, on the wire (SRV-2)
 
@@ -73,6 +63,7 @@ testable without a browser:
   streaming buffer without a live turn" — the state behind the wedged
   spinner the first phone demo found — cannot be constructed
   (WEB-3/4/5 are structural over it).
+- **`BackendState`** — the private startup state: `Loading`, `Ready(ModelInfo)`, or `Failed`. Startup events name model resolution, digest verification, and backend launch. Only `Ready` enables input, and only `VerifiedSha256` earns a `verified:<digest prefix>` label.
 - **`Entry`** — committed history: `User`, `Assistant` (answer plus the
   reasoning fold), `Image(DecodedImage)`, `Note`, `Error`. Artifact
   bytes decode to raw RGBA in the model; only the view makes textures.
@@ -85,23 +76,13 @@ testable without a browser:
 
 ## The verbs: one turn, end to end
 
-You type and press send. The app refuses if a turn is live (WEB-2);
-otherwise it stamps a client-local `turn_id`, pushes your line into the
-mirror, arms `Turn::Live`, and sends `Submit { turn_id, text }` as one
-JSON frame. serve decodes it (SRV-2) and forwards it up the request
-plane; the host runs the turn and emits events; each event goes out as
-one frame; `drain_socket` folds each into the `Transcript` — fragments
-append to the live answer or the reasoning fold, `RetractAnswer` pulls
-narration back by *characters* (never bytes — a multibyte fragment cut
-by bytes would shear a char), `Image` bytes decode and become a texture
-fitted to the screen, and `Done` settles the turn: commit the answer if
-it carried text, disarm. The view repaints on every socket wakeup.
+Before a turn, the host emits typed startup phases and then `Ready(ModelInfo)`. The browser folds those events into `BackendState`; an open socket alone does not enable input. Once connected and ready, pressing send stamps a client-local `turn_id`, records the user line in the mirror, arms `Turn::Live`, and sends `Submit { turn_id, text }` as one JSON frame. Serve forwards it to the host, and every returned `HostEvent` becomes one frame. Fragments append to the answer or reasoning text, tool notes remain separate, images become textures, and `Done` commits a nonempty answer and disarms the turn.
 
 ```mermaid
 sequenceDiagram
     participant B as browser (yatima-web)
     participant S as serve (Bridge)
-    participant H as host (engine thread)
+    participant H as host (backend thread)
     B->>S: Submit {turn_id, text} — one JSON frame
     S->>H: HostRequest over the request plane
     H-->>S: Started · Fragment* · ToolNote* · Image* · Done
@@ -151,11 +132,13 @@ on its behalf. Three behaviors make the seam honest:
   (WEB-5). The reconnect button swaps the dead socket and keeps the
   mirror and its textures; a browser refresh would wipe them.
 
+A reconnect within the same app keeps the transcript and resumes the event stream. A full page reload creates a new mirror. Until `plans/web-replay.plan.md` adds state replay, a page loaded after another client already consumed `Ready` honestly remains in `loading…` with input disabled; it does not invent backend state.
+
 ## Laws
 
 The canonical registries live in the crate docs, each id cited by a
 test (`grep -rn 'upholds:'`): **SRV-1/2/3** in `serve/src/lib.rs`,
-**WEB-1..6** in `web/src/lib.rs`, the host planes (**HOST-1..5**) in
+**WEB-1..7** in `web/src/lib.rs`, the host planes (**HOST-1..5**) in
 `host/src/lib.rs`, and the wire (**PROTO-2**, **WASM-1**) in
 `protocol/src/lib.rs`. This article narrates them; the crate docs
 define them.
