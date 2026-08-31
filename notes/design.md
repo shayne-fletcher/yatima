@@ -360,21 +360,33 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   cancellation. Current tools: `ReadFile`, `ListDir`, `WriteFile`, `ReadUrl`,
   `ReadPage`, `ReadImage`, `Plot`, and `SendNotification`, each holding its
   own capability.
-  `ReadUrl` returns a body **verbatim** (JSON/plaintext/APIs); `ReadPage` fetches
-  an HTML page under the same `WebOrigin` capability and returns the **readable
-  main article** (title + text) via a readability pass (`dom_smoothie`),
-  async-first: the body is streamed under a hard size cap (never buffered then
-  measured), the CPU extraction runs on `spawn_blocking`, output is truncated to
-  a char budget rather than failing, and obvious non-HTML is rejected with a
-  "use read_url" message. Server-rendered HTML only — no JS, paywalls, or
-  cross-origin links. Long articles page **model-drivenly**: each window's
-  truncation marker names the `offset` for the next call, and continuations are
-  served from a per-tool fetch-once cache (FETCH-1/WIN-1) — one network fetch
-  per URL per session, which is the shape a throttled host (sieve's EDGAR)
-  requires: re-fetching is the expensive act, re-reading is free. The first
-  window's header lists the readable region's images (absolute, alt-labeled,
-  capped) — the discovery seam feeding `read_image`; header metadata rides
-  single-newline lines so the window tiling law is untouched.
+  `ReadUrl` returns a body **verbatim** (JSON/plaintext/APIs) — except HTML at
+  size, which it declines toward `read_page` (2026-08-30): raw markup is
+  context poison replayed through every later prefill round, so `text/html`
+  past a small cap is refused with a redirecting error, and a headerless or
+  octet-stream response is conservatively sniffed for document markers so a
+  silent server cannot smuggle a page past the guard (an explicit non-HTML
+  content-type stays authoritative). `ReadPage` fetches an HTML page under the
+  same `WebOrigin` capability and returns the **readable main article** (title
+  + text) via a readability pass (`dom_smoothie`), async-first: the body is
+  streamed under a hard size cap (never buffered then measured), the CPU
+  extraction runs on `spawn_blocking`, output is truncated to a char budget
+  rather than failing, and obvious non-HTML is rejected with a "use read_url"
+  message. Server-rendered HTML only — no JS, paywalls, or cross-origin links.
+  Long articles page **model-drivenly**: each window's truncation marker names
+  the `offset` for the next call, and continuations are served from a per-tool
+  fetch-once cache (FETCH-1/WIN-1) — one network fetch per URL per session,
+  which is the shape a throttled host (sieve's EDGAR) requires: re-fetching is
+  the expensive act, re-reading is free. The first window's header lists the
+  page's images — scanned from the **raw served HTML only**, in document
+  order, because extractor output is untrustworthy for attributes (it
+  rewrites `src` to MediaWiki's `resource` File:-page URL and strips the
+  classes the furniture filters key on; observed live 2026-08-30 as an
+  [images] list whose entry 1 was an HTML page). Each entry is the densest
+  server-authored `srcset` candidate (chosen, never constructed), entities
+  unescaped, icon/logo/math furniture filtered; the printed head is capped
+  with the tail spoken, and header metadata rides single-newline lines so the
+  window tiling law is untouched (IMG-3).
 - **`ReadImage`** fetches an image (SVG/PNG/JPEG) from the granted origins
   and saves it as a viewable artifact (IMG-1): content-type gate with a
   magic-byte sniff for silent servers, streamed size cap, output confined to
@@ -901,19 +913,18 @@ and deliberately shelved — the note records why so we don't repeat them.
   quality.
 - **Native Mistral tool codec** (`[TOOL_CALLS]` / `[AVAILABLE_TOOLS]`) — a second
   tool-trained family in the agent; complex (special-token detok, 9-char IDs).
-- **Index-based `read_image` — take URL fidelity away from the model.** One
-  live session produced the whole failure taxonomy: mis-copied thumbnail
-  URLs (HTTP 400), *constructed* thumbnail URLs with invented hash
-  directories (HTTP 400 — the paths are unguessable by design), and
-  re-fetches of already-shown files. The listing should number its entries
-  and `read_image` should accept `{"image": 3}` against the session's last
-  `[images]` list, with the URL form kept for direct user-supplied targets.
-  Kills the class by construction instead of by teaching text. Design
-  question to settle first: how `ReadPage` and `ReadImage` share the
-  listing (they are separate `Tool`s today; the seam is deliberate).
-  Follows the night of 2026-07-04: IMG-2 (typed artifact events,
-  content-hash fetch-once) fixed re-display; this is the remaining
-  discovery half.
+- **Index-based `read_image` — complete (2026-08-30).** The listing numbers
+  its entries; `read_image` accepts `{"image": N}` against the session's
+  most recent `[images]` list, `{"images": [N, …]}` for a bounded batch
+  (at most 8 per call — one tool round instead of N, each entry keeping
+  byte-identical single-image semantics through the shared `show_one`
+  engine), and the exact-URL form for targets copied verbatim from any
+  session listing. The listing seam settled as a session-shared
+  `ImageListing` handed to both tools at construction. URL fidelity is
+  away from the model by construction; the HTTP-failure error teaches
+  "copy exactly or use the number" without implying a list-membership
+  rule that does not exist. Follows the night of 2026-07-04: IMG-2 fixed
+  re-display; this closed the discovery half.
 - **`read_page` find-in-page — promoted; sieve's reasons, not chat's.**
   `{"url": …, "find": "going concern"}` returning the window(s) around
   matches plus where the other matches live. The memo pipeline's model job
@@ -943,6 +954,15 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **Local llama.cpp backend — managed Muse agent complete (2026-08-24).** `yatima agent --profile muse-glimmer --root . --prompt ...` runs the tool loop over the same verified managed server as chat. One shared backend resolution serves both subcommands, so profiles, `--backend`/`--server-url`, and the rejection of Candle-only flags (`--cpu`, `--prefill-chunk`) behave identically in each; one spawn helper composes digest verification, the compatibility gates, and the pinned context and sampling, so no caller can omit them (LSRV-5). The agent pairs the Muse template with the native ATEM tool codec: the model addresses capability-scoped tools directly (`to=read_file`), invocations and results enter the run's working transcript structurally while persistent history stays answer-only (AGENT-3, PROTO-1), and the printed answer is framing-free. Managed chat and agent translate Ctrl-C into the shared monotone cancellation state and then take the same bounded explicit shutdown path as ordinary completion, so an interrupt cannot bypass child reap (CANCEL-1, LSRV-1). Attached mode can run the agent too, but its identity remains operator-attested and unverified.
 - **Local llama.cpp backend — shared host and frontend integration complete (2026-08-30).** The host backend thread owns either Candle or a verified managed `llama-server`, while `HostClient` carries movable request/event/cancel planes and `HostOwner` carries the joined-shutdown proof. The TUI, native GUI, and serve/browser path accept `--profile muse-glimmer`, show typed startup phases and verified identity, and use the same chat/tool event meanings. Live acceptance now covers all three views: the GUI completed capability-scoped image work and reaped on window close; one continuous browser connection completed ordinary and tool-backed turns without ATEM framing; Ctrl-C and SIGTERM both returned the WebSocket stream lease, joined the owner, and left no managed child. The llama-server integration arc is closed. Exact managed context accounting and compaction remain a separate follow-up; maintainer work resumes with walkthrough Chapter 3 first.
 - **GUI Glimmer visual subtraction — complete (2026-08-30).** `--whimsy` and everything behind it — the avatar, easter eggs, splash, status ticker, and the always-on repaint machinery — are removed at the maintainer's direction ("it's cute but it code for nothing"). What remains is state-bearing: the /stats grid, typed startup phases and verified identity, streaming turn displays, a one-second repaint only while loading, and a bounded help-overlay animation. It proved egui's range and then stopped paying for its complexity; no decorative replacement is planned.
+- **Verification stamp (2026-08-30).** LSRV-5 verification admits exactly two
+  evidence paths: a full hash now, or a prior launch's full hash carried by a
+  stamp beside the artifact recording the digest against the file identity
+  (size + mtime) captured around that hash — sampled before and confirmed
+  after, so a file replaced mid-hash writes no stamp. Any observable change,
+  re-pinned expectation, or unparseable stamp pays the full hash. Accepted
+  gap, stated in the registry: byte rewrites preserving both stat fields are
+  local tampering by an actor who already owns the machine. Effect: the ~30 s
+  launch re-hash of an unchanged 17 GB GGUF drops to milliseconds.
 - **Agent tool-round budget — temporarily 12 (2026-08-30).** `knobs::AGENT_MAX_STEPS` is raised from 6 to 12 after three live budget exhaustions during Muse image errands in one session: current web-tool friction (the `[images]`-list indirection and `read_image`'s most-recent-list constraint) roughly doubles the rounds an errand costs, and 6 was calibrated for frictionless rounds. This is a product knob, not a law — AGENT-1 still supplies termination. Revisit downward once the search/grant ergonomics work retires that friction.
 - **Remote `Completer` (Anthropic / OpenAI)** — the payoff of the async-`Completer`
   generalization (CMP-1): a `RemoteCompleter` holds only `Send` state and its

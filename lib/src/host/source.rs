@@ -170,8 +170,12 @@ impl<'de> Deserialize<'de> for Sha256Digest {
     }
 }
 
-/// A resolved GGUF whose complete contents matched an expected SHA-256 digest.
-/// Only [`verify`] can construct this refinement.
+/// A resolved GGUF proven to match an expected SHA-256 digest by one of
+/// two admissible evidence paths: a full hash performed now, or a full
+/// hash from an earlier launch carried forward by a verification stamp
+/// whose recorded file identity (size + mtime) still matches exactly
+/// (trust boundary and accepted gap: LSRV-5). Only the verify family can
+/// construct this refinement.
 #[derive(Debug, Clone)]
 pub struct VerifiedModelArtifact {
     artifact: GgufArtifact,
@@ -206,8 +210,10 @@ impl std::fmt::Display for VerifyCancelled {
 
 impl std::error::Error for VerifyCancelled {}
 
-/// Hash the exact canonical GGUF selected by resolution and refine it to a
-/// verified artifact only when every byte matches `expected` (LSRV-5).
+/// Prove the exact canonical GGUF selected by resolution matches
+/// `expected` and refine it to a verified artifact (LSRV-5): the full
+/// hash, unless a matching verification stamp carries a prior launch's
+/// proof of the same expectation over the observably-unchanged file.
 pub async fn verify(
     artifact: GgufArtifact,
     expected: &Sha256Digest,
@@ -242,8 +248,29 @@ async fn verify_hash(
     cancel: Option<crate::Cancel>,
 ) -> Result<VerifiedModelArtifact> {
     let path = artifact.path().to_path_buf();
-    let actual = crate::run_blocking(move || sha256_file(&path, cancel.as_ref()))?;
-    if actual != *expected {
+    let expected = *expected;
+    let actual = crate::run_blocking(move || -> Result<Sha256Digest> {
+        // A matching stamp discharges the hash: the digest was proven over
+        // these observably-identical bytes on an earlier launch (LSRV-5,
+        // stamp amendment). Anything else — no stamp, wrong size or mtime,
+        // a re-pinned expectation, unparseable text — pays the full hash.
+        if let Some(digest) = stamp_match(&path, &expected) {
+            return Ok(digest);
+        }
+        // The stamp binds the digest to ONE observed identity: sampled
+        // before hashing and confirmed unchanged after. A file replaced
+        // mid-hash has no stable identity and writes no stamp — stamping
+        // the after-image would bind this digest to bytes never hashed.
+        let before = stat_identity(&path);
+        let actual = sha256_file(&path, cancel.as_ref())?;
+        if actual == expected {
+            if let Some(identity) = hashed_identity(before, stat_identity(&path)) {
+                write_stamp(&path, identity, &actual);
+            }
+        }
+        Ok(actual)
+    })?;
+    if actual != expected {
         bail!(
             "SHA-256 mismatch for {}: expected {expected}, found {actual}",
             artifact.path().display()
@@ -253,6 +280,76 @@ async fn verify_hash(
         artifact,
         digest: actual,
     })
+}
+
+/// The stamp's sibling path: `<artifact>.sha256-stamp`.
+fn stamp_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(".sha256-stamp");
+    PathBuf::from(os)
+}
+
+/// A file's observable identity: size, mtime seconds, mtime subsec nanos.
+type FileIdentity = (u64, u64, u32);
+
+/// The identity a completed hash may be bound to: only when the samples
+/// taken immediately before and after hashing agree. A file replaced or
+/// rewritten mid-hash has no stable identity; `None` writes no stamp and
+/// the next launch simply re-hashes.
+fn hashed_identity(
+    before: Option<FileIdentity>,
+    after: Option<FileIdentity>,
+) -> Option<FileIdentity> {
+    match (before, after) {
+        (Some(b), Some(a)) if b == a => Some(b),
+        _ => None,
+    }
+}
+
+/// The artifact's [`FileIdentity`] — what the stamp is keyed to. A file
+/// whose mtime predates the epoch gets no stamp service.
+fn stat_identity(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((meta.len(), mtime.as_secs(), mtime.subsec_nanos()))
+}
+
+/// The stamped digest, only when the stamp parses, matches the file's
+/// current size and mtime exactly, and records exactly the expected digest
+/// (a re-pinned profile must re-prove, not inherit). The accepted gap is
+/// local tampering that rewrites bytes while preserving both stat fields —
+/// an actor who can do that owns the machine; the pin defends against
+/// wrong, stale, or corrupt artifacts, not root.
+fn stamp_match(path: &Path, expected: &Sha256Digest) -> Option<Sha256Digest> {
+    let (size, mtime_s, mtime_ns) = stat_identity(path)?;
+    let raw = std::fs::read_to_string(stamp_path(path)).ok()?;
+    let mut fields = raw.split_whitespace();
+    let stamped_size: u64 = fields.next()?.parse().ok()?;
+    let stamped_s: u64 = fields.next()?.parse().ok()?;
+    let stamped_ns: u32 = fields.next()?.parse().ok()?;
+    let stamped: Sha256Digest = fields.next()?.parse().ok()?;
+    (fields.next().is_none()
+        && stamped_size == size
+        && stamped_s == mtime_s
+        && stamped_ns == mtime_ns
+        && stamped == *expected)
+        .then_some(stamped)
+}
+
+/// Record the proven digest against the identity captured around the
+/// hash (never re-sampled here — see [`hashed_identity`]). Best effort:
+/// verification already succeeded, and a failed write only costs the
+/// next launch a re-hash.
+fn write_stamp(path: &Path, identity: FileIdentity, digest: &Sha256Digest) {
+    let (size, mtime_s, mtime_ns) = identity;
+    let _ = std::fs::write(
+        stamp_path(path),
+        format!("{size} {mtime_s} {mtime_ns} {digest}\n"),
+    );
 }
 
 /// Sync shim over [`verify`], bridged through the one runtime (RT-1) — one of
@@ -727,6 +824,107 @@ mod tests {
             verified.path(),
             directory.path().join("model.gguf").canonicalize().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn stamp_discharges_the_rehash_and_pins_its_trust_boundary() {
+        // upholds: LSRV-5 (stamp amendment) — a successful full verify
+        // writes the stamp, and a later verify whose file stats match
+        // trusts it without re-hashing. The second half deliberately pins
+        // the ACCEPTED GAP, not an aspiration: bytes rewritten while the
+        // stamp is forged to match the new stats still pass, because
+        // size+mtime is the whole of the change detection.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        let bytes = b"small deterministic GGUF fixture";
+        std::fs::write(&path, bytes).unwrap();
+        let resolve = || {
+            resolve_directory(directory.path().to_path_buf())
+                .unwrap()
+                .into_gguf()
+                .unwrap()
+        };
+        let expected = Sha256Digest::of_bytes(bytes);
+        verify(resolve(), &expected).await.unwrap();
+        let stamp = stamp_path(&path.canonicalize().unwrap());
+        assert!(stamp.exists(), "the full verify wrote its stamp");
+
+        // Corrupt the bytes (same length), then forge the stamp's stat
+        // fields to the corrupted file's identity: stamp-trust passes
+        // without hashing — the documented gap, witnessed on purpose.
+        std::fs::write(&path, b"corrupt deterministic GGUF fixtur").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let (size, mtime_s, mtime_ns) = stat_identity(&canonical).unwrap();
+        std::fs::write(&stamp, format!("{size} {mtime_s} {mtime_ns} {expected}\n")).unwrap();
+        let trusted = verify(resolve(), &expected).await.unwrap();
+        assert_eq!(trusted.digest(), &expected);
+    }
+
+    #[test]
+    fn a_shifting_identity_is_never_stamped() {
+        // upholds: LSRV-5 (stamp amendment) — the stamp binds a digest to
+        // the one identity observed both before and after hashing. A file
+        // replaced mid-hash (differing samples) or unstattable at either
+        // edge yields no identity, so no stamp can bind the digest to
+        // bytes that were never hashed.
+        let a = (10u64, 100u64, 5u32);
+        let b = (10u64, 100u64, 6u32);
+        assert_eq!(hashed_identity(Some(a), Some(a)), Some(a));
+        assert_eq!(hashed_identity(Some(a), Some(b)), None);
+        assert_eq!(hashed_identity(None, Some(a)), None);
+        assert_eq!(hashed_identity(Some(a), None), None);
+    }
+
+    #[tokio::test]
+    async fn any_observable_change_or_repin_pays_the_full_hash() {
+        // upholds: LSRV-5 (stamp amendment) — a size change, an mtime
+        // change (any rewrite), a re-pinned expectation, and a malformed
+        // stamp each fall back to the full hash, which then tells the
+        // truth about the bytes.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        let bytes = b"small deterministic GGUF fixture";
+        std::fs::write(&path, bytes).unwrap();
+        let resolve = || {
+            resolve_directory(directory.path().to_path_buf())
+                .unwrap()
+                .into_gguf()
+                .unwrap()
+        };
+        let expected = Sha256Digest::of_bytes(bytes);
+        verify(resolve(), &expected).await.unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let stamp = stamp_path(&canonical);
+
+        // Same-length corruption: the rewrite moves mtime, the stamp
+        // mismatches, the full hash runs and catches it.
+        std::fs::write(&path, b"corrupt deterministic GGUF fixtur").unwrap();
+        let error = verify(resolve(), &expected).await.unwrap_err();
+        assert!(error.to_string().contains("SHA-256 mismatch"), "{error}");
+
+        // Restore; a passing full hash re-stamps.
+        std::fs::write(&path, bytes).unwrap();
+        verify(resolve(), &expected).await.unwrap();
+
+        // Size change: caught.
+        std::fs::write(&path, b"grown").unwrap();
+        std::fs::write(&path, [bytes.as_slice(), b"x"].concat()).unwrap();
+        let error = verify(resolve(), &expected).await.unwrap_err();
+        assert!(error.to_string().contains("SHA-256 mismatch"), "{error}");
+
+        // Restore and stamp; a re-pinned expectation ignores the stamp and
+        // re-proves against the new pin (here: honestly failing).
+        std::fs::write(&path, bytes).unwrap();
+        verify(resolve(), &expected).await.unwrap();
+        let repinned = Sha256Digest::of_bytes(b"a different pin");
+        let error = verify(resolve(), &repinned).await.unwrap_err();
+        assert!(error.to_string().contains("SHA-256 mismatch"), "{error}");
+
+        // Malformed stamp: ignored, full verify passes and rewrites it.
+        std::fs::write(&stamp, "not a stamp at all").unwrap();
+        verify(resolve(), &expected).await.unwrap();
+        let rewritten = std::fs::read_to_string(&stamp).unwrap();
+        assert!(rewritten.ends_with(&format!("{expected}\n")), "{rewritten}");
     }
 
     #[tokio::test]

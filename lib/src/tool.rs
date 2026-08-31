@@ -33,6 +33,12 @@ use tracing::Instrument;
 
 const DEFAULT_READ_URL_MAX_BYTES: usize = 1_000_000;
 
+/// Cap on a `text/html` body `read_url` will return. Raw markup is almost
+/// all noise per byte (observed live: one File-page read put 88k chars of
+/// HTML into the transcript, and every later round replayed it through
+/// prefill); past this, the honest answer is "use read_page".
+const READ_URL_HTML_MAX_BYTES: usize = 16_384;
+
 /// `read_page` input cap: the streamed body is rejected once it exceeds this, so
 /// a pathological page cannot be buffered into memory.
 const DEFAULT_READ_PAGE_MAX_BYTES: usize = 4_000_000;
@@ -1219,8 +1225,13 @@ impl Tool for ReadUrl {
     async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
         let target = required_string(&args, "read_url", "url")?;
         let url = self.origins.resolve(target)?;
-        let response = self.client.get(url).send().await?;
+        let response = self.client.get(url.clone()).send().await?;
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let body = response.bytes().await?;
         if !status.is_success() {
             bail!(
@@ -1233,6 +1244,27 @@ impl Tool for ReadUrl {
                 "read_url response too large: {} bytes exceeds {} byte limit",
                 body.len(),
                 self.max_bytes
+            );
+        }
+        // HTML at size is context poison, not content: every byte returned
+        // here rides in the transcript through all later rounds. read_page
+        // exists precisely to extract the signal. An explicit non-HTML
+        // content-type is authoritative; an absent or generic one
+        // (octet-stream) defers to a sniff of the leading bytes, so a
+        // headerless server cannot smuggle a full page past the guard.
+        let is_html = match content_type.as_deref() {
+            Some(ct) if !ct.to_ascii_lowercase().contains("application/octet-stream") => {
+                ct.to_ascii_lowercase().contains("html")
+            }
+            _ => looks_like_html(&body),
+        };
+        if is_html && body.len() > READ_URL_HTML_MAX_BYTES {
+            bail!(
+                "read_url: {url} is {} bytes of raw HTML — use read_page, \
+                 which extracts the readable text and lists the page's \
+                 images for read_image (read_url is for raw non-HTML \
+                 content)",
+                body.len()
             );
         }
         Ok(String::from_utf8(body.to_vec())?)
@@ -1405,8 +1437,9 @@ impl ReadPage {
         if offset == 0 && !page.images.is_empty() {
             self.listing.publish(&page.images); // IMG-3: what {"image": N} selects from
             out.push_str(
-                "\n[images — display one with read_image {\"image\": N}; \
-                 markdown image links do not render:",
+                "\n[images — display one with read_image {\"image\": N} or \
+                 several with {\"images\": [N, …]}; markdown image links do \
+                 not render:",
             );
             for (n, (src, alt)) in page
                 .images
@@ -1597,11 +1630,13 @@ impl Tool for ReadPage {
         let url_string = base.to_string();
         let (title, text, images) = tokio::task::spawn_blocking(
             move || -> Result<(String, String, Vec<(String, String)>)> {
-            // Scan the whole fetched page before the extractor consumes it:
-            // the readable region misses infobox tails, galleries, and
-            // navboxes — real pictures a reader will ask for. The listing
-            // must cover the page, not the extraction (IMG-3).
-            let page_wide = article_images(&html, &base);
+            // The listing reads the whole *raw* page before the extractor
+            // consumes it — for coverage (the readable region misses
+            // infobox tails, galleries, navboxes — real pictures a reader
+            // will ask for; IMG-3) and for truth (the extractor rewrites
+            // img attributes; see `article_images`). Document order: the
+            // furniture filters keep chrome out of the capped head.
+            let images = article_images(&html, &base);
             let cfg = dom_smoothie::Config {
                 max_elements_to_parse: READ_PAGE_MAX_ELEMENTS,
                 ..Default::default()
@@ -1615,14 +1650,6 @@ impl Tool for ReadPage {
             let article = readability.parse().map_err(|e| {
                 anyhow!("read_page: no readable article at {url_string}: {e}; use read_url for raw content")
             })?;
-            // Article-region images keep the low numbers; the rest of the
-            // page follows, deduped.
-            let mut images = article_images(&article.content, &base);
-            for (url, alt) in page_wide {
-                if !images.iter().any(|(u, _)| *u == url) {
-                    images.push((url, alt));
-                }
-            }
             Ok((
                 article.title.to_string(),
                 article.text_content.to_string(),
@@ -1662,6 +1689,12 @@ const READ_PAGE_MAX_IMAGES_SHOWN: usize = 24;
 /// pathological body can't buffer unbounded (the guard streams).
 const DEFAULT_READ_IMAGE_MAX_BYTES: usize = 8_000_000;
 
+/// Cap on one `read_image` call's `images` batch — bounds a single tool
+/// round's network and disk work while still collapsing a typical harvest
+/// (observed live: 11 images, one round each, on a local model where every
+/// round is a full prefill+generation cycle) into one or two rounds.
+const READ_IMAGE_MAX_BATCH: usize = 8;
+
 /// The image types `read_image` will save, with their extensions and magic
 /// signatures (the sniff when a server sends no content-type).
 const IMAGE_TYPES: &[(&str, &str)] = &[
@@ -1672,8 +1705,10 @@ const IMAGE_TYPES: &[(&str, &str)] = &[
 ];
 
 /// A quoted attribute's value inside an HTML tag body (`src="…"`), with a
-/// boundary check so `srcset`/`data-src` never match as `src`. A scanner,
-/// not a parser: good enough for discovery metadata, never authoritative.
+/// boundary check so `srcset`/`data-src` never match as `src`, and the
+/// five attribute entity escapes undone (a listed URL must be fetchable
+/// verbatim — `&amp;` in a query string is not). A scanner, not a parser:
+/// good enough for discovery metadata, never authoritative.
 fn attr_value(tag: &str, name: &str) -> Option<String> {
     let mut rest = tag;
     loop {
@@ -1690,7 +1725,7 @@ fn attr_value(tag: &str, name: &str) -> Option<String> {
                 if quote == '"' || quote == '\'' {
                     let inner = &after[1..];
                     let end = inner.find(quote)?;
-                    return Some(inner[..end].to_string());
+                    return Some(unescape_attr(&inner[..end]));
                 }
             }
         }
@@ -1698,8 +1733,49 @@ fn attr_value(tag: &str, name: &str) -> Option<String> {
     }
 }
 
-/// The readable region's `<img>` sources with their alt text: resolved
-/// absolute against the page URL, deduped in document order, capped at
+/// A conservative HTML sniff for responses with no authoritative
+/// content-type: document-shaped markers in the leading bytes. Used only
+/// by `read_url`'s context guard — never to decide rendering.
+fn looks_like_html(body: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&body[..body.len().min(512)]).to_ascii_lowercase();
+    ["<!doctype html", "<html", "<head", "<body"]
+        .iter()
+        .any(|marker| head.contains(marker))
+}
+
+/// The five entity escapes attribute values carry, undone. `&amp;` must go
+/// last: `&amp;lt;` is the literal text `&lt;`, not `<`.
+fn unescape_attr(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The densest candidate in the tag's `srcset` — the server-authored
+/// higher-resolution variant of the same image (`url 2x` / `url 640w`
+/// forms; a bare candidate counts as 1). `None` when the attribute is
+/// absent or yields no candidate, and the plain `src` stands. Choosing
+/// from `srcset` never *constructs* a URL: every candidate was written by
+/// the server, so the no-invented-thumbnails rule holds.
+fn densest_srcset_candidate(tag: &str) -> Option<String> {
+    let srcset = attr_value(tag, "srcset")?;
+    let mut best: Option<(f64, String)> = None;
+    for candidate in srcset.split(',') {
+        let mut parts = candidate.split_whitespace();
+        let Some(url) = parts.next() else { continue };
+        let density = parts
+            .next()
+            .and_then(|d| d.trim_end_matches(['x', 'w']).parse::<f64>().ok())
+            .unwrap_or(1.0);
+        if best.as_ref().is_none_or(|(b, _)| density > *b) {
+            best = Some((density, url.to_string()));
+        }
+    }
+    best.map(|(_, url)| url)
+}
+
 /// The origins of listed images the held origin set cannot reach — deduped,
 /// render-ready (`scheme://host[:port]`), listing order. These are the
 /// grants a `read_image` on the listing would need but does not have.
@@ -1729,13 +1805,20 @@ fn ungranted_image_origins(images: &[(String, String)], origins: &WebOrigins) ->
 const READ_PAGE_ICON_MAX_PX: u32 = 64;
 
 /// Every content image in `content_html` — what `read_page` publishes so
-/// the model can discover something worth a `read_image` call. Uncapped:
-/// completeness is the point (the display cap lives at render,
-/// [`READ_PAGE_MAX_IMAGES_SHOWN`]). Page furniture never spends a slot
-/// (nor the model's attention): `data:` URLs (nothing to fetch),
-/// icon-sized imgs ([`READ_PAGE_ICON_MAX_PX`]), and MediaWiki's math
-/// fallback renders (`mwe-math` classes — formulas, not pictures; a
-/// Wikipedia-shaped special case like the sibling-origin note).
+/// the model can discover something worth a `read_image` call. Scans the
+/// *raw served HTML only*: extractor output is untrustworthy here
+/// (dom_smoothie rewrites `src` to MediaWiki's `resource` attribute — the
+/// `File:` description *page* — and strips the classes the furniture
+/// filters key on; observed live as an [images] list whose entry 1 was
+/// HTML). Uncapped: completeness is the point (the display cap lives at
+/// render, [`READ_PAGE_MAX_IMAGES_SHOWN`]). Each entry is the densest
+/// server-authored candidate (`srcset` over `src` — never constructed).
+/// Page furniture never spends a slot (nor the model's attention):
+/// `data:` URLs (nothing to fetch), icon-sized imgs
+/// ([`READ_PAGE_ICON_MAX_PX`]), site-chrome logos (`logo` classes), and
+/// MediaWiki's math fallback renders (`mwe-math` classes — formulas, not
+/// pictures; a Wikipedia-shaped special case like the sibling-origin
+/// note).
 fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut rest = content_html;
@@ -1758,9 +1841,10 @@ fn article_images(content_html: &str, base: &Url) -> Vec<(String, String)> {
         if icon_sized {
             continue;
         }
-        if attr_value(tag, "class").is_some_and(|c| c.contains("mwe-math")) {
+        if attr_value(tag, "class").is_some_and(|c| c.contains("mwe-math") || c.contains("logo")) {
             continue;
         }
+        let src = densest_srcset_candidate(tag).unwrap_or(src);
         let Ok(resolved) = base.join(&src) else {
             continue;
         };
@@ -1906,9 +1990,14 @@ impl Tool for ReadImage {
             // The spec states the tool's live authority (CAP-3a).
             description: format!(
                 "Fetch an image (SVG/PNG/JPEG/GIF) and save it for the user to \
-                 view. Prefer {{\"image\": N}} — the entry's number in the \
-                 most recent read_page [images] list. A url must be copied \
-                 exactly from that list, never constructed. May read only \
+                 view. This is the only way an image reaches the user: \
+                 markdown image syntax and links in answer text never \
+                 render. Prefer {{\"image\": N}} — the entry's number in the \
+                 most recent read_page [images] list — or several at once \
+                 with {{\"images\": [N, …]}} (at most 8 per call): one round \
+                 instead of many. A url must be copied \
+                 exactly from an [images] list this session (any earlier \
+                 page's list still counts), never constructed. May read only \
                  these origins: {}. Returns the file path. {GRANT_PROTOCOL}",
                 self.origins.list().join(", ")
             ),
@@ -1919,9 +2008,14 @@ impl Tool for ReadImage {
                         "type": "integer",
                         "description": "1-based number of an entry in the most recent read_page [images] list (preferred)"
                     },
+                    "images": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "several images in one call: 1-based numbers from the most recent read_page [images] list (at most 8 per call)"
+                    },
                     "url": {
                         "type": "string",
-                        "description": "absolute image URL on a granted origin, copied exactly from a read_page [images] list"
+                        "description": "absolute image URL on a granted origin, copied exactly from any read_page [images] list this session"
                     },
                     "again": {
                         "type": "boolean",
@@ -1944,6 +2038,62 @@ impl Tool for ReadImage {
             .get("again")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        // Several entries in one round: at one image per call, an N-image
+        // harvest is N prefill+generation cycles on a local model. Each
+        // entry keeps the exact single-image semantics (CAP-2 resolve,
+        // fetch-once memo, type gate, artifact event); the call succeeds
+        // when at least one entry displayed, and every entry reports its
+        // own line.
+        if let Some(list) = args.get("images") {
+            if args.get("image").is_some() || args.get("url").is_some() {
+                bail!(
+                    "read_image: pass \"images\" alone, not together with \
+                     \"image\" or \"url\""
+                );
+            }
+            if again {
+                bail!(
+                    "read_image: re-show one at a time — {{\"again\": true}} \
+                     goes with \"image\" or \"url\", not \"images\""
+                );
+            }
+            let ns = list.as_array().ok_or_else(|| {
+                anyhow!("read_image: `images` must be an array of numbers, got {list}")
+            })?;
+            if ns.is_empty() {
+                bail!("read_image: `images` needs at least one number");
+            }
+            if ns.len() > READ_IMAGE_MAX_BATCH {
+                bail!(
+                    "read_image: at most {READ_IMAGE_MAX_BATCH} images per \
+                     call — split the batch"
+                );
+            }
+            let mut lines: Vec<String> = Vec::new();
+            let mut any_ok = false;
+            for v in ns {
+                let Some(n) = v.as_u64().and_then(|u| usize::try_from(u).ok()) else {
+                    lines.push(format!("image {v}: must be a positive integer index"));
+                    continue;
+                };
+                let line = match self.select_teach(n) {
+                    Ok(target) => match self.show_one(&target, false, &ctx).await {
+                        Ok(summary) => {
+                            any_ok = true;
+                            summary
+                        }
+                        Err(e) => format!("{e:#}"),
+                    },
+                    Err(e) => format!("{e:#}"),
+                };
+                lines.push(format!("image {n}: {line}"));
+            }
+            let report = lines.join("\n");
+            if !any_ok {
+                bail!("read_image: no image in the batch displayed —\n{report}");
+            }
+            return Ok(report);
+        }
         let selected;
         let target = match (args.get("url"), args.get("image")) {
             (Some(_), Some(_)) => bail!(
@@ -1985,31 +2135,53 @@ impl Tool for ReadImage {
                 }
                 bail!(
                     "read_image: pass {{\"image\": N}} — the entry's number \
-                     in the most recent read_page [images] list (or an exact \
-                     \"url\" from it)"
+                     in the most recent read_page [images] list — or an \
+                     exact \"url\" copied from any [images] list this \
+                     session"
                 )
             }
             (Some(url), None) => url
                 .as_str()
                 .ok_or_else(|| anyhow!("read_image: `url` must be a string, got {url}"))?,
             (None, Some(n)) => {
-                let n = n.as_u64().ok_or_else(|| {
-                    anyhow!("read_image: `image` must be a positive integer, got {n}")
-                })?;
-                selected = self.listing.select(n as usize).map_err(|len| match len {
-                    0 => anyhow!(
-                        "read_image: no [images] list yet this session — \
-                         call read_page first; its first window lists the \
-                         page's images by number"
-                    ),
-                    len => anyhow!(
-                        "read_image: image {n} is out of range — the most \
-                         recent read_page listed {len} images (1..={len})"
-                    ),
-                })?;
+                let idx = n
+                    .as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "read_image: `image` must be a positive integer \
+                             index, got {n}"
+                        )
+                    })?;
+                selected = self.select_teach(idx)?;
                 selected.as_str()
             }
         };
+        self.show_one(target, again, &ctx).await
+    }
+}
+
+impl ReadImage {
+    /// The listing lookup with its teaching errors — shared by the single
+    /// and batch forms.
+    fn select_teach(&self, n: usize) -> Result<String> {
+        self.listing.select(n).map_err(|len| match len {
+            0 => anyhow!(
+                "read_image: no [images] list yet this session — call \
+                 read_page first; its first window lists the page's images \
+                 by number"
+            ),
+            len => anyhow!(
+                "read_image: image {n} is out of range — the most recent \
+                 read_page listed {len} images (1..={len})"
+            ),
+        })
+    }
+
+    /// Resolve, fetch (or memo-hit), gate, save, and emit one image — the
+    /// shared engine of the single and batch forms. `again` only softens
+    /// the repeat narration; display and memo semantics are identical.
+    async fn show_one(&self, target: &str, again: bool, ctx: &ToolCtx) -> Result<String> {
         let url = self.origins.resolve(target)?; // CAP-2 before any network
 
         // Fetch-once: a repeat of a URL this session re-teaches and re-emits
@@ -2059,10 +2231,11 @@ impl Tool for ReadImage {
         let status = response.status();
         if !status.is_success() {
             bail!(
-                "read_image failed with HTTP {status} for {url} — image URLs \
-                 must be copied exactly from a read_page [images] list, never \
-                 constructed (thumbnail URLs encode content hashes and a \
-                 fixed size whitelist — both unguessable)"
+                "read_image failed with HTTP {status} for {url} — likely a \
+                 mistyped or re-wrapped URL: copy it exactly from an \
+                 [images] list (or use the entry's number); constructed or \
+                 edited thumbnail URLs 404 because their paths encode \
+                 unguessable content hashes"
             );
         }
         let content_type = response
@@ -2096,8 +2269,9 @@ impl Tool for ReadImage {
         // else teaches the text tools.
         let Some(ext) = image_ext(content_type.as_deref(), &body) else {
             bail!(
-                "read_image: {url} is not an SVG/PNG/JPEG/GIF image ({}); use \
-                 read_page for HTML or read_url for raw content",
+                "read_image: {url} is not an SVG/PNG/JPEG/GIF image ({}); for \
+                 an HTML page use read_page — its [images] list carries the \
+                 fetchable URLs (read_url is for raw non-HTML content only)",
                 content_type.as_deref().unwrap_or("no content-type")
             );
         };
@@ -3319,6 +3493,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_url_declines_oversized_html_toward_read_page() {
+        // upholds: the transcript-economy guard — raw HTML at size is
+        // context poison, replayed through every later prefill round
+        // (observed live: one 88k-char File-page read; the rounds after it
+        // crawled). Big HTML teaches read_page; the same bytes as non-HTML
+        // still flow; small HTML still flows.
+        let server = MockServer::start().await;
+        let big = "<p>x</p>".repeat(4_000);
+        Mock::given(method("GET"))
+            .and(path("/big.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(big.clone().into_bytes(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/big.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(big.into_bytes(), "text/plain"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/small.html"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"<p>tiny</p>".to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+        // A headerless (octet-stream) server must not smuggle a document
+        // past the guard: the sniff catches the doctype. Non-document
+        // headerless bytes of the same size still flow.
+        let doc = format!(
+            "<!doctype html><html><body>{}</body></html>",
+            "x".repeat(20_000)
+        );
+        Mock::given(method("GET"))
+            .and(path("/naked.html"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(doc.into_bytes()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/naked.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0x42u8; 20_000]))
+            .mount(&server)
+            .await;
+
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadUrl::new(origins).unwrap());
+        let call = |route: &str| ToolCall {
+            name: "read_url".to_string(),
+            args: json(&format!(r#"{{"url": "{route}"}}"#)),
+        };
+        let refused = tools.dispatch_async(&call("/big.html")).await;
+        let rendered = refused.render_for_model("read_url");
+        assert!(rendered.is_error, "{}", rendered.content);
+        assert!(
+            rendered.content.contains("use read_page"),
+            "the refusal teaches the right tool: {}",
+            rendered.content
+        );
+        let naked = tools
+            .dispatch_async(&call("/naked.html"))
+            .await
+            .render_for_model("read_url");
+        assert!(
+            naked.is_error && naked.content.contains("use read_page"),
+            "the sniff catches a headerless document: {}",
+            naked.content
+        );
+        for fine in ["/big.txt", "/small.html", "/naked.bin"] {
+            let ok = tools.dispatch_async(&call(fine)).await;
+            assert!(matches!(ok, ToolOutcome::Success { .. }), "{fine}: {ok:?}");
+        }
+    }
+
     #[test]
     fn read_url_rejects_escaping_origins_before_network() {
         // upholds: CAP-2 — an arbitrary host cannot be smuggled through args.
@@ -3490,10 +3740,11 @@ well known works of art depicting paradoxical architecture.</p>
     #[tokio::test]
     async fn read_page_lists_article_images_for_discovery() {
         // upholds: WIN-1 (header metadata never disturbs the window tiling)
-        // + the read_page → read_image discovery seam: the readable region's
-        // images are listed once, in window 0's header — absolute (relative
-        // srcs resolved against the page), alt-labeled, srcset never
-        // mistaken for src.
+        // + the read_page → read_image discovery seam: the page's images
+        // are listed once, in window 0's header — absolute (relative srcs
+        // resolved against the page), alt-labeled, and each entry the
+        // densest server-authored candidate (srcset chosen deliberately,
+        // never by mis-parse).
         let html = r#"<!DOCTYPE html><html><head><title>Impossible Objects</title></head>
 <body><article>
 <h1>Impossible Objects</h1>
@@ -3532,14 +3783,15 @@ well known works of art depicting paradoxical architecture.</p>
         assert!(
             first
                 .content
-                .contains(&format!("\n  1. {}/img/tri.svg", server.uri())),
-            "numbered entries: {}",
+                .contains(&format!("\n  1. {}/img/tri-2x.png", server.uri())),
+            "numbered entries, densest variant: {}",
             first.content
         );
         assert!(
-            first
-                .content
-                .contains(&format!("{}/img/tri.svg (Penrose triangle)", server.uri())),
+            first.content.contains(&format!(
+                "{}/img/tri-2x.png (Penrose triangle)",
+                server.uri()
+            )),
             "relative src resolves absolute, alt rides along: {}",
             first.content
         );
@@ -3551,8 +3803,8 @@ well known works of art depicting paradoxical architecture.</p>
             first.content
         );
         assert!(
-            !first.content.contains("tri-2x"),
-            "srcset is not src: {}",
+            !first.content.contains("/img/tri.svg"),
+            "the 1x src yields to the denser srcset candidate: {}",
             first.content
         );
         // The off-origin image's missing grant is named (CAP-3: the model
@@ -3589,9 +3841,10 @@ well known works of art depicting paradoxical architecture.</p>
     async fn read_page_images_cover_the_page_and_speak_truncation() {
         // upholds: IMG-3 — the listing covers the whole fetched page, not
         // just the extracted article (footers/galleries/navboxes hold real
-        // pictures a reader will ask for); article-region entries keep the
-        // low numbers; the header prints only the head and *says* what it
-        // is not printing; and every entry stays selectable by number.
+        // pictures a reader will ask for); entries follow document order,
+        // so the article's own image leads; the header prints only the
+        // head and *says* what it is not printing; and every entry stays
+        // selectable by number.
         let footer_imgs: String = (1..=28)
             .map(|i| format!(r#"<img src="/pics/f.png?i={i}" alt="related {i}">"#))
             .collect();
@@ -3679,16 +3932,63 @@ as the first window of the page without tripping any extraction guard.</p>
         assert!(content.starts_with("wrote "), "{content}");
     }
 
+    #[tokio::test]
+    async fn read_page_lists_renderable_urls_not_extractor_rewrites() {
+        // upholds: IMG-3 — the [images] listing comes from the raw served
+        // HTML, never from extractor output. Observed live (2026-08-30):
+        // the readability pass rewrites a MediaWiki img's `src` to its
+        // `resource` attribute — the File: *description page* — and strips
+        // the classes the furniture filters key on, so entry 1 selected an
+        // HTML page, read_image refused it, and the errand burned its
+        // whole budget re-deriving what the list should have said.
+        let html = r#"<html><head><title>M</title></head><body><article><h1>M</h1>
+<img resource="https://en.example/wiki/File:Real.jpg"
+ src="//files.example/thumb/Real.jpg/500px-Real.jpg"
+ srcset="//files.example/thumb/Real.jpg/960px-Real.jpg 2x"
+ class="mw-file-element" width="340" height="255">
+<p>Prose long enough for the extractor to keep: the set of points whose
+orbits stay bounded under repeated squaring traces the famous cardioid
+with its halo of bulbs, and every window of the boundary hides another
+copy of the whole set at every scale a reader cares to zoom.</p>
+</article></body></html>"#;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/m"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let tools = Tools::new().with(ReadPage::with_limits(origins, 1_000_000, 80).unwrap());
+        let first = read_window(&tools, "/m", 0).await;
+        assert!(!first.is_error, "{}", first.content);
+        assert!(
+            first
+                .content
+                .contains("://files.example/thumb/Real.jpg/960px-Real.jpg"),
+            "the densest server-authored media URL is listed: {}",
+            first.content
+        );
+        assert!(
+            !first.content.contains("File:Real.jpg"),
+            "an HTML description page never enters the listing: {}",
+            first.content
+        );
+    }
+
     #[test]
     fn article_images_lists_content_not_furniture() {
         // The discovery listing carries *content* images only: data: URLs,
-        // icon-sized imgs (declared width or height under 64px), and
-        // MediaWiki math-fallback renders are page furniture that would
-        // otherwise spend the capped slots (and the model's attention)
-        // before the first real picture.
+        // icon-sized imgs (declared width or height under 64px), site
+        // logos, and MediaWiki math-fallback renders are page furniture
+        // that would otherwise spend the capped slots (and the model's
+        // attention) before the first real picture.
         let base = Url::parse("https://en.wikipedia.org/wiki/X").unwrap();
         let html = concat!(
             r#"<img src="/static/icons/enwiki-25.svg" width="25" height="25">"#,
+            r#"<img class="mw-logo-wordmark" src="/static/wordmark.svg" alt="Wikipedia">"#,
             r#"<img src="data:image/png;base64,AAAA">"#,
             r#"<img class="mwe-math-fallback-image-inline mw-invert" "#,
             r#"src="https://wikimedia.org/api/rest_v1/media/math/render/svg/abc" alt="x^2">"#,
@@ -3706,6 +4006,34 @@ as the first window of the page without tripping any extraction guard.</p>
             ]
         );
         assert_eq!(images[0].1, "a real picture");
+    }
+
+    #[test]
+    fn article_images_prefer_densest_srcset_and_unescape() {
+        // upholds: IMG-3 — an entry is the densest *server-authored*
+        // candidate (srcset over src; choosing is not constructing) and is
+        // fetchable verbatim (attribute entity escapes undone, `&amp;`
+        // last so `&amp;lt;` stays literal). A srcset with no parseable
+        // candidate falls back to src.
+        let base = Url::parse("https://en.wikipedia.org/wiki/X").unwrap();
+        let html = concat!(
+            r#"<img src="/t/A.jpg/500px-A.jpg?a=1&amp;b=2" "#,
+            r#"srcset="/t/A.jpg/750px-A.jpg 1.5x, /t/A.jpg/960px-A.jpg?a=1&amp;b=2 2x" "#,
+            r#"alt="Tom &amp; Jerry">"#,
+            r#"<img src="/plain.png" alt="no srcset">"#,
+            r#"<img src="/fallback.png" srcset=", ,">"#,
+        );
+        let images = article_images(html, &base);
+        let srcs: Vec<&str> = images.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(
+            srcs,
+            [
+                "https://en.wikipedia.org/t/A.jpg/960px-A.jpg?a=1&b=2",
+                "https://en.wikipedia.org/plain.png",
+                "https://en.wikipedia.org/fallback.png",
+            ]
+        );
+        assert_eq!(images[0].1, "Tom & Jerry");
     }
 
     #[test]
@@ -3727,6 +4055,122 @@ as the first window of the page without tripping any extraction guard.</p>
         assert!(
             ungranted_image_origins(&images[..1], &origins).is_empty(),
             "an all-granted listing draws no note"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_image_shows_several_in_one_call_and_reports_each() {
+        // upholds: IMG-3 (batch selection is still index copies against the
+        // shared listing) + IMG-2 (each entry keeps single-image display
+        // and memo semantics) — one call, several images, one line per
+        // entry; a bad entry reports without sinking the good ones.
+        let server = MockServer::start().await;
+        for (route, body) in [
+            ("/a.png", b"\x89PNG\r\n\x1a\naaaa".as_slice()),
+            ("/b.png", b"\x89PNG\r\n\x1a\nbbbb".as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "image/png")
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let listing = ImageListing::default();
+        listing.publish(&[
+            (format!("{}/a.png", server.uri()), "a".to_string()),
+            (format!("{}/b.png", server.uri()), "b".to_string()),
+        ]);
+        let tools = Tools::new().with(
+            ReadImage::new(origins, dir.path().join("images"))
+                .unwrap()
+                .with_listing(listing),
+        );
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_image".to_string(),
+                args: json(r#"{"images": [1, 2, 99]}"#),
+            })
+            .await;
+        let ToolOutcome::Success { content } = &result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(content.matches("wrote ").count(), 2, "{content}");
+        assert!(content.contains("image 1: wrote"), "{content}");
+        assert!(content.contains("image 2: wrote"), "{content}");
+        assert!(
+            content.contains("image 99: ") && content.contains("out of range"),
+            "a bad entry reports in place: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_image_batch_teaches_bounds_and_exclusivity() {
+        // upholds: the batch form's edges — empty and oversized lists,
+        // mixing with the single forms, and an all-failed batch — every
+        // one a teach, never an opaque failure or a silent partial.
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let listing = ImageListing::default();
+        listing.publish(&[(format!("{}/only.png", server.uri()), String::new())]);
+        let tools = Tools::new().with(
+            ReadImage::new(origins, dir.path().join("images"))
+                .unwrap()
+                .with_listing(listing),
+        );
+        let run = |args: String| {
+            let tools = &tools;
+            async move {
+                tools
+                    .dispatch_async(&ToolCall {
+                        name: "read_image".to_string(),
+                        args: json(&args),
+                    })
+                    .await
+                    .render_for_model("read_image")
+            }
+        };
+        let empty = run(r#"{"images": []}"#.to_string()).await;
+        assert!(
+            empty.is_error && empty.content.contains("at least one number"),
+            "{}",
+            empty.content
+        );
+        let over = run(format!(
+            r#"{{"images": [{}]}}"#,
+            (1..=9)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .await;
+        assert!(
+            over.is_error && over.content.contains("at most 8"),
+            "{}",
+            over.content
+        );
+        let mixed = run(r#"{"images": [1], "image": 1}"#.to_string()).await;
+        assert!(
+            mixed.is_error && mixed.content.contains("alone"),
+            "{}",
+            mixed.content
+        );
+        let all_bad = run(r#"{"images": [98, 99]}"#.to_string()).await;
+        assert!(
+            all_bad.is_error && all_bad.content.contains("no image in the batch displayed"),
+            "{}",
+            all_bad.content
+        );
+        assert!(
+            all_bad.content.contains("out of range"),
+            "the per-entry teaching survives into the batch failure: {}",
+            all_bad.content
         );
     }
 

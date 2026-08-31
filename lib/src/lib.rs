@@ -170,18 +170,29 @@
 //!   events also check the same state before delivery. The result carries only
 //!   pre-cancellation text, with `Stopped`, and no polling interval participates.
 //! - **LSRV-5** verified managed identity starts with a [`GgufArtifact`] refined
-//!   by [`verify`] into a [`VerifiedModelArtifact`]: the complete canonical file
-//!   matches the expected [`Sha256Digest`], and the same private identity value
+//!   by the verify family into a [`VerifiedModelArtifact`]: the canonical file
+//!   is proven to match the expected [`Sha256Digest`] by one of exactly two
+//!   evidence paths — a full hash performed now, or a prior launch's full hash
+//!   carried by a verification stamp whose recorded file identity (size +
+//!   mtime, captured around that hash) still matches — and the same private
+//!   identity value
 //!   supplies the child process's `-m` pathname. [`LlamaServerSpawn::verified`]
 //!   inseparably carries build-floor, embedded-template-digest, context, and slot
 //!   [`ServerGates`], which run after introspection and before a server value can
 //!   serve a completion. The host's managed path is a launched-path witness of
-//!   the same construction: only [`verify_sync`]'s refined artifact reaches its
-//!   spawn, and its `Ready` reports the digest as the wire's verified identity
+//!   the same construction: only [`verify_cancellable_sync`]'s refined artifact
+//!   reaches its spawn, and its `Ready` reports the digest as the wire's verified identity
 //!   (yatima-host's battery). Digest failure spawns nothing; gate failure reaps and
 //!   joins the child. Ordinary managed and attached sessions remain
 //!   [`ServerIdentity::Unverified`]. Generated text and `/props` self-reports
-//!   are never identity evidence. The trust boundary is the local process and
+//!   are never identity evidence. A verification stamp beside the artifact
+//!   (`<file>.sha256-stamp`) may discharge the re-hash on a later launch when
+//!   size and mtime match a digest already proven for the same expectation;
+//!   any observable change, re-pinned expectation, or unparseable stamp pays
+//!   the full hash (the accepted gap — bytes rewritten with both stat fields
+//!   preserved — is local tampering by an actor who already owns the
+//!   machine; cited by the stamp witnesses in `host::source`). The trust
+//!   boundary is the local process and
 //!   filesystem: pathname replacement between verification and child open is
 //!   outside it.
 //!
@@ -291,11 +302,16 @@
 //! - **IMG-3** picking a picture is an index copy, never a URL
 //!   transcription: `read_page`'s first window publishes its numbered
 //!   `[images]` list into a session-shared [`ImageListing`], and
-//!   `read_image {"image": N}` selects from it (the exact-url form remains
-//!   for user-supplied targets). The listing covers the whole fetched page
-//!   (article-region images first, the rest deduped after — the extraction
-//!   alone misses galleries and navboxes), every entry is selectable even
-//!   past the printed head, and truncation is always spoken, never silent.
+//!   `read_image` selects from it — one number or a bounded batch of them
+//!   per call (the exact-url form remains for targets copied verbatim from
+//!   any session listing). The listing
+//!   reads only the raw served HTML, in document order — extractor output
+//!   rewrites img attributes and once listed an HTML File: page as entry 1
+//!   — with each entry the densest server-authored candidate (srcset over
+//!   src; chosen, never constructed). It covers the whole fetched page
+//!   (the extraction alone misses galleries and navboxes), every entry is
+//!   selectable even past the printed head, and truncation is always
+//!   spoken, never silent.
 //!   No listing yet and out-of-range numbers teach rather than fail
 //!   opaquely. Cited by the numbered-listing, page-wide-coverage,
 //!   spoken-truncation, and select-by-number tests.
