@@ -65,7 +65,15 @@ details close to the code.
   artifact's bytes and ships them as `HostEvent::Image`, textured on receipt (an
   SVG rasterizes first, the one view concern kept here so it compiles into the
   coming WASM client). A pump thread wakes egui as host events arrive.
-  The shell is quiet and state-bearing: purely event-driven repaint plus a one-second clock while loading and a bounded help-overlay animation — no decorative machinery. The binary retains the one `HostOwner`; `GuiApp` receives only `HostClient`, folds typed startup phases into one loading/ready/failed state, and shows verified identity only when carried by `ModelInfo`.
+  The shell is quiet and state-bearing: purely event-driven repaint plus a one-second clock while loading — no decorative machinery; the help overlay is a still page. The binary retains the one `HostOwner`; `GuiApp` receives only `HostClient`, folds typed startup phases into one loading/ready/failed state, and shows verified identity only when carried by `ModelInfo`.
+- **`yatima-drive`** — the headless-run and evidence crate. Its first product is
+  the GUI flight recorder: one capacity-one channel feeds one Tokio task that
+  alone owns the tape files and sequence. The GUI's synchronous callback only
+  enqueues from its existing `block_in_place` region; async callers await the
+  same handle. `TAPE-1` says complete JSONL records form the flushed prefix,
+  artifacts precede references, a barrier acknowledges durability, and clean
+  consuming finish drains and summarizes the run. No Yatima-owned recorder
+  thread exists.
 - **`yatima-serve`** — the native bridge that draws nothing: it owns a
   `yatima-host` `HostOwner` in `main` and gives the browser bridge only the movable `HostClient` planes. It carries requests, events, and cancellation over one WebSocket. Ctrl-C, SIGTERM, and server errors close live sessions, drain Axum under a bound, and then consume the owner so a managed child is joined and reaped. Its laws: `SRV-1`
   binds only an explicit, specific address — the unspecified forms, including
@@ -753,7 +761,8 @@ stack, the `yatima-protocol` doc (**PROTO-2**, and **WASM-1**: it — and the
 other libraries the browser client stands on, `yatima-text` — compile for
 `wasm32`, so `yatima-web` can build on them), the `yatima-host` doc
 (**HOST-1/2/3**), the `yatima-tui` doc (**TUI-1..7**), the `yatima-serve`
-doc (**SRV-1/2/3**), and the `yatima-web` doc (**WEB-1..7**). Each is
+doc (**SRV-1/2/3**), the `yatima-web` doc (**WEB-1..7**), and the
+`yatima-drive` doc (**TAPE-1**). Each is
 protected by a test that cites its id in an `// upholds: <id>` comment
 (`grep -r 'upholds:'`) — except **WASM-1**, which is a *compile-time* law:
 its guard is `scripts/check-wasm.sh` (run in CI), not a citing test.
@@ -761,7 +770,7 @@ its guard is `scripts/check-wasm.sh` (run in CI), not a citing test.
 In brief: model store & discovery (**MS-1/2/3**, **MD-1/2/3**, **EOS-1**,
 **FETCH-1**, dedup/order under **DISC**); generation (**SAM-1/2**, **STOP-1**,
 **GEN-3**, **GE-1**); agent & tools (**AGENT-1/2**, **TOOL-1/2**, **CAP-1/2**,
-**PROTO-1**); observability (**OBS-1/2/3/4**); chat templates
+**PROTO-1**); observability (**OBS-1/2/3/4**, **TAPE-1**); chat templates
 (**TMPL-1/2**, **REASON-1**); CLI (**CLI-1/2/3/4**); the frontend host and its
 wire plane (**HOST-1/2/3**, **PROTO-2**, **WASM-1**), the terminal UI
 (**TUI-1..7**), the WebSocket bridge (**SRV-1/2/3**), and the browser client

@@ -17,7 +17,10 @@ fetch = ["yatima-host/fetch"]
 # (5c.1): multi-thread flavor is required — run_native sits inside
 # block_in_place, which is invalid on a current-thread runtime. No backend
 # dependency enters this crate.
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# The async flight recorder: the GUI holds only a cloneable producer while
+# main retains the consuming owner and joins it after backend shutdown.
+yatima-drive = { path = "../drive" }
 # The engine-facing host (the actor, the protocol, file logging). The GUI is a
 # thin view over it (HOST-1); the runner half it used to carry now lives there.
 yatima-host = { path = "../host" }
@@ -27,6 +30,7 @@ yatima-lib = { path = "../lib" }
 # Shared model-text prettification (LaTeX → Unicode); pure std, WASM-clean.
 yatima-text = { path = "../text" }
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 # Immediate-mode GUI on wgpu (Metal on macOS). egui 0.35 shapes text via
 # harfrust + skrifa (kerning, ligatures, combining marks); bidi/RTL is the one
@@ -50,3 +54,6 @@ egui_commonmark = { version = "0.24", default-features = false, features = ["pul
 # raster; text/system-fonts so labeled diagrams render). Pure Rust —
 # serves unchanged in the WASM client.
 resvg = { version = "0.47", default-features = false, features = ["text", "system-fonts"] }
+
+[dev-dependencies]
+tempfile = "3"

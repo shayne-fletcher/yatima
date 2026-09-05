@@ -9,6 +9,7 @@ members = [
   "protocol",
   "host",
   "serve",
+  "drive",
 ]
 # The browser client is deliberately NOT a member: it targets wasm32 and
 # depends on yatima-protocol alone, and the native `cargo test --workspace`

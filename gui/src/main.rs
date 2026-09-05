@@ -16,15 +16,22 @@
 //! forwards host events to the UI and wakes egui per event. Rendering is
 //! immediate mode: `update` is a pure projection of the accumulated state,
 //! redrawn each frame (the same discipline as the TUI's `ui(frame, &App)`).
+//! With `--tape`, the same request/event boundary also feeds yatima-drive's
+//! async flight recorder; the app holds only its producer handle while `main`
+//! retains and joins the owner.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::Parser;
 use eframe::egui;
 
+use yatima_drive::{start_recorder, RecorderHandle, RecorderOwner, TapeMeta, TapeRecord};
 use yatima_host::{
     init_file_logging, resolve_host_model, spawn_nonblocking, CancelGate, Channel, HostClient,
     HostConfig, HostEvent, HostModelChoices, HostRequest, ModelIdentity, ModelInfo, StartupPhase,
@@ -32,6 +39,8 @@ use yatima_host::{
 };
 use yatima_lib::{GenOpts, Sampling};
 use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
+
+const RECORDER_CONTROL_WITHIN: Duration = Duration::from_secs(5);
 
 /// Interactive GUI chat over a local model.
 #[derive(Parser)]
@@ -70,6 +79,9 @@ struct Args {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// Record this GUI session. With no DIR, writes under runs/.
+    #[arg(long, num_args = 0..=1, value_name = "DIR")]
+    tape: Option<Option<PathBuf>>,
 }
 
 fn resolve(args: &Args) -> Result<HostConfig> {
@@ -91,6 +103,40 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         ..Default::default()
     };
     Ok(resolved.into_host_config(base, args.system.clone()))
+}
+
+fn tape_dir(choice: &Option<Option<PathBuf>>, utc_stamp: &str, pid: u32) -> Option<PathBuf> {
+    match choice {
+        None => None,
+        Some(Some(dir)) => Some(dir.clone()),
+        Some(None) => Some(PathBuf::from(format!("runs/{utc_stamp}-{pid}-gui"))),
+    }
+}
+
+async fn recorder_control_within<T, F>(what: &str, within: Duration, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::time::timeout(within, future)
+        .await
+        .map_err(|_| anyhow::anyhow!("flight recorder {what} timed out after {within:?}"))?
+}
+
+fn record_tape(handle: Option<&RecorderHandle>, record: TapeRecord) {
+    if let Some(handle) = handle {
+        // Recording failure never suppresses the host action. The consuming
+        // owner retains and reports the recorder task's original error.
+        let _ = handle.enqueue_blocking(record);
+    }
+}
+
+fn dispatch_request(
+    handle: Option<&RecorderHandle>,
+    req_tx: &Sender<HostRequest>,
+    request: HostRequest,
+) {
+    record_tape(handle, TapeRecord::Request(request.clone()));
+    let _ = req_tx.send(request);
 }
 
 /// Rasterize an SVG to PNG bytes at a display-friendly size: the intrinsic
@@ -260,6 +306,8 @@ fn compact_identity(identity: &ModelIdentity) -> Option<String> {
 
 struct GuiApp {
     req_tx: Sender<HostRequest>,
+    /// The flight recorder's producer half. `main` retains the sole owner.
+    tape: Option<RecorderHandle>,
     /// The host's events, forwarded from its channel by a pump thread that also
     /// wakes egui on each one (the host has no egui handle of its own).
     ev_rx: Receiver<HostEvent>,
@@ -344,7 +392,11 @@ impl GuiApp {
     /// Build the app over the movable client planes. The backend thread's
     /// one `HostOwner` lives in `main`, never here (HOST-3): every ordinary
     /// window return reaches its awaited, joined shutdown.
-    fn new(cc: &eframe::CreationContext<'_>, client: HostClient) -> GuiApp {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        client: HostClient,
+        tape: Option<RecorderHandle>,
+    ) -> GuiApp {
         let ctx = cc.egui_ctx.clone();
         install_fonts(&ctx);
         // The host's event channel is a tokio receiver with no egui handle; a
@@ -368,6 +420,7 @@ impl GuiApp {
         });
         GuiApp {
             req_tx: client.req_tx,
+            tape,
             ev_rx,
             cancel: client.cancel,
             next_turn_id: 0,
@@ -480,6 +533,10 @@ impl GuiApp {
     /// second Esc a no-op.
     fn cancel_turn(&mut self) {
         if let Turn::Live { id, .. } = self.turn {
+            record_tape(
+                self.tape.as_ref(),
+                TapeRecord::Request(HostRequest::Cancel { turn_id: id }),
+            );
             self.cancel.cancel(id);
             self.transcript.push(Msg::Note("— interrupted".to_string()));
             self.settle();
@@ -499,6 +556,7 @@ impl GuiApp {
     /// start the live turn's elapsed-time and token-rate display.
     fn drain_events(&mut self, now: f32) {
         while let Ok(ev) = self.ev_rx.try_recv() {
+            record_tape(self.tape.as_ref(), TapeRecord::Event(ev.clone()));
             match ev {
                 // The lifecycle events fold through the pure sum (witnessed);
                 // only the view side-effects live here: input focus on Ready,
@@ -618,6 +676,10 @@ impl GuiApp {
         }
     }
 
+    fn dispatch(&self, request: HostRequest) {
+        dispatch_request(self.tape.as_ref(), &self.req_tx, request);
+    }
+
     /// Submit the current input as a turn — unless empty, not ready, or a turn
     /// is already in flight (single-in-flight, as in the TUI).
     fn submit(&mut self) {
@@ -668,7 +730,7 @@ impl GuiApp {
             return;
         }
         if prompt == "/reset" {
-            let _ = self.req_tx.send(HostRequest::Reset);
+            self.dispatch(HostRequest::Reset);
             self.clear();
             self.transcript
                 .push(Msg::Note("conversation reset".to_string()));
@@ -678,19 +740,19 @@ impl GuiApp {
         // Grant management (CAP-3: these, plus URLs typed in a message, are
         // the *only* sources of web authority).
         if prompt == "/grants" {
-            let _ = self.req_tx.send(HostRequest::ListGrants);
+            self.dispatch(HostRequest::ListGrants);
             self.input.clear();
             return;
         }
         if let Some(origin) = prompt.strip_prefix("/grant ") {
-            let _ = self.req_tx.send(HostRequest::Grant {
+            self.dispatch(HostRequest::Grant {
                 origin: origin.trim().to_string(),
             });
             self.input.clear();
             return;
         }
         if let Some(origin) = prompt.strip_prefix("/revoke ") {
-            let _ = self.req_tx.send(HostRequest::Revoke {
+            self.dispatch(HostRequest::Revoke {
                 origin: origin.trim().to_string(),
             });
             self.input.clear();
@@ -701,7 +763,7 @@ impl GuiApp {
         // its origin (CAP-3) — granted before the turn runs, so the model can
         // act on it immediately. URLs from any other source never pass here.
         for origin in yatima_lib::origins_in(&prompt) {
-            let _ = self.req_tx.send(HostRequest::Grant { origin });
+            self.dispatch(HostRequest::Grant { origin });
         }
         self.transcript.push(Msg::User(prompt.clone()));
         self.turn_start = None;
@@ -714,7 +776,7 @@ impl GuiApp {
             reasoning: String::new(),
             artifacts: Vec::new(),
         };
-        let _ = self.req_tx.send(HostRequest::Submit {
+        self.dispatch(HostRequest::Submit {
             turn_id,
             text: prompt,
         });
@@ -1297,53 +1359,264 @@ async fn main() -> Result<()> {
         .or_else(|| args.repo.clone())
         .unwrap_or_else(|| "local model".to_string());
     let title = format!("yatima — {title_label}");
+    let utc_stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let requested_tape = tape_dir(&args.tape, &utc_stamp, std::process::id());
 
     // The backend spawns before the window and its one owner stays here in
     // `main` (HOST-3): every ordinary `run_native` return reaches the
     // awaited, joined shutdown below — never only the Drop-request fallback.
     let (client, owner) = spawn_nonblocking(cfg)?;
-
-    eprintln!("loading model… (first run may fetch weights)");
-    let native = eframe::NativeOptions {
-        renderer: eframe::Renderer::Wgpu,
-        viewport: egui::ViewportBuilder::default()
-            .with_title(title.clone())
-            .with_inner_size([580.0, 410.0]),
-        ..Default::default()
+    let recorder: Result<Option<(RecorderHandle, RecorderOwner)>> =
+        if let Some(dir) = requested_tape {
+            let meta = TapeMeta {
+                origin: format!("yatima-gui {}", env!("CARGO_PKG_VERSION")),
+                model: title_label.clone(),
+                notes: std::collections::BTreeMap::from([(
+                    "agent_max_steps".to_string(),
+                    yatima_host::knobs::AGENT_MAX_STEPS.to_string(),
+                )]),
+            };
+            match recorder_control_within(
+                "startup",
+                RECORDER_CONTROL_WITHIN,
+                start_recorder(&dir, meta),
+            )
+            .await
+            {
+                Ok((handle, owner)) => {
+                    eprintln!("flight recorder: {}", dir.display());
+                    Ok(Some((handle, owner)))
+                }
+                Err(error) => Err(error.context("start the requested flight recorder")),
+            }
+        } else {
+            Ok(None)
+        };
+    let (tape_handle, tape_owner, session) = match recorder {
+        Err(error) => (None, None, Err(error)),
+        Ok(recorder) => {
+            let (tape_handle, tape_owner) = match recorder {
+                Some((handle, owner)) => (Some(handle), Some(owner)),
+                None => (None, None),
+            };
+            eprintln!("loading model… (first run may fetch weights)");
+            let native = eframe::NativeOptions {
+                renderer: eframe::Renderer::Wgpu,
+                viewport: egui::ViewportBuilder::default()
+                    .with_title(title.clone())
+                    .with_inner_size([580.0, 410.0]),
+                ..Default::default()
+            };
+            // `run_native` blocks for the window's whole life and must stay on
+            // the process main thread (macOS AppKit) — never `spawn_blocking`.
+            // `block_in_place` tells the multi-thread runtime without moving
+            // threads; the flavor above is load-bearing (invalid on
+            // current-thread).
+            let session = tokio::task::block_in_place(|| {
+                let app_tape = tape_handle.clone();
+                eframe::run_native(
+                    &title,
+                    native,
+                    Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, client, app_tape)))),
+                )
+                .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+            });
+            (tape_handle, tape_owner, session)
+        }
     };
-    // `run_native` blocks for the window's whole life and must stay on the
-    // process main thread (macOS AppKit) — never `spawn_blocking`.
-    // `block_in_place` tells the multi-thread runtime without moving
-    // threads; the flavor above is load-bearing (invalid on current-thread).
-    let session = tokio::task::block_in_place(|| {
-        eframe::run_native(
-            &title,
-            native,
-            Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, client)))),
-        )
-        .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
-    });
-    let joined = owner.shutdown().await;
-    combined_outcome(session, joined)
+    let shutdown_record = match &tape_handle {
+        Some(handle) => {
+            recorder_control_within(
+                "shutdown record",
+                RECORDER_CONTROL_WITHIN,
+                handle.enqueue(TapeRecord::Request(HostRequest::Shutdown)),
+            )
+            .await
+        }
+        None => Ok(()),
+    };
+    close_session(
+        session,
+        shutdown_record,
+        owner.shutdown(),
+        move |disposition| async move {
+            match tape_owner {
+                Some(owner) => owner.finish(disposition).await.map(|_| ()),
+                None => Ok(()),
+            }
+        },
+    )
+    .await
 }
 
-/// Fold the window's outcome with the owner's joined shutdown: the eframe
-/// error stays primary, and a shutdown failure is never discarded — appended
-/// as context when both fail, standing alone when only it fails
-/// (HOST-3 / LSRV-1 at this frontend's boundary; witnessed).
-fn combined_outcome(session: Result<()>, joined: Result<()>) -> Result<()> {
-    match (session, joined) {
+/// Fold the window, backend owner, and recorder owner outcomes without losing
+/// any failure. The earlier lifecycle boundary stays primary; later failures
+/// are attached as context (HOST-3 / LSRV-1 / TAPE-1, witnessed).
+fn combined_outcome(session: Result<()>, joined: Result<()>, recorded: Result<()>) -> Result<()> {
+    let session_and_backend = match (session, joined) {
         (Ok(()), joined) => joined.map_err(|e| e.context("shut down the backend owner")),
         (Err(session), Ok(())) => Err(session),
         (Err(session), Err(joined)) => {
             Err(session.context(format!("backend owner shutdown also failed: {joined:#}")))
         }
+    };
+    match (session_and_backend, recorded) {
+        (Ok(()), recorded) => recorded.map_err(|e| e.context("finish the flight recorder")),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(recorded)) => {
+            Err(primary.context(format!("flight recorder also failed: {recorded:#}")))
+        }
     }
+}
+
+fn combined_recorder_outcome(control: Result<()>, finish: Result<()>) -> Result<()> {
+    match (control, finish) {
+        (Ok(()), finish) => finish,
+        (Err(control), Ok(())) => Err(control),
+        (Err(control), Err(finish)) => {
+            Err(control.context(format!("flight recorder finish also failed: {finish:#}")))
+        }
+    }
+}
+
+async fn close_session<H, F, FF>(
+    session: Result<()>,
+    shutdown_record: Result<()>,
+    host_shutdown: H,
+    finish_recorder: F,
+) -> Result<()>
+where
+    H: Future<Output = Result<()>>,
+    F: FnOnce(&'static str) -> FF,
+    FF: Future<Output = Result<()>>,
+{
+    // HOST-3: recorder congestion or failure is already represented by
+    // `shutdown_record`; it can never skip the owner's joined shutdown.
+    let joined = host_shutdown.await;
+    let disposition = match (&session, &joined) {
+        (Ok(()), Ok(())) => "completed",
+        (Err(_), _) => "window-error",
+        (Ok(()), Err(_)) => "backend-error",
+    };
+    let recorded = combined_recorder_outcome(shutdown_record, finish_recorder(disposition).await);
+    combined_outcome(session, joined, recorded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Longer than RecorderOwner's bound, so the owner reports and joins before
+    // this outer test guard can fire.
+    const TEST_WITHIN: Duration = Duration::from_secs(15);
+
+    async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(TEST_WITHIN, future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not finish within {TEST_WITHIN:?}"))
+    }
+
+    #[test]
+    fn tape_flag_has_three_exact_forms() {
+        let absent = Args::try_parse_from(["yatima-gui"]).unwrap();
+        assert_eq!(absent.tape, None);
+
+        let defaulted = Args::try_parse_from(["yatima-gui", "--tape"]).unwrap();
+        assert_eq!(defaulted.tape, Some(None));
+
+        let explicit = Args::try_parse_from(["yatima-gui", "--tape", "/tmp/yatima-run"]).unwrap();
+        assert_eq!(explicit.tape, Some(Some(PathBuf::from("/tmp/yatima-run"))));
+    }
+
+    #[test]
+    fn default_tape_directory_uses_utc_stamp_and_pid() {
+        let choice = Some(None);
+        assert_eq!(
+            tape_dir(&choice, "20260905T151500Z", 41),
+            Some(PathBuf::from("runs/20260905T151500Z-41-gui"))
+        );
+        assert_ne!(
+            tape_dir(&choice, "20260905T151500Z", 41),
+            tape_dir(&choice, "20260905T151500Z", 42),
+            "same-second processes have distinct run directories"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_recorder_never_suppresses_the_host_request() {
+        within("closed recorder cannot suppress a host request", async {
+            // upholds: TAPE-1 — the GUI's blocking bridge runs only inside
+            // the established blocking region, and recorder failure cannot
+            // swallow the host side effect.
+            let dir = tempfile::tempdir().unwrap();
+            let (handle, owner) = start_recorder(&dir.path().join("run"), TapeMeta::default())
+                .await
+                .unwrap();
+            owner.finish("completed").await.unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            tokio::task::block_in_place(|| {
+                dispatch_request(Some(&handle), &tx, HostRequest::Reset);
+            });
+            assert_eq!(rx.try_recv().unwrap(), HostRequest::Reset);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_stalled_recorder_cannot_suppress_backend_shutdown() {
+        within("stalled recorder cannot suppress backend shutdown", async {
+            // upholds: HOST-3 / TAPE-1 — a bounded recorder-control failure
+            // remains visible while the backend owner still reaches shutdown.
+            let shutdown_record = recorder_control_within(
+                "shutdown record",
+                Duration::from_millis(20),
+                std::future::pending::<Result<()>>(),
+            )
+            .await;
+            let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reached_by_shutdown = reached.clone();
+            let result = close_session(
+                Ok(()),
+                shutdown_record,
+                async move {
+                    reached_by_shutdown.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                },
+                |_| async {
+                    Err(anyhow::anyhow!(
+                        "flight recorder finish timed out; task aborted and joined"
+                    ))
+                },
+            )
+            .await;
+
+            assert!(reached.load(std::sync::atomic::Ordering::Acquire));
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("shutdown record timed out"), "{error}");
+            assert!(error.contains("task aborted and joined"), "{error}");
+        })
+        .await;
+    }
+
+    #[test]
+    fn every_host_request_route_uses_the_recorder_boundary() {
+        // upholds: TAPE-1 — request sends have one record-before-side-effect
+        // seam; the gate-adjacent Cancel is recorded before the gate trips.
+        let src = include_str!("main.rs");
+        let dispatch_call = format!("self.{}(", "dispatch");
+        assert_eq!(src.matches(&dispatch_call).count(), 6);
+        let bypass = format!("self.req_tx.{}(", "send");
+        assert_eq!(src.matches(&bypass).count(), 0);
+
+        let cancel_start = src.find("fn cancel_turn").unwrap();
+        let cancel_end = src[cancel_start..].find("\n    fn clear").unwrap() + cancel_start;
+        let cancel = &src[cancel_start..cancel_end];
+        assert!(
+            cancel.find("HostRequest::Cancel").unwrap()
+                < cancel.find("self.cancel.cancel").unwrap(),
+            "the semantic cancel precedes the out-of-band gate"
+        );
+    }
 
     #[test]
     fn svg_rasterizes_to_display_png() {
@@ -1575,24 +1848,68 @@ mod tests {
 
     #[test]
     fn combined_outcome_never_loses_a_failure() {
-        // upholds: HOST-3 / LSRV-1 (frontend composition) — eframe failure
-        // primary, shutdown failure appended, either alone reported.
-        assert!(combined_outcome(Ok(()), Ok(())).is_ok());
-        let only_shutdown =
-            combined_outcome(Ok(()), Err(anyhow::anyhow!("reap failed"))).unwrap_err();
-        assert!(format!("{only_shutdown:#}").contains("reap failed"));
-        let only_session = combined_outcome(Err(anyhow::anyhow!("wgpu died")), Ok(())).unwrap_err();
-        assert!(format!("{only_session:#}").contains("wgpu died"));
-        let both = combined_outcome(
-            Err(anyhow::anyhow!("wgpu died")),
-            Err(anyhow::anyhow!("reap failed")),
-        )
-        .unwrap_err();
-        let text = format!("{both:#}");
-        assert!(
-            text.contains("wgpu died") && text.contains("reap failed"),
-            "{text}"
-        );
+        // upholds: HOST-3 / LSRV-1 / TAPE-1 — all eight outcomes preserve
+        // every failed axis; the window remains primary.
+        for mask in 0_u8..8 {
+            let session = if mask & 1 == 0 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("wgpu died"))
+            };
+            let joined = if mask & 2 == 0 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("reap failed"))
+            };
+            let recorded = if mask & 4 == 0 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("tape failed"))
+            };
+            let outcome = combined_outcome(session, joined, recorded);
+            if mask == 0 {
+                assert!(outcome.is_ok());
+                continue;
+            }
+            let text = format!("{:#}", outcome.unwrap_err());
+            if mask & 1 != 0 {
+                assert!(text.contains("wgpu died"), "{text}");
+            }
+            if mask & 2 != 0 {
+                assert!(text.contains("reap failed"), "{text}");
+            }
+            if mask & 4 != 0 {
+                assert!(text.contains("tape failed"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn recorder_outcome_preserves_control_and_finish_failures() {
+        for mask in 0_u8..4 {
+            let control = if mask & 1 == 0 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("control timed out"))
+            };
+            let finish = if mask & 2 == 0 {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("finish timed out"))
+            };
+            let outcome = combined_recorder_outcome(control, finish);
+            if mask == 0 {
+                assert!(outcome.is_ok());
+                continue;
+            }
+            let text = format!("{:#}", outcome.unwrap_err());
+            if mask & 1 != 0 {
+                assert!(text.contains("control timed out"), "{text}");
+            }
+            if mask & 2 != 0 {
+                assert!(text.contains("finish timed out"), "{text}");
+            }
+        }
     }
 
     #[test]
@@ -1614,6 +1931,11 @@ mod tests {
             !app_struct.contains(&owner_ty),
             "the app must not hold the owner"
         );
+        let recorder_owner_ty = format!("Recorder{}", "Owner");
+        assert!(
+            !app_struct.contains(&recorder_owner_ty),
+            "the app must not hold the recorder owner"
+        );
 
         let spawn_call = format!("= {}(", "spawn_nonblocking");
         assert_eq!(
@@ -1621,14 +1943,33 @@ mod tests {
             1,
             "exactly one spawn site (in main)"
         );
-        let shutdown_call = format!("owner.{}().await", "shutdown");
+        let shutdown_call = format!("owner.{}()", "shutdown");
         assert_eq!(
             src.matches(&shutdown_call).count(),
             1,
-            "main awaits the joined shutdown once"
+            "main transfers the joined shutdown future once"
+        );
+        let close_start = src.find("async fn close_session").unwrap();
+        let close_end = src[close_start..].find("\n#[cfg(test)]").unwrap() + close_start;
+        let close = &src[close_start..close_end];
+        assert!(
+            close.find("host_shutdown.await").unwrap()
+                < close.find("finish_recorder(disposition).await").unwrap(),
+            "the backend joins before recorder finalization"
+        );
+        let finish_call = format!("owner.{}(disposition).await", "finish");
+        assert_eq!(
+            src.matches(&finish_call).count(),
+            1,
+            "main consumes the recorder owner once"
         );
         let bip = format!("block_{}", "in_place");
         assert!(src.contains(&bip), "run_native rides block_in_place");
+        let bridge = format!("handle.{}(record)", "enqueue_blocking");
+        assert!(
+            src.contains(&bridge),
+            "the synchronous recorder bridge stays at the GUI boundary"
+        );
         // The call form specifically: the design comments rightly *mention*
         // the prohibition, and mentions are not violations.
         let forbidden = format!("spawn_{}(", "blocking");
