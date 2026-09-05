@@ -119,6 +119,10 @@ fn rasterize_svg(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// The `/help` listing.
+/// The help overlay's accent: the aurora ramp's green stop, fixed — the
+/// overlay is a still page, not a light show.
+const HELP_ACCENT: egui::Color32 = egui::Color32::from_rgb(72, 210, 160);
+
 const HELP_TEXT: &str = "\
 commands
   /grant <origin>   grant web read access (or just type a URL in a message)
@@ -287,7 +291,6 @@ struct GuiApp {
     focus_input: bool,
     /// `/help` overlay: whether it's showing, and when its drop began.
     help_open: bool,
-    help_start: f32,
     /// Per-turn telemetry for the live status readout: engine time of the first
     /// token, and the count of streamed tokens (reasoning + answer).
     turn_start: Option<f32>,
@@ -381,7 +384,6 @@ impl GuiApp {
             opacity: 0.85,
             focus_input: false,
             help_open: false,
-            help_start: 0.0,
             turn_start: None,
             gen_tokens: 0,
             context_used: None,
@@ -398,10 +400,9 @@ impl GuiApp {
         egui::Color32::from_white_alpha((self.opacity.clamp(0.0, 1.0) * 255.0).round() as u8)
     }
 
-    /// The `/help` overlay: a dimmed scrim over which the help lines drop in
-    /// from the top one at a time and bounce-settle near the bottom — Tetris
-    /// style. Dismissed by Esc or a click.
-    fn draw_help(&mut self, ui: &mut egui::Ui, now: f32) {
+    /// The `/help` overlay: an accurate, still command listing over a dimmed
+    /// scrim. Dismissed by Esc or a click.
+    fn draw_help(&mut self, ui: &mut egui::Ui) {
         let screen = ui.ctx().content_rect();
         let p = ui.ctx().layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -411,54 +412,30 @@ impl GuiApp {
 
         let font = egui::FontId::monospace(14.0);
         let line_h = 22.0;
-
         let lines: Vec<&str> = HELP_TEXT.lines().collect();
-        // The drop finishes 0.6s after the last line starts; the dismiss hint
-        // fades for 0.4s more. Past `anim_end` the overlay is a still image:
-        // the accent freezes there and no further frames are requested.
-        let settled = self.help_start + lines.len() as f32 * 0.10 + 0.6;
-        let anim_end = settled + 0.4;
-        let acc = aurora_at(now.min(anim_end) * 0.35);
-        let color = egui::Color32::from_rgb(acc.r(), acc.g(), acc.b());
         let block_h = lines.len() as f32 * line_h;
-        let rest_top = screen.bottom() - 96.0 - block_h;
+        let top = screen.bottom() - 96.0 - block_h;
         let x = screen.center().x - 235.0;
-        let y_from = screen.top() - line_h;
 
         for (i, line) in lines.iter().enumerate() {
-            let t0 = self.help_start + i as f32 * 0.10;
-            if now < t0 {
-                continue; // hasn't dropped yet
-            }
-            let prog = ((now - t0) / 0.6).clamp(0.0, 1.0);
-            let e = ease_out_bounce(prog);
-            let y = y_from + (rest_top + i as f32 * line_h - y_from) * e;
             p.text(
-                egui::pos2(x, y),
+                egui::pos2(x, top + i as f32 * line_h),
                 egui::Align2::LEFT_TOP,
                 line,
                 font.clone(),
-                color,
+                HELP_ACCENT,
             );
         }
-
-        // A dismiss hint, faded in once the stack has landed.
-        let hint = ((now - settled) / 0.4).clamp(0.0, 1.0);
-        if hint > 0.0 {
-            p.text(
-                egui::pos2(screen.center().x, rest_top + block_h + 16.0),
-                egui::Align2::CENTER_TOP,
-                "esc / click to close",
-                egui::FontId::proportional(12.0),
-                with_alpha(color, (hint * 150.0) as u8),
-            );
-        }
+        p.text(
+            egui::pos2(screen.center().x, top + block_h + 16.0),
+            egui::Align2::CENTER_TOP,
+            "esc / click to close",
+            egui::FontId::proportional(12.0),
+            with_alpha(HELP_ACCENT, 150),
+        );
 
         if ui.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.any_click()) {
             self.help_open = false;
-        }
-        if now < anim_end {
-            ui.ctx().request_repaint();
         }
     }
 
@@ -643,7 +620,7 @@ impl GuiApp {
 
     /// Submit the current input as a turn — unless empty, not ready, or a turn
     /// is already in flight (single-in-flight, as in the TUI).
-    fn submit(&mut self, now: f32) {
+    fn submit(&mut self) {
         let prompt = self.input.trim().to_string();
         match submit_action(&prompt, self.backend.ready().is_some(), self.in_flight()) {
             // The line stays in the box: nothing typed is lost to a gate.
@@ -666,8 +643,7 @@ impl GuiApp {
             return;
         }
         if prompt == "/help" {
-            self.help_open = true; // drop the help in, Tetris-style
-            self.help_start = now;
+            self.help_open = true;
             self.input.clear();
             return;
         }
@@ -986,7 +962,7 @@ impl eframe::App for GuiApp {
                 // the opacity slider). So we only grab when nothing is focused.
                 let nothing_focused = ui.memory(|m| m.focused().is_none());
                 if send || entered {
-                    self.submit(now);
+                    self.submit();
                     edit.request_focus();
                 } else if self.backend.ready().is_some()
                     && !self.in_flight()
@@ -1048,7 +1024,7 @@ impl eframe::App for GuiApp {
         });
 
         if self.help_open {
-            self.draw_help(ui, now);
+            self.draw_help(ui);
         }
 
         // Keep redrawing while a turn streams (the runner also pokes us per
@@ -1189,52 +1165,6 @@ fn k(n: usize) -> String {
 /// `color` with its alpha replaced (it keeps the RGB, takes a new opacity).
 fn with_alpha(color: egui::Color32, a: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
-}
-
-/// The classic ease-out-bounce on `[0,1]` — a falling object that hits the floor
-/// and bounces a couple of times before settling. Drives the `/help` drop.
-fn ease_out_bounce(x: f32) -> f32 {
-    let n1 = 7.5625;
-    let d1 = 2.75;
-    if x < 1.0 / d1 {
-        n1 * x * x
-    } else if x < 2.0 / d1 {
-        let x = x - 1.5 / d1;
-        n1 * x * x + 0.75
-    } else if x < 2.5 / d1 {
-        let x = x - 2.25 / d1;
-        n1 * x * x + 0.9375
-    } else {
-        let x = x - 2.625 / d1;
-        n1 * x * x + 0.984375
-    }
-}
-
-/// An aurora color (northern-lights green -> teal -> cyan -> blue -> violet ->
-/// pink), ping-ponged and sampled at `phase`. The GUI cousin of the TUI's
-/// aurora ramp; truecolor here rather than the 256-color cube.
-fn aurora_at(phase: f32) -> egui::Color32 {
-    const STOPS: [(u8, u8, u8); 7] = [
-        (72, 210, 160),
-        (64, 200, 200),
-        (80, 180, 230),
-        (110, 140, 235),
-        (150, 120, 225),
-        (200, 120, 205),
-        (225, 140, 180),
-    ];
-    let span = (STOPS.len() - 1) as f32;
-    let p = phase.rem_euclid(2.0 * span);
-    let p = if p > span { 2.0 * span - p } else { p };
-    let i = p.floor() as usize;
-    let f = p - i as f32;
-    let j = (i + 1).min(STOPS.len() - 1);
-    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
-    egui::Color32::from_rgb(
-        lerp(STOPS[i].0, STOPS[j].0),
-        lerp(STOPS[i].1, STOPS[j].1),
-        lerp(STOPS[i].2, STOPS[j].2),
-    )
 }
 
 fn render_msg(
