@@ -1663,14 +1663,19 @@ impl ReadPage {
         out.push_str("\n\n");
         out.push_str(&body);
         if end < total {
-            // State the unread fraction and target the satisficing failure
-            // directly: models conclude from the first window unless the
-            // marker names the moment they go wrong.
+            // The marker names BOTH exits with equal weight. Its first form
+            // ("…before concluding") targeted satisficing — models conclude
+            // from the first window unless the moment they go wrong is named
+            // — but the one-sided imperative goaded an image errand into
+            // paging 18KB of text it never needed (taped live, 2026-09-06).
+            // Decisiveness and anti-satisficing are the same instruction:
+            // decide, from what the question actually needs.
             let unread_pct = (total - end) * 100 / total;
             out.push_str(&format!(
-                "\n\n[chars {offset}..{end} of {total} — {unread_pct}% of \
-                 this page is unread; if the answer is not above, call \
-                 read_page again with offset={end} before concluding]"
+                "\n\n[chars {offset}..{end} of {total} — {unread_pct}% \
+                 unread. If the user's request is already satisfied, answer \
+                 now without reading further; only if the answer truly needs \
+                 more of this text, continue with offset={end}]"
             ));
         } else if offset > 0 {
             out.push_str(&format!("\n\n[chars {offset}..{end} of {total}; end]"));
