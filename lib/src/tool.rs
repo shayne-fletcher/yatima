@@ -1896,6 +1896,16 @@ fn already_read_note(url: &str, page: &CachedPage, offset: usize) -> String {
     )
 }
 
+/// A list index however the model spelled it: a JSON number, or a numeric
+/// string ("2") — one live turn quoted a whole batch and lost a 25-second
+/// round to the type error. The intent is unambiguous; read it tolerantly.
+fn image_index(v: &Value) -> Option<usize> {
+    if let Some(n) = v.as_u64() {
+        return usize::try_from(n).ok();
+    }
+    v.as_str()?.trim().parse::<usize>().ok()
+}
+
 /// The compact image-discovery projection: labels when the page supplied
 /// them, otherwise the URL's final path component. Selection never depends on
 /// this display string; `ImageListing` retains the exact URL beside the number.
@@ -2411,7 +2421,7 @@ impl Tool for ReadImage {
             let mut lines: Vec<String> = Vec::new();
             let mut any_ok = false;
             for v in ns {
-                let Some(n) = v.as_u64().and_then(|u| usize::try_from(u).ok()) else {
+                let Some(n) = image_index(v) else {
                     lines.push(format!("image {v}: must be a positive integer index"));
                     continue;
                 };
@@ -2483,15 +2493,12 @@ impl Tool for ReadImage {
                     .ok_or_else(|| anyhow!("read_image: `url` must be a string, got {url}"))?,
             ),
             (None, Some(n)) => {
-                let idx = n
-                    .as_u64()
-                    .and_then(|v| usize::try_from(v).ok())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "read_image: `image` must be a positive integer \
-                             index, got {n}"
-                        )
-                    })?;
+                let idx = image_index(n).ok_or_else(|| {
+                    anyhow!(
+                        "read_image: `image` must be a positive integer \
+                         index, got {n}"
+                    )
+                })?;
                 self.select_teach(idx)?
             }
         };
@@ -2582,7 +2589,8 @@ impl ReadImage {
         if let Some(len) = response.content_length() {
             if len as usize > self.max_bytes {
                 bail!(
-                    "read_image: response too large ({len} bytes > {} byte limit) for {url}",
+                    "read_image: response too large ({len} bytes > {} byte limit) for {url} — \
+                     this image can never be fetched; do not retry it, pick different numbers",
                     self.max_bytes
                 );
             }
@@ -4573,6 +4581,19 @@ copy of the whole set at every scale a reader cares to zoom.</p>
             content.contains("image 99: ") && content.contains("out of range"),
             "a bad entry reports in place: {content}"
         );
+    }
+
+    #[test]
+    fn image_indices_read_tolerantly_however_spelled() {
+        // A quoted batch ("2" for 2) once burned a 25-second round on a type
+        // error; the intent is unambiguous, so both spellings select. Junk
+        // still refuses.
+        assert_eq!(image_index(&serde_json::json!(2)), Some(2));
+        assert_eq!(image_index(&serde_json::json!("2")), Some(2));
+        assert_eq!(image_index(&serde_json::json!(" 14 ")), Some(14));
+        assert_eq!(image_index(&serde_json::json!("two")), None);
+        assert_eq!(image_index(&serde_json::json!(-1)), None);
+        assert_eq!(image_index(&serde_json::json!(2.5)), None);
     }
 
     #[tokio::test]

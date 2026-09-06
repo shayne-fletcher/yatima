@@ -220,6 +220,10 @@ enum Turn {
     Idle,
     Live {
         id: u64,
+        /// When the request was submitted — the start of the wall-clock span
+        /// the settled-turn report shows ("✻ mused for 0:58"): request to
+        /// ready-for-the-next-request, whatever the ending.
+        submitted: std::time::Instant,
         /// The answer streaming in (armed in `submit`).
         answer: String,
         /// The chain-of-thought (and tool notes) streaming in alongside it.
@@ -395,6 +399,39 @@ struct GuiApp {
     /// The unfinished input stashed when navigation began; Down past the
     /// newest entry restores it.
     draft: String,
+    /// The last settled turn's report — how long the request took to hand
+    /// the box back, shown by the input while idle ("✻ mused for 0:58").
+    last_turn: Option<TurnReport>,
+}
+
+/// One settled turn, reported by the input panel: the ending's verb and the
+/// request-to-ready wall-clock seconds.
+struct TurnReport {
+    verb: &'static str,
+    secs: f32,
+}
+
+/// The settled verb, deterministic per turn (no clock, no RNG — the same
+/// turn always bakes the same way). Muse gets to have mused.
+fn turn_verb(id: u64) -> &'static str {
+    const VERBS: [&str; 6] = [
+        "mused",
+        "baked",
+        "brewed",
+        "conjured",
+        "distilled",
+        "simmered",
+    ];
+    VERBS[(id % VERBS.len() as u64) as usize]
+}
+
+/// `58s` under a minute, the status rail's `M:SS` clock above it.
+fn fmt_took(secs: f32) -> String {
+    if secs < 60.0 {
+        format!("{}s", secs.max(0.0) as u32)
+    } else {
+        fmt_clock(secs)
+    }
 }
 
 /// Put Source Code Pro at the head of both font families, keeping egui's
@@ -479,6 +516,7 @@ impl GuiApp {
             prompt_history: Vec::new(),
             history_nav: None,
             draft: String::new(),
+            last_turn: None,
         }
     }
 
@@ -538,14 +576,27 @@ impl GuiApp {
     /// artifact is already inline as a texture) and inline LaTeX prettifies.
     /// The host's session is truth; this is the UI mirror.
     fn settle(&mut self) {
+        self.settle_as(None);
+    }
+
+    /// The one `Live → Idle` edge, with the ending's word: `None` picks the
+    /// turn's own settled verb, a `Some` names an abnormal ending ("stopped",
+    /// "errored", "lost"). Either way the report line learns how long the
+    /// request took to hand the box back.
+    fn settle_as(&mut self, ending: Option<&'static str>) {
         if let Turn::Live {
+            id,
+            submitted,
             answer,
             reasoning,
             first_artifact,
-            ..
         } = std::mem::take(&mut self.turn)
         {
             commit_turn(&mut self.transcript, first_artifact, &answer, &reasoning);
+            self.last_turn = Some(TurnReport {
+                verb: ending.unwrap_or_else(|| turn_verb(id)),
+                secs: submitted.elapsed().as_secs_f32(),
+            });
         }
     }
 
@@ -563,7 +614,7 @@ impl GuiApp {
             );
             self.cancel.cancel(id);
             self.transcript.push(Msg::Note("— interrupted".to_string()));
-            self.settle();
+            self.settle_as(Some("stopped after"));
         }
     }
 
@@ -574,6 +625,7 @@ impl GuiApp {
         self.transcript.clear();
         self.turn = Turn::Idle;
         self.help_open = false;
+        self.last_turn = None;
     }
 
     /// Fold host events into the UI mirror. `now` is the egui clock used to
@@ -595,6 +647,12 @@ impl GuiApp {
                         // set — drift the sum type cannot express); its
                         // artifacts are already on screen: fetches survive
                         // the loss.
+                        if let Turn::Live { submitted, .. } = &self.turn {
+                            self.last_turn = Some(TurnReport {
+                                verb: "lost after",
+                                secs: submitted.elapsed().as_secs_f32(),
+                            });
+                        }
                         self.turn = Turn::Idle;
                     }
                     self.backend.fold(&ev);
@@ -709,6 +767,12 @@ impl GuiApp {
                     // The partial prose is discarded as before; the turn's
                     // artifacts are already on screen (real fetches always
                     // land), and the error explains the ending below them.
+                    if let Turn::Live { submitted, .. } = &self.turn {
+                        self.last_turn = Some(TurnReport {
+                            verb: "errored after",
+                            secs: submitted.elapsed().as_secs_f32(),
+                        });
+                    }
                     self.turn = Turn::Idle;
                     self.transcript.push(Msg::Error(message));
                 }
@@ -804,6 +868,7 @@ impl GuiApp {
         self.next_turn_id += 1;
         self.turn = Turn::Live {
             id: turn_id,
+            submitted: std::time::Instant::now(),
             answer: String::new(),
             reasoning: String::new(),
             first_artifact: None,
@@ -967,6 +1032,18 @@ impl eframe::App for GuiApp {
 
         egui::Panel::bottom("input").show(ui, |ui| {
             ui.add_space(4.0);
+            // The settled-turn report: how long the last request took to hand
+            // the box back, in the aurora accent, while nothing is in flight
+            // (the status rail's live clock covers the running case).
+            if !self.in_flight() {
+                if let Some(report) = &self.last_turn {
+                    ui.label(
+                        egui::RichText::new(format!("✻ {} {}", report.verb, fmt_took(report.secs)))
+                            .size(12.0)
+                            .color(with_alpha(HELP_ACCENT, 170)),
+                    );
+                }
+            }
             ui.horizontal(|ui| {
                 let send = if self.in_flight() {
                     if ui.button("stop").clicked() {
@@ -1951,6 +2028,20 @@ mod tests {
         assert!(reveals_reasoning(false, "   "));
         assert!(!reveals_reasoning(false, "an ordinary answer"));
         assert!(reveals_reasoning(true, "an ordinary answer"));
+    }
+
+    #[test]
+    fn turn_report_wording_is_deterministic_and_compact() {
+        // The settled verb depends only on the turn id (the same turn always
+        // bakes the same way), abnormal endings say what happened, and the
+        // duration reads as seconds under a minute, the rail clock above it.
+        assert_eq!(turn_verb(0), turn_verb(0));
+        let verbs: std::collections::HashSet<_> = (0..6).map(turn_verb).collect();
+        assert_eq!(verbs.len(), 6, "six turns, six words");
+        assert_eq!(turn_verb(0), "mused", "Muse gets to have mused");
+        assert_eq!(fmt_took(58.4), "58s");
+        assert_eq!(fmt_took(85.0), "1:25");
+        assert_eq!(fmt_took(-1.0), "0s");
     }
 
     #[test]
