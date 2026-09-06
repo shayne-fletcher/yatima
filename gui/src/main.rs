@@ -573,7 +573,7 @@ impl GuiApp {
     /// request took to hand the box back.
     fn settle_as(&mut self, ending: Option<&'static str>) {
         if let Turn::Live {
-            id,
+            id: _,
             submitted,
             answer,
             reasoning,
