@@ -1942,10 +1942,12 @@ const READ_PAGE_MAX_IMAGES_SHOWN: usize = 24;
 const DEFAULT_READ_IMAGE_MAX_BYTES: usize = 8_000_000;
 
 /// Cap on one `read_image` call's `images` batch — bounds a single tool
-/// round's network and disk work while still collapsing a typical harvest
-/// (observed live: 11 images, one round each, on a local model where every
-/// round is a full prefill+generation cycle) into one or two rounds.
-const READ_IMAGE_MAX_BATCH: usize = 8;
+/// round's network and disk work while collapsing a typical harvest into
+/// ONE round: at 8, a taped 12-image errand paid a second ~25-second
+/// reasoning round purely to the cap (2026-09-06); a Wikipedia-article
+/// harvest runs 10-16 pictures, so 16 covers it while still bounding a
+/// pathological ask.
+const READ_IMAGE_MAX_BATCH: usize = 16;
 
 /// The image types `read_image` will save, with their extensions and magic
 /// signatures (the sniff when a server sends no content-type).
@@ -4682,14 +4684,14 @@ copy of the whole set at every scale a reader cares to zoom.</p>
         );
         let over = run(format!(
             r#"{{"images": [{}]}}"#,
-            (1..=9)
+            (1..=READ_IMAGE_MAX_BATCH + 1)
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
         .await;
         assert!(
-            over.is_error && over.content.contains("at most 8"),
+            over.is_error && over.content.contains("at most 16"),
             "{}",
             over.content
         );
