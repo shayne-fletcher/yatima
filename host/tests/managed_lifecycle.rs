@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use yatima_host::{
     spawn_nonblocking, Channel, HostClient, HostConfig, HostEvent, HostOwner, HostRequest,
-    ModelIdentity, StartupPhase, StopKind, ToolNoteKind,
+    ModelExecution, ModelIdentity, StartupPhase, StopKind, ToolNoteKind,
 };
 use yatima_lib::{
     ChatFormat, ChildCleanupFailed, GenOpts, LlamaServerProfile, ModelProfile, ModelSource,
@@ -100,7 +100,8 @@ async fn recv(client: &mut HostClient) -> HostEvent {
 
 /// Drive a spawned host to `Ready`, asserting the exact managed phase order
 /// on the way (PROTO-2's vocabulary at its actual boundaries) and the
-/// verified identity carried by `Ready` (LSRV-5 at the host boundary).
+/// verified identity and owned process id carried by `Ready` (LSRV-5 and
+/// HOST-3 at the host boundary).
 async fn ready_after_phases(client: &mut HostClient, expected_digest: &Sha256Digest) -> HostEvent {
     for expected in [
         StartupPhase::ResolvingModel,
@@ -124,6 +125,10 @@ async fn ready_after_phases(client: &mut HostClient, expected_digest: &Sha256Dig
     assert_eq!(
         info.backend, "b10520-stub",
         "backend names the server build"
+    );
+    assert!(
+        matches!(info.execution, ModelExecution::ManagedProcess { .. }),
+        "Ready must carry the owned managed process id"
     );
     ready
 }
@@ -190,14 +195,27 @@ async fn shutdown_joined(owner: HostOwner) {
 async fn managed_muse_chat_turn_rides_the_existing_events() {
     let _session = SESSION.lock().await;
     // upholds: HOST-3 / LSRV-5 / REASON-1 — the full happy path: exact phase
-    // order, Ready carrying the verified digest, a Muse turn whose reasoning
-    // and answer arrive as ordinary classified Fragments with no ATEM bytes,
-    // and a joined shutdown that leaves no child.
+    // order, Ready carrying the verified digest and the exact live child PID,
+    // a Muse turn whose reasoning and answer arrive as ordinary classified
+    // Fragments with no ATEM bytes, and a joined shutdown that leaves no child.
     let directory = TempDir::new().unwrap();
     let marker = directory.path().display().to_string();
     let (mut client, owner) =
         spawn_nonblocking(managed_config(&directory, "muse-chat", STUB_BYTES)).unwrap();
-    ready_after_phases(&mut client, &digest(STUB_BYTES)).await;
+    let ready = ready_after_phases(&mut client, &digest(STUB_BYTES)).await;
+    let HostEvent::Ready(info) = ready else {
+        unreachable!("ready_after_phases returns Ready")
+    };
+    let ModelExecution::ManagedProcess { pid } = info.execution else {
+        panic!("managed launch must report a managed process")
+    };
+    let children = surviving_children(&marker)
+        .await
+        .expect("the managed child is alive at Ready");
+    assert!(
+        children.lines().any(|line| line.trim() == pid.to_string()),
+        "Ready pid {pid} must identify the live managed child: {children}"
+    );
 
     submit(&client, 1, "what is yatima?");
     let mut reasoning = String::new();

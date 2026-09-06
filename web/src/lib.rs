@@ -1080,7 +1080,9 @@ mod tests {
             label: "muse-glimmer".into(),
             arch: "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M".into(),
             backend: "b10520-cd644c395".into(),
-            device: "external".into(),
+            execution: yatima_protocol::ModelExecution::ManagedProcess {
+                pid: std::num::NonZeroU32::new(4242).unwrap(),
+            },
             format: "MuseGlimmer".into(),
             sampling: "temp 1.00 · top-p 0.95 · seed 0".into(),
             max_tokens: 4096,
@@ -1199,7 +1201,9 @@ mod tests {
             label: "qwen32b".into(),
             arch: "Qwen2".into(),
             backend: "metal/BF16".into(),
-            device: "gpu".into(),
+            execution: yatima_protocol::ModelExecution::InProcess {
+                device: "gpu".into(),
+            },
             format: "Qwen".into(),
             sampling: "greedy".into(),
             max_tokens: 4096,

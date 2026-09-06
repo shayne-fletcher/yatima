@@ -775,6 +775,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::time::Duration;
     use tokio::sync::mpsc::unbounded_channel;
+    use yatima_host::ModelExecution;
     use yatima_lib::Cancel;
 
     fn test_app() -> (App, std::sync::mpsc::Receiver<HostRequest>) {
@@ -783,7 +784,9 @@ mod tests {
             label: "test-model".into(),
             arch: "Qwen2".into(),
             backend: "test".into(),
-            device: "cpu".into(),
+            execution: ModelExecution::InProcess {
+                device: "cpu".into(),
+            },
             format: "Qwen".into(),
             sampling: "greedy".into(),
             max_tokens: 1024,
@@ -1276,7 +1279,9 @@ mod tests {
             label: "muse-glimmer".into(),
             arch: "Muse-Glimmer-30B".into(),
             backend: "b10520".into(),
-            device: "external".into(),
+            execution: ModelExecution::ManagedProcess {
+                pid: std::num::NonZeroU32::new(4242).unwrap(),
+            },
             format: "MuseGlimmer".into(),
             sampling: "temp 1.00 · top-p 0.95 · seed 0".into(),
             max_tokens: 4096,

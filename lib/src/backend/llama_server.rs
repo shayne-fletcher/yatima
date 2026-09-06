@@ -38,6 +38,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -610,6 +611,7 @@ impl std::error::Error for ChildCleanupFailed {}
 /// one owner; only the bounded diagnostic tails are shared with drain tasks.
 pub struct LlamaServer {
     child: Child,
+    process_id: NonZeroU32,
     stdout_drain: Option<JoinHandle<std::io::Result<()>>>,
     stderr_drain: Option<JoinHandle<std::io::Result<()>>>,
     stdout_tail: SharedTail,
@@ -771,6 +773,10 @@ impl LlamaServer {
         let mut child = command
             .spawn()
             .with_context(|| format!("execute {}", spec.binary.display()))?;
+        let process_id = child
+            .id()
+            .and_then(NonZeroU32::new)
+            .context("managed llama-server has no process id after spawn")?;
         let stdout = child.stdout.take().expect("stdout was configured as piped");
         let stderr = child.stderr.take().expect("stderr was configured as piped");
         let stdout_tail = SharedTail::new();
@@ -779,6 +785,7 @@ impl LlamaServer {
         let stderr_drain = tokio::spawn(drain_pipe(stderr, stderr_tail.clone()));
         Ok(LlamaServer {
             child,
+            process_id,
             stdout_drain: Some(stdout_drain),
             stderr_drain: Some(stderr_drain),
             stdout_tail,
@@ -878,6 +885,11 @@ impl LlamaServer {
 
     pub fn launched_artifact(&self) -> &Path {
         self.artifact.path()
+    }
+
+    /// The OS process id captured from the child handle at launch.
+    pub fn process_id(&self) -> NonZeroU32 {
+        self.process_id
     }
 
     pub fn identity(&self) -> &ServerIdentity {

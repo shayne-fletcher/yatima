@@ -38,6 +38,8 @@
 //!   step on every push; a dependency added to this crate that cannot reach
 //!   wasm32 fails the build, not the browser.
 
+use std::num::NonZeroU32;
+
 use serde::{Deserialize, Serialize};
 
 /// Which stream a completion fragment belongs to — the wire mirror of
@@ -125,10 +127,19 @@ pub enum ModelIdentity {
     Unverified,
 }
 
-/// What is running, reported once the model is ready. Every field is a
-/// pre-formatted string so a frontend is a pure view — it renders these, it
-/// does not compute them. A given frontend reads the subset it displays (the
-/// TUI shows `backend`; the GUI's status rail shows `arch`/`device`/`sampling`).
+/// Where model execution lives. The variants prevent an in-process device
+/// from being confused with the PID of a managed child process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelExecution {
+    /// Yatima owns the model runtime in this process.
+    InProcess { device: String },
+    /// Yatima owns a local child process serving the model.
+    ManagedProcess { pid: NonZeroU32 },
+}
+
+/// What is running, reported once the model is ready. Display strings are
+/// prepared where their evidence lives; identity and execution remain typed,
+/// so a frontend is a pure view rather than an inference boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     /// The model's display label (a profile name or the model directory).
@@ -142,10 +153,8 @@ pub struct ModelInfo {
     /// or, for a managed server, its gate-checked build (e.g.
     /// `b10520-cd644c395`).
     pub backend: String,
-    /// Where decode runs, coarsely: `cpu`, `gpu`, or `external` (a managed
-    /// server process owns its own device placement; this host does not
-    /// guess it).
-    pub device: String,
+    /// Whether decode runs in this process or in an owned local child.
+    pub execution: ModelExecution,
     /// The resolved chat format, formatted (e.g. `Qwen`).
     pub format: String,
     /// The sampling summary (e.g. `greedy` or `temp 0.70 · top-p 0.95 · seed 0`).
@@ -263,7 +272,9 @@ mod tests {
             label: "qwq".into(),
             arch: "Qwen2".into(),
             backend: "metal/BF16".into(),
-            device: "gpu".into(),
+            execution: ModelExecution::InProcess {
+                device: "gpu".into(),
+            },
             format: "Qwen".into(),
             sampling: "greedy".into(),
             max_tokens: 1024,
@@ -277,6 +288,9 @@ mod tests {
     fn verified_model_info() -> ModelInfo {
         ModelInfo {
             identity: ModelIdentity::VerifiedSha256(DIGEST.into()),
+            execution: ModelExecution::ManagedProcess {
+                pid: NonZeroU32::new(4242).unwrap(),
+            },
             ..model_info()
         }
     }
@@ -457,6 +471,36 @@ mod tests {
             })
             .unwrap(),
             "{\"Startup\":{\"phase\":\"VerifyingModel\"}}"
+        );
+    }
+
+    #[test]
+    fn execution_location_is_a_tagged_sum() {
+        // upholds: PROTO-2 — execution location is structural on the wire:
+        // a managed process necessarily carries its PID, while an in-process
+        // runtime necessarily carries its device label.
+        let managed = ModelExecution::ManagedProcess {
+            pid: NonZeroU32::new(4242).unwrap(),
+        };
+        let managed_json = serde_json::to_string(&managed).unwrap();
+        assert_eq!(managed_json, "{\"ManagedProcess\":{\"pid\":4242}}");
+        assert_eq!(
+            serde_json::from_str::<ModelExecution>(&managed_json).unwrap(),
+            managed
+        );
+        assert!(
+            serde_json::from_str::<ModelExecution>("{\"ManagedProcess\":{\"pid\":0}}").is_err(),
+            "zero can never enter the managed process identity"
+        );
+
+        let in_process = ModelExecution::InProcess {
+            device: "gpu".into(),
+        };
+        let in_process_json = serde_json::to_string(&in_process).unwrap();
+        assert_eq!(in_process_json, "{\"InProcess\":{\"device\":\"gpu\"}}");
+        assert_eq!(
+            serde_json::from_str::<ModelExecution>(&in_process_json).unwrap(),
+            in_process
         );
     }
 

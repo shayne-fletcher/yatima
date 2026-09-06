@@ -1,4 +1,5 @@
-//! `yatima-gui` — the GPU frontend: chat, agent turns, and image artifacts.
+//! `yatima-gui` — the native graphical frontend: chat, agent turns, and image
+//! artifacts.
 //!
 //! An egui/eframe app (wgpu → Metal on macOS) that is a thin view over
 //! [`yatima_host`]: it loads a local model, streams chat turns, and — on
@@ -34,8 +35,8 @@ use eframe::egui;
 use yatima_drive::{start_recorder, RecorderHandle, RecorderOwner, TapeMeta, TapeRecord};
 use yatima_host::{
     init_file_logging, resolve_host_model, spawn_nonblocking, CancelGate, Channel, HostClient,
-    HostConfig, HostEvent, HostModelChoices, HostRequest, ModelIdentity, ModelInfo, StartupPhase,
-    ToolNoteKind,
+    HostConfig, HostEvent, HostModelChoices, HostRequest, ModelExecution, ModelIdentity, ModelInfo,
+    StartupPhase, ToolNoteKind,
 };
 use yatima_lib::{GenOpts, Sampling};
 use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
@@ -302,6 +303,31 @@ fn compact_identity(identity: &ModelIdentity) -> Option<String> {
         }
         ModelIdentity::Unverified => None,
     }
+}
+
+fn about_text(info: Option<&ModelInfo>) -> String {
+    let Some(info) = info else {
+        return "yatima - local LLM runtime".to_string();
+    };
+    let backend = match &info.execution {
+        ModelExecution::InProcess { device } => {
+            format!("backend {} · in-process {device}.", info.backend)
+        }
+        ModelExecution::ManagedProcess { pid } => format!(
+            "backend llama-server · local process (pid {pid}) · build {}.",
+            info.backend
+        ),
+    };
+    let identity = match &info.identity {
+        ModelIdentity::VerifiedSha256(digest) => {
+            format!("model identity verified sha256 {digest}.")
+        }
+        ModelIdentity::Unverified => "model identity unverified.".to_string(),
+    };
+    format!(
+        "yatima - local LLM runtime\nmodel {} · {}.\n{identity}\n{backend}",
+        info.label, info.arch
+    )
 }
 
 struct GuiApp {
@@ -715,16 +741,7 @@ impl GuiApp {
             return;
         }
         if prompt == "/about" {
-            let about = match self.backend.ready() {
-                Some(i) => format!(
-                    "yatima — a local-LLM runtime; this is her GPU frontend \
-                     (egui · wgpu/Metal).\nrunning {} · {} · {}.",
-                    i.label, i.arch, i.device
-                ),
-                None => "yatima — a local-LLM runtime; this is her GPU frontend \
-                         (egui · wgpu/Metal)."
-                    .to_string(),
-            };
+            let about = about_text(self.backend.ready());
             self.transcript.push(Msg::Note(about));
             self.input.clear();
             return;
@@ -892,10 +909,18 @@ impl eframe::App for GuiApp {
                                     (Some(u), None) => k(u),
                                     _ => "–".to_string(),
                                 };
+                                let execution = match &info.execution {
+                                    ModelExecution::InProcess { device } => {
+                                        format!("in-process {device}")
+                                    }
+                                    ModelExecution::ManagedProcess { pid } => {
+                                        format!("local process (pid {pid})")
+                                    }
+                                };
                                 let rows = [
                                     ("model", info.label.as_str()),
                                     ("arch", info.arch.as_str()),
-                                    ("device", info.device.as_str()),
+                                    ("execution", execution.as_str()),
                                     ("format", info.format.as_str()),
                                     ("sampling", info.sampling.as_str()),
                                     ("max tokens", max_tokens.as_str()),
@@ -1637,7 +1662,9 @@ mod tests {
             label: "muse-glimmer".into(),
             arch: "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M".into(),
             backend: "b10520-cd644c395".into(),
-            device: "external".into(),
+            execution: ModelExecution::ManagedProcess {
+                pid: std::num::NonZeroU32::new(4242).unwrap(),
+            },
             format: "MuseGlimmer".into(),
             sampling: "temp 1.00 · top-p 0.95 · seed 0".into(),
             max_tokens: 4096,
@@ -1706,6 +1733,24 @@ mod tests {
             Some("verified:4cc57c0f")
         );
         assert_eq!(compact_identity(&ModelIdentity::Unverified), None);
+    }
+
+    #[test]
+    fn about_names_verified_model_and_owned_server_process() {
+        // upholds: LSRV-5 / HOST-3 — the view keeps authenticated model
+        // identity distinct from the managed process identity carried by the
+        // host; neither is inferred from model prose or a magic device label.
+        let digest = "4cc57c0f51040a226e5a72cc47b7613f7772950e460a665f7083de89f183f60e";
+        let info = muse_info(ModelIdentity::VerifiedSha256(digest.into()));
+        assert_eq!(
+            about_text(Some(&info)),
+            format!(
+                "yatima - local LLM runtime\n\
+                 model muse-glimmer · Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.\n\
+                 model identity verified sha256 {digest}.\n\
+                 backend llama-server · local process (pid 4242) · build b10520-cd644c395."
+            )
+        );
     }
 
     #[test]

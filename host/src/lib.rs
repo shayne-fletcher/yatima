@@ -84,7 +84,8 @@ mod resolve;
 pub use logging::{init_file_logging, init_stderr_logging};
 pub use resolve::{resolve_host_model, HostBackendConfig, HostModelChoices, ResolvedHostModel};
 pub use yatima_protocol::{
-    Channel, HostEvent, HostRequest, ModelIdentity, ModelInfo, StartupPhase, StopKind, ToolNoteKind,
+    Channel, HostEvent, HostRequest, ModelExecution, ModelIdentity, ModelInfo, StartupPhase,
+    StopKind, ToolNoteKind,
 };
 
 /// A turn identifier, monotonic per session. Lets a frontend ignore stale events.
@@ -528,7 +529,7 @@ fn actor_main(
         label,
         arch: facts.arch,
         backend: facts.backend,
-        device: facts.device,
+        execution: facts.execution,
         format: format!("{format:?}"),
         sampling: sampling_summary(opts.sampling),
         max_tokens: opts.max_tokens,
@@ -712,7 +713,7 @@ struct BackendFacts {
     /// architecture to infer from).
     format: ChatFormat,
     backend: String,
-    device: String,
+    execution: ModelExecution,
     context_length: Option<usize>,
     identity: ModelIdentity,
     /// Whether the *engine* decodes on Metal (drives the CTX-2 KV-depth
@@ -759,7 +760,9 @@ fn build_backend(
                 arch: format!("{:?}", engine.arch()),
                 format,
                 backend: engine.backend(),
-                device: if cpu { "cpu" } else { "gpu" }.to_string(),
+                execution: ModelExecution::InProcess {
+                    device: if cpu { "cpu" } else { "gpu" }.to_string(),
+                },
                 context_length: engine.context_length(),
                 // A directory load verifies no digest: no authenticated
                 // identity evidence exists (LSRV-5's verified form is the
@@ -834,7 +837,9 @@ fn build_backend(
                 arch,
                 format,
                 backend: server.props().build.clone(),
-                device: "external".to_string(),
+                execution: ModelExecution::ManagedProcess {
+                    pid: server.process_id(),
+                },
                 context_length: Some(server.props().n_ctx as usize),
                 identity,
                 engine_on_metal: false,

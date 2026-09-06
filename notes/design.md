@@ -17,9 +17,7 @@ details close to the code.
 - **`yatima-cli`** — a thin wrapper: `yatima generate`, `yatima chat`, `yatima
   agent`, and `yatima models-dir`, with model selection parsed into a
   `ModelSource` ADT at the edge.
-- **`yatima-protocol`** — the frontend wire plane, spelled once: `HostEvent`
-  and `HostRequest`, plus `ModelInfo` and the `Channel`/`StopKind` mirrors of
-  their `yatima-lib` namesakes. Serde-only and WASM-clean by construction —
+- **`yatima-protocol`** — the frontend wire plane, spelled once: `HostEvent` and `HostRequest`, plus `ModelInfo`, its typed `ModelIdentity` and `ModelExecution`, and the `Channel`/`StopKind` mirrors of their `yatima-lib` namesakes. `ModelExecution` is a sum: in-process execution carries a device; a managed process carries the nonzero PID read directly from Yatima's child handle. The PID proves which owned process serves the session; the verified SHA-256 separately authenticates the model artifact, while the gate-checked build remains the server's report. `execution_location_is_a_tagged_sum` pins the wire algebra and rejects PID zero; `managed_muse_chat_turn_rides_the_existing_events` checks the advertised PID against the live managed child. Serde-only and WASM-clean by construction —
   serve's browser client deserializes these, so nothing here may drag candle;
   `yatima-lib` is deliberately absent (the lib↔wire conversions live in
   `yatima-host`). Its `PROTO-2` law: every variant round-trips losslessly, the
@@ -58,9 +56,7 @@ details close to the code.
   ui-liveness, reasoning-foldable, prompt-cancel, single-in-flight) is in the
   crate doc. Built in slices: Slice 1 chat + streaming + reasoning split, Slice 2
   foldable reasoning + context meter, Slice 3 Esc cancellation.
-- **`yatima-gui`** — the GPU frontend (egui/eframe, wgpu → Metal): the same thin
-  view over `yatima-host`, so the model cannot tell hosts apart because there is
-  one host. It renders the `HostEvent` stream as a markdown/texture transcript
+- **`yatima-gui`** — the native graphical frontend (egui/eframe, wgpu → Metal for drawing): the same thin view over `yatima-host`, so the model cannot tell hosts apart because there is one host. It renders the `HostEvent` stream as a markdown/texture transcript
   (`egui_commonmark`), with inline image artifacts — the host reads a plot/image
   artifact's bytes and ships them as `HostEvent::Image`, textured on receipt (an
   SVG rasterizes first, the one view concern kept here so it compiles into the
