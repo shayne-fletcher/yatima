@@ -2302,13 +2302,12 @@ fn requests_image_display(user: &str) -> bool {
         })
 }
 
-#[async_trait]
-impl Tool for ReadImage {
-    fn spec(&self) -> ToolSpec {
-        // Tool specs are regenerated before every Agent run. Project the
-        // session memo into this one so AGENT-3's lean answer-only history
-        // does not make the model forget which current-list images it already
-        // displayed (IMG-2).
+impl ReadImage {
+    /// The session's shown/not-yet-shown ranges, appended to every result
+    /// (never the spec — the spec heads the KV prefix and must not move):
+    /// AGENT-3's lean history cannot make the model forget what it already
+    /// displayed, because the freshest tool result says so (IMG-2).
+    fn listing_state(&self) -> String {
         let shown_urls: std::collections::HashSet<String> = self
             .fetched
             .lock()
@@ -2318,15 +2317,28 @@ impl Tool for ReadImage {
             .cloned()
             .collect();
         let (shown, available) = self.listing.display_partition(&shown_urls);
-        let listing_state = if shown.is_empty() && available.is_empty() {
-            "No read_page [images] list is currently available.".to_string()
+        if shown.is_empty() && available.is_empty() {
+            "[no read_page [images] list is currently available]".to_string()
         } else {
             format!(
-                "Current [images] list state: already shown numbers: {}; not-yet-shown numbers: {}.",
+                "[list state — already shown: {}; not yet shown: {}]",
                 number_ranges(&shown),
                 number_ranges(&available)
             )
-        };
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadImage {
+    fn spec(&self) -> ToolSpec {
+        // The spec is deliberately BYTE-STABLE for the whole session: it
+        // renders into the system prompt, which heads the KV prefix — a
+        // mutable spec invalidated the entire prompt cache after every
+        // display, and one taped turn paid a 606-second full re-prefill for
+        // it (2026-09-06). The live shown/not-yet-shown state rides each
+        // read_image RESULT instead: append-only context, cache-safe, and
+        // exactly where the model is looking when it decides the next call.
         ToolSpec {
             name: "read_image".to_string(),
             // The spec states the tool's live authority (CAP-3a).
@@ -2342,16 +2354,16 @@ impl Tool for ReadImage {
                  do not ask whether to fetch or render them. Prefer \
                  {{\"image\": N}} — the entry's number in the \
                  most recent read_page [images] list — or several at once \
-                 with {{\"images\": [N, …]}} (at most 8 per call): one round \
-                 instead of many. A url must be copied \
+                 with {{\"images\": [N, …]}} (at most {READ_IMAGE_MAX_BATCH} \
+                 per call): one round instead of many. A url must be copied \
                  exactly from an [images] list this session (any earlier \
                  page's list still counts), never constructed. May read only \
                  these origins: {}. Unless the user explicitly asks to see an \
                  image again, choose only not-yet-shown numbers; repeated bytes \
-                 produce no display event. {} Returns the file path. \
+                 produce no display event. Each result ends with the current \
+                 shown/not-yet-shown list state. Returns the file path. \
                  {GRANT_PROTOCOL}",
                 self.origins.list().join(", "),
-                listing_state
             ),
             params: serde_json::json!({
                 "type": "object",
@@ -2444,7 +2456,7 @@ impl Tool for ReadImage {
                 };
                 lines.push(format!("image {n}: {line}"));
             }
-            let report = lines.join("\n");
+            let report = format!("{}\n{}", lines.join("\n"), self.listing_state());
             if !any_ok {
                 bail!("read_image: no image in the batch displayed —\n{report}");
             }
@@ -2509,7 +2521,8 @@ impl Tool for ReadImage {
                 self.select_teach(idx)?
             }
         };
-        self.show_one(&target, again, &ctx).await
+        let summary = self.show_one(&target, again, &ctx).await?;
+        Ok(format!("{summary}\n{}", self.listing_state()))
     }
 }
 
@@ -4845,8 +4858,10 @@ as the first window of the page without tripping any extraction guard.</p>
                 .description
         };
 
-        // Before any read_page: a number teaches "call read_page first".
-        assert!(image_description().contains("No read_page [images] list"));
+        // The spec is byte-stable for the session: it heads the KV prefix,
+        // and a mutable spec once cost a taped turn a 606-second full
+        // re-prefill. The live state rides results instead.
+        let spec_before_everything = image_description();
         let early = tools.dispatch_async(&image_call(r#"{"image": 1}"#)).await;
         let early = early.render_for_model("").content;
         assert!(early.contains("no [images] list yet"), "{early}");
@@ -4860,8 +4875,6 @@ as the first window of the page without tripping any extraction guard.</p>
             .await;
         assert!(page.is_success(), "{page:?}");
         let state = image_description();
-        assert!(state.contains("already shown numbers: none"), "{state}");
-        assert!(state.contains("not-yet-shown numbers: 1"), "{state}");
         assert!(
             state.contains("invoke read_image before answering"),
             "{state}"
@@ -4875,15 +4888,20 @@ as the first window of the page without tripping any extraction guard.</p>
             "{state}"
         );
 
-        // …and {"image": 1} fetches exactly that entry.
+        // …and {"image": 1} fetches exactly that entry, its result carrying
+        // the shown/not-yet-shown state the spec no longer mutates for.
         let picked = tools.dispatch_async(&image_call(r#"{"image": 1}"#)).await;
         let ToolOutcome::Success { content } = &picked else {
             panic!("{picked:?}");
         };
         assert!(content.starts_with("wrote "), "{content}");
-        let state = image_description();
-        assert!(state.contains("already shown numbers: 1"), "{state}");
-        assert!(state.contains("not-yet-shown numbers: none"), "{state}");
+        assert!(content.contains("already shown: 1"), "{content}");
+        assert!(content.contains("not yet shown: none"), "{content}");
+        assert_eq!(
+            image_description(),
+            spec_before_everything,
+            "the spec never moves: the KV prefix survives every display"
+        );
 
         // With the page's whole (one-image) listing shown, a bare repeat
         // states exhaustion as a computed fact and names the next move.
