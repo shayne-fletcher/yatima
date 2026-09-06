@@ -505,7 +505,9 @@ impl GuiApp {
                 phase: None,
                 since: 0.0,
             },
-            opacity: 0.85,
+            // Full fidelity by default: the artifact IS the deliverable, and
+            // the slider remains for anyone who wants images quieter.
+            opacity: 1.0,
             focus_input: false,
             help_open: false,
             turn_start: None,
