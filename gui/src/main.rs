@@ -195,11 +195,19 @@ enum Msg {
         /// it after the fact. Never re-enters the prompt (the lib drops it).
         reasoning: Option<String>,
     },
-    /// A decoded image artifact, uploaded as a GPU texture.
-    Image(egui::TextureHandle),
+    /// A decoded image artifact, uploaded as a GPU texture, with the identity
+    /// assigned by the tool that selected it.
+    Image(ImageMsg),
     /// An app message (e.g. `/help`, `/about`) — not from the model.
     Note(String),
     Error(String),
+}
+
+struct ImageMsg {
+    texture: egui::TextureHandle,
+    label: String,
+    source: Option<String>,
+    list_index: Option<usize>,
 }
 
 /// The turn in flight, if any. One sum where three parallel fields (an answer
@@ -216,13 +224,13 @@ enum Turn {
         answer: String,
         /// The chain-of-thought (and tool notes) streaming in alongside it.
         reasoning: String,
-        /// Artifacts received mid-turn (decoded images, and their decode
-        /// errors): the turn owns them so they land AFTER the entry that
-        /// cites them, never above its reasoning fold. Lifecycle: flushed
-        /// into the transcript by settle (after the entry) and by the
-        /// Error/Fatal disarms; a Ctrl+L clear discards the whole live
-        /// mirror, buffered artifacts included, deliberately.
-        artifacts: Vec<Msg>,
+        /// Transcript index of this turn's first artifact, if any arrived.
+        /// Artifacts display the moment they decode (a long tool turn must
+        /// not hide finished images — observed live at 1:22 on 2026-09-06),
+        /// and settle inserts the committed entry at this index so the entry
+        /// still leads its artifacts (the 2026-08-30 placement fix holds).
+        /// A clear/reset disarms the turn, so the index never dangles.
+        first_artifact: Option<usize>,
     },
 }
 
@@ -523,31 +531,21 @@ impl GuiApp {
     }
 
     /// Settle the streaming turn: commit an entry when either answer or
-    /// reasoning survived, place its artifacts after it, then disarm — the one
-    /// `Live → Idle` edge shared by a clean `Done` and `cancel_turn`. Committed
-    /// text is display-polished: local image links drop (the artifact is already
-    /// inline as a texture) and inline LaTeX prettifies. The host's session is
-    /// truth; this is the UI mirror.
+    /// reasoning survived, inserted ABOVE the turn's already-displayed
+    /// artifacts so the entry still leads what it cites, then disarm — the
+    /// one `Live → Idle` edge shared by a clean `Done` and `cancel_turn`.
+    /// Committed text is display-polished: local image links drop (the
+    /// artifact is already inline as a texture) and inline LaTeX prettifies.
+    /// The host's session is truth; this is the UI mirror.
     fn settle(&mut self) {
         if let Turn::Live {
             answer,
             reasoning,
-            artifacts,
+            first_artifact,
             ..
         } = std::mem::take(&mut self.turn)
         {
-            self.transcript
-                .extend(settled_msgs(&answer, &reasoning, artifacts));
-        }
-    }
-
-    /// Flush a live turn's artifacts without committing its text — the
-    /// error/fatal disarms: the partial prose is discarded as before, but
-    /// the artifacts were real fetches and always land.
-    fn flush_turn_artifacts(&mut self) {
-        if let Turn::Live { artifacts, .. } = &mut self.turn {
-            let artifacts = std::mem::take(artifacts);
-            self.transcript.extend(artifacts);
+            commit_turn(&mut self.transcript, first_artifact, &answer, &reasoning);
         }
     }
 
@@ -594,9 +592,9 @@ impl GuiApp {
                     if matches!(&ev, HostEvent::Fatal(_)) {
                         // The turn disarms whole (the old three-field shape
                         // cleared the buffers here but left the in-flight id
-                        // set — drift the sum type cannot express), and its
-                        // artifacts land first: fetches survive the loss.
-                        self.flush_turn_artifacts();
+                        // set — drift the sum type cannot express); its
+                        // artifacts are already on screen: fetches survive
+                        // the loss.
                         self.turn = Turn::Idle;
                     }
                     self.backend.fold(&ev);
@@ -660,7 +658,14 @@ impl GuiApp {
                 // The host read the artifact's bytes; here they become a
                 // texture. An SVG rasterizes first (a view concern, kept in the
                 // wasm-compilable half); a raster format decodes directly.
-                HostEvent::Image { bytes, name, .. } => {
+                HostEvent::Image {
+                    bytes,
+                    name,
+                    label,
+                    source,
+                    list_index,
+                    ..
+                } => {
                     // Keep the bytes reachable for a later clicked
                     // self-reference: the platform viewer needs a file, and
                     // the wire (deliberately) carries no host-side path.
@@ -672,17 +677,28 @@ impl GuiApp {
                     } else {
                         decode_texture(&self.ctx, &bytes)
                     };
+                    let label = if label.trim().is_empty() {
+                        name.clone()
+                    } else {
+                        label
+                    };
                     let msg = match decoded {
-                        Ok(tex) => Msg::Image(tex),
+                        Ok(texture) => Msg::Image(ImageMsg {
+                            texture,
+                            label,
+                            source,
+                            list_index,
+                        }),
                         Err(e) => Msg::Error(format!("image decode: {e}")),
                     };
-                    // Mid-turn artifacts ride the turn and land after the
-                    // entry that cites them (see Turn::Live::artifacts); an
-                    // artifact outside any turn still posts directly.
-                    match &mut self.turn {
-                        Turn::Live { artifacts, .. } => artifacts.push(msg),
-                        Turn::Idle => self.transcript.push(msg),
+                    // Alive, not buffered: the artifact displays the moment
+                    // it decodes. The live turn only remembers where its
+                    // first one landed, so settle can insert the committed
+                    // entry above them (see Turn::Live::first_artifact).
+                    if let Turn::Live { first_artifact, .. } = &mut self.turn {
+                        first_artifact.get_or_insert(self.transcript.len());
                     }
+                    self.transcript.push(msg);
                 }
                 // Commit any surviving answer or reasoning, followed by the
                 // turn's artifacts — `settle`, the one `Live → Idle` edge. A
@@ -690,10 +706,9 @@ impl GuiApp {
                 // no-op.
                 HostEvent::Done { .. } => self.settle(),
                 HostEvent::Error { message, .. } => {
-                    // The partial prose is discarded as before, but the
-                    // turn's artifacts were real fetches: they land, then
-                    // the error explains the ending.
-                    self.flush_turn_artifacts();
+                    // The partial prose is discarded as before; the turn's
+                    // artifacts are already on screen (real fetches always
+                    // land), and the error explains the ending below them.
                     self.turn = Turn::Idle;
                     self.transcript.push(Msg::Error(message));
                 }
@@ -791,7 +806,7 @@ impl GuiApp {
             id: turn_id,
             answer: String::new(),
             reasoning: String::new(),
-            artifacts: Vec::new(),
+            first_artifact: None,
         };
         self.dispatch(HostRequest::Submit {
             turn_id,
@@ -1276,7 +1291,7 @@ fn render_msg(
             }
             egui_commonmark::CommonMarkViewer::new().show(ui, md_cache, answer);
         }
-        Msg::Image(tex) => {
+        Msg::Image(image) => {
             speaker(ui, "yatima", egui::Color32::LIGHT_GREEN);
             // Centered, tinted to settle the chart's white panel into the dark
             // UI, and clamped to the available width so an over-wide artifact
@@ -1284,10 +1299,16 @@ fn render_msg(
             let max_w = (ui.available_width() - 8.0).clamp(64.0, 640.0);
             ui.vertical_centered(|ui| {
                 ui.add(
-                    egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                    egui::Image::new(egui::load::SizedTexture::from_handle(&image.texture))
                         .max_width(max_w)
                         .tint(image_tint),
                 );
+                let caption = image_caption(image.list_index, &image.label);
+                if let Some(source) = image.source.as_deref() {
+                    ui.hyperlink_to(caption, source);
+                } else {
+                    ui.label(egui::RichText::new(caption).small().weak());
+                }
             });
         }
         Msg::Note(text) => {
@@ -1298,6 +1319,13 @@ fn render_msg(
         }
     }
     ui.add_space(8.0);
+}
+
+fn image_caption(list_index: Option<usize>, label: &str) -> String {
+    match list_index {
+        Some(index) => format!("image {index} · {label}"),
+        None => label.to_string(),
+    }
 }
 
 /// What a submitted line is (pure; witnessed). App-plane commands are UI
@@ -1344,18 +1372,30 @@ fn reveals_reasoning(show_reasoning: bool, answer: &str) -> bool {
 /// The turn's artifacts follow the entry — adjacent to the text that cites
 /// them, below it, unconditionally: a turn with pictures and no words still
 /// shows its pictures.
-fn settled_msgs(answer: &str, reasoning: &str, artifacts: Vec<Msg>) -> Vec<Msg> {
-    let mut out = Vec::new();
+/// Commit a settling turn into the transcript: the entry (when any answer or
+/// reasoning survived) is inserted at `first_artifact` — above the turn's
+/// already-displayed artifacts, so the entry leads what it cites (the
+/// 2026-08-30 placement rule) even though the artifacts rendered the moment
+/// they arrived. Without artifacts the entry simply appends.
+fn commit_turn(
+    transcript: &mut Vec<Msg>,
+    first_artifact: Option<usize>,
+    answer: &str,
+    reasoning: &str,
+) {
     let reasoning = reasoning.trim();
     // Plain scripts: egui's fonts lack the Unicode super/subscript
     // blocks (e⁻ˣ would be tofu).
     let answer = prettify_math_plain_scripts(&tame_markdown_images(answer));
-    if !answer.trim().is_empty() || !reasoning.is_empty() {
-        let reasoning = (!reasoning.is_empty()).then(|| prettify_math_plain_scripts(reasoning));
-        out.push(Msg::Assistant { answer, reasoning });
+    if answer.trim().is_empty() && reasoning.is_empty() {
+        return;
     }
-    out.extend(artifacts);
-    out
+    let reasoning = (!reasoning.is_empty()).then(|| prettify_math_plain_scripts(reasoning));
+    let entry = Msg::Assistant { answer, reasoning };
+    match first_artifact {
+        Some(index) if index <= transcript.len() => transcript.insert(index, entry),
+        _ => transcript.push(entry),
+    }
 }
 
 /// Decode PNG bytes and upload them as an egui texture.
@@ -1804,22 +1844,48 @@ mod tests {
         )
     }
 
+    fn test_image() -> ImageMsg {
+        ImageMsg {
+            texture: test_texture(),
+            label: "triangle".into(),
+            source: Some("https://example.com/triangle.png".into()),
+            list_index: Some(3),
+        }
+    }
+
     #[test]
-    fn settle_places_artifacts_after_the_entry_that_cites_them() {
-        // upholds: the placement fix (observed live ×3, 2026-08-30) — the
-        // committed entry first, the turn's artifacts after it, never above
-        // the reasoning fold.
-        let msgs = settled_msgs(
+    fn settle_places_the_entry_above_its_live_displayed_artifacts() {
+        // upholds: both display rules at once — artifacts render the moment
+        // they arrive (the 1:22 invisibility fix, 2026-09-06), and settle
+        // still inserts the committed entry above them so the entry leads
+        // what it cites (the placement fix observed live ×3, 2026-08-30).
+        // The shape mirrors the taped live session: a Note landed, then two
+        // images displayed mid-turn, then the turn settled.
+        let mut transcript = vec![
+            Msg::Note("granted".into()),
+            Msg::Image(test_image()),
+            Msg::Image(test_image()),
+        ];
+        commit_turn(
+            &mut transcript,
+            Some(1),
             "here is the triangle:",
             "fetch it first",
-            vec![Msg::Image(test_texture())],
         );
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(transcript.len(), 4);
         assert!(
-            matches!(&msgs[0], Msg::Assistant { answer, .. } if answer.contains("triangle")),
+            matches!(&transcript[0], Msg::Note(_)),
+            "pre-turn chatter stays put"
+        );
+        assert!(
+            matches!(&transcript[1], Msg::Assistant { answer, .. } if answer.contains("triangle")),
             "the entry leads"
         );
-        assert!(matches!(&msgs[1], Msg::Image(_)), "its artifact follows");
+        assert!(
+            matches!(&transcript[2], Msg::Image(_)),
+            "its artifacts follow"
+        );
+        assert!(matches!(&transcript[3], Msg::Image(_)));
     }
 
     #[test]
@@ -1827,10 +1893,16 @@ mod tests {
         // upholds: the empty-answer swallow fix — a NoAnswer/MaxSteps ending
         // carries the host's explanatory warning in its reasoning fold; the
         // entry must land as evidence, never silently vanish.
-        let msgs = settled_msgs("", "…\n⚠ tool-step budget exhausted (6)\n", Vec::new());
-        assert_eq!(msgs.len(), 1);
+        let mut transcript = Vec::new();
+        commit_turn(
+            &mut transcript,
+            None,
+            "",
+            "…\n⚠ tool-step budget exhausted (6)\n",
+        );
+        assert_eq!(transcript.len(), 1);
         assert!(
-            matches!(&msgs[0], Msg::Assistant { answer, reasoning: Some(r) }
+            matches!(&transcript[0], Msg::Assistant { answer, reasoning: Some(r) }
                 if answer.trim().is_empty() && r.contains("budget exhausted")),
             "the reasoning (and its warning) survives"
         );
@@ -1883,12 +1955,26 @@ mod tests {
 
     #[test]
     fn artifacts_survive_even_a_wordless_turn() {
-        // A turn with pictures and no words still shows its pictures; a turn
-        // with nothing at all still commits nothing.
-        let msgs = settled_msgs("", "", vec![Msg::Image(test_texture())]);
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(&msgs[0], Msg::Image(_)));
-        assert!(settled_msgs("", "", Vec::new()).is_empty());
+        // A turn with pictures and no words leaves its already-displayed
+        // pictures untouched; a turn with nothing at all commits nothing.
+        let mut transcript = vec![Msg::Image(test_image())];
+        commit_turn(&mut transcript, Some(0), "", "");
+        assert_eq!(transcript.len(), 1);
+        assert!(matches!(&transcript[0], Msg::Image(_)));
+        let mut empty = Vec::new();
+        commit_turn(&mut empty, None, "", "");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn image_captions_map_list_numbers_to_labels() {
+        // upholds: IMG-2 — views render the tool's typed human identity, not
+        // the content-hash filename or a model-written description.
+        assert_eq!(
+            image_caption(Some(21), "Double spiral"),
+            "image 21 · Double spiral"
+        );
+        assert_eq!(image_caption(None, "Generated plot"), "Generated plot");
     }
 
     #[test]
