@@ -1,0 +1,8 @@
+# The founding scenario, preserved exactly (plans/headless-drive.plan.md,
+# First investigation): three turns; the binary question is whether turn 3
+# emits HostEvent::Image records.
+/grant https://en.wikipedia.org/
+/grant https://upload.wikimedia.org/
+read https://en.wikipedia.org/wiki/Mandelbrot_set. use it to find and render mandelbrot images.
+fetch more images from the page and render them
+find and render even more images. do not render the same image twice. no duplicates

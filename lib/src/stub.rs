@@ -99,6 +99,12 @@ pub fn run() -> ! {
                 // stub, whose child process must stay alive to be reaped.
                 dribble(&mut stream);
             }
+            "/completion" if behavior == "stall-then-answer" && completion_hits == 1 => {
+                // First turn dribbles until the peer's cancel lands; later
+                // completions answer normally — the timeout-then-continue
+                // fixture (keyed like error-then-answer).
+                dribble(&mut stream);
+            }
             "/completion" if behavior == "die-after-ready" || behavior == "leak-pipe-die" => {
                 eprintln!("die-after-ready marker");
                 process::exit(25);

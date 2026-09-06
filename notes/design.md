@@ -69,7 +69,11 @@ details close to the code.
   same handle. `TAPE-1` says complete JSONL records form the flushed prefix,
   artifacts precede references, a barrier acknowledges durability, and clean
   consuming finish drains and summarizes the run. No Yatima-owned recorder
-  thread exists.
+  thread exists. Its second product is the `yatima-drive` scenario driver:
+  GUI-box lines run headlessly against the real host, both planes taped
+  unconditionally (TAPE-1), every wait bounded, one severity-joined exit-code
+  verdict, and an exit that always converges on the joined reap
+  (HOST-3/LSRV-1, CANCEL-1 cancellation, CAP-3 scenario grants).
 - **`yatima-serve`** — the native bridge that draws nothing: it owns a
   `yatima-host` `HostOwner` in `main` and gives the browser bridge only the movable `HostClient` planes. It carries requests, events, and cancellation over one WebSocket. Ctrl-C, SIGTERM, and server errors close live sessions, drain Axum under a bound, and then consume the owner so a managed child is joined and reaped. Its laws: `SRV-1`
   binds only an explicit, specific address — the unspecified forms, including

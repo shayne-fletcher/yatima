@@ -4,18 +4,39 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 
-# The headless scenario driver's library: the request/event flight recorder
-# (D0/D0.5) and, next, the scenario runner (D1). Images are stored out of line;
-# this crate depends on yatima-protocol for the wire shapes and stays free of
-# frontend machinery.
+# The headless frontend: the request/event flight recorder (D0/D0.5) as the
+# library, and the scenario driver bin (D1) that runs GUI-box lines against
+# the real host, tapes both planes, and exits through the joined shutdown.
+# Images are stored out of line; the wire shapes come from yatima-protocol.
 [dependencies]
 yatima-protocol = { path = "../protocol" }
+# The driver bin spawns the same HostOwner/HostClient pair as every frontend
+# and resolves models through the shared resolver.
+yatima-host = { path = "../host" }
+# Profiles and the CAP-3 origin extractor for scenario auto-grants.
+yatima-lib = { path = "../lib" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["fs", "io-util", "rt", "sync", "time"] }
+# `macros`/`signal` carry the bin's current-thread entry and pinned Ctrl-C
+# future; the rest is the recorder's existing set. The driver spawns no
+# subprocess (git provenance arrives via YATIMA_GIT_DESCRIBE) and has no
+# block_in_place edge, so the single-thread runtime is the economical
+# spelling.
+tokio = { version = "1", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros"] }
+# `process` serves the integration battery's child driving and pgrep oracle.
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread"] }
