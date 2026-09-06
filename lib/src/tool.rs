@@ -1383,6 +1383,15 @@ pub struct ReadPage {
     /// spend). FIFO-evicted at [`READ_PAGE_CACHE_PAGES`]; session-lifetime
     /// only. A std `Mutex` — never held across an `.await`.
     cache: std::sync::Mutex<PageCache>,
+    /// Windows already served this session, keyed `(url, offset,
+    /// images_only)`. Fetch-once makes a repeated identical window
+    /// byte-identical, so re-serving it re-prefills thousands of chars for
+    /// zero information — one live session re-read the same page three times
+    /// in a turn (2026-09-06). A repeat gets a two-line reminder instead;
+    /// the `[images]` listing is still republished so selection numbers
+    /// never go stale. Only windows whose page is still cached count: an
+    /// evicted page genuinely refetches and serves in full again.
+    served: std::sync::Mutex<std::collections::HashSet<(String, usize, bool)>>,
     /// Where window 0 publishes its numbered `[images]` list (IMG-3);
     /// `read_image` holds the same handle and selects by number.
     listing: ImageListing,
@@ -1525,6 +1534,7 @@ impl ReadPage {
             max_input_bytes,
             max_output_chars,
             cache: std::sync::Mutex::new(PageCache::default()),
+            served: std::sync::Mutex::new(std::collections::HashSet::new()),
             listing: ImageListing::default(),
         })
     }
@@ -1728,13 +1738,27 @@ impl Tool for ReadPage {
         let url = self.origins.resolve(target)?;
 
         // Fetch-once: a cached extraction serves every continuation without
-        // touching the network (or a throttled host's request budget).
+        // touching the network (or a throttled host's request budget). An
+        // *identical* window repeat is pure waste — the cache guarantees the
+        // same bytes — so it gets a reminder, not a re-prefill; the listing
+        // still republishes so image numbers keep selecting from this page.
         let cached = self
             .cache
             .lock()
             .expect("read_page cache poisoned")
             .get(url.as_str());
         if let Some(page) = cached {
+            let repeat = !self
+                .served
+                .lock()
+                .expect("read_page served memo poisoned")
+                .insert((url.as_str().to_string(), offset, images_only));
+            if repeat {
+                if offset == 0 {
+                    self.listing.publish(&page.images);
+                }
+                return Ok(already_read_note(url.as_str(), &page, offset));
+            }
             return self.render_window(url.as_str(), &page, offset, images_only);
         }
 
@@ -1843,8 +1867,33 @@ impl Tool for ReadPage {
             .lock()
             .expect("read_page cache poisoned")
             .insert(url.to_string(), page.clone());
+        self.served
+            .lock()
+            .expect("read_page served memo poisoned")
+            .insert((url.to_string(), offset, images_only));
         self.render_window(url.as_str(), &page, offset, images_only)
     }
+}
+
+/// What an identical window repeat gets instead of thousands of re-prefilled
+/// chars: where the content already is, and what a useful next step looks
+/// like. Decisiveness is the point — a model circling "maybe read it again"
+/// is told plainly that the step bought nothing.
+fn already_read_note(url: &str, page: &CachedPage, offset: usize) -> String {
+    let total = page.text.chars().count();
+    let images = if page.images.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; its {} [images] are still the ones selectable by number",
+            page.images.len()
+        )
+    };
+    format!(
+        "[already read this session: {url} at offset {offset} ({total} chars total{images}). \
+         That window's text is earlier in this conversation, unchanged — re-reading it adds \
+         nothing. Answer from what you have, or continue at a different offset.]"
+    )
 }
 
 /// The compact image-discovery projection: labels when the page supplied
@@ -5208,6 +5257,62 @@ position over the coming years.</p>
         assert!(result.content.contains("quarterly revenue rose sharply")); // article prose
         assert!(!result.content.contains("BEACON_PIXEL_12345")); // script dropped
         assert!(!result.content.contains("SUBSCRIBE_NAV_LINK")); // nav dropped
+    }
+
+    #[tokio::test]
+    async fn read_page_serves_an_identical_window_once() {
+        // A repeated identical window is a two-line reminder, never a
+        // re-prefill (fetch-once makes the repeat byte-identical); a
+        // different offset still serves in full, and an offset-0 repeat
+        // republishes the [images] listing so numbers stay selectable.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+        let listing = ImageListing::default();
+        let reader = ReadPage::with_limits(WebOrigins::one(&server.uri()).unwrap(), 1_000_000, 50)
+            .unwrap()
+            .with_listing(listing.clone());
+        let tools = Tools::new().with(reader);
+        let call = |args: &'static str| {
+            let call = ToolCall {
+                name: "read_page".to_string(),
+                args: json(args),
+            };
+            let tools = &tools;
+            async move { tools.dispatch_async(&call).await }
+        };
+
+        let first = call(r#"{"url": "/post"}"#)
+            .await
+            .render_for_model("read_page");
+        assert!(first.content.contains("Quarterly Report"), "served in full");
+
+        let repeat = call(r#"{"url": "/post"}"#)
+            .await
+            .render_for_model("read_page");
+        assert!(!repeat.is_error);
+        assert!(
+            repeat.content.contains("already read this session"),
+            "the repeat is a reminder: {}",
+            repeat.content
+        );
+        assert!(
+            !repeat.content.contains("Quarterly Report"),
+            "no re-prefill"
+        );
+
+        let continued = call(r#"{"url": "/post", "offset": 50}"#)
+            .await
+            .render_for_model("read_page");
+        assert!(
+            !continued.content.contains("already read this session"),
+            "a fresh offset serves in full"
+        );
     }
 
     #[test]
