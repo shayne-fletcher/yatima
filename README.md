@@ -24,6 +24,12 @@ Yatima keeps model calls in ordinary Rust control flow. It owns prompts, transcr
 
 That is one unstaged turn. The URL granted its origin for the session, the model fetched the page through a capability-scoped tool, and the answer streamed live. Fetched content cannot grant new authority.
 
+<p align="center">
+  <img src="./images/yatima-gui.png" width="520" alt="yatima-gui after a settled turn: two Mandelbrot zoom images displayed with their list-number captions, the verified model digest in the status rail, and the turn's latency reported beside the input — baked 45s">
+</p>
+
+The native GUI, asked to find and render Mandelbrot images: each picture carries the list number and caption it was selected by — typed identity from the tool, never model prose — the rail pins the verified model digest, and the line by the input reports what the turn cost. <sub>Images shown: [Wolfgang Beyer's Mandelbrot zoom series](https://commons.wikimedia.org/wiki/File:Mandel_zoom_07_satellite.jpg), CC BY-SA 3.0.</sub>
+
 ## Quickstart
 
 ```bash
