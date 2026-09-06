@@ -221,7 +221,7 @@ enum Turn {
     Live {
         id: u64,
         /// When the request was submitted — the start of the wall-clock span
-        /// the settled-turn report shows ("✻ mused for 0:58"): request to
+        /// the settled-turn report shows ("✻ took 0:58"): request to
         /// ready-for-the-next-request, whatever the ending.
         submitted: std::time::Instant,
         /// The answer streaming in (armed in `submit`).
@@ -400,7 +400,7 @@ struct GuiApp {
     /// newest entry restores it.
     draft: String,
     /// The last settled turn's report — how long the request took to hand
-    /// the box back, shown by the input while idle ("✻ mused for 0:58").
+    /// the box back, shown by the input while idle ("✻ took 0:58").
     last_turn: Option<TurnReport>,
 }
 
@@ -409,20 +409,6 @@ struct GuiApp {
 struct TurnReport {
     verb: &'static str,
     secs: f32,
-}
-
-/// The settled verb, deterministic per turn (no clock, no RNG — the same
-/// turn always bakes the same way). Muse gets to have mused.
-fn turn_verb(id: u64) -> &'static str {
-    const VERBS: [&str; 6] = [
-        "mused",
-        "baked",
-        "brewed",
-        "conjured",
-        "distilled",
-        "simmered",
-    ];
-    VERBS[(id % VERBS.len() as u64) as usize]
 }
 
 /// `58s` under a minute, the status rail's `M:SS` clock above it.
@@ -596,7 +582,7 @@ impl GuiApp {
         {
             commit_turn(&mut self.transcript, first_artifact, &answer, &reasoning);
             self.last_turn = Some(TurnReport {
-                verb: ending.unwrap_or_else(|| turn_verb(id)),
+                verb: ending.unwrap_or("took"),
                 secs: submitted.elapsed().as_secs_f32(),
             });
         }
@@ -2033,14 +2019,10 @@ mod tests {
     }
 
     #[test]
-    fn turn_report_wording_is_deterministic_and_compact() {
-        // The settled verb depends only on the turn id (the same turn always
-        // bakes the same way), abnormal endings say what happened, and the
-        // duration reads as seconds under a minute, the rail clock above it.
-        assert_eq!(turn_verb(0), turn_verb(0));
-        let verbs: std::collections::HashSet<_> = (0..6).map(turn_verb).collect();
-        assert_eq!(verbs.len(), 6, "six turns, six words");
-        assert_eq!(turn_verb(0), "mused", "Muse gets to have mused");
+    fn turn_report_duration_is_compact() {
+        // The report is plainly factual — "took", or an abnormal ending's
+        // own words — and the duration reads as seconds under a minute, the
+        // rail's clock above it.
         assert_eq!(fmt_took(58.4), "58s");
         assert_eq!(fmt_took(85.0), "1:25");
         assert_eq!(fmt_took(-1.0), "0s");
