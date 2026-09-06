@@ -24,6 +24,12 @@ Yatima keeps model calls in ordinary Rust control flow. It owns prompts, transcr
 
 That is one unstaged turn. The URL granted its origin for the session, the model fetched the page through a capability-scoped tool, and the answer streamed live. Fetched content cannot grant new authority.
 
+<p align="center">
+  <img src="./images/mandel-zoom-07-satellite.jpg" width="820" alt="a satellite minibrot from Wolfgang Beyer's Mandelbrot zoom series — fetched, verified, and displayed by yatima's own image tools">
+</p>
+
+This one yatima found itself. Asked to "find and render mandelbrot images" from Wikipedia, the agent read the page, chose this satellite from the article's listing, fetched it through the same capability-scoped tools, and displayed it — the founding scenario of the headless driver, whose tape records every byte of the errand. <sub>Image: [Wolfgang Beyer](https://commons.wikimedia.org/wiki/File:Mandel_zoom_07_satellite.jpg) with Ultra Fractal, [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/).</sub>
+
 ## Quickstart
 
 ```bash
