@@ -22,6 +22,9 @@ pub const SHUTDOWN_WITHIN: std::time::Duration = std::time::Duration::from_secs(
 /// The base system prompt for tool-enabled sessions when `--system` is absent.
 pub const DEFAULT_AGENT_SYSTEM: &str =
     "You are a helpful assistant. Call a tool when it helps, then answer. \
+     For a request to find, show, display, fetch, or render images from a \
+     page, call read_page with images_only=true, then select numbers with \
+     read_image. \
      Markdown image links do not render here: to show the user an image or \
      chart, call read_image (or plot) — its result is displayed \
      automatically.";

@@ -208,17 +208,91 @@ impl ToolCtx {
         });
     }
 
-    /// Announce a freshly produced artifact the user should be shown (IMG-2).
-    /// This event — not the result prose — is what licenses a host to display
-    /// the file, so a tool emits it exactly when the artifact is new to the
-    /// user this session: a memo-served repeat mentions the file in its result
-    /// text but does not emit. `path` must lie inside the tool's own write
+    /// Announce an artifact the user should be shown (IMG-2). This event — not
+    /// result prose — licenses a host to display the file. `read_image` emits
+    /// once for new bytes and again only when its `again` argument records an
+    /// explicit re-show request. `path` must lie inside the tool's own write
     /// sandbox (PLOT-2 / IMG-1).
-    pub fn emit_artifact(&self, path: impl Into<PathBuf>) {
+    pub fn emit_artifact(&self, artifact: impl Into<ToolArtifact>) {
         let _ = self.events.send(ToolEvent::Artifact {
             call_id: self.call_id,
-            path: path.into(),
+            artifact: artifact.into(),
         });
+    }
+}
+
+/// A displayable artifact and the human identity that travels with it.
+/// `path` remains the display authority; the other fields let views identify
+/// the bytes without parsing a tool result or a model-written answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolArtifact {
+    pub path: PathBuf,
+    pub label: String,
+    pub source: Option<String>,
+    pub list_index: Option<usize>,
+}
+
+impl ToolArtifact {
+    pub fn image(
+        path: impl Into<PathBuf>,
+        label: impl Into<String>,
+        source: impl Into<String>,
+        list_index: Option<usize>,
+    ) -> ToolArtifact {
+        let path = path.into();
+        let label = label.into();
+        let label = if label.trim().is_empty() {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("image")
+                .to_string()
+        } else {
+            label.trim().to_string()
+        };
+        ToolArtifact {
+            path,
+            label,
+            source: Some(source.into()),
+            list_index,
+        }
+    }
+
+    fn from_path(path: PathBuf) -> ToolArtifact {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("artifact")
+            .to_string();
+        ToolArtifact {
+            path,
+            label,
+            source: None,
+            list_index: None,
+        }
+    }
+}
+
+impl From<PathBuf> for ToolArtifact {
+    fn from(path: PathBuf) -> ToolArtifact {
+        ToolArtifact::from_path(path)
+    }
+}
+
+impl From<&PathBuf> for ToolArtifact {
+    fn from(path: &PathBuf) -> ToolArtifact {
+        ToolArtifact::from_path(path.clone())
+    }
+}
+
+impl From<&std::path::Path> for ToolArtifact {
+    fn from(path: &std::path::Path) -> ToolArtifact {
+        ToolArtifact::from_path(path.to_path_buf())
+    }
+}
+
+impl From<&str> for ToolArtifact {
+    fn from(path: &str) -> ToolArtifact {
+        ToolArtifact::from_path(path.into())
     }
 }
 
@@ -238,7 +312,7 @@ pub enum ToolEvent {
     /// typed event, never a host's parse of result prose.
     Artifact {
         call_id: ToolCallId,
-        path: PathBuf,
+        artifact: ToolArtifact,
     },
     Finished {
         call_id: ToolCallId,
@@ -305,6 +379,14 @@ pub trait Tool: Send + Sync {
     fn available(&self) -> bool {
         true
     }
+    /// Whether this user turn explicitly requires a successful call to this
+    /// tool before the agent may commit a final answer. The default is false;
+    /// tools opt in only with a narrow, deterministic predicate over the user
+    /// text. This is an execution obligation, not permission: capability
+    /// checks still govern whether the tool is advertised or callable.
+    fn requires_call_for(&self, _user: &str) -> bool {
+        false
+    }
     /// Run the tool. Returning `Err` is fine — [`Tools::dispatch_async`] turns it
     /// into a typed [`ToolOutcome`]; the tool need not format failures itself.
     async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String>;
@@ -336,6 +418,16 @@ impl Tools {
             .iter()
             .filter(|t| t.available())
             .map(|t| t.spec())
+            .collect()
+    }
+
+    /// Available tools whose own turn predicate requires a successful call
+    /// before a final answer may commit.
+    pub fn required_for(&self, user: &str) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|tool| tool.available() && tool.requires_call_for(user))
+            .map(|tool| tool.spec().name)
             .collect()
     }
 
@@ -1338,19 +1430,50 @@ impl PageCache {
 #[derive(Clone, Default)]
 pub struct ImageListing(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
 
+#[derive(Clone)]
+struct ImageTarget {
+    target: String,
+    label: Option<String>,
+    list_index: Option<usize>,
+}
+
+impl ImageTarget {
+    fn direct(target: impl Into<String>) -> ImageTarget {
+        ImageTarget {
+            target: target.into(),
+            label: None,
+            list_index: None,
+        }
+    }
+}
+
 impl ImageListing {
     fn publish(&self, images: &[(String, String)]) {
         *self.0.lock().expect("image listing poisoned") = images.to_vec();
     }
 
-    /// The URL at 1-based `n`, or the listing's current length for the
+    /// The entry at 1-based `n`, or the listing's current length for the
     /// teaching message when `n` misses.
-    fn select(&self, n: usize) -> std::result::Result<String, usize> {
+    fn select(&self, n: usize) -> std::result::Result<ImageTarget, usize> {
         let listing = self.0.lock().expect("image listing poisoned");
         n.checked_sub(1)
             .and_then(|i| listing.get(i))
-            .map(|(url, _)| url.clone())
+            .map(|(url, label)| ImageTarget {
+                target: url.clone(),
+                label: Some(label.clone()),
+                list_index: Some(n),
+            })
             .ok_or(listing.len())
+    }
+
+    fn describe(&self, url: &str) -> Option<(usize, String)> {
+        self.0
+            .lock()
+            .expect("image listing poisoned")
+            .iter()
+            .enumerate()
+            .find(|(_, (listed, _))| listed == url)
+            .map(|(index, (_, label))| (index + 1, label.clone()))
     }
 
     /// Every listed URL — what `read_image` checks the shown-set against to
@@ -1362,6 +1485,16 @@ impl ImageListing {
             .iter()
             .map(|(url, _)| url.clone())
             .collect()
+    }
+
+    /// Partition the current listing's one-based numbers by whether their URL
+    /// has already produced an image this session.
+    fn display_partition(
+        &self,
+        shown_urls: &std::collections::HashSet<String>,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let listing = self.0.lock().expect("image listing poisoned");
+        (1..=listing.len()).partition(|n| shown_urls.contains(&listing[*n - 1].0))
     }
 }
 
@@ -1407,7 +1540,16 @@ impl ReadPage {
     /// Render one `max_output_chars` window of a cached page, starting at
     /// `offset` (in characters of the readable text). The trailing marker
     /// tells the model how to continue, so pagination is model-driven.
-    fn render_window(&self, url: &str, page: &CachedPage, offset: usize) -> Result<String> {
+    /// `images_only` projects the same page-wide listing as compact numbered
+    /// labels and omits article text; the exact URLs remain in `ImageListing`
+    /// for `read_image` to resolve by number (IMG-3).
+    fn render_window(
+        &self,
+        url: &str,
+        page: &CachedPage,
+        offset: usize,
+        images_only: bool,
+    ) -> Result<String> {
         let total = page.text.chars().count();
         if offset >= total && !(offset == 0 && total == 0) {
             bail!(
@@ -1434,8 +1576,12 @@ impl ReadPage {
         // Image discovery rides in the header (single-newline lines, so the
         // header/body/marker window structure is untouched — WIN-1), once,
         // in the first window.
-        if offset == 0 && !page.images.is_empty() {
+        if offset == 0 {
+            // A page with no images also replaces the prior listing: "most
+            // recent" must never leave stale selection authority behind.
             self.listing.publish(&page.images); // IMG-3: what {"image": N} selects from
+        }
+        if offset == 0 && !page.images.is_empty() {
             out.push_str(
                 "\n[images — display one with read_image {\"image\": N} or \
                  several with {\"images\": [N, …]}; markdown image links do \
@@ -1448,8 +1594,12 @@ impl ReadPage {
                 .enumerate()
             {
                 out.push_str(&format!("\n  {}. ", n + 1));
-                out.push_str(src);
-                if !alt.is_empty() {
+                if images_only {
+                    out.push_str(&image_listing_label(src, alt));
+                } else {
+                    out.push_str(src);
+                }
+                if !images_only && !alt.is_empty() {
                     out.push_str(" (");
                     out.push_str(alt);
                     out.push(')');
@@ -1479,6 +1629,8 @@ impl ReadPage {
                 );
             }
             out.push(']');
+        } else if offset == 0 && images_only {
+            out.push_str("\n[images: none found on this page]");
         } else if offset > 0 && !page.images.is_empty() {
             // Deeper windows carry no image URLs by design, and a model
             // hunting for "more images" past the first window will
@@ -1488,8 +1640,15 @@ impl ReadPage {
             out.push_str(
                 "\n[images: already listed in the offset-0 window — that \
                  list covers the whole page; display one with read_image \
-                 {\"image\": N} against it, never a constructed URL]",
+                {\"image\": N} against it, never a constructed URL]",
             );
+        }
+        if images_only {
+            out.push_str(
+                "\n\n[article text omitted for fast image discovery; call \
+                 read_page without \"images_only\" to read it]",
+            );
+            return Ok(out);
         }
         out.push_str("\n\n");
         out.push_str(&body);
@@ -1537,6 +1696,10 @@ impl Tool for ReadPage {
                     "offset": {
                         "type": "integer",
                         "description": "character offset to continue a previously truncated read from (default 0)"
+                    },
+                    "images_only": {
+                        "type": "boolean",
+                        "description": "true when the user asks to find, show, display, fetch, or render images: return the compact numbered image list without article text or source URLs, then choose numbers with read_image (default false)"
                     }
                 },
                 "required": ["url"]
@@ -1556,6 +1719,12 @@ impl Tool for ReadPage {
                 anyhow!("read_page: `offset` must be a non-negative integer, got {v}")
             })? as usize,
         };
+        let images_only = optional_bool(&args, "read_page", "images_only")?.unwrap_or(false);
+        if images_only && offset != 0 {
+            return Err(invalid_args(
+                "read_page: `images_only` is a first-window view and requires offset 0",
+            ));
+        }
         let url = self.origins.resolve(target)?;
 
         // Fetch-once: a cached extraction serves every continuation without
@@ -1566,7 +1735,7 @@ impl Tool for ReadPage {
             .expect("read_page cache poisoned")
             .get(url.as_str());
         if let Some(page) = cached {
-            return self.render_window(url.as_str(), &page, offset);
+            return self.render_window(url.as_str(), &page, offset, images_only);
         }
 
         let mut response = self.client.get(url.clone()).send().await?;
@@ -1674,8 +1843,27 @@ impl Tool for ReadPage {
             .lock()
             .expect("read_page cache poisoned")
             .insert(url.to_string(), page.clone());
-        self.render_window(url.as_str(), &page, offset)
+        self.render_window(url.as_str(), &page, offset, images_only)
     }
+}
+
+/// The compact image-discovery projection: labels when the page supplied
+/// them, otherwise the URL's final path component. Selection never depends on
+/// this display string; `ImageListing` retains the exact URL beside the number.
+fn image_listing_label(src: &str, alt: &str) -> String {
+    let alt = alt.trim();
+    if !alt.is_empty() {
+        return alt.to_string();
+    }
+    Url::parse(src)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.rfind(|part| !part.is_empty()))
+                .map(str::to_string)
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unlabeled image".to_string())
 }
 
 /// Cap on the image entries *printed* in window 0's header — the full list
@@ -1901,12 +2089,12 @@ pub struct ReadImage {
     listing: ImageListing,
 }
 
-/// See [`ReadImage::fetched`]. `by_url` keeps the artifact *path* as data
-/// alongside the summary so an `"again": true` re-show emits the typed
-/// artifact event without parsing its own prose.
+/// See [`ReadImage::fetched`]. `by_url` keeps the complete artifact as data
+/// alongside the summary so an `"again": true` re-show preserves its human
+/// identity without parsing the tool's own prose.
 #[derive(Default)]
 struct ImageMemo {
-    by_url: std::collections::HashMap<String, (String, PathBuf)>,
+    by_url: std::collections::HashMap<String, (String, ToolArtifact)>,
     shown: std::collections::HashSet<String>,
 }
 
@@ -1919,6 +2107,43 @@ fn sorted_urls<V>(by_url: &std::collections::HashMap<String, V>) -> String {
     let mut urls: Vec<&str> = by_url.keys().map(String::as_str).collect();
     urls.sort_unstable();
     urls.join(", ")
+}
+
+/// Compact a sorted list of one-based numbers into `1-3, 5, 8-10`.
+fn number_ranges(numbers: &[usize]) -> String {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    let mut end = 0;
+    for &number in numbers {
+        match start {
+            None => {
+                start = Some(number);
+                end = number;
+            }
+            Some(_) if number == end + 1 => end = number,
+            Some(first) => {
+                ranges.push(if first == end {
+                    first.to_string()
+                } else {
+                    format!("{first}-{end}")
+                });
+                start = Some(number);
+                end = number;
+            }
+        }
+    }
+    if let Some(first) = start {
+        ranges.push(if first == end {
+            first.to_string()
+        } else {
+            format!("{first}-{end}")
+        });
+    }
+    if ranges.is_empty() {
+        "none".to_string()
+    } else {
+        ranges.join(", ")
+    }
 }
 
 impl ReadImage {
@@ -1982,9 +2207,60 @@ fn image_ext(content_type: Option<&str>, body: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// The deliberately small language recognized as an explicit image-display
+/// request. An image noun must occur somewhere, and at least one action word
+/// must not be immediately negated. This is a syntactic trigger, not an
+/// attempt to understand arbitrary prose.
+fn requests_image_display(user: &str) -> bool {
+    let normalized = user
+        .to_lowercase()
+        .replace("don't", "do not")
+        .replace("don’t", "do not");
+    let words: Vec<&str> = normalized
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let has_image = words.iter().any(|word| {
+        matches!(
+            *word,
+            "image" | "images" | "picture" | "pictures" | "photo" | "photos"
+        )
+    });
+    has_image
+        && words.iter().enumerate().any(|(i, word)| {
+            matches!(*word, "fetch" | "show" | "display" | "render")
+                && !matches!(
+                    i.checked_sub(1).and_then(|j| words.get(j)),
+                    Some(&"not") | Some(&"never")
+                )
+        })
+}
+
 #[async_trait]
 impl Tool for ReadImage {
     fn spec(&self) -> ToolSpec {
+        // Tool specs are regenerated before every Agent run. Project the
+        // session memo into this one so AGENT-3's lean answer-only history
+        // does not make the model forget which current-list images it already
+        // displayed (IMG-2).
+        let shown_urls: std::collections::HashSet<String> = self
+            .fetched
+            .lock()
+            .expect("read_image memo poisoned")
+            .by_url
+            .keys()
+            .cloned()
+            .collect();
+        let (shown, available) = self.listing.display_partition(&shown_urls);
+        let listing_state = if shown.is_empty() && available.is_empty() {
+            "No read_page [images] list is currently available.".to_string()
+        } else {
+            format!(
+                "Current [images] list state: already shown numbers: {}; not-yet-shown numbers: {}.",
+                number_ranges(&shown),
+                number_ranges(&available)
+            )
+        };
         ToolSpec {
             name: "read_image".to_string(),
             // The spec states the tool's live authority (CAP-3a).
@@ -1992,14 +2268,24 @@ impl Tool for ReadImage {
                 "Fetch an image (SVG/PNG/JPEG/GIF) and save it for the user to \
                  view. This is the only way an image reaches the user: \
                  markdown image syntax and links in answer text never \
-                 render. Prefer {{\"image\": N}} — the entry's number in the \
+                 render. To fulfill a request to show, display, or render \
+                 images, invoke read_image before answering; never substitute \
+                 links, paths, a list, or prose saying the call is the next \
+                 step. The user's request is already authorization: when \
+                 not-yet-shown numbers are available, call read_image now and \
+                 do not ask whether to fetch or render them. Prefer \
+                 {{\"image\": N}} — the entry's number in the \
                  most recent read_page [images] list — or several at once \
                  with {{\"images\": [N, …]}} (at most 8 per call): one round \
                  instead of many. A url must be copied \
                  exactly from an [images] list this session (any earlier \
                  page's list still counts), never constructed. May read only \
-                 these origins: {}. Returns the file path. {GRANT_PROTOCOL}",
-                self.origins.list().join(", ")
+                 these origins: {}. Unless the user explicitly asks to see an \
+                 image again, choose only not-yet-shown numbers; repeated bytes \
+                 produce no display event. {} Returns the file path. \
+                 {GRANT_PROTOCOL}",
+                self.origins.list().join(", "),
+                listing_state
             ),
             params: serde_json::json!({
                 "type": "object",
@@ -2028,6 +2314,10 @@ impl Tool for ReadImage {
 
     fn available(&self) -> bool {
         !self.origins.is_empty()
+    }
+
+    fn requires_call_for(&self, user: &str) -> bool {
+        requests_image_display(user)
     }
 
     async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String> {
@@ -2094,7 +2384,6 @@ impl Tool for ReadImage {
             }
             return Ok(report);
         }
-        let selected;
         let target = match (args.get("url"), args.get("image")) {
             (Some(_), Some(_)) => bail!(
                 "read_image: pass either \"image\" (a number from the last \
@@ -2122,8 +2411,8 @@ impl Tool for ReadImage {
                              yet — call read_page and pick an [images] \
                              number first"
                         ),
-                        (1, Some((summary, path))) => {
-                            ctx.emit_artifact(&path);
+                        (1, Some((summary, artifact))) => {
+                            ctx.emit_artifact(artifact);
                             return Ok(format!("{summary} — re-shown at the user's request"));
                         }
                         (_, Some(_)) => bail!(
@@ -2140,9 +2429,10 @@ impl Tool for ReadImage {
                      session"
                 )
             }
-            (Some(url), None) => url
-                .as_str()
-                .ok_or_else(|| anyhow!("read_image: `url` must be a string, got {url}"))?,
+            (Some(url), None) => ImageTarget::direct(
+                url.as_str()
+                    .ok_or_else(|| anyhow!("read_image: `url` must be a string, got {url}"))?,
+            ),
             (None, Some(n)) => {
                 let idx = n
                     .as_u64()
@@ -2153,18 +2443,17 @@ impl Tool for ReadImage {
                              index, got {n}"
                         )
                     })?;
-                selected = self.select_teach(idx)?;
-                selected.as_str()
+                self.select_teach(idx)?
             }
         };
-        self.show_one(target, again, &ctx).await
+        self.show_one(&target, again, &ctx).await
     }
 }
 
 impl ReadImage {
     /// The listing lookup with its teaching errors — shared by the single
     /// and batch forms.
-    fn select_teach(&self, n: usize) -> Result<String> {
+    fn select_teach(&self, n: usize) -> Result<ImageTarget> {
         self.listing.select(n).map_err(|len| match len {
             0 => anyhow!(
                 "read_image: no [images] list yet this session — call \
@@ -2178,15 +2467,15 @@ impl ReadImage {
         })
     }
 
-    /// Resolve, fetch (or memo-hit), gate, save, and emit one image — the
-    /// shared engine of the single and batch forms. `again` only softens
-    /// the repeat narration; display and memo semantics are identical.
-    async fn show_one(&self, target: &str, again: bool, ctx: &ToolCtx) -> Result<String> {
-        let url = self.origins.resolve(target)?; // CAP-2 before any network
+    /// Resolve, fetch (or memo-hit), gate, save, and possibly emit one image —
+    /// the shared engine of the single and batch forms. `again` is the only
+    /// path that emits bytes already displayed this session.
+    async fn show_one(&self, target: &ImageTarget, again: bool, ctx: &ToolCtx) -> Result<String> {
+        let url = self.origins.resolve(&target.target)?; // CAP-2 before any network
 
-        // Fetch-once: a repeat of a URL this session re-teaches and re-emits
-        // (IMG-2: the memo governs the network and the narration, never the
-        // pixels), but never re-fetches — the artifact is already on disk.
+        // Fetch-once: a repeat of a URL this session re-teaches but neither
+        // re-fetches nor re-emits unless `again` records an explicit request
+        // to show the same bytes again (IMG-2).
         let (memo_hit, shown_urls, exhausted) = {
             let memo = self.fetched.lock().expect("read_image memo poisoned");
             let listed = self.listing.urls();
@@ -2196,23 +2485,17 @@ impl ReadImage {
                 !listed.is_empty() && listed.iter().all(|u| memo.by_url.contains_key(u)),
             )
         };
-        if let Some((summary, path)) = memo_hit {
-            // Every successful call emits the display event (IMG-2): the
-            // fetch memo is about the *network* and the *narration*, never
-            // the pixels — a view may have reloaded since the first showing
-            // (serve's browser client does), and a host that withholds the
-            // event on "already shown" leaves that view silently empty
-            // while the model narrates success (observed live, at length).
-            ctx.emit_artifact(&path);
+        if let Some((summary, cached)) = memo_hit {
             if again {
+                ctx.emit_artifact(self.describe_artifact(target, &url, cached.path));
                 return Ok(format!("{summary} — re-shown at the user's request"));
             }
             if exhausted {
                 // Not the model's guess: computed against a listing that
                 // covers the whole page. Name the productive next move.
                 return Ok(format!(
-                    "{summary} — re-shown; it was already fetched this \
-                     session, and every image in the current [images] list \
+                    "{summary} — already shown; not displayed again; it was \
+                     already fetched this session, and every image in the current [images] list \
                      has now been shown. Reading deeper windows of this page \
                      will not reveal new images (the list covers the whole \
                      page); if the user wants more, ask them for a different \
@@ -2220,7 +2503,8 @@ impl ReadImage {
                 ));
             }
             return Ok(format!(
-                "{summary} — re-shown; it was already fetched this session, \
+                "{summary} — already shown; not displayed again; it was \
+                 already fetched this session, \
                  so do not present it as new. Shown so far: {shown_urls}. If \
                  the user wants another, pick a different number from the \
                  read_page [images] list (call read_page again if you no \
@@ -2280,6 +2564,7 @@ impl ReadImage {
         let out = self.dir.resolve(&name)?; // IMG-1 confinement
         tokio::fs::write(&out, &body).await?;
         let summary = format!("wrote {} ({ext}, {} bytes)", out.display(), body.len());
+        let artifact = self.describe_artifact(target, &url, out.clone());
         {
             let mut memo = self.fetched.lock().expect("read_image memo poisoned");
             // Same bytes under a different URL (the artifact name is the
@@ -2287,19 +2572,17 @@ impl ReadImage {
             // memoized too, so its own repeats short-circuit the fetch.
             if !memo.shown.insert(name.clone()) {
                 memo.by_url
-                    .insert(url.to_string(), (summary.clone(), out.clone()));
-                // Emit here too (IMG-2): the dedup is narration policy, not
-                // display policy — the view may not have the pixels anymore.
+                    .insert(url.to_string(), (summary.clone(), artifact.clone()));
                 if again {
                     drop(memo);
-                    ctx.emit_artifact(&out);
+                    ctx.emit_artifact(artifact);
                     return Ok(format!("{summary} — re-shown at the user's request"));
                 }
                 let shown_urls = sorted_urls(&memo.by_url);
                 drop(memo);
-                ctx.emit_artifact(&out);
                 return Ok(format!(
-                    "{summary} — re-shown; byte-identical to an image \
+                    "{summary} — already shown; not displayed again; \
+                     byte-identical to an image \
                      already fetched this session under a different URL, so \
                      do not present it as new. Shown so far: {shown_urls}. \
                      If the user wants another, pick a different number from \
@@ -2307,10 +2590,30 @@ impl ReadImage {
                 ));
             }
             memo.by_url
-                .insert(url.to_string(), (summary.clone(), out.clone()));
+                .insert(url.to_string(), (summary.clone(), artifact.clone()));
         }
-        ctx.emit_artifact(&out); // IMG-2: display authority, first showing only
+        ctx.emit_artifact(artifact); // IMG-2: display authority, first showing only
         Ok(summary)
+    }
+
+    fn describe_artifact(&self, target: &ImageTarget, url: &Url, path: PathBuf) -> ToolArtifact {
+        let listed = target
+            .list_index
+            .zip(target.label.clone())
+            .or_else(|| self.listing.describe(url.as_str()));
+        let (list_index, listed_label) = listed
+            .map(|(index, label)| (Some(index), label))
+            .unwrap_or((None, String::new()));
+        let label = (!listed_label.trim().is_empty())
+            .then(|| listed_label.trim().to_string())
+            .or_else(|| {
+                url.path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "image".to_string());
+        ToolArtifact::image(path, label, url.as_str(), list_index)
     }
 }
 
@@ -3838,6 +4141,120 @@ well known works of art depicting paradoxical architecture.</p>
     }
 
     #[tokio::test]
+    async fn read_page_images_only_keeps_selection_and_drops_prefill_bulk() {
+        // upholds: IMG-3 — the fast projection exposes only compact labels,
+        // while the shared listing still maps its numbers to the exact source
+        // URLs consumed by read_image. The cached ordinary view remains the
+        // complete article and does not refetch (PAGE-1/WIN-1).
+        let article = "A long explanation of the Mandelbrot set and its boundary. ".repeat(80);
+        let html = format!(
+            r#"<html><head><title>Mandelbrot set</title></head><body><article>
+<h1>Mandelbrot set</h1>
+<img src="/images/overview.png" alt="Mandelbrot overview">
+<p>{article}</p>
+<img src="/images/detail-long-name.png">
+</article></body></html>"#
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mandelbrot"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/images/detail-long-name.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"\x89PNG\r\n\x1a\nmandelbrot-detail"),
+            )
+            .mount(&server)
+            .await;
+
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let listing = ImageListing::default();
+        let dir = tempfile::tempdir().unwrap();
+        let tools = Tools::new()
+            .with(
+                ReadPage::with_limits(origins.clone(), 1_000_000, 20_000)
+                    .unwrap()
+                    .with_listing(listing.clone()),
+            )
+            .with(
+                ReadImage::new(origins, dir.path().join("images"))
+                    .unwrap()
+                    .with_listing(listing),
+            );
+
+        let compact = tools
+            .dispatch_async(&ToolCall {
+                name: "read_page".into(),
+                args: json(r#"{"url":"/mandelbrot","images_only":true}"#),
+            })
+            .await
+            .render_for_model("read_page");
+        assert!(!compact.is_error, "{}", compact.content);
+        assert!(compact.content.contains("1. Mandelbrot overview"));
+        assert!(compact.content.contains("2. detail-long-name.png"));
+        assert!(!compact.content.contains("/images/overview.png"));
+        assert!(!compact.content.contains(&article[..200]));
+        assert!(compact.content.len() < 500, "{}", compact.content);
+
+        let mut image = tools.spawn(ToolCall {
+            name: "read_image".into(),
+            args: json(r#"{"image":2}"#),
+        });
+        let artifact = loop {
+            match image.recv().await {
+                Some(ToolEvent::Artifact { artifact, .. }) => break artifact,
+                Some(ToolEvent::Finished { outcome, .. }) => {
+                    panic!("finished before artifact: {outcome:?}")
+                }
+                Some(_) => {}
+                None => panic!("tool event stream closed before artifact"),
+            }
+        };
+        assert_eq!(artifact.list_index, Some(2));
+        assert_eq!(artifact.label, "detail-long-name.png");
+        assert_eq!(
+            artifact.source.as_deref(),
+            Some(format!("{}/images/detail-long-name.png", server.uri()).as_str())
+        );
+        let _ = image.join().await;
+
+        let ordinary = read_window(&tools, "/mandelbrot", 0).await;
+        assert!(!ordinary.is_error, "{}", ordinary.content);
+        assert!(ordinary.content.contains(&article[..200]));
+        assert!(ordinary.content.contains("/images/overview.png"));
+        // The page mock's expect(1) proves this ordinary view reused the
+        // extraction populated by the compact view.
+    }
+
+    #[tokio::test]
+    async fn read_page_images_only_rejects_nonzero_offset_and_wrong_type() {
+        let server = MockServer::start().await;
+        let tools =
+            Tools::new().with(ReadPage::new(WebOrigins::one(&server.uri()).unwrap()).unwrap());
+        for args in [
+            r#"{"url":"/page","offset":1,"images_only":true}"#,
+            r#"{"url":"/page","images_only":"yes"}"#,
+        ] {
+            let result = tools
+                .dispatch_async(&ToolCall {
+                    name: "read_page".into(),
+                    args: json(args),
+                })
+                .await
+                .render_for_model("read_page");
+            assert!(result.is_error, "{args}: {}", result.content);
+        }
+    }
+
+    #[tokio::test]
     async fn read_page_images_cover_the_page_and_speak_truncation() {
         // upholds: IMG-3 — the listing covers the whole fetched page, not
         // just the extracted article (footers/galleries/navboxes hold real
@@ -4110,6 +4527,52 @@ copy of the whole set at every scale a reader cares to zoom.</p>
     }
 
     #[tokio::test]
+    async fn numbered_image_artifact_keeps_its_list_identity() {
+        // upholds: IMG-2 / IMG-3 — the exact number, alt text, and source URL
+        // published by read_page travel on the typed artifact event. A view
+        // never has to infer them from the hash filename or model prose.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mandelbrot.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"\x89PNG\r\n\x1a\nmandelbrot"),
+            )
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let listing = ImageListing::default();
+        let source = format!("{}/mandelbrot.png", server.uri());
+        listing.publish(&[(source.clone(), "Mandelbrot set detail".into())]);
+        let tools = Tools::new().with(
+            ReadImage::new(origins, dir.path().join("images"))
+                .unwrap()
+                .with_listing(listing),
+        );
+        let mut task = tools.spawn(ToolCall {
+            name: "read_image".into(),
+            args: json(r#"{"image": 1}"#),
+        });
+        let artifact = loop {
+            match task.recv().await {
+                Some(ToolEvent::Artifact { artifact, .. }) => break artifact,
+                Some(ToolEvent::Finished { outcome, .. }) => {
+                    panic!("finished before artifact: {outcome:?}")
+                }
+                Some(_) => {}
+                None => panic!("tool event stream closed before artifact"),
+            }
+        };
+        assert_eq!(artifact.list_index, Some(1));
+        assert_eq!(artifact.label, "Mandelbrot set detail");
+        assert_eq!(artifact.source.as_deref(), Some(source.as_str()));
+        assert!(artifact.path.starts_with(dir.path().join("images")));
+        let _ = task.join().await;
+    }
+
+    #[tokio::test]
     async fn read_image_batch_teaches_bounds_and_exclusivity() {
         // upholds: the batch form's edges — empty and oversized lists,
         // mixing with the single forms, and an all-failed batch — every
@@ -4247,10 +4710,11 @@ copy of the whole set at every scale a reader cares to zoom.</p>
 
     #[tokio::test]
     async fn read_image_selects_by_number_from_the_shared_listing() {
-        // upholds: IMG-3 — read_page's first window publishes its numbered
-        // [images] list into the shared ImageListing and read_image
-        // {"image": N} selects from it: picking a picture is an index copy,
-        // never a URL transcription. Every miss teaches: no listing yet,
+        // upholds: IMG-2 / IMG-3 — read_page's first window publishes its
+        // numbered [images] list into the shared ImageListing and read_image
+        // {"image": N} selects from it. The regenerated spec projects which
+        // numbers remain across Agent runs; picking stays an index copy, never
+        // a URL transcription. Every miss teaches: no listing yet,
         // out-of-range, both args, neither arg.
         let server = MockServer::start().await;
         let html = r#"<html><body><article><h1>T</h1>
@@ -4295,7 +4759,17 @@ as the first window of the page without tripping any extraction guard.</p>
             args: json(args),
         };
 
+        let image_description = || {
+            tools
+                .specs()
+                .into_iter()
+                .find(|spec| spec.name == "read_image")
+                .expect("read_image remains available")
+                .description
+        };
+
         // Before any read_page: a number teaches "call read_page first".
+        assert!(image_description().contains("No read_page [images] list"));
         let early = tools.dispatch_async(&image_call(r#"{"image": 1}"#)).await;
         let early = early.render_for_model("").content;
         assert!(early.contains("no [images] list yet"), "{early}");
@@ -4308,6 +4782,21 @@ as the first window of the page without tripping any extraction guard.</p>
             })
             .await;
         assert!(page.is_success(), "{page:?}");
+        let state = image_description();
+        assert!(state.contains("already shown numbers: none"), "{state}");
+        assert!(state.contains("not-yet-shown numbers: 1"), "{state}");
+        assert!(
+            state.contains("invoke read_image before answering"),
+            "{state}"
+        );
+        assert!(
+            state.contains("never substitute links, paths, a list, or prose"),
+            "{state}"
+        );
+        assert!(
+            state.contains("call read_image now and do not ask"),
+            "{state}"
+        );
 
         // …and {"image": 1} fetches exactly that entry.
         let picked = tools.dispatch_async(&image_call(r#"{"image": 1}"#)).await;
@@ -4315,6 +4804,9 @@ as the first window of the page without tripping any extraction guard.</p>
             panic!("{picked:?}");
         };
         assert!(content.starts_with("wrote "), "{content}");
+        let state = image_description();
+        assert!(state.contains("already shown numbers: 1"), "{state}");
+        assert!(state.contains("not-yet-shown numbers: none"), "{state}");
 
         // With the page's whole (one-image) listing shown, a bare repeat
         // states exhaustion as a computed fact and names the next move.
@@ -4342,13 +4834,34 @@ as the first window of the page without tripping any extraction guard.</p>
         assert!(neither.contains(r#"pass {"image": N}"#), "{neither}");
     }
 
+    #[test]
+    fn explicit_image_display_requests_require_read_image() {
+        // upholds: IMG-2 — this is the complete syntactic boundary that turns
+        // an image-display request into an agent call obligation. Positive and
+        // negated actions are distinct; unrelated image discussion stays chat.
+        for user in [
+            "read the page and render mandelbrot images",
+            "fetch more images from the page and render them",
+            "find and render even more images; do not render the same image twice",
+            "show me a picture",
+        ] {
+            assert!(requests_image_display(user), "{user}");
+        }
+        for user in [
+            "explain image rendering",
+            "do not render images",
+            "never show pictures",
+            "find images but do not render them",
+        ] {
+            assert!(!requests_image_display(user), "{user}");
+        }
+    }
+
     #[tokio::test]
-    async fn read_image_emits_the_artifact_event_on_every_success() {
-        // upholds: IMG-2 — the typed artifact event is the display license,
-        // and every successful call fires it: first fetch, memo-hit repeat,
-        // and byte-identical duplicate alike. The memo spares the network
-        // and shapes the narration; the pixels are the view's business, and
-        // a view may have reloaded since the first showing.
+    async fn read_image_emits_once_unless_again_is_explicit() {
+        // upholds: IMG-2 — the typed artifact event is the display license.
+        // New bytes emit once; a memo-hit repeat and byte-identical duplicate
+        // emit nothing; `again: true` is the sole explicit re-show path.
         let server = MockServer::start().await;
         let png: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-image-bytes";
         for route in ["/tri.png", "/tri-copy.png"] {
@@ -4377,7 +4890,7 @@ as the first window of the page without tripping any extraction guard.</p>
                 let mut artifacts = Vec::new();
                 loop {
                     match task.recv().await {
-                        Some(ToolEvent::Artifact { path, .. }) => artifacts.push(path),
+                        Some(ToolEvent::Artifact { artifact, .. }) => artifacts.push(artifact),
                         Some(ToolEvent::Finished { outcome, .. }) => break (outcome, artifacts),
                         Some(_) => {}
                         None => break (task.join().await, artifacts),
@@ -4390,25 +4903,30 @@ as the first window of the page without tripping any extraction guard.</p>
         assert!(first.is_success(), "{first:?}");
         assert_eq!(artifacts.len(), 1, "first showing announces the artifact");
         assert!(
-            artifacts[0].starts_with(dir.path().join("images")),
+            artifacts[0].path.starts_with(dir.path().join("images")),
             "the event names the sandboxed artifact: {:?}",
-            artifacts[0]
+            artifacts[0].path
         );
+        assert_eq!(artifacts[0].label, "tri.png");
+        assert_eq!(
+            artifacts[0].source.as_deref(),
+            Some(format!("{}/tri.png", server.uri()).as_str())
+        );
+        assert_eq!(artifacts[0].list_index, None);
 
-        // Repeats emit too (IMG-2): the memo spares the network and shapes
-        // the narration, never the pixels — a view may have reloaded since
-        // the first showing, and a withheld event left it silently empty
-        // while the model narrated success (observed live).
+        // Repeats succeed from the memo but do not display duplicate pixels.
         let (repeat, artifacts) = run("/tri.png").await;
         assert!(repeat.is_success(), "{repeat:?}");
-        assert_eq!(artifacts.len(), 1, "a URL rerun re-emits the display event");
+        assert!(
+            artifacts.is_empty(),
+            "a URL repeat stays off the display plane"
+        );
 
         let (dup, artifacts) = run("/tri-copy.png").await;
         assert!(dup.is_success(), "{dup:?}");
-        assert_eq!(
-            artifacts.len(),
-            1,
-            "byte-identical content under a new URL re-emits too"
+        assert!(
+            artifacts.is_empty(),
+            "byte-identical content under a new URL stays off the display plane"
         );
 
         // The one sanctioned repeat: "again" asserts the user asked, and the
@@ -4420,7 +4938,7 @@ as the first window of the page without tripping any extraction guard.</p>
         let mut artifacts = Vec::new();
         let outcome = loop {
             match task.recv().await {
-                Some(ToolEvent::Artifact { path, .. }) => artifacts.push(path),
+                Some(ToolEvent::Artifact { artifact, .. }) => artifacts.push(artifact),
                 Some(ToolEvent::Finished { outcome, .. }) => break outcome,
                 Some(_) => {}
                 None => break task.join().await,

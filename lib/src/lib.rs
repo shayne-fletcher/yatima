@@ -197,7 +197,9 @@
 //!   outside it.
 //!
 //! Agent & tools (capability-scoped action):
-//! - **AGENT-1** the agent loop terminates in ≤ `max_steps` tool rounds.
+//! - **AGENT-1** the agent loop terminates after at most `max_steps` non-final
+//!   steps: a dispatched tool round, a protocol-recovery turn, or a retry for
+//!   an unmet tool-declared call requirement each consumes one.
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
 //!   name is an `is_error` result, never ambient execution (sandbox by omission).
 //! - **AGENT-3** across runs, an [`Agent`]'s persistent history carries only
@@ -219,7 +221,8 @@
 //!   surrounding whitespace), and a fold `Break` or external [`Cancel`]
 //!   stops the decode at token granularity — `Stopped`, history untouched.
 //!   Answer fragments of a step that ends in a tool call are narration; the
-//!   following `ToolCall` event licenses folding them into working matter.
+//!   a following `ToolCall` or `Retry` event licenses folding them into
+//!   working matter.
 //! - **TOOL-1** tool calls are async task executions: they can be awaited,
 //!   joined, watched through [`ToolEvent`], and cooperatively cancelled without
 //!   changing their argument schema.
@@ -285,19 +288,26 @@
 //!   host displays it in its medium's idiom.
 //! - **IMG-2** display authority is the typed artifact event
 //!   ([`ToolCtx::emit_artifact`] → `ToolEvent::Artifact` →
-//!   `AgentEvent::ToolArtifact`), never a parse of result prose — and
-//!   **every successful call emits it**. `read_image`'s fetch-once memo
-//!   (by URL *and* by content hash) governs the *network* and the
-//!   *narration* — a repeat never refetches, and its teaching text tells
-//!   the model not to present the picture as new — but never the pixels:
-//!   the host cannot assume a view still holds them (serve's browser
-//!   client reloads; withholding the event on "already shown" left a
-//!   reloaded view silently empty while the model narrated success —
-//!   observed live). Display dedup, if any view wants it, is that view's
-//!   policy. `{"again": true}` survives as the explicit re-show wording.
-//!   When every listed image has been shown, the teach states that
-//!   exhaustion as a computed fact. Cited by the repeat/duplicate,
-//!   re-show, and exhaustion tests on `read_image` and the artifact-event
+//!   `AgentEvent::ToolArtifact`), never a parse of result prose. `read_image`'s
+//!   artifact carries both identities needed downstream: its sandboxed path
+//!   and hash filename for machines, plus the source URL, advertised list
+//!   number, and label for people. The host, wire, views, and recorder preserve
+//!   that record, so an answer's “image 21” can be matched to the pixels shown.
+//!   Cited by `numbered_image_artifact_keeps_its_list_identity`,
+//!   `artifact_read_takes_the_event_path`, the protocol/tape round trips, and
+//!   the GUI/TUI/web image projection tests.
+//!   `read_image`'s session memo is keyed by URL and content hash: a repeat
+//!   never refetches
+//!   or emits another display event, while `{"again": true}` is the sole
+//!   explicit re-show path. Before every agent run, its current numbered
+//!   listing is partitioned into already-shown and not-yet-shown numbers in
+//!   the regenerated tool spec, so AGENT-3's answer-only history cannot erase
+//!   this display state. For the narrow syntactic class of explicit image
+//!   display requests, the tool also requires a successful `read_image` call
+//!   before the agent may commit a final answer; narration cannot impersonate
+//!   the effect. When every listed image has been shown, the teaching states
+//!   that exhaustion as a computed fact. Cited by the required-call,
+//!   session-ledger, repeat/duplicate, re-show, exhaustion, and artifact-event
 //!   tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL
 //!   transcription: `read_page`'s first window publishes its numbered
@@ -311,7 +321,10 @@
 //!   src; chosen, never constructed). It covers the whole fetched page
 //!   (the extraction alone misses galleries and navboxes), every entry is
 //!   selectable even past the printed head, and truncation is always
-//!   spoken, never silent.
+//!   spoken, never silent. For an explicit image task, `images_only` projects
+//!   that same listing as compact numbered labels while exact URLs remain in
+//!   the shared cell; article prose and source URLs do not inflate the next
+//!   model prefill, and number-to-artifact identity is unchanged.
 //!   No listing yet and out-of-range numbers teach rather than fail
 //!   opaquely. Cited by the numbered-listing, page-wide-coverage,
 //!   spoken-truncation, and select-by-number tests.
@@ -413,9 +426,9 @@ pub use template::{
 };
 pub use tool::{
     ImageListing, JsonToolCall, ListDir, MuseAtemCodec, Plot, PlotBound, PlotSeries, QwenToolCall,
-    ReadFile, ReadImage, ReadPage, ReadUrl, SendNotification, Tool, ToolCall, ToolCallCodec,
-    ToolCallId, ToolCtx, ToolEvent, ToolExtraction, ToolFailure, ToolOutcome, ToolRejection,
-    ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
+    ReadFile, ReadImage, ReadPage, ReadUrl, SendNotification, Tool, ToolArtifact, ToolCall,
+    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolExtraction, ToolFailure, ToolOutcome,
+    ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
 };
 pub use transcript::{Role, ToolArguments, Turn};
 

@@ -1270,9 +1270,22 @@ impl<W: Write> AgentDisplay<W> {
                 let name = self.current_tool.take().unwrap_or_else(|| "tool".into());
                 let _ = writeln!(self.out, "[{name}: {}]", outcome.kind());
             }
-            AgentEvent::ToolArtifact(path) => {
+            AgentEvent::Retry(reason) => {
                 self.end_fragments();
-                let _ = writeln!(self.out, "[artifact: {}]", path.display());
+                self.current_tool = None;
+                let _ = writeln!(self.out, "[retry: {reason}]");
+            }
+            AgentEvent::ToolArtifact(artifact) => {
+                self.end_fragments();
+                let label = artifact
+                    .list_index
+                    .map(|index| format!("image {index}: {}", artifact.label))
+                    .unwrap_or(artifact.label);
+                let _ = writeln!(
+                    self.out,
+                    "[artifact: {label} — {}]",
+                    artifact.path.display()
+                );
             }
             AgentEvent::Reasoning(_) | AgentEvent::Final(_) => self.end_fragments(),
             AgentEvent::ToolStarted(_) => {}

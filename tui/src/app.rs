@@ -50,6 +50,9 @@ pub struct InFlight {
     /// Whether a cancel has been requested for this turn (the decode stops at the
     /// next token boundary; the indicator shows "cancelling…" until `Done`).
     pub cancelling: bool,
+    /// Human image identities received during the turn, posted immediately
+    /// after the completed assistant entry.
+    pub artifacts: Vec<String>,
 }
 
 /// Status-bar facts.
@@ -344,6 +347,7 @@ impl App {
             frags: 0,
             answering: false,
             cancelling: false,
+            artifacts: Vec::new(),
         });
         let _ = self.req_tx.send(HostRequest::Submit {
             turn_id,
@@ -516,7 +520,14 @@ impl App {
             }
             HostEvent::Done { turn_id, stop } if self.is_current(turn_id) => {
                 self.finish_assistant(stop);
-                self.in_flight = None;
+                let artifacts = self
+                    .in_flight
+                    .take()
+                    .map(|turn| turn.artifacts)
+                    .unwrap_or_default();
+                for label in artifacts {
+                    self.push_entry(Entry::Notice(label));
+                }
             }
             HostEvent::Error { turn_id, message } if self.is_current(turn_id) => {
                 self.push_entry(Entry::Error(message));
@@ -542,10 +553,21 @@ impl App {
             HostEvent::Note(message) => {
                 self.push_entry(Entry::Notice(message));
             }
-            // The host reads artifact bytes and ships an Image for a texturing
-            // frontend; the terminal opens the file via the ToolNote path
-            // instead, so these bytes go unused here.
-            HostEvent::Image { .. } => {}
+            // The terminal opens the file via the ToolNote path; retain the
+            // typed human identity and post it after the answer so list numbers
+            // in the prose still map to the externally displayed image.
+            HostEvent::Image {
+                turn_id,
+                name,
+                label,
+                list_index,
+                ..
+            } if self.is_current(turn_id) => {
+                if let Some(turn) = self.in_flight.as_mut() {
+                    let label = if label.trim().is_empty() { name } else { label };
+                    turn.artifacts.push(image_caption(list_index, &label));
+                }
+            }
             _ => {} // stale event for a turn that is no longer current.
         }
     }
@@ -571,6 +593,13 @@ impl App {
         if let Some(Entry::Assistant { stop: s, .. }) = self.transcript.last_mut() {
             *s = Some(stop);
         }
+    }
+}
+
+fn image_caption(list_index: Option<usize>, label: &str) -> String {
+    match list_index {
+        Some(index) => format!("image {index}: {label}"),
+        None => format!("image: {label}"),
     }
 }
 
@@ -1129,6 +1158,32 @@ mod tests {
         assert!(answer.is_empty(), "narration retracted, got {answer:?}");
     }
 
+    #[test]
+    fn image_identity_is_posted_after_the_completed_turn() {
+        // upholds: IMG-2 — the terminal cannot texture the bytes inline, but
+        // the typed list number and label remain visible beside the turn.
+        let (mut app, _rx) = test_app();
+        app.set_input("show it");
+        app.apply(Intent::Submit);
+        app.on_engine_event(HostEvent::Started { turn_id: 0 });
+        app.on_engine_event(HostEvent::Image {
+            turn_id: 0,
+            bytes: vec![1, 2, 3],
+            name: "img-deadbeef.png".into(),
+            label: "Mandelbrot set detail".into(),
+            source: Some("https://example.com/mandelbrot.png".into()),
+            list_index: Some(21),
+        });
+        app.on_engine_event(HostEvent::Done {
+            turn_id: 0,
+            stop: StopKind::Eos,
+        });
+        assert!(matches!(
+            app.transcript.last(),
+            Some(Entry::Notice(text)) if text == "image 21: Mandelbrot set detail"
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ui_stays_live_during_generation() {
         // upholds: TUI-4 — generation runs off the UI loop, so a key is serviced
@@ -1142,6 +1197,7 @@ mod tests {
             frags: 0,
             answering: false,
             cancelling: false,
+            artifacts: Vec::new(),
         });
 
         let (event_tx, event_rx) = unbounded_channel();

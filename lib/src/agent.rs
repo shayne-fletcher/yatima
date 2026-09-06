@@ -14,7 +14,8 @@ use crate::completer::Completer;
 use crate::reasoning::{Channel, Reasoned};
 use crate::template::PromptTemplate;
 use crate::tool::{
-    ToolCall, ToolCallCodec, ToolEvent, ToolExtraction, ToolOutcome, ToolRejection, Tools,
+    ToolArtifact, ToolCall, ToolCallCodec, ToolEvent, ToolExtraction, ToolOutcome, ToolRejection,
+    Tools,
 };
 #[cfg(test)]
 use crate::transcript::Role;
@@ -22,6 +23,7 @@ use crate::transcript::Turn;
 use crate::{Cancel, GenOpts};
 use anyhow::Result;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 /// An observable step of a run, delivered to [`Agent::run_with`]'s fold.
@@ -31,11 +33,16 @@ pub enum AgentEvent {
     ToolStarted(ToolCall),
     ToolProgress(String),
     /// A tool announced a freshly produced artifact the user should be shown
-    /// (IMG-2): the display license is this typed event, never a parse of the
-    /// outcome's prose. Memo-served repeats produce an outcome but no
-    /// artifact event.
-    ToolArtifact(std::path::PathBuf),
+    /// (IMG-2): the display license and its human label/source/list number are
+    /// this typed event, never a parse of the outcome's prose. Memo-served
+    /// repeats produce an outcome but no artifact event.
+    ToolArtifact(ToolArtifact),
     ToolOutcome(ToolOutcome),
+    /// A candidate final answer did not discharge a tool-declared obligation
+    /// for this user turn. Streaming consumers retract that step's answer;
+    /// the agent strengthens the system instruction and retries under the
+    /// same finite step budget (AGENT-1/AGENT-4).
+    Retry(String),
     /// A live slice of the current step's decode (AGENT-4), classified as it
     /// streams: chain-of-thought on [`Channel::Reasoning`], prose on
     /// [`Channel::Answer`]. Codec markup never reaches the answer channel:
@@ -44,7 +51,8 @@ pub enum AgentEvent {
     /// [`AgentEvent::ToolCall`]. Answer fragments of a step that
     /// ends in a tool call are *narration* (prose the model wrote before
     /// calling): the following `ToolCall` event licenses a consumer to fold
-    /// them into working matter.
+    /// them into working matter. A [`AgentEvent::Retry`] has the same meaning
+    /// when a candidate answer missed a tool-declared call requirement.
     Fragment {
         channel: Channel,
         text: String,
@@ -63,7 +71,7 @@ pub enum AgentEvent {
 pub enum AgentStop {
     /// The model produced a final answer.
     Final,
-    /// The `max_steps` tool-round budget was exhausted (AGENT-1).
+    /// The `max_steps` non-final-step budget was exhausted (AGENT-1).
     MaxSteps,
     /// The caller's fold returned `ControlFlow::Break`.
     Stopped,
@@ -293,11 +301,14 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         );
         let rendered_tools = self.codec.render_system(&self.tools.specs());
         let system = self.template.compose_system(&self.system, &rendered_tools);
+        let required_tools = self.tools.required_for(user);
+        let mut successful_tools = HashSet::<String>::new();
+        let mut requirement_misses = 0usize;
         // Seed the working transcript with the session history (AGENT-3): prior
         // exchanges' user/answer turns only — their tool rounds and reasoning
         // were ephemeral to their runs.
         let mut transcript = Vec::with_capacity(self.history.len() + 2);
-        transcript.push(Turn::system(system));
+        transcript.push(Turn::system(system.clone()));
         transcript.extend(self.history.iter().cloned());
         transcript.push(Turn::user(user));
 
@@ -442,6 +453,35 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         stop = AgentStop::NoAnswer;
                         break;
                     }
+                    let unmet: Vec<&str> = required_tools
+                        .iter()
+                        .filter(|name| !successful_tools.contains(*name))
+                        .map(String::as_str)
+                        .collect();
+                    if !unmet.is_empty() {
+                        requirement_misses += 1;
+                        let names = unmet.join(", ");
+                        let reason = format!(
+                            "final answer withheld: this request requires a successful {names} call"
+                        );
+                        match step(acc, AgentEvent::Retry(reason.clone()))? {
+                            ControlFlow::Continue(a) => acc = a,
+                            ControlFlow::Break(a) => {
+                                acc = a;
+                                stop = AgentStop::Stopped;
+                                break;
+                            }
+                        }
+                        steps += 1;
+                        if steps >= self.max_steps {
+                            stop = AgentStop::MaxSteps;
+                            break;
+                        }
+                        transcript[0] = Turn::system(format!(
+                            "{system}\n\nRequired action for this user turn: {names} must succeed before you answer. Attempt {requirement_misses} was rejected because it answered without doing so. Call the required tool now; do not claim the action happened, list candidates, or ask permission."
+                        ));
+                        continue;
+                    }
                     transcript.push(Turn::assistant(reply.clone()));
                     match step(acc, AgentEvent::Final(reply.clone()))? {
                         ControlFlow::Continue(a) | ControlFlow::Break(a) => acc = a,
@@ -490,8 +530,8 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                     }
                                 }
                             }
-                            Some(ToolEvent::Artifact { path, .. }) => {
-                                match step(acc, AgentEvent::ToolArtifact(path))? {
+                            Some(ToolEvent::Artifact { artifact, .. }) => {
+                                match step(acc, AgentEvent::ToolArtifact(artifact))? {
                                     ControlFlow::Continue(a) => acc = a,
                                     ControlFlow::Break(a) => {
                                         task.cancel();
@@ -543,6 +583,9 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     };
 
                     let result = outcome.render_for_model(&tool_name);
+                    if outcome.is_success() {
+                        successful_tools.insert(tool_name.clone());
+                    }
                     transcript.push(Turn::tool_result(
                         result.name,
                         result.content,
@@ -699,7 +742,7 @@ mod tests {
     use super::*;
     use crate::completer::Completion;
     use crate::template::PlainTemplate;
-    use crate::tool::{JsonToolCall, ReadFile};
+    use crate::tool::{JsonToolCall, ReadFile, Tool, ToolCtx, ToolSpec};
     use crate::{capability::Dir, StopReason};
     use std::io::Write;
 
@@ -786,6 +829,27 @@ mod tests {
         )
     }
 
+    struct RequiredAction;
+
+    #[async_trait::async_trait]
+    impl Tool for RequiredAction {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "required_action".to_string(),
+                description: "perform the requested visible action".to_string(),
+                params: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn requires_call_for(&self, user: &str) -> bool {
+            user == "render image"
+        }
+
+        async fn call(&self, _args: serde_json::Value, _ctx: ToolCtx) -> Result<String> {
+            Ok("rendered".to_string())
+        }
+    }
+
     fn muse_call(tool: &str, paths: &[&str]) -> String {
         let mut body =
             format!(" to={tool}<|message|><atem:function_calls>\n<atem:invoke name=\"{tool}\">\n");
@@ -840,6 +904,86 @@ mod tests {
                 && t.content()
                     .is_some_and(|content| content.contains("the sky is blue"))
         }));
+    }
+
+    #[test]
+    fn required_tool_call_blocks_narrated_success_then_recovers() {
+        // upholds: AGENT-1 / AGENT-4 / IMG-2 — a candidate answer cannot
+        // impersonate a required effect. It is observable as Retry, never
+        // Final or history; the successful call discharges the requirement;
+        // both non-final steps consume the common finite budget.
+        let tools = Tools::new().with(RequiredAction);
+        let call = call("required_action", "unused");
+        let mut model = Scripted::new(&[
+            "I rendered it without calling anything.",
+            &call,
+            "The image is now rendered.",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 4);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.steps, 2, "one requirement retry plus one tool round");
+        assert_eq!(run.answer, "The image is now rendered.");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Retry(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Final(_)))
+                .count(),
+            1,
+            "the narrated candidate never becomes Final"
+        );
+        assert!(
+            run.transcript
+                .iter()
+                .all(|turn| turn.content() != Some("I rendered it without calling anything.")),
+            "the rejected claim never enters working or persistent history"
+        );
+        drop(agent);
+        assert!(model.prompts[1].contains("required_action must succeed"));
+        assert!(!model.prompts[1].contains("I rendered it without calling anything."));
+    }
+
+    #[test]
+    fn required_tool_call_retries_are_bounded_and_commit_nothing() {
+        // upholds: AGENT-1 / IMG-2 — a model that keeps narrating a required
+        // effect cannot loop forever or commit the fabrication.
+        let tools = Tools::new().with(RequiredAction);
+        let mut model = Scripted::new(&["done without a call", "still no call"]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 2);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+
+        assert_eq!(run.stop, AgentStop::MaxSteps);
+        assert_eq!(run.steps, 2);
+        assert!(run.answer.is_empty());
+        assert!(agent.history().is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Retry(_)))
+                .count(),
+            2
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Final(_))));
     }
 
     #[test]
@@ -1161,10 +1305,14 @@ mod tests {
             .collect();
         assert!(matches!(marks[0], AgentEvent::ToolCall(_)));
         assert!(matches!(marks[1], AgentEvent::ToolStarted(_)));
-        let AgentEvent::ToolArtifact(path) = marks[2] else {
+        let AgentEvent::ToolArtifact(artifact) = marks[2] else {
             panic!("expected ToolArtifact, got {:?}", marks[2]);
         };
-        assert_eq!(path, std::path::Path::new("/sandbox/announced.png"));
+        assert_eq!(
+            artifact.path,
+            std::path::Path::new("/sandbox/announced.png")
+        );
+        assert_eq!(artifact.label, "announced.png");
         assert!(matches!(marks[3], AgentEvent::ToolOutcome(_)));
         assert!(matches!(marks[4], AgentEvent::Final(_)));
     }

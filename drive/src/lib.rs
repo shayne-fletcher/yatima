@@ -403,6 +403,9 @@ where
             turn_id,
             bytes,
             name,
+            label,
+            source,
+            list_index,
         } = event
         else {
             return Ok(serde_json::to_value(event)?);
@@ -428,6 +431,9 @@ where
             "Image": {
                 "turn_id": turn_id,
                 "name": name,
+                "label": label,
+                "source": source,
+                "list_index": list_index,
                 "artifact": format!("artifacts/{file}"),
                 "sha256": digest,
                 "bytes_len": bytes.len(),
@@ -718,6 +724,9 @@ mod tests {
                 turn_id: 3,
                 bytes: bytes.clone(),
                 name: "img.png".into(),
+                label: "Mandelbrot set".into(),
+                source: Some("https://example.com/mandelbrot.png".into()),
+                list_index: Some(9),
             }))
             .await
             .unwrap();
@@ -734,6 +743,9 @@ mod tests {
         let wire: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         let image = &wire["event"]["Image"];
         assert_eq!(image["artifact"], "artifacts/0000-img.png");
+        assert_eq!(image["label"], "Mandelbrot set");
+        assert_eq!(image["source"], "https://example.com/mandelbrot.png");
+        assert_eq!(image["list_index"], 9);
         assert_eq!(image["sha256"], hex(&Sha256::digest(&bytes)));
         assert_eq!(image["bytes_len"], bytes.len());
         assert!(image.get("bytes").is_none(), "image bytes stay out of line");
@@ -817,6 +829,9 @@ mod tests {
                     turn_id: 1,
                     bytes: vec![1, 2, 3],
                     name: name.into(),
+                    label: "unsafe name".into(),
+                    source: None,
+                    list_index: None,
                 }))
                 .await
                 .unwrap();

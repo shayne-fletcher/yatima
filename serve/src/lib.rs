@@ -666,6 +666,9 @@ mod tests {
                 turn_id: 7,
                 bytes: vec![0x89, b'P', b'N', b'G'],
                 name: "img-abc.png".into(),
+                label: "Mandelbrot set".into(),
+                source: Some("https://example.com/mandelbrot.png".into()),
+                list_index: Some(9),
             },
             HostEvent::Note("compacted: dropped 2".into()),
         ];

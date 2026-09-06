@@ -102,6 +102,9 @@ pub enum Entry {
 /// an animated GIF.
 pub struct DecodedImage {
     pub name: String,
+    pub label: String,
+    pub source: Option<String>,
+    pub list_index: Option<usize>,
     pub size: [usize; 2],
     pub frames: Vec<AnimationFrame>,
 }
@@ -145,6 +148,9 @@ pub fn decode_rgba(bytes: &[u8]) -> Option<DecodedImage> {
         }
         return Some(DecodedImage {
             name: String::new(),
+            label: String::new(),
+            source: None,
+            list_index: None,
             size,
             frames,
         });
@@ -153,6 +159,9 @@ pub fn decode_rgba(bytes: &[u8]) -> Option<DecodedImage> {
     let (w, h) = rgba.dimensions();
     Some(DecodedImage {
         name: String::new(),
+        label: String::new(),
+        source: None,
+        list_index: None,
         size: [w as usize, h as usize],
         frames: vec![AnimationFrame {
             rgba: rgba.into_raw(),
@@ -532,16 +541,40 @@ impl Transcript {
                     answer.truncate(cut);
                 }
             }
-            HostEvent::Image { bytes, name, .. } => match decode_rgba(&bytes) {
+            HostEvent::Image {
+                bytes,
+                name,
+                label,
+                source,
+                list_index,
+                ..
+            } => match decode_rgba(&bytes) {
                 Some(mut img) => {
                     img.name = name;
+                    img.label = if label.trim().is_empty() {
+                        img.name.clone()
+                    } else {
+                        label
+                    };
+                    img.source = source;
+                    img.list_index = list_index;
                     self.entries.push(Entry::Image(img));
                 }
                 // Unknown format: a named placeholder line, never an error
                 // (the artifact exists; this build just doesn't render it).
-                None => self
-                    .entries
-                    .push(Entry::Note(format!("[image {name} — not rendered here]"))),
+                None => {
+                    let label = if label.trim().is_empty() {
+                        name.clone()
+                    } else {
+                        label
+                    };
+                    let caption = list_index
+                        .map(|index| format!("image {index}: {label}"))
+                        .unwrap_or(label);
+                    self.entries.push(Entry::Note(format!(
+                        "[{caption} — {name}; not rendered here]"
+                    )));
+                }
             },
             HostEvent::Note(message) => self.entries.push(Entry::Note(message)),
             HostEvent::Grants { origins, message } => {
@@ -1254,16 +1287,25 @@ mod tests {
             turn_id: 1,
             bytes: png,
             name: "plot.png".into(),
+            label: "Revenue by quarter".into(),
+            source: None,
+            list_index: None,
         });
         t.fold(HostEvent::Image {
             turn_id: 1,
             bytes: jpg,
             name: "photo.jpg".into(),
+            label: "Mandelbrot set".into(),
+            source: Some("https://example.com/mandelbrot.jpg".into()),
+            list_index: Some(9),
         });
         t.fold(HostEvent::Image {
             turn_id: 1,
             bytes: b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(),
             name: "figure.svg".into(),
+            label: "Vector figure".into(),
+            source: None,
+            list_index: None,
         });
 
         match &t.entries[0] {
@@ -1275,7 +1317,14 @@ mod tests {
             }
             _ => panic!("expected a decoded PNG"),
         }
-        assert!(matches!(&t.entries[1], Entry::Image(i) if i.name == "photo.jpg"));
+        assert!(matches!(
+            &t.entries[1],
+            Entry::Image(i)
+                if i.name == "photo.jpg"
+                    && i.label == "Mandelbrot set"
+                    && i.list_index == Some(9)
+                    && i.source.as_deref() == Some("https://example.com/mandelbrot.jpg")
+        ));
         match &t.entries[2] {
             Entry::Note(line) => assert!(line.contains("figure.svg"), "{line}"),
             _ => panic!("unknown format must be a named placeholder note"),

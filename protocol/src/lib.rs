@@ -203,14 +203,20 @@ pub enum HostEvent {
         kind: ToolNoteKind,
         text: String,
     },
-    /// An image artifact the turn produced (a plot render, a fetched image):
-    /// the file's bytes, already read by the host, and its filename. A
-    /// frontend textures/ships them; the terminal frontend may instead open
-    /// the file named in the accompanying `ToolNote`.
+    /// An image artifact the turn produced (a plot render, a fetched image).
+    /// `name` is its machine-facing artifact filename; `label`, `source`, and
+    /// `list_index` are the human identity supplied by the tool. Frontends
+    /// display that identity rather than reconstructing it from model prose.
     Image {
         turn_id: u64,
         bytes: Vec<u8>,
         name: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        list_index: Option<usize>,
     },
     /// The granted-origin set after a grant/revoke/list, with a line for the
     /// transcript (CAP-3 authority is visible history).
@@ -348,6 +354,9 @@ mod tests {
                 turn_id: 1,
                 bytes: vec![0x89, 0x50, 0x4e, 0x47],
                 name: "chart.png".into(),
+                label: "Revenue by quarter".into(),
+                source: Some("https://example.com/chart.png".into()),
+                list_index: Some(3),
             },
             HostEvent::Grants {
                 origins: vec!["https://example.com".into()],
@@ -435,6 +444,25 @@ mod tests {
             let back: HostEvent = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(ev, back, "round-trip mismatch for {json}");
         }
+    }
+
+    #[test]
+    fn image_identity_fields_are_additive_on_the_wire() {
+        // upholds: PROTO-2 — pre-label image events remain readable; current
+        // producers always supply the fields, while an older producer maps to
+        // the filename fallback in each view.
+        let event: HostEvent =
+            serde_json::from_str(r#"{"Image":{"turn_id":1,"bytes":[1,2,3],"name":"old.png"}}"#)
+                .unwrap();
+        assert!(matches!(
+            event,
+            HostEvent::Image {
+                label,
+                source: None,
+                list_index: None,
+                ..
+            } if label.is_empty()
+        ));
     }
 
     #[test]

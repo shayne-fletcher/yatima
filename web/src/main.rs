@@ -423,6 +423,17 @@ mod app {
                                             )
                                             .max_width(max_w),
                                         );
+                                        let caption = match img.list_index {
+                                            Some(number) => {
+                                                format!("image {number} · {}", img.label)
+                                            }
+                                            None => img.label.clone(),
+                                        };
+                                        if let Some(source) = img.source.as_deref() {
+                                            ui.hyperlink_to(caption, source);
+                                        } else {
+                                            ui.weak(caption);
+                                        }
                                     });
                                 }
                                 Entry::Note(text) => {

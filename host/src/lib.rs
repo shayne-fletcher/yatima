@@ -73,7 +73,7 @@ use yatima_lib::{
     AgentEvent, AgentStop, Cancel, Channel as LibChannel, ChatFormat, ChatSession,
     ChildCleanupFailed, Completer, Engine, GenOpts, ImageListing, JsonToolCall, KvDepthRisk,
     LlamaServer, LlamaServerSpawn, ModelSource, MuseAtemCodec, Plot, PlotSandbox, PromptTemplate,
-    QwenToolCall, ReadImage, ReadPage, ReadUrl, Sampling, ServerIdentity, StopReason,
+    QwenToolCall, ReadImage, ReadPage, ReadUrl, Sampling, ServerIdentity, StopReason, ToolArtifact,
     ToolCallCodec, ToolOutcome, Tools, VerifyCancelled, WebOrigins, METAL_KV_VALIDATED,
 };
 
@@ -1297,21 +1297,25 @@ fn web_tools(origins: &WebOrigins) -> Result<Tools> {
     Ok(tools)
 }
 
-/// Read back the image an artifact tool just announced (a plot render, a
-/// fetched image), returning its bytes and filename. The path arrives on the
-/// typed artifact event (IMG-2) — the tool emitted it, so it always points
-/// inside the tool's own sandbox (PLOT-2 / IMG-1) and only ever names an
-/// artifact the user has not seen this session. Format-agnostic — an SVG's
-/// raw bytes pass through; a view that cannot show SVG rasterizes on receipt
-/// (that stays a view concern).
-fn read_artifact(path: &std::path::Path) -> Result<(Vec<u8>, String)> {
-    let bytes = std::fs::read(path)?;
-    let name = path
+/// Read back an artifact tool's announced image and project its machine and
+/// human identities onto the protocol event (IMG-2). Format-agnostic: an
+/// SVG's raw bytes pass through and views decide how to texture them.
+fn read_artifact(turn_id: TurnId, artifact: ToolArtifact) -> Result<HostEvent> {
+    let bytes = std::fs::read(&artifact.path)?;
+    let name = artifact
+        .path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("artifact")
         .to_string();
-    Ok((bytes, name))
+    Ok(HostEvent::Image {
+        turn_id,
+        bytes,
+        name,
+        label: artifact.label,
+        source: artifact.source,
+        list_index: artifact.list_index,
+    })
 }
 
 /// Run one chat turn: stream `turn_streaming`'s raw fragments through the
@@ -1507,19 +1511,24 @@ fn run_agent_turn<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
                 note(kind, text);
                 step_answer.clear();
             }
-            AgentEvent::ToolArtifact(path) => {
+            AgentEvent::Retry(reason) => {
+                if !step_answer.is_empty() {
+                    let narration = std::mem::take(&mut step_answer);
+                    let _ = event_tx.send(HostEvent::RetractAnswer {
+                        turn_id,
+                        chars: narration.chars().count(),
+                    });
+                    fragment(LibChannel::Reasoning, format!("{}\n", narration.trim_end()));
+                }
+                note(ToolNoteKind::Failure, reason);
+            }
+            AgentEvent::ToolArtifact(artifact) => {
                 // IMG-2: the typed artifact event is the display license —
-                // result prose is model-facing only. Every successful
-                // read_image emits one (repeats included): the memo governs
-                // narration, not pixels — a view may have reloaded since
-                // the first showing.
-                match read_artifact(&path) {
-                    Ok((bytes, name)) => {
-                        let _ = event_tx.send(HostEvent::Image {
-                            turn_id,
-                            bytes,
-                            name,
-                        });
+                // result prose is model-facing only. read_image emits for new
+                // bytes, or for the sole explicit repeat path (`again: true`).
+                match read_artifact(turn_id, artifact) {
+                    Ok(event) => {
+                        let _ = event_tx.send(event);
                     }
                     Err(e) => note(ToolNoteKind::Failure, format!("artifact: {e}")),
                 }
@@ -1827,13 +1836,49 @@ mod tests {
         // event's path, never from parsing result prose: a missing file
         // errors; a real file yields its bytes and bare filename (the wire's
         // Image.name).
-        assert!(read_artifact(std::path::Path::new("/nonexistent/x.png")).is_err());
+        assert!(read_artifact(
+            1,
+            ToolArtifact::image(
+                "/nonexistent/x.png",
+                "X",
+                "https://example.com/x.png",
+                Some(4),
+            ),
+        )
+        .is_err());
 
         let path = std::env::temp_dir().join("yatima-host-artifact-test.png");
         std::fs::write(&path, b"PNGDATA").unwrap();
-        let (bytes, name) = read_artifact(&path).unwrap();
+        let event = read_artifact(
+            7,
+            ToolArtifact::image(
+                &path,
+                "Mandelbrot set",
+                "https://example.com/mandelbrot.png",
+                Some(12),
+            ),
+        )
+        .unwrap();
+        let HostEvent::Image {
+            turn_id,
+            bytes,
+            name,
+            label,
+            source,
+            list_index,
+        } = event
+        else {
+            panic!("expected image event");
+        };
+        assert_eq!(turn_id, 7);
         assert_eq!(bytes, b"PNGDATA");
         assert_eq!(name, "yatima-host-artifact-test.png");
+        assert_eq!(label, "Mandelbrot set");
+        assert_eq!(
+            source.as_deref(),
+            Some("https://example.com/mandelbrot.png")
+        );
+        assert_eq!(list_index, Some(12));
         let _ = std::fs::remove_file(&path);
     }
 
