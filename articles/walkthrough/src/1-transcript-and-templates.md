@@ -1,15 +1,14 @@
 # 1. Transcript and templates
 
-This chapter begins with the smallest conversation types in Yatima and follows them through prompt rendering. It reads [`transcript.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/transcript.rs) and [`template.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/template.rs) at commit `d724b9ed2f07b709dff29597ff91f24aff5ac8ad`.
+This chapter begins with Yatima's common conversation data and follows it into a model-native prompt. It reads [`transcript.rs`](https://github.com/shayne-fletcher/yatima/blob/402d34a26bedd9d254e76a51be8c034961e28db1/lib/src/transcript.rs) and [`template.rs`](https://github.com/shayne-fletcher/yatima/blob/402d34a26bedd9d254e76a51be8c034961e28db1/lib/src/template.rs) at commit `402d34a26bedd9d254e76a51be8c034961e28db1`.
 
-The central fact is simple: conversation memory is a list of turns, and a prompt template rebuilds the complete model prompt from that list whenever Yatima asks for another completion. The model engine does not retain the conversation between calls.
+The central fact is simple: conversation memory is structured data. A prompt template renders that data into the syntax expected by one model family and interprets the reply using the matching response protocol. The model backend itself does not remember earlier calls.
 
 ## `transcript.rs`: conversation data
 
-The private `transcript` module defines two public types. `lib.rs` re-exports them as `yatima_lib::Role` and `yatima_lib::Turn`, so callers do not import the private module itself.
+The private `transcript` module defines the public `Role` enum, `Turn` enum, and `ToolArguments` struct. `lib.rs` re-exports all three from the `yatima_lib` crate root.
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     System,
     User,
@@ -17,41 +16,72 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Debug, Clone)]
-pub struct Turn {
-    pub role: Role,
-    pub content: String,
+pub enum Turn {
+    System(String),
+    User(String),
+    Assistant(String),
+    AssistantToolCall {
+        name: String,
+        arguments: ToolArguments,
+    },
+    ToolResult {
+        name: String,
+        content: String,
+        is_error: bool,
+    },
 }
 ```
 
-The `Role` enum says who supplied one piece of transcript text:
+`Role` is the smaller vocabulary needed by code that only asks who supplied a turn. `Turn` retains the data needed to render that turn correctly:
 
-- `System` is an instruction that governs the conversation.
-- `User` is text supplied by the user.
-- `Assistant` is text supplied by the model.
-- `Tool` is the result of a tool call fed back to the model. It is not the request to call a tool; the request is model output and currently remains inside an assistant turn while an agent run is in progress.
+- `System`, `User`, and `Assistant` carry ordinary text.
+- `AssistantToolCall` carries a tool name and structured arguments.
+- `ToolResult` carries the corresponding name, returned text, and success or error status.
 
-The `Turn` struct pairs one role with an owned `String`. A turn has no methods and does not borrow any session or model state. Cloning a turn clones its text.
+This representation prevents several invalid states. A tool invocation cannot exist without a name and arguments, and a tool result cannot lose the name needed by the next prompt. Templates receive these meanings directly; they do not recover them by parsing display strings such as `[read_file ok]`.
 
-There is deliberately no `Transcript` struct in this file. The chat and agent code own their respective `Vec<Turn>` values and decide when to append, roll back, retain, or discard turns. This module supplies their common vocabulary without taking responsibility for session policy.
+The `Turn::role` method maps both assistant variants to `Role::Assistant` and maps `ToolResult` to `Role::Tool`. The `Turn::content` method returns text for ordinary turns and tool results, but returns `None` for a tool call because its payload is structured rather than a single string.
 
-Any code can construct any sequence of turns because both fields are public. The types do not enforce alternation, require a system turn to come first, or prohibit two adjacent user turns. Those rules, where needed, belong to the chat or agent code that owns the list.
+`ToolArguments` owns an ordered list of unique name/value pairs. `try_from_pairs` rejects duplicate parameter names. `from_json_object` converts a JSON object into the same representation, while `to_json_object` converts it back for tool dispatch. Preserving order matters to Muse's ATEM renderer even though dispatch sees an equivalent JSON object.
 
-An assistant turn contains no private reasoning text. The completion is split before the turn is constructed, and only the answer side enters a transcript that may be rendered again. During a tool-using agent run that answer-side text can still contain the model's tool-call syntax. Chapter 2 follows the reasoning split; Chapters 8 and 10 follow tool-call parsing and the agent's working transcript.
+There is no `Transcript` type here. `ChatSession` and `Agent` each own a `Vec<Turn>` and decide when an exchange is committed, rolled back, or discarded. The transcript module defines valid entries; it does not impose session policy or require roles to alternate.
 
-## `template.rs`: model-native prompts
+An `Assistant` turn contains answer text only. Reasoning and protocol framing are removed before construction. `AssistantToolCall` and `ToolResult` are temporary working turns during an agent run; persistent agent history contains completed user and assistant exchanges.
 
-Different instruction-tuned models expect different control tokens and role names. The private `template` module hides those spellings behind the public `PromptTemplate` trait:
+## `template.rs`: both directions of a model protocol
+
+Instruction-tuned models expect particular control tokens, role names, and response framing. The public `PromptTemplate` trait keeps those choices together:
 
 ```rust
 pub trait PromptTemplate {
     fn render(&self, turns: &[Turn]) -> String;
+
+    fn compose_system(&self, system: &str, tool_instructions: &str) -> String;
+    fn classifier(&self) -> ResponseClassifier;
+    fn interpret_response(&self, raw: &str) -> Reasoned;
 }
 ```
 
-The `render` method borrows a template, borrows a slice of turns, and returns a newly allocated prompt string. It does not change the turns or retain state between calls. It returns `String`, not `Result<String>`, because rendering itself has no recoverable error path.
+Only `render` is required. The other methods have defaults suitable for ordinary marker-based formats.
 
-The file defines seven built-in template structs:
+- `render` turns the complete transcript into a fresh prompt ending at the next assistant cue.
+- `compose_system` combines the caller's system instruction with model-facing tool declarations.
+- `classifier` constructs the state machine used to classify streamed fragments as reasoning, answer, or tool protocol material.
+- `interpret_response` performs the final whole-response interpretation used before transcript commit.
+
+Keeping these methods on one trait prevents prompt selection and response interpretation from drifting apart. A Muse prompt must be read as ATEM; a pre-seeded reasoning prompt must begin its response classifier inside reasoning.
+
+The blanket implementation for `Box<T>` forwards every method:
+
+```rust
+impl<T: PromptTemplate + ?Sized> PromptTemplate for Box<T> {
+    // render, compose_system, classifier, and interpret_response all delegate
+}
+```
+
+This lets a runtime-selected `Box<dyn PromptTemplate>` satisfy the generic template parameter of `ChatSession` or `Agent`. Forwarding every method is important: using a default for a boxed Muse template would silently replace its ATEM interpreter with the marker splitter.
+
+The file defines eight built-in template structs:
 
 - `PlainTemplate`
 - `ChatMlTemplate`
@@ -60,158 +90,65 @@ The file defines seven built-in template structs:
 - `MistralTemplate`
 - `GlmTemplate`
 - `DeepSeekTemplate`
+- `MuseGlimmerTemplate`
 
-All seven implement the `PromptTemplate` trait. Other crates may implement the public trait for their own template types, so this is the current built-in set rather than a closed list.
+Downstream crates may implement `PromptTemplate`, so this is the built-in inventory rather than a closed set.
 
-Every implementation performs the same broad operation: visit the supplied turns in order, write each one using the selected model family's syntax, and finish with the cue that tells the model to produce the next assistant message.
+## Marker-based formats
 
-The trait also has this forwarding implementation:
+`ChatMlTemplate` renders Qwen-style blocks and a final assistant cue. Its reasoning variant, `ChatMlThinkTemplate`, adds `<think>` to that cue. Because the prompt has already opened reasoning, the latter overrides both `classifier` and `interpret_response` with their seeded forms.
 
-```rust
-impl<T: PromptTemplate + ?Sized> PromptTemplate for Box<T> {
-    fn render(&self, turns: &[Turn]) -> String {
-        (**self).render(turns)
-    }
-}
-```
+`GemmaTemplate` and `MistralTemplate` fold system text into the first user turn because their prompt formats have no separate system role. `GlmTemplate` emits its required `[gMASK]<sop>` prefix. `DeepSeekTemplate` emits its beginning token and also pre-seeds `<think>`.
 
-This lets `Box<dyn PromptTemplate>` satisfy a `T: PromptTemplate` bound. A host can therefore choose a concrete format at runtime, put that value in a box, and pass the box to a generic `ChatSession` or `Agent`. The box owns the selected template; it does not own the transcript. Yatima's current templates happen to have no fields, but neither the trait nor this implementation requires that.
-
-### Plain text
-
-The `PlainTemplate` struct is the fallback and the simplest implementation. It writes a literal role tag before every turn and then appends an empty assistant tag:
-
-```text
-<|system|>
-Be brief.
-<|user|>
-What is 2 + 2?
-<|assistant|>
-```
-
-This format is useful in tests and when no trained format is known. It is not claimed to be any model family's native chat format, so it is a poor default for a real instruction-tuned model when a specific template is available.
-
-### ChatML and reasoning ChatML
-
-The `ChatMlTemplate` and `ChatMlThinkTemplate` structs share the private `render_chatml` function. System, user, and assistant turns become ordinary ChatML blocks. A tool result is represented as a ChatML user block containing `<tool_response>` markers because that is the shape expected by the Qwen tool protocol.
-
-Both templates end with an assistant cue. `ChatMlThinkTemplate` additionally places `<think>` in that cue. The model therefore begins generating inside a reasoning block and is expected to emit its closing marker. The streaming code must know about that choice so it classifies the output correctly; Chapter 2 explains that stateful side of the arrangement.
-
-### Gemma and Mistral
-
-The `GemmaTemplate` and `MistralTemplate` structs handle models that have no separate system role. Each renderer saves system text in a local `pending_system` value and folds it into the next user turn:
+The renderer sees structured tool turns. For example, a Qwen working transcript can be built without embedding protocol strings in `Turn`:
 
 ```rust
-let content = match pending_system.take() {
-    Some(sys) => format!("{sys}\n\n{}", turn.content),
-    None => turn.content.clone(),
-};
-```
+let arguments = ToolArguments::try_from_pairs([(
+    "path".to_string(),
+    serde_json::Value::String("README.md".to_string()),
+)])?;
 
-For the turns `System("Be brief.")` and `User("hi")`, Gemma receives one user message containing both pieces:
-
-```text
-<start_of_turn>user
-Be brief.
-
-hi<end_of_turn>
-<start_of_turn>model
-```
-
-Mistral performs the same fold but renders it as `[INST] Be brief.\n\nhi[/INST]`; the closing `[/INST]` is also its generation cue. Neither renderer writes its model's beginning-of-sequence token: the corresponding tokenizer adds that token, and writing it here would insert it twice.
-
-These templates are chat-only in Yatima, but for different reasons. Gemma-2-it's native chat format defines only user and model turns; it has no trained syntax for tool declarations, calls, or results. Supporting tools with that model would require an invented prompting convention rather than implementing a missing native protocol. Mistral-7B-Instruct-v0.3 is trained for function calling, but `MistralTemplate` implements only its plain `[INST]` chat format; Yatima has not implemented Mistral's `[AVAILABLE_TOOLS]` and `[TOOL_CALLS]` syntax or a codec for parsing it. Both renderers can place tool-result text in a prompt by treating it like user text, but neither currently supports a complete tool exchange in Yatima. Format selection therefore reports that both are chat-only.
-
-### GLM and DeepSeek
-
-The `GlmTemplate` and `DeepSeekTemplate` structs preserve system text as system text because those formats support it. They also write their required opening token or prefix themselves because their tokenizers do not add it.
-
-GLM maps `Role::Tool` to its `observation` role and ends with an assistant cue. DeepSeek writes system text at the front, renders the other turns with its native markers, and ends with an assistant cue followed by `<think>`. Because that opening marker is already in the prompt, it will not appear in the generated text. The `ReasoningSplitter` struct reads generated text and separates the reasoning from the answer. For DeepSeek it starts in reasoning mode, treats the initial output as reasoning, and switches to the answer when the model emits `</think>`. Chapter 2 explains its implementation.
-
-## One rendering from beginning to end
-
-Suppose a chat session has completed one exchange and the user asks a follow-up question. The session's history can be rendered directly:
-
-```rust
 let turns = vec![
-    Turn {
-        role: Role::User,
-        content: "My name is Ada.".into(),
-    },
-    Turn {
-        role: Role::Assistant,
-        content: "Nice to meet you, Ada.".into(),
-    },
-    Turn {
-        role: Role::User,
-        content: "What is my name?".into(),
-    },
+    Turn::user("Read README.md and name the project."),
+    Turn::assistant_tool_call("read_file", arguments),
+    Turn::tool_result("read_file", "# Yatima", false),
 ];
 
 let prompt = ChatMlTemplate.render(&turns);
 ```
 
-The private `render_chatml` helper function starts with an empty `String` and visits the slice from first turn to last. It writes each turn as a ChatML block, then appends the cue for a new assistant message:
+`ChatMlTemplate` renders the invocation inside `<tool_call>` and the result inside `<tool_response>`. Other templates can render the same typed turns differently.
+
+## Muse Glimmer and ATEM
+
+`MuseGlimmerTemplate` has two fields: a `ReasoningStrength` enum and an optional current date. Unlike the fieldless templates, it carries runtime configuration used during rendering.
+
+Muse uses addressed messages rather than an inline `<think>` span:
 
 ```text
-<|im_start|>user
-My name is Ada.<|im_end|>
-<|im_start|>assistant
-Nice to meet you, Ada.<|im_end|>
-<|im_start|>user
-What is my name?<|im_end|>
-<|im_start|>assistant
+<|start|>assistant to=self<|message|>reasoning<|eom|>
+<|start|>assistant to=user<|message|>answer<|eot|>
 ```
 
-The returned string contains the whole conversation, not only the latest question. The model can answer "Ada" because the earlier user and assistant turns have been placed in its prompt again.
+The bare assistant cue is already present at the end of the prompt, so the first generated header continues that cue. `to=self` carries reasoning, `to=user` carries the surfaced answer, and another recipient names a tool.
 
-An agent uses the same operation after a tool finishes. Assuming its system instructions have already advertised `read_file`, its working transcript might be:
+`MuseGlimmerTemplate::render` writes ordinary transcript turns, assistant tool invocations, and tool results in ATEM syntax. It also adds the model's reasoning-strength directive and recipient list to the system block. `compose_system` places tool declarations in that same native system format.
 
-```rust
-let working_transcript = vec![
-    Turn {
-        role: Role::User,
-        content: "Read README.md and tell me the project name.".into(),
-    },
-    Turn {
-        role: Role::Assistant,
-        content: concat!(
-            "<tool_call>\n",
-            r#"{"name":"read_file","arguments":{"path":"README.md"}}"#,
-            "\n</tool_call>",
-        )
-        .into(),
-    },
-    Turn {
-        role: Role::Tool,
-        content: "[read_file ok] # Yatima".into(),
-    },
-];
+For the reverse direction, `classifier` returns `ResponseClassifier::Atem` and `interpret_response` runs the same `AtemInterpreter` over the completed reply. Chapter 2 opens that interpreter. This symmetry is the practical contract: the type that writes a protocol also selects the code that reads it.
 
-let next_prompt = ChatMlTemplate.render(&working_transcript);
-```
+## Selection and failure
 
-For the `Role::Tool` turn, the `render_chatml` helper function writes a ChatML user block containing:
+The `ChatFormat` enum, introduced in detail later, maps configured formats to these template implementations. A model profile pins a known model to its expected format. Muse's profile additionally supplies its model artifact, generation recipe, and managed `llama-server` requirements.
 
-```text
-<tool_response>
-[read_file ok] # Yatima
-</tool_response>
-```
+Rendering returns `String`, not `Result<String>`. Selecting the wrong format therefore does not fail locally; it sends the model unfamiliar syntax and usually produces poor or malformed output. The profile and frontend resolvers reject contradictory format overrides before that can happen for a pinned profile.
 
-The agent has already parsed the request, executed the tool, and constructed the result turn. The template's only job is to put the enlarged transcript into the syntax Qwen expects. Tool-call parsing and validation belong to the codec examined in Chapter 8.
-
-Nothing in this path can return a Rust error. The practical failure is selecting a format that does not match the model: rendering still succeeds, but the model receives unfamiliar control tokens and may stop following instructions or produce repetitive text. The `ChatFormat` enum maps a configured format to one of these template implementations, while model profiles select a format for known models. Chapter 8 introduces that enum, its mapping, and its tool-support checks.
-
-## Contract for callers
-
-Callers provide an ordered slice of owned transcript entries and choose a template appropriate for the model. In return, the template preserves the supplied history in that model's native syntax and leaves the prompt ready for the model's next assistant output.
-
-The template does not choose itself, validate the transcript, decide whether tools are supported, split generated reasoning, or retain conversation state. Those responsibilities remain with the format, chat, agent, and reasoning code above it.
+Two template rules matter when adding a format. `TMPL-1` requires beginning-of-sequence material to be emitted exactly once between tokenizer and template. `TMPL-2` requires formats without a system role to fold that text into the first user turn.
 
 ## Maintainer checkpoint
 
-- Conversation text is owned by the `Vec<Turn>` inside a chat session or agent run; `transcript.rs` defines the entries but owns no session.
-- `PromptTemplate::render` borrows the complete turn list and returns a fresh prompt string. It is pure and has no error or cancellation path.
-- To add a model's prompt syntax, implement the `PromptTemplate` trait here, then update the `ChatFormat` enum and model profiles described in Chapter 8.
-- Before adding a template, determine whether the tokenizer or the template writes the beginning-of-sequence token (`TMPL-1`) and whether the model supports a system role or needs that text folded into a user turn (`TMPL-2`).
+- `Turn` stores role-specific meanings directly. Do not encode tool identity or success inside display text.
+- A session owns its `Vec<Turn>`; the transcript module owns no conversation.
+- `PromptTemplate` owns prompt rendering, system/tool composition, streaming classifier selection, and final response interpretation for one protocol.
+- Add a marker-based model by implementing its renderer and selecting the correct ordinary or seeded marker classifier.
+- Add an addressed-message model by giving it a protocol interpreter rather than pretending its messages are another reasoning-marker dialect.
+- Preserve `REASON-1`: reasoning, framing, and tool protocol material must not enter the assistant answer committed for the next prompt.

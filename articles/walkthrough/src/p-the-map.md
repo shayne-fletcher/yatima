@@ -1,30 +1,33 @@
 # P. The map
 
-Yatima can be embedded as a Rust library or run through its CLI, terminal UI, desktop GUI, or browser view. This chapter shows where a request goes, which part owns the conversation, where model and tool work happens, and where a maintainer should begin common changes.
+Yatima runs local language models behind one conversation and tool interface. A caller can embed `yatima-lib` directly, use the CLI, or send turns through the shared host from the terminal UI, desktop GUI, or browser. This chapter identifies the principal types and shows where a turn goes.
 
-The chapter describes commit `d724b9ed2f07b709dff29597ff91f24aff5ac8ad`. Later chapters open the implementation one part at a time.
+The chapter describes commit `402d34a26bedd9d254e76a51be8c034961e28db1`. Later chapters open the implementation one file at a time.
 
 ## A frontend turn
 
-The CLI calls `yatima-lib` directly. Turns from the TUI, GUI, and browser all go through `yatima-host`. The `HostRequest` and `HostEvent` enums carry a turn between those frontends and the host. The host owns an instance of the `Engine` struct and handles each turn with either the `ChatSession` struct or the `Agent` struct; both ask for model output through the `Completer` trait. Each arrow below means that the value or request above passes to the step below.
+The `yatima-cli` crate can call `yatima-lib` directly. The TUI, GUI, server, and browser use the `yatima-host` crate. A frontend sends a `HostRequest` enum value and rebuilds its display from `HostEvent` enum values; it does not own a second model session.
+
+In plain English, a hosted turn follows this path:
 
 ```text
-HostRequest::Submit { turn_id, text }
-    -> yatima-host's engine thread
-    -> ChatSession or Agent borrows the Engine
-    -> Engine's Completer implementation runs complete_streaming
-    -> optional tool call and another model step
-    -> HostEvent::Fragment / ToolNote / Done
-    -> frontend updates its display
+frontend submits text
+    -> host backend thread receives it
+    -> ChatSession or Agent renders the conversation
+    -> the selected Completer produces a streamed reply
+    -> an optional tool call starts another model step
+    -> host events update the frontend
 ```
 
-The relevant parts of their declarations are:
+Each arrow means that the step on the left passes work or data to the step on the right. The host backend is either Candle's in-process `Engine` struct or a supervised `LlamaServer` child process. Both implement the `Completer` trait, so chat and agent code do not contain separate conversation loops for the two inference systems.
+
+The relevant declarations are:
 
 ```rust
 pub struct ChatSession<'a, C: Completer, T: PromptTemplate> {
     completer: &'a mut C,
     template: T,
-    // conversation state
+    // options and conversation state
 }
 
 pub struct Agent<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> {
@@ -32,131 +35,99 @@ pub struct Agent<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> {
     tools: &'a Tools,
     codec: K,
     template: T,
-    // conversation state
+    // options and conversation state
 }
 ```
 
-- `C: Completer` means that `C` may be any type implementing the `Completer` trait.
-- In the host, `C` is `Engine`; the `Engine` struct implements `Completer`.
-- Both structs store `&'a mut C`, so they borrow the engine rather than own it. The lifetime `'a` prevents either borrow from outliving the engine.
-- Both own an implementation of the `PromptTemplate` trait as `T`. The `Agent` struct additionally borrows a `Tools` struct and owns an implementation of the `ToolCallCodec` trait as `K`.
-- The `Agent` struct does not implement `Completer` and cannot fill `C`; it is one of the enclosing structs parameterized by `C`.
+- `C: Completer` means that `C` may be any type implementing the `Completer` trait. The host uses its private `HostBackend` enum for `C`; that enum delegates to either `Engine` or `LlamaServer`.
+- Both structs store `&'a mut C`, so they borrow the backend rather than own it. The lifetime `'a` prevents the borrow from outliving the backend.
+- Both own a `T: PromptTemplate`, which renders prompts and interprets replies in one model protocol.
+- The `Agent` struct additionally borrows the allowed `Tools` and owns a `K: ToolCallCodec` that turns model protocol messages into typed tool calls.
 
-The host thread therefore owns the engine instance and the conversation history. A frontend owns only its input and a display built from `HostEvent` values. It may show partial output while a turn is running, but it does not keep a second model session.
-
-A program embedding `yatima-lib` directly takes on that ownership itself. It creates an `Engine` instance, then uses it directly or passes a mutable reference to one of two session structs: `ChatSession` or `Agent`.
+`ChatSession` and `Agent` are siblings; neither contains the other. Both own conversation history and re-render it because a `Completer` call has no implicit memory of earlier prompts.
 
 ## Workspace crates
 
-The workspace is divided by responsibility:
+| Crate | Job |
+|---|---|
+| `yatima-lib` | Model backends, prompt and response protocols, transcript state, capabilities, tools, and agent execution. |
+| `yatima-protocol` | Serializable request and event meanings shared with the browser. |
+| `yatima-text` | Pure output formatting shared by views. |
+| `yatima-host` | The backend thread, authoritative conversation, capability changes, and request/event/control planes. |
+| `yatima-cli` | Command parsing and direct library use. |
+| `yatima-tui`, `yatima-gui` | Native views over the host. |
+| `yatima-serve` | The WebSocket bridge to the host. |
+| `yatima-web` | The WASM browser view and event mirror. |
 
-| Crate | Direct Yatima dependencies | Job |
-|---|---|---|
-| `yatima-lib` | none | Load models, generate text, keep chat history, and run tools and agents. |
-| `yatima-protocol` | none | Define serializable requests and events shared with the browser. |
-| `yatima-text` | none | Prettify output without owning model or session state. |
-| `yatima-host` | `yatima-lib`, `yatima-protocol` | Own the engine thread and conversation used by frontends. |
-| `yatima-cli` | `yatima-lib` | Provide the direct command-line embedding. |
-| `yatima-tui`, `yatima-gui` | `yatima-host`, `yatima-lib`, `yatima-text` | Maintain native user-interface state and render host events. |
-| `yatima-serve` | `yatima-host`, `yatima-lib`, `yatima-protocol` | Carry host requests and events over WebSocket. |
-| `yatima-web` | `yatima-protocol`, `yatima-text` | Render the browser view. |
-
-`yatima-protocol` deliberately knows nothing about `yatima-lib`. The host converts between library values and wire messages, so the browser can use the protocol without compiling Candle or native model code to WASM.
-
-`yatima-web` is excluded from the native Cargo workspace and built separately for the `wasm32` target. The TUI, GUI, and server depend on `yatima-lib` to construct configuration values such as the `GenOpts` and `ModelProfile` structs and to parse origins, but they do not call model decoding directly. Frontend turns still pass through the host protocol.
+`yatima-protocol` knows nothing about native model types. The host converts library events into protocol events, allowing `yatima-web` to compile for WASM without Candle or `llama-server` dependencies.
 
 ## Inside `yatima-lib`
 
-Most names below are Rust modules declared in `lib/src/lib.rs`. Read them in this broad order:
+Most names in this table are private Rust modules declared in `lib/src/lib.rs`:
 
-| Order | Modules | Purpose |
+| Read first | Modules | Purpose |
 |---|---|---|
-| 1. Foundations and helpers | `cancel`, `expr`, `reasoning`, `runtime`, `token_output_stream`, `transcript` | Shared data, pure parsing, cancellation, and runtime support. |
-| 2. Model code | `engine`, `completer`, `template` | Load models, produce completions, and render prompts. |
-| 3a. Configuration | `host` (`lib/src/host/`) | Define model formats, profiles, and sources. This is not the separate `yatima-host` crate. |
-| 3b. Conversations and actions | `capability`, `tool`, `chat`, `agent` | Define permissions, external actions, and conversation state. |
+| Foundations | `cancel`, `expr`, `reasoning`, `runtime`, `token_output_stream`, `transcript` | Shared data, parsing, cancellation, response classification, and runtime support. |
+| Model interface and implementations | `completer`, `engine`, `backend`, `template` | Define the common completion interface, run Candle or `llama-server`, and speak model-native protocols. |
+| Configuration | `host` under `lib/src/host/` | Define formats, profiles, model sources, and generation recipes. This is not the `yatima-host` crate. |
+| Conversations and actions | `capability`, `tool`, `chat`, `agent` | Define authority, external actions, session state, and the model/tool loop. |
 
-The `ModelId` struct and the `models_root` and `model_dir` functions are defined in the crate root rather than in separate modules; they belong with the foundations for dependency purposes. The CLI is a separate crate, and examples are Cargo example targets. Both are callers of `yatima-lib`, not modules inside it.
+Inside the crate, these modules are intended to depend in that direction. Rust does not enforce the ordering between modules in one crate, so `LAYER-1` is a review rule: shared types belong in the lowest module that needs to understand them. The `Turn` enum, for example, lives in `transcript` because templates, chat, and agents all use it.
 
-Model code may import foundations. The configuration and conversation/action groups may import model code and foundations, but they should not import one another. Lower groups must not import higher groups. Rust does not enforce this ordering between modules in one crate, so the [`LAYER-1` law](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/notes/design.md#L112) makes it a review check.
+## Three ways to ask a model
 
-Put a shared type in the lowest-level module that needs to understand it. The `Role` enum and `Turn` struct, for example, live in `transcript` because templates, chat, and agents all use them. Within the conversation-and-tool group, the `capability` module defines permissions and the `tool` module uses them. The `chat` module defines the tool-free `ChatSession` struct; the `agent` module defines the `Agent` struct that combines model completion with tools.
+- `Engine::generate` performs raw generation. It has no transcript or prompt template.
+- `ChatSession::turn` renders stored conversation history, asks one `Completer` for a response, interprets it, and commits a clean answer.
+- `Agent::run` starts from history but may interpret a tool call, execute it under explicit capabilities, and ask the model again before committing a final answer.
 
-## Three ways to use a model
-
-- The `Engine::generate` method sends a raw prompt to the model, passes generated text fragments to a callback, and returns a `Generation` struct containing the token count and stop reason. It has no conversation history or prompt template.
-- The `ChatSession::turn` method renders the stored conversation as a prompt, obtains one completion, and adds the answer to its history.
-- The `Agent::run` method also starts from stored conversation history, but it may run a tool and ask the model again before it reaches a final answer.
-
-The same normal paths can be compared compactly:
+The normal paths can be summarized as follows:
 
 ```text
-direct generation: Prompt -> GeneratedText
-chat session:      Transcript -> rendered Prompt -> Completion -> updated Transcript
-agent run:         Transcript -> (Completion -> ToolCall -> ToolOutcome)* -> Completion -> final answer -> updated Transcript
+generation: prompt -> generated text
+chat:       transcript -> rendered prompt -> reply -> updated transcript
+agent:      transcript -> reply -> zero or more tool rounds -> final answer
 ```
 
-This is a process sketch, not a Rust or Haskell type signature. An arrow means "the step on the left produces the step on the right," and `*` means that the grouped tool round may happen zero or more times. `Completion` and `ToolCall` are structs from the source, and `ToolOutcome` is an enum; `Prompt`, `GeneratedText`, and `Transcript` are descriptive labels, not Rust types. Cancellation, errors, generation metadata, and the agent's step limit are left out of this normal-path summary.
+These are process sketches, not Rust type signatures. Each arrow means “is followed by.”
 
-The `ChatSession` and `Agent` structs are siblings built on the same `Completer` and `PromptTemplate` traits and `Turn` struct; neither is built from the other. Both re-render their stored history because the `Engine` struct does not remember previous prompts.
+## The common model interface
 
-## Model work: the `Completer` trait
+The `Completer` trait is the boundary used by both `ChatSession` and `Agent`. Its asynchronous methods accept a rendered prompt, generation options, and stop strings, then return a `Completion` struct or stream classified fragments.
 
-The [`Completer`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/completer.rs#L88) trait is how chat and agent code ask for model output. Its core method takes a prompt, a `GenOpts` struct, and stop strings, then returns a `Completion` struct:
+`Engine` implements the trait using in-process Candle inference. `LlamaServerCompleter` implements it over loopback HTTP, while `LlamaServer` owns and supervises the corresponding child process and delegates completion to that adapter. A managed Muse profile resolves one exact GGUF, verifies its digest and server properties, starts the child, and reports the verified identity through the host.
 
-```rust
-async fn complete(
-    &mut self,
-    prompt: &str,
-    opts: &GenOpts,
-    stops: &[String],
-) -> Result<Completion>;
-```
+The backend decides how inference runs; conversation code still owns prompts, transcripts, reasoning separation, tool semantics, and commit policy.
 
-The `complete_streaming` trait method adds a token callback and cancellation handle to the same operation. Callers await either method directly, one model step at a time.
+## External actions
 
-The implementation decides how the work runs. The current `Engine` implementation performs Candle's synchronous, mutable decoding on Yatima's blocking path. The returned `Completion` struct contains the generated text and the reason generation stopped.
+A concrete tool implements the `Tool` trait. Its `call` method receives model-supplied JSON arguments and a dispatcher-created `ToolCtx` struct. The tool instance itself holds authority such as an allowed filesystem root or set of web origins. The model supplies arguments, not permission.
 
-This is where a new model backend begins. The `ChatSession` and `Agent` structs are already generic over the `Completer` trait; `yatima-host` still constructs an `Engine` instance, so making a new backend available to frontends also requires changing host ownership and configuration.
-
-## External actions: the `Tool` trait
-
-A tool implements the [`Tool`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/tool.rs#L289) trait. Its `call` method receives model arguments in the `serde_json::Value` type and a dispatcher-created `ToolCtx` struct, then returns text or an error:
-
-```rust
-async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String>;
-```
-
-The tool context carries the call id, cancellation token, and event sender. The tool itself holds any directory, web-origin, plotting, or notification permission it needs. A model cannot grant itself access merely by asking for it.
-
-The `Tools` struct stores the set an agent is allowed to call. It rejects unknown names, starts registered calls as tasks, and records each result as a variant of the `ToolOutcome` enum: `Success`, `Rejected`, `Failed`, `Cancelled`, or `TimedOut`. The runtime uses that full enum; its model-facing form is the smaller `ToolResult` struct.
-
-This is where a new external action begins: define its permission type in the `capability` module, implement the `Tool` trait, and add an instance to the `Tools` struct supplied to an agent.
+The `Tools` struct stores the actions available to one agent. The `ToolCallCodec` trait interprets model-specific request syntax. Qwen uses ChatML tool-call markup; Muse uses addressed ATEM messages. Both become the same typed tool invocation before dispatch.
 
 ## Who owns the state
 
 | Program part | State it keeps |
 |---|---|
-| Direct library caller | Its `Engine`, `ChatSession` or `Agent`, and supplied tools. |
-| `yatima-host` engine thread | The engine, one conversation, active tool permissions, and the current turn. |
-| `yatima-serve` | The WebSocket connection and temporary ownership of the host event receiver, not a second conversation. |
-| Frontend | Input, scroll and selection state, and a display reconstructed from host events. |
+| Direct library caller | Its backend, session or agent, and supplied tools. |
+| `yatima-host` backend thread | One backend, the authoritative conversation, active capabilities, and current turn. |
+| `yatima-serve` | The WebSocket connection and temporary access to host events, not another conversation. |
+| Frontend | Input and display state reconstructed from host events. |
 
-Model calls use the mutable engine one at a time. `ChatSession` or `Agent` owns the conversation kept for later prompts. Tool calls have a shorter task lifecycle. A frontend may disappear and rebuild its display without becoming the owner of either the engine or the conversation.
+The host retains a separate owner handle so shutdown can cancel work, join its thread, and prove that a managed `llama-server` child was reaped. Frontends may disappear or reconnect without becoming owners of model or conversation state.
 
 ## Maintainer checkpoint
 
 | Change | Start here |
 |---|---|
-| Model loading, sampling, or token generation | [`engine.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/engine.rs) |
-| The common model interface or another backend | [`completer.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/completer.rs); then `yatima-host` if frontends must select it |
-| Transcript vocabulary or prompt rendering | [`transcript.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/transcript.rs) and [`template.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/template.rs) |
-| Tool permissions | [`capability.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/capability.rs) |
-| Tool protocol or a concrete external action | [`tool.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/tool.rs) |
-| Chat history and commit policy | [`chat.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/chat.rs) |
-| The model/tool loop | [`agent.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/lib/src/agent.rs) |
-| Frontend session ownership, cancellation, or live grants | [`host/src/lib.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/host/src/lib.rs) |
-| Serializable request or event meaning | [`protocol/src/lib.rs`](https://github.com/shayne-fletcher/yatima/blob/d724b9ed2f07b709dff29597ff91f24aff5ac8ad/protocol/src/lib.rs), with conversion in the host |
-| Display behavior | the relevant frontend, or `yatima-text` for shared pure formatting |
+| Candle model loading or token generation | `lib/src/engine.rs` |
+| Common completion interface | `lib/src/completer.rs` |
+| Managed `llama-server` transport or lifecycle | `lib/src/backend/llama_server.rs` |
+| Transcript vocabulary or model protocol | `lib/src/transcript.rs`, `lib/src/template.rs`, and `lib/src/reasoning.rs` |
+| Model profiles and sources | `lib/src/host/` |
+| Tool permission or implementation | `lib/src/capability.rs` and `lib/src/tool.rs` |
+| Chat or agent commit policy | `lib/src/chat.rs` and `lib/src/agent.rs` |
+| Hosted ownership and event projection | `host/src/lib.rs` |
+| Wire meaning | `protocol/src/lib.rs` |
+| View behavior | the relevant frontend, or `yatima-text` for shared formatting |
 
-The next chapter starts with the lowest shared vocabulary: `Role`, `Turn`, and the templates that turn a transcript into a model prompt.
+The next chapter begins with the common transcript vocabulary and the templates that speak each model's prompt and response protocol.
