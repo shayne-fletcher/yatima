@@ -456,23 +456,7 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
   `read_page` result must not ride along in every later prompt). Interrupted or
   step-exhausted runs persist nothing, so the caller can simply re-ask. One-shot
   use (the CLI) is the fresh-agent-per-run special case.
-- **Hosted by the TUI, authorized at runtime (CAP-3).** Sessions launch with
-  zero web authority — no flag. Authority derives only from user utterances:
-  a URL typed in a message auto-grants its origin for the session
-  (`origins_in` scans *only* user-typed text — a URL inside fetched content
-  mints nothing), and `/grant`, `/grants`, `/revoke` manage the set
-  explicitly. Grants accumulate into a shared, growable `WebOrigins`
-  (CAP-2 generalizes to the origin *set*) held by `read_url`/`read_page`;
-  while empty, the web tools omit themselves from the advertised specs, and
-  once granted their descriptions enumerate the set (CAP-3a — the prompt
-  always states the model's true authority). `/reset` clears conversation,
-  not grants. A tool-trained format serves **one sessionful agent from turn
-  one**: pre-grant, the model sees exactly the no-authority tools (plot) —
-  with zero advertised tools a codec renders zero tool-calling instructions
-  (CAP-3a all the way down) — and a grant surfaces the web tools
-  mid-session. `/grant` mints authority; it is not a mode switch. (The
-  earlier chat→agent transplant is gone: plotting needed no web authority
-  and was hostage to web ceremony.) Chat-only formats keep the plain chat
+- **Hosted by the frontends, authorized at runtime (CAP-3/CAP-4).** Sessions launch with zero granted origins. Only the user adds an origin: a URL typed in a message auto-grants it, proposal controls submit explicit grants, and `/grant`, `/grants`, and `/revoke` manage the set. Search and model output grant nothing. A successfully read page may derive narrower authority for the exact public images in its current listing, including cross-origin images; it never grants the image host or a navigational link, and revoking the source page kills its descendants. Grants accumulate in the shared `WebOrigins` held by the readers; tools without applicable authority stay out of the advertised specs, while a configured `web_search` remains visible because discovery requires no page grant. `/reset` clears conversation, not grants. A tool-trained format serves **one sessionful agent from turn one**; `/grant` changes authority, not mode. Chat-only formats keep the plain chat
   path and refuse grants. Agent decodes **stream** (AGENT-4):
   classified fragments arrive live — reasoning and tool activity on the
   `Reasoning` channel (tool rounds are working matter, so the reasoning pane

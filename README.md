@@ -22,7 +22,7 @@ Yatima keeps model calls in ordinary Rust control flow. It owns prompts, transcr
   <img src="./images/yatima-penrose.png" width="820" alt="yatima-tui mid-turn: a typed URL auto-granted its origin, the read_page tool ran, and the answer is streaming live at 1.4 tok/s">
 </p>
 
-That is one unstaged turn. The URL granted its origin for the session, the model fetched the page through a capability-scoped tool, and the answer streamed live. Fetched content cannot grant new authority.
+That is one unstaged turn. The URL granted its origin for the session, the model fetched the page through a capability-scoped tool, and the answer streamed live. New page origins still need approval; exact public images listed by an approved page may be fetched without a second grant.
 
 <p align="center">
   <img src="./images/yatima-gui.png" width="520" alt="yatima-gui after a settled turn: two Mandelbrot zoom images displayed with their list-number captions, the verified model digest in the status rail, and the turn's latency reported beside the input — baked 45s">
@@ -49,6 +49,7 @@ Managed mode requires `llama-server` on `PATH`. Yatima verifies the model, start
 - Run local models through Candle or llama.cpp behind one `Completer` interface.
 - Use Yatima through the CLI, TUI, native egui app, browser viewer, or embedded in Rust.
 - Chat and run capability-scoped tools. Muse Glimmer's native ATEM protocol works through the CLI, TUI, native GUI, and browser viewer.
+- Search the web, approve proposed sources, and render images discovered on approved pages.
 - Give tools explicit authority such as a directory or a set of web origins.
 - Stream reasoning, answers, and tool status without leaking protocol markup.
 
@@ -56,7 +57,7 @@ The crate registry names the important guarantees, and tests cite the laws they 
 
 ## Documentation
 
-See the [articles](articles/README.md) for user and developer guides. See the [design notes](notes/design.md) for invariants and implementation rationale.
+See the [articles](articles/README.md) for user and developer guides, including the [web-research workflow](articles/web-research.md). See the [design notes](notes/design.md) for invariants and implementation rationale.
 
 ## License
 

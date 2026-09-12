@@ -1,29 +1,16 @@
 # Tools & capabilities
 
-Tools hold their authority. A `ReadFile` tool constructed with a `Dir` can only
-read under that root; `WriteFile` uses a separate `WriteDir`; `ReadUrl` (raw
-body) and `ReadPage` (readable main article from HTML) share a `WebOrigins` —
-a growable **set** of HTTP(S) origins; `SendNotification` is scoped to a
-pre-shared `NtfyTopic`. The model supplies arguments, not authority (CAP-2).
-`Tool` is public and `Tools::with` takes any `impl Tool`, so a consumer crate
-can register its own domain tools.
+Tools hold their authority. A `ReadFile` tool constructed with a `Dir` can only read under that root; `WriteFile` uses a separate `WriteDir`; `ReadUrl` and `ReadPage` share a growable set of HTTP(S) origins; and `SendNotification` is scoped to a pre-shared `NtfyTopic`. `WebSearch` discovers numbered sources but grants no authority. `ReadImage` can use an explicit origin grant or the exact listing derived from an approved page. The model supplies arguments, not authority (CAP-2). `Tool` is public and `Tools::with` takes any `impl Tool`, so a consumer crate can register its own domain tools.
 
-## Runtime grants (CAP-3)
+## Runtime grants (CAP-3 / CAP-4)
 
-Web authority is granted at runtime, and only by **user utterances**: an
-origin enters a session's `WebOrigins` when the user types a URL (the host
-scans user-typed text only) or issues an explicit grant command. Grants
-accumulate — session authority is the union — never persist across sessions,
-and shrink only by explicit revoke. Nothing a tool returns or the model
-generates can reach `WebOrigins::grant`: no such code path exists, so a
-malicious page cannot mint authority.
+Only the user can add an origin to a session's `WebOrigins`: type a URL, approve a proposed origin, or issue an explicit grant command. Grants accumulate for the session, never persist across sessions, and shrink only by explicit revoke. Search results and model output cannot grant an origin.
 
-The prompt always states the model's live authority (CAP-3a): a web tool with
-an empty origin set omits itself from the advertised tool specs — the model
-never sees a tool it cannot use — and once granted, the tool's description
-enumerates its origins. Membership is checked at call time; an out-of-set URL
-is refused before any network I/O, and a relative URL resolves only when
-exactly one origin is granted.
+A successfully read page may confer narrower authority: `read_image {"image": N}` may fetch the exact public image URL published in that page's current image listing, even when the image is hosted elsewhere. This does not grant the image host or permit navigation there. The authority disappears when the source page is revoked or its listing is replaced. Private, loopback, and otherwise non-public derived targets are refused; a user can still grant a local origin explicitly.
+
+The prompt always states the model's live origin grants (CAP-3a). A web reader with no applicable authority is omitted from the advertised tool specs. Membership is checked before network I/O, and every redirect is checked again. A relative URL resolves only when exactly one origin is granted.
+
+For the complete interactive workflow, see [Web research](web-research.md).
 
 ## Fetch-once pagination (FETCH-1 / WIN-1)
 

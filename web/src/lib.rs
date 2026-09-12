@@ -14,9 +14,9 @@
 //! other format renders as a named placeholder line, never an error), grant
 //! management by command or one tap (`/grant`, `/grants`, `/revoke`; a URL
 //! typed in a message auto-grants at the serve edge — CAP-3 — since this
-//! client is protocol-only and cannot scan origins itself; a refusal that
-//! names a missing origin surfaces a grant button — WEB-7) with reports
-//! rendered as notes, no context meter beyond a token count.
+//! client is protocol-only and cannot scan origins itself; the host's typed
+//! grant proposal surfaces approval buttons — WEB-7) with reports rendered
+//! as notes, no context meter beyond a token count.
 //!
 //! # Invariant & law registry
 //!

@@ -1,39 +1,27 @@
 # The TUI
 
-`yatima-tui` is an interactive session over a local model: streaming chat,
-foldable reasoning, and — on tool-trained formats — a web-capable agent whose
-authority you grant at runtime, mid-conversation.
+`yatima-tui` is an interactive session over a local model: streaming chat, foldable reasoning, and, on tool-trained formats, a web-capable agent whose authority you grant at runtime.
 
 ```bash
 cargo run -p yatima-tui --release --features metal -- --profile qwen32b
 ```
 
-No web flags exist. A session starts with **zero** web authority.
+Configure `YATIMA_SEARCH_URL` or `YATIMA_BRAVE_KEY` to add web search. A session still starts with **zero page-reading authority**: search discovers sources but does not approve them.
 
 ## Granting web access (CAP-3)
 
-Web authority derives only from *your* utterances:
+Only you can grant an origin:
 
 - **Type a URL.** `summarize https://en.wikipedia.org/wiki/Roger_Penrose`
   auto-grants `https://en.wikipedia.org` for the session before the turn runs —
   a visible `◆ granted read access…` notice lands in the transcript and the
   status rail shows `web:en.wikipedia.org`.
-- **`/grant <origin>`** is the explicit form; **`/grants`** lists the set;
-  **`/revoke <origin>`** shrinks it.
+- **Approve a proposal.** After a search, Yatima displays numbered source origins. Use **`/grant N`** to approve them individually or **`/grant all`** to approve the set. Once every proposed origin has landed, Yatima retries the original question once.
+- **`/grant <origin>`** is the explicit form; **`/grants`** lists the set; **`/revoke <origin>`** shrinks it.
 
-Grants are origin-scoped (`https://en.wikipedia.org`, path stripped — the path
-is the model's business at call time, the origin is the authority), accumulate
-for the session (the rail shows `web:N origins`), and never persist across
-sessions. Crucially, a URL the model *encounters* — in a fetched page, in its
-own output — grants nothing: there is no code path from content to authority.
-`/reset` clears the conversation but keeps grants; capability is not
-conversation.
+Grants are origin-scoped (`https://en.wikipedia.org`, with the path stripped), accumulate for the session, and never persist across sessions. A page may authorize only the exact public images in its current image listing, including images hosted on another origin; it cannot grant that origin or authorize arbitrary links. `/reset` clears the conversation but keeps grants because capability state is separate from conversation state.
 
-On a tool-capable format the sessionful agent serves from turn one; the
-web tools stay hidden while no origin is granted (CAP-3a), so a grant simply
-surfaces them mid-session — it mints authority, it is not a mode switch. On
-chat-only formats (e.g. the reasoning profiles), grants are refused with a
-clear message — tool calling needs a tool-capable format.
+On a tool-capable format the sessionful agent serves from turn one. Before the first grant, page readers stay hidden; configured search remains available because discovery needs no page authority. A grant changes the tools' authority, not the session mode. On chat-only formats, grants are refused because tool calling needs a tool-capable format.
 
 ## What a tool turn looks like (AGENT-4)
 
@@ -81,8 +69,6 @@ when it doesn't.
 | PgUp / PgDn | scroll the transcript |
 | Ctrl+C twice | quit (Ctrl+D stays an editing key: delete-char) |
 | `/reset` | clear the conversation (grants survive) |
-| `/grant <origin>` · `/grants` · `/revoke <origin>` | manage web authority |
+| `/grant <origin>` · `/grant N` · `/grant all` · `/grants` · `/revoke <origin>` | manage web authority and proposals |
 
-The transcript speakers are your login name and `yatima`; the bottom rail
-carries the machine facts — profile, backend, chat format, context meter,
-granted origins.
+The transcript speakers are your login name and `yatima`; the bottom rail carries the machine facts: profile, backend, chat format, context meter, and granted origins. See [Web research](web-research.md) for search setup and the full authority flow.

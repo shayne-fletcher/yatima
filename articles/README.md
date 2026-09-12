@@ -2,6 +2,7 @@
 
 - [CLI usage](cli.md) - chat, agents, and managed or attached `llama-server` workflows.
 - [The TUI](tui.md) - interactive sessions, runtime grants, streaming, and controls.
+- [Web research](web-research.md) - search, source approval, page reading, images, and recorded scenarios.
 - [Tools and capabilities](capabilities.md) - how tools receive and use authority.
 - [Models and quantization](models.md) - supported model families and weight formats.
 - [Reasoning models](reasoning-models.md) - reasoning channels, templates, and profiles.

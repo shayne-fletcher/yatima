@@ -63,11 +63,7 @@ That command exercises the core path: local model load, prompt rendering, an
 agent turn, a capability-scoped `read_file` tool call under `--root`, and a
 grounded final answer.
 
-The CLI agent also takes `--web-origin <url>` to pre-grant one HTTP(S) origin
-for a one-shot run — the batch shape. For interactive work prefer the
-[TUI](tui.md), where web authority is granted at runtime by simply typing a
-URL (CAP-3), grants accumulate across the session, and long pages stream and
-paginate live.
+The CLI agent also takes `--web-origin <url>` to pre-grant one HTTP(S) origin for a one-shot run. Configure `YATIMA_SEARCH_URL` or `YATIMA_BRAVE_KEY` to add `web_search`; its numbered results can be passed directly to `read_page` and `read_url`, but they grant no reading authority. The one-shot CLI has no proposal controls, so pre-grant the origin the run may read. For interactive source approval, use the [TUI](tui.md), native GUI, or [browser viewer](browser-viewer.md). The complete flow is in [Web research](web-research.md).
 
 ## Generate and chat
 

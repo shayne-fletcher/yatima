@@ -21,11 +21,19 @@ answer pane and replays as reasoning. Cancellation is token-level on both the
 chat and agent paths: a fold `Break` or an external `Cancel` stops the decode
 at the next token, and an interrupted run persists nothing (AGENT-3).
 
-The agent is sessionful (AGENT-3): completed exchanges persist their user turn
-and final answer; tool rounds and reasoning are ephemeral to their run. In the
-TUI, sessions start on the plain streaming chat path and the first origin
-grant transplants the chat history into the agent — both histories are
-user/answer turns, so the switch is invisible.
+The agent is sessionful (AGENT-3): completed exchanges persist their user turn and final answer; tool rounds and reasoning are ephemeral to their run. Tool-capable formats use this path from the first turn. Tools whose authority is empty stay out of the prompt; configured search is available immediately because it discovers sources without granting them.
+
+When the non-final tool-step budget is exhausted, the agent offers the model one final answer-only completion. No tool is advertised or dispatched in that reserve round. This preserves termination without turning a long but useful research run into silence.
+
+## Web research
+
+`WebSearch` discovers sources through a configured SearXNG endpoint or Brave Search. It publishes stable numbered results into a session registry shared by `read_page` and `read_url`, so the model can select `{"result": N}` without copying a URL. Selection is only addressing: the result's origin must still be granted.
+
+After a turn asks for new origins, the host emits one typed `GrantProposal`. The GUI and browser render buttons; the TUI accepts `/grant N` or `/grant all`. Frontends serialize multiple grants and retry the original prompt once after the whole proposed set lands. The host reports every grant and revoke to the model on its next prompt, so model state does not depend on interpreting the UI.
+
+An approved page's current image listing may derive authority for each exact public image it names. The derivation records the source page, survives a cross-origin image host, and dies when the source grant or listing dies. It never inserts the image host into the origin set.
+
+The `yatima-drive` binary runs a line-oriented scenario against the same host and records requests, events, timings, and image artifacts through `yatima-drive`'s asynchronous flight recorder. This makes live failures reproducible without creating a second host path. See [Web research](web-research.md) for usage.
 
 ## Diagnostics
 

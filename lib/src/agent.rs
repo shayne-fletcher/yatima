@@ -169,10 +169,8 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         self.last_prompt_tokens
     }
 
-    /// Seed the session history (builder style) — the transplant a host uses
-    /// when a plain chat session becomes tool-bearing mid-conversation (the
-    /// first origin grant): both histories are user/answer `Turn`s, so the
-    /// seam is invisible (AGENT-3).
+    /// Seed the session history (builder style), for a caller moving an
+    /// existing user/answer conversation into an agent (AGENT-3).
     pub fn with_history(mut self, history: Vec<Turn>) -> Self {
         self.history = history;
         self
@@ -1799,9 +1797,8 @@ mod tests {
 
     #[test]
     fn transplanted_history_seeds_the_next_run() {
-        // upholds: AGENT-3 — a host switching a plain chat to a tool-bearing
-        // agent mid-session (the first origin grant) seeds the agent with the
-        // chat's user/answer turns, and the next run's prompt re-renders them.
+        // upholds: AGENT-3 — an existing user/answer conversation can seed an
+        // agent, and the next run's prompt re-renders those turns.
         let tools = Tools::new();
         let mut model = Scripted::new(&["Blue, as you said."]);
         let prior = vec![

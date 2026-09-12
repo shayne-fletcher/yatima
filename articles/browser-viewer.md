@@ -92,18 +92,13 @@ sequenceDiagram
     S->>H: CancelGate.cancel(turn_id) — trips the gate mid-decode
 ```
 
-## Web authority from a browser (CAP-3)
+## Web research from a browser
 
-Grants work exactly as in the TUI and GUI — authority derives only from
-*your* utterances — with one relocation: the browser client is
-protocol-only and cannot scan for origins itself (`origins_in` lives in
-`yatima-lib`, which never compiles to wasm), so **serve, the browser's
-native edge, owns the auto-grant**. Type a URL in your message and the
-bridge grants its origin before the turn runs; `/grant <origin>`,
-`/grants`, and `/revoke <origin>` are the explicit forms, parsed
-client-side into the protocol's requests. Grant reports come back as
-muted notes in the transcript. A URL the model encounters still grants
-nothing — there is no code path from content to authority.
+Search, proposal chips, grants, page reading, and derived images behave as they do in the native views. Configure `YATIMA_SEARCH_URL` or `YATIMA_BRAVE_KEY` in the `yatima-serve` process. When a turn proposes source origins, the browser renders controls from the typed `GrantProposal` event; it never parses model prose to find them. Approve the origins individually or use **grant all**; after the whole proposed set has landed, the original question retries once.
+
+Only the user adds origins. The browser client is protocol-only and cannot scan text itself, so `yatima-serve` scans user submissions and grants origins from URLs the user typed before forwarding the turn. `/grant <origin>`, `/grants`, and `/revoke <origin>` remain available. An approved page may authorize only the exact public images it lists, not arbitrary links or an entire image host.
+
+See [Web research](web-research.md) for the complete workflow and provider setup.
 
 ## The seam: what a phone actually tests
 

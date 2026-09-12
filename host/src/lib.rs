@@ -1353,8 +1353,9 @@ fn web_tools(origins: &WebOrigins) -> Result<Tools> {
     let listing = ImageListing::default();
     // One search registry per session: web_search publishes stable result
     // ids into it (R1b hands the same instance to the readers). The tool
-    // exists exactly when YATIMA_SEARCH_URL configures an endpoint —
-    // searching finds; reading still requires a grant (CAP-2/CAP-3).
+    // exists when YATIMA_SEARCH_URL configures a SearXNG endpoint or
+    // YATIMA_BRAVE_KEY configures Brave Search — searching finds; reading
+    // still requires a grant (CAP-2/CAP-3).
     let search_registry = SearchRegistry::default();
     let mut tools = Tools::new()
         .with(ReadUrl::new(origins.clone())?.with_search_results(search_registry.clone()))
