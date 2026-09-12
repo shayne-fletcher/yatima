@@ -669,6 +669,7 @@ mod tests {
                 label: "Mandelbrot set".into(),
                 source: Some("https://example.com/mandelbrot.png".into()),
                 list_index: Some(9),
+                derived_from: None,
             },
             HostEvent::Note("compacted: dropped 2".into()),
         ];

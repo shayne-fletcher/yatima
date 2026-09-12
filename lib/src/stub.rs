@@ -64,11 +64,18 @@ pub fn run() -> ! {
     let mut completion_hits = 0usize;
     for stream in listener.incoming() {
         let mut stream = stream.unwrap_or_else(|error| fail(&format!("accept: {error}")));
-        let path = request_path(&mut stream);
+        let (path, request_body) = read_request(&mut stream);
         if path == "/completion" {
             completion_hits += 1;
             std::fs::write(completion_sentinel(model), b"completion requested")
                 .unwrap_or_else(|error| fail(&format!("write completion sentinel: {error}")));
+            // The rendered prompt, per completion, for journey assertions
+            // (e.g. HOST-6: the grant note rides the next prompt).
+            std::fs::write(
+                Path::new(model).with_extension(format!("prompt{completion_hits}")),
+                request_body.as_bytes(),
+            )
+            .unwrap_or_else(|error| fail(&format!("write prompt capture: {error}")));
         }
         match path.as_str() {
             "/health" => {
@@ -147,6 +154,78 @@ pub fn run() -> ! {
                     "muse-tool-round" => sse(&[
                         " to=self<|message|>the fetch was refused; answer from memory<|eom|>",
                         "<|start|>assistant to=user<|message|>the final grounded answer<|eot|>",
+                    ]),
+                    // One search round: call web_search, then answer from
+                    // the results — the R1a shipped-binary composition
+                    // fixture (search mints no read authority, so no page
+                    // fetch follows).
+                    "search-round" if completion_hits == 1 => sse(&[
+                        " to=self<|message|>the user wants findings; search first<|eom|>",
+                        "<|start|>assistant to=web_search<|message|><atem:function_calls>\n",
+                        "<atem:invoke name=\"web_search\">\n<atem:parameter name=\"query\">",
+                        "antikythera mechanism</atem:parameter>\n</atem:invoke>\n",
+                        "</atem:function_calls><|eot|>",
+                    ]),
+                    "search-round" => sse(&[
+                        " to=self<|message|>results in hand; report them<|eom|>",
+                        "<|start|>assistant to=user<|message|>found: the listed pages above<|eot|>",
+                    ]),
+                    // The full research journey (the drive acceptance
+                    // scenario): search and report; then, once granted, a
+                    // 403'd fetch survived in-turn, the good page's images
+                    // listed, one displayed, and a grounded close. The
+                    // fetch URLs arrive by env — the hermetic web stub
+                    // binds an ephemeral port no static arm can know.
+                    "research-journey" if completion_hits == 1 => sse(&[
+                        " to=self<|message|>the user wants writeups; search first<|eom|>",
+                        "<|start|>assistant to=web_search<|message|><atem:function_calls>\n",
+                        "<atem:invoke name=\"web_search\">\n<atem:parameter name=\"query\">",
+                        "antikythera mechanism</atem:parameter>\n</atem:invoke>\n",
+                        "</atem:function_calls><|eot|>",
+                    ]),
+                    "research-journey" if completion_hits == 2 => {
+                        let url = env::var("YATIMA_STUB_PAGE_URL").unwrap_or_default();
+                        let answer = format!(
+                            "<|start|>assistant to=user<|message|>the best writeup is \
+                             {url} — grant its origin to read it<|eot|>"
+                        );
+                        sse(&[
+                            " to=self<|message|>report; reading needs a grant<|eom|>",
+                            &answer,
+                        ])
+                    }
+                    "research-journey" if completion_hits == 3 => {
+                        let url = env::var("YATIMA_STUB_FORBIDDEN_URL").unwrap_or_default();
+                        let invoke = format!(
+                            "<|start|>assistant to=read_page<|message|><atem:function_calls>\n\
+                             <atem:invoke name=\"read_page\">\n<atem:parameter name=\"url\">\
+                             {url}</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>"
+                        );
+                        sse(&[" to=self<|message|>read the first writeup<|eom|>", &invoke])
+                    }
+                    "research-journey" if completion_hits == 4 => {
+                        let url = env::var("YATIMA_STUB_PAGE_URL").unwrap_or_default();
+                        let invoke = format!(
+                            "<|start|>assistant to=read_page<|message|><atem:function_calls>\n\
+                             <atem:invoke name=\"read_page\">\n<atem:parameter name=\"url\">\
+                             {url}</atem:parameter>\n<atem:parameter name=\"images_only\">\
+                             true</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>"
+                        );
+                        sse(&[
+                            " to=self<|message|>that source refused; another has images<|eom|>",
+                            &invoke,
+                        ])
+                    }
+                    "research-journey" if completion_hits == 5 => sse(&[
+                        " to=self<|message|>display the first listed image<|eom|>",
+                        "<|start|>assistant to=read_image<|message|><atem:function_calls>\n",
+                        "<atem:invoke name=\"read_image\">\n<atem:parameter name=\"image\">",
+                        "1</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>",
+                    ]),
+                    "research-journey" => sse(&[
+                        " to=self<|message|>image shown; close the journey<|eom|>",
+                        "<|start|>assistant to=user<|message|>read the writeup and displayed ",
+                        "its first image<|eot|>",
                     ]),
                     _ => sse(&["stub answer"]),
                 };
@@ -234,18 +313,50 @@ fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-fn request_path(stream: &mut TcpStream) -> String {
-    let mut request = [0u8; 16 * 1024];
-    let count = stream
-        .read(&mut request)
-        .unwrap_or_else(|error| fail(&format!("read request: {error}")));
-    let first = String::from_utf8_lossy(&request[..count]);
-    first
+/// Read one request: the path, and the body once content-length is
+/// satisfied (capped) — the body is the rendered prompt, which journey
+/// tests assert on (a `GET` has length 0 and returns immediately).
+fn read_request(stream: &mut TcpStream) -> (String, String) {
+    let mut request: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let count = stream
+            .read(&mut chunk)
+            .unwrap_or_else(|error| fail(&format!("read request: {error}")));
+        if count == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..count]);
+        if let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&request[..head_end]);
+            let need = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if request.len() >= head_end + 4 + need {
+                break;
+            }
+        }
+        if request.len() > 4 * 1024 * 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&request);
+    let path = text
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/")
-        .to_string()
+        .to_string();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (path, body)
 }
 
 fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {

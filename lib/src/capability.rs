@@ -13,7 +13,7 @@
 //! not language-enforced object-capabilities (cf. Eio). We don't hand tools
 //! ambient `std::fs`/`std::process`; the containment below is enforced.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use reqwest::Url;
 use std::path::{Path, PathBuf};
 
@@ -119,7 +119,7 @@ impl WebOrigin {
             // because the model cannot mint authority (CAP-3): its only
             // move is asking the user.
             bail!(
-                "ask the user to grant {} — url escapes web origin {}: {url}",
+                "ask the user to type /grant {} — url escapes web origin {}: {url}",
                 origin_str(&url),
                 self.origin.as_str().trim_end_matches('/')
             );
@@ -206,7 +206,7 @@ impl WebOrigins {
                 // survive the tail clip): the model cannot mint authority,
                 // so the refusal names the exact grant to ask the user for.
                 bail!(
-                    "ask the user to grant {} — url escapes the granted web \
+                    "ask the user to type /grant {} — url escapes the granted web \
                      origins [{}]: {url}",
                     origin_str(&url),
                     set.iter()
@@ -341,7 +341,45 @@ fn parse_ntfy_server(server: &str) -> Result<Url> {
 }
 
 fn parse_origin_url(server: &str, what: &str) -> Result<Url> {
-    let url = Url::parse(server)?;
+    // Users paste origins out of model prose, wrappers and all — shed the
+    // punctuation an origin can never legitimately carry at its edges,
+    // to a fixpoint (wrappers and sentence punctuation alternate:
+    // "(b.example).").
+    let mut server = server.trim();
+    loop {
+        let shed = server
+            .trim_matches(|c: char| "<>()[]{}\"'`".contains(c))
+            .trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        if shed == server {
+            break;
+        }
+        server = shed;
+    }
+    // Users type hosts, not URLs — "/grant en.wikipedia.org" died live
+    // with the parser's raw "relative URL without a base". A scheme-less
+    // utterance defaults to https: a convenience toward the stronger
+    // transport, never a downgrade (http must be asked for by name).
+    let url = if server.contains("://") {
+        Url::parse(server)?
+    } else {
+        let url = Url::parse(&format!("https://{server}")).map_err(|_| {
+            anyhow!("{what} must name a host, like https://example.com — got {server:?}")
+        })?;
+        // The default serves real hosts, not stray prose tokens — "Grant"
+        // is a syntactically valid hostname, and a pasted instruction
+        // block once minted https://grant (taped live). A bare label
+        // needs a dot, a port, an IP, or localhost to be believed.
+        let host = url.host_str().unwrap_or_default();
+        let plausible =
+            host.contains('.') || host == "localhost" || host.contains(':') || url.port().is_some();
+        if !plausible {
+            bail!(
+                "{what} {server:?} does not look like a host — \
+                 for example: https://en.wikipedia.org"
+            );
+        }
+        url
+    };
     match url.scheme() {
         "http" | "https" => {}
         other => bail!("{what} must use http or https, got {other:?}"),
@@ -412,6 +450,50 @@ pub fn origins_in(text: &str) -> Vec<String> {
             continue;
         }
         let origin = origin_str(&url);
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    }
+    out
+}
+
+/// The single producer grammar behind the typed grant proposal (R2 /
+/// WEB-7): canonical ASCII origins extracted from model prose or a tool
+/// refusal — the host emits these on `HostEvent::GrantProposal`, and no
+/// frontend ever parses prose for origins itself. Strictly stricter than
+/// [`origins_in`] (which scans the *user's own* text): here the text is
+/// model-influenced, so anything non-canonical or visually deceptive is
+/// dropped at the producer — non-ASCII hosts (punycode stays punycode
+/// because `Url` renders it so; a raw unicode confusable never survives
+/// to a clickable control), userinfo, non-web schemes, and hosts with no
+/// dot. Extraction adds no authority: a proposal is rendered, and only
+/// the user's tap grants (CAP-3).
+pub fn proposed_origins(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let Some(at) = word.find("http://").or_else(|| word.find("https://")) else {
+            continue;
+        };
+        let candidate =
+            word[at..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'', '>']);
+        let Ok(url) = Url::parse(candidate) else {
+            continue;
+        };
+        let Some(host) = url.host_str() else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || !host.is_ascii()
+            || !host.contains('.')
+        {
+            continue;
+        }
+        let origin = origin_str(&url);
+        if !origin.is_ascii() {
+            continue;
+        }
         if !out.contains(&origin) {
             out.push(origin);
         }
@@ -491,7 +573,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("ask the user to grant https://upload.wikimedia.org"),
+            err.contains("ask the user to type /grant https://upload.wikimedia.org"),
             "{err}"
         );
         // The single-capability form teaches the same way.
@@ -501,9 +583,62 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("ask the user to grant https://b.example:8443"),
+            err.contains("ask the user to type /grant https://b.example:8443"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn grants_accept_what_users_actually_type() {
+        // A scheme-less host defaults to https (taped live: "/grant
+        // en.wikipedia.org" died on the parser's raw "relative URL
+        // without a base"), pasted wrappers and punctuation shed, and the
+        // failure that remains teaches the shape instead of quoting the
+        // parser. https-only defaulting: http is never inferred.
+        let set = WebOrigins::new();
+        assert!(set.grant("en.wikipedia.org").unwrap());
+        assert!(
+            !set.grant("https://en.wikipedia.org").unwrap(),
+            "the scheme-less grant and its https twin are the same origin"
+        );
+        assert!(set.grant("\"https://a.example\",").unwrap());
+        assert!(set.grant("(b.example:8443).").unwrap());
+        assert_eq!(
+            set.list(),
+            [
+                "https://en.wikipedia.org",
+                "https://a.example",
+                "https://b.example:8443"
+            ]
+        );
+        let err = WebOrigins::new()
+            .grant("not a url")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https://example.com"), "{err}");
+    }
+
+    #[test]
+    fn proposed_origins_admit_canonical_ascii_web_origins_only() {
+        // upholds: WEB-7 (producer side, R2) — model-influenced text
+        // yields only canonical ASCII origins fit for a clickable chip:
+        // userinfo, non-web schemes, dotless hosts dropped; a unicode
+        // host canonicalizes to visible punycode (never a confusable);
+        // origins dedupe in first-seen order.
+        let text = "Read https://en.wikipedia.org/wiki/X then \
+                    http://a.example:8080/y; skip https://user:pw@evil.example/, \
+                    ftp://files.example/z, https://localhost/x, and \
+                    https://en.wikipedia.org/wiki/Other (same origin).";
+        assert_eq!(
+            proposed_origins(text),
+            ["https://en.wikipedia.org", "http://a.example:8080"]
+        );
+        assert_eq!(
+            proposed_origins("see https://bücher.example/x"),
+            ["https://xn--bcher-kva.example"],
+            "unicode hosts render as punycode, never as confusable glyphs"
+        );
+        assert!(proposed_origins("no urls here, just prose").is_empty());
     }
 
     #[test]

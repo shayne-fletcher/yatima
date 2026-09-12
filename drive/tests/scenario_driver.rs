@@ -140,7 +140,7 @@ async fn happy_path_orders_both_planes_and_accounts_the_run() {
     let origin = header["meta"]["origin"].as_str().unwrap();
     assert!(origin.starts_with("yatima-drive "), "{origin}");
     assert_eq!(header["meta"]["model"], "stub-muse");
-    assert_eq!(header["meta"]["notes"]["agent_max_steps"], "12");
+    assert_eq!(header["meta"]["notes"]["agent_max_steps"], "16");
     assert_eq!(
         header["meta"]["notes"]["git_describe"], "battery-provenance",
         "invoker-supplied provenance rides the header verbatim"
@@ -343,6 +343,380 @@ async fn startup_failure_after_the_recorder_exits_1_with_a_summary() {
     assert!(!stub_children_alive(dir.path()).await, "child reaped");
 }
 
+/// A one-shot hermetic SearXNG-shaped endpoint: std TCP, no dependencies —
+/// answers every GET with one fixed JSON result set, then keeps serving
+/// until dropped via the returned shutdown flag.
+fn searxng_stub() -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind searxng stub");
+    let addr = listener.local_addr().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    listener.set_nonblocking(true).ok();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let body = r#"{"results":[{"title":"Antikythera mechanism","url":"https://en.example/wiki/Antikythera","content":"an ancient analog computer"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        while !stop_thread.load(std::sync::atomic::Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    });
+    (format!("http://{addr}/search"), stop)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shipped_binary_composes_search_without_minting_authority() {
+    // upholds: CAP-2/CAP-3 (R1a) — the real binary, an env-injected
+    // hermetic endpoint, and a scripted model: the tape shows the search
+    // call succeed, and no result page is ever requested (nothing was
+    // granted, and the found origin resolves nowhere in this sandbox).
+    let _serial = SESSION.lock().await;
+    let (endpoint, stop) = searxng_stub();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("search-round.gguf"), b"stub").unwrap();
+    let scenario_path = dir.path().join("scenario.txt");
+    std::fs::write(
+        &scenario_path,
+        "find me writeups on the antikythera mechanism\n",
+    )
+    .unwrap();
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_yatima-drive"))
+        .arg(&scenario_path)
+        .arg("--tape")
+        .arg(dir.path().join("run"))
+        .env("YATIMA_DRIVE_TEST_STUB_DIR", dir.path())
+        .env(
+            "YATIMA_DRIVE_TEST_STUB_BIN",
+            env!("CARGO_BIN_EXE_llama-server-stub-drive"),
+        )
+        .env("YATIMA_GIT_DESCRIBE", "battery-provenance")
+        .env("YATIMA_SEARCH_URL", &endpoint)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn yatima-drive");
+    let output = tokio::time::timeout(WITHIN, child.wait_with_output())
+        .await
+        .expect("bounded exit")
+        .expect("collect output");
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_dir = PathBuf::from(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .expect("run dir on stdout"),
+    );
+    let lines = tape_lines(&run_dir);
+    let notes: Vec<(String, String)> = lines
+        .iter()
+        .filter_map(|l| {
+            let note = &l["event"]["ToolNote"];
+            Some((
+                note["kind"].as_str()?.to_string(),
+                note["text"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let call_at = notes
+        .iter()
+        .position(|(k, t)| k == "Call" && t.contains("web_search"))
+        .unwrap_or_else(|| panic!("the search call is on the tape: {notes:?}"));
+    assert!(
+        matches!(notes.get(call_at + 1), Some((k, _)) if k == "Success"),
+        "the search succeeded (long results summarize as a char count): {notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|(k, _)| k == "Failure"),
+        "no tool failed: {notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|(_, t)| t.contains("read_page")),
+        "no page fetch followed — searching mints no authority: {notes:?}"
+    );
+    assert!(!stub_children_alive(dir.path()).await, "child reaped");
+}
+
+/// The journey's whole hermetic web: search endpoint, a 403-serving page,
+/// a readable article with one image, and the image itself — one origin,
+/// one listener, ephemeral port. std TCP, no dependencies.
+fn journey_web_stub() -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind journey stub");
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let search_body = format!(
+        r#"{{"results":[
+            {{"title":"Antikythera overview","url":"{origin}/forbidden","content":"a refusing source"}},
+            {{"title":"Antikythera fragments","url":"{origin}/wiki/Antikythera","content":"an ancient analog computer"}}
+        ]}}"#
+    );
+    listener.set_nonblocking(true).ok();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        while !stop_thread.load(std::sync::atomic::Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // The accepted stream inherits the listener's
+                    // non-blocking mode (observed: an early read saw zero
+                    // bytes and routed a real request to 404); force
+                    // blocking and read until the request line is whole.
+                    stream.set_nonblocking(false).ok();
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => buf.extend_from_slice(&chunk[..count]),
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&buf)
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+                        .unwrap_or_default();
+                    let (status, content_type, body) = match path.split('?').next() {
+                        Some("/search") => ("200 OK", "application/json", search_body.clone()),
+                        Some("/forbidden") => {
+                            ("403 Forbidden", "text/plain", "bots begone".to_string())
+                        }
+                        Some("/wiki/Antikythera") => (
+                            "200 OK",
+                            "text/html",
+                            "<html><body><article><h1>Antikythera mechanism</h1>\
+                             <p>An ancient Greek analog computer recovered from a wreck.</p>\
+                             <img src=\"/img/fragment.svg\" alt=\"the largest fragment\">\
+                             </article></body></html>"
+                                .to_string(),
+                        ),
+                        Some("/img/fragment.svg") => (
+                            "200 OK",
+                            "image/svg+xml",
+                            "<svg xmlns=\"http://www.w3.org/2000/svg\" \
+                             width=\"4\" height=\"4\"/>"
+                                .to_string(),
+                        ),
+                        _ => ("404 Not Found", "text/plain", "no such page".to_string()),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    });
+    (origin, stop)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_research_journey_survives_a_403_and_displays_an_image() {
+    // The acceptance harness for the whole web-research journey (fast and
+    // hermetic): search → report → user grants → a 403'd fetch survived
+    // IN-TURN with the redirecting ERR-1 error (never a grant beg) → the
+    // good page's images listed → one displayed → grounded close. Also
+    // witnesses HOST-6 end to end: the grant note rides the model's next
+    // prompt through the shipped binary.
+    let _serial = SESSION.lock().await;
+    let (origin, stop) = journey_web_stub();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("research-journey.gguf"), b"stub").unwrap();
+    let scenario_path = dir.path().join("scenario.txt");
+    std::fs::write(
+        &scenario_path,
+        format!(
+            "find me good writeups on the antikythera mechanism\n\
+             /grant {origin}\n\
+             read the first writeup and show me an image from it\n"
+        ),
+    )
+    .unwrap();
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_yatima-drive"))
+        .arg(&scenario_path)
+        .arg("--tape")
+        .arg(dir.path().join("run"))
+        .env("YATIMA_DRIVE_TEST_STUB_DIR", dir.path())
+        .env(
+            "YATIMA_DRIVE_TEST_STUB_BIN",
+            env!("CARGO_BIN_EXE_llama-server-stub-drive"),
+        )
+        .env("YATIMA_GIT_DESCRIBE", "battery-provenance")
+        .env("YATIMA_SEARCH_URL", format!("{origin}/search"))
+        .env("YATIMA_STUB_FORBIDDEN_URL", format!("{origin}/forbidden"))
+        .env("YATIMA_STUB_PAGE_URL", format!("{origin}/wiki/Antikythera"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn yatima-drive");
+    let output = tokio::time::timeout(WITHIN, child.wait_with_output())
+        .await
+        .expect("bounded exit")
+        .expect("collect output");
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_dir = PathBuf::from(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .expect("run dir on stdout"),
+    );
+    let lines = tape_lines(&run_dir);
+    let notes: Vec<(String, String)> = lines
+        .iter()
+        .filter_map(|l| {
+            let note = &l["event"]["ToolNote"];
+            Some((
+                note["kind"].as_str()?.to_string(),
+                note["text"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    let position = |pred: &dyn Fn(&(String, String)) -> bool| {
+        notes
+            .iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("expected note missing: {notes:?}"))
+    };
+    let search = position(&|(k, t)| k == "Call" && t.contains("web_search"));
+    assert!(matches!(&notes[search + 1], (k, _) if k == "Success"));
+    // The 403 leg: the failure is the redirecting ERR-1 error, and it
+    // never suggests granting.
+    let refused = position(&|(k, t)| k == "Failure" && t.contains("/forbidden"));
+    assert!(
+        notes[refused]
+            .1
+            .contains("the origin is granted, but the server refused")
+            && notes[refused].1.contains("HTTP 403"),
+        "{}",
+        notes[refused].1
+    );
+    assert!(
+        !notes[refused].1.contains("/grant"),
+        "a server refusal must not beg: {}",
+        notes[refused].1
+    );
+    // The journey continues in the same turn: article images, then the
+    // display.
+    let listing =
+        position(&|(k, t)| k == "Call" && t.contains("read_page") && t.contains("images_only"));
+    assert!(matches!(&notes[listing + 1], (k, _) if k == "Success"));
+    let display = position(&|(k, t)| k == "Call" && t.contains("read_image"));
+    assert!(
+        matches!(&notes[display + 1], (k, _) if k == "Success"),
+        "{notes:?}"
+    );
+    assert!(search < refused && refused < listing && listing < display);
+    assert_eq!(
+        notes.iter().filter(|(k, _)| k == "Failure").count(),
+        1,
+        "the 403 is the only failure: {notes:?}"
+    );
+    assert!(
+        !event_seqs(&lines, "Image").is_empty(),
+        "the displayed image rides the tape as a typed artifact event"
+    );
+    // R2, end to end: the settled search turn's answer named the page
+    // URL, so the host emitted its typed GrantProposal (canonical origin,
+    // no prose parse) ahead of the user's Grant request on the tape.
+    let proposals = event_seqs(&lines, "GrantProposal");
+    let grants = request_seqs(&lines, "Grant");
+    assert!(
+        !proposals.is_empty(),
+        "the typed proposal rides the tape: {lines:?}"
+    );
+    assert!(
+        proposals[0] < grants[0],
+        "propose, then the user's tap/command grants"
+    );
+    let proposed_origin = lines
+        .iter()
+        .find_map(|l| l["event"]["GrantProposal"]["origins"][0].as_str())
+        .expect("proposal carries origins");
+    assert!(
+        origin.starts_with(proposed_origin),
+        "the proposal names the page origin: {proposed_origin} vs {origin}"
+    );
+
+    // R4's deterministic acceptance order, on the shipped binary's tape:
+    // search → GrantProposal(A) → Grant(A) → read_page(A) → derived
+    // image(B) → displayed — with no request to A before its grant, no
+    // grant for B ever, and the tape's Image record carrying the CAP-4
+    // derivation edge back to the granted page.
+    let search_seq = lines
+        .iter()
+        .find(|l| {
+            l["event"]["ToolNote"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("web_search"))
+        })
+        .and_then(|l| l["seq"].as_u64())
+        .expect("search on tape");
+    let first_read_seq = lines
+        .iter()
+        .find(|l| {
+            l["event"]["ToolNote"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("read_page"))
+        })
+        .and_then(|l| l["seq"].as_u64())
+        .expect("read_page on tape");
+    assert!(
+        search_seq < proposals[0] && proposals[0] < grants[0] && grants[0] < first_read_seq,
+        "search → proposal → grant → read, in tape order"
+    );
+    // (Cross-origin derivation — an image host that is never granted —
+    // is witnessed at the lib layer, where the loopback test seam is
+    // cfg(test)-only; no shipped binary carries a CAP-4 switch.)
+    let image_record = lines
+        .iter()
+        .find(|l| !l["event"]["Image"].is_null())
+        .expect("the displayed image rides the tape");
+    assert_eq!(
+        image_record["event"]["Image"]["derived_from"]
+            .as_str()
+            .unwrap_or_default(),
+        format!("{origin}/wiki/Antikythera"),
+        "the CAP-4 derivation edge is recorded beside the image identity"
+    );
+
+    // HOST-6, end to end: the second turn's first completion prompt
+    // carries the grant note the host queued for the model.
+    let prompt3 = std::fs::read_to_string(dir.path().join("research-journey.prompt3"))
+        .expect("the stub captured turn 2's prompt");
+    assert!(
+        prompt3.contains("the user granted read access to"),
+        "the grant note reaches the model's next prompt: {prompt3}"
+    );
+    assert!(!stub_children_alive(dir.path()).await, "child reaped");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sigint_mid_turn_interrupts_cleanly() {
     // upholds: CANCEL-1 / HOST-3 / TAPE-1 — the cooperative interrupt
@@ -396,6 +770,220 @@ async fn sigint_mid_turn_interrupts_cleanly() {
         request_seqs(&lines, "Shutdown").len(),
         1,
         "recorded shutdown"
+    );
+    assert!(!stub_children_alive(dir.path()).await, "child reaped");
+}
+
+/// The R4 hermetic two-origin web: page host A (search, 403 route,
+/// article) and a separate image host B the article embeds — B is never
+/// granted, so a displayed image proves CAP-4 derivation through the
+/// shipped binary. Feature-gated with the seam it needs.
+#[cfg(feature = "hermetic-acceptance")]
+fn r4_web_stub() -> (
+    String,
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::{Read, Write};
+    let serve = |listener: std::net::TcpListener,
+                 stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+                 route: Box<dyn Fn(&str) -> (String, String, String) + Send>| {
+        listener.set_nonblocking(true).ok();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => buf.extend_from_slice(&chunk[..count]),
+                            }
+                        }
+                        let path = String::from_utf8_lossy(&buf)
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+                            .unwrap_or_default();
+                        let (status, content_type, body) =
+                            route(path.split('?').next().unwrap_or(""));
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\n\
+                                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+    };
+    let page_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind page stub");
+    let origin = format!("http://{}", page_listener.local_addr().unwrap());
+    let image_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind image stub");
+    let image_origin = format!("http://{}", image_listener.local_addr().unwrap());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let search_body = format!(
+        r#"{{"results":[{{"title":"Antikythera fragments","url":"{origin}/wiki/Antikythera","content":"an ancient analog computer"}}]}}"#
+    );
+    let page_html = format!(
+        "<html><body><article><h1>Antikythera mechanism</h1>\
+         <p>An ancient Greek analog computer recovered from a wreck.</p>\
+         <img src=\"{image_origin}/img/fragment.svg\" alt=\"the largest fragment\">\
+         </article></body></html>"
+    );
+    serve(
+        page_listener,
+        stop.clone(),
+        Box::new(move |path| match path {
+            "/search" => (
+                "200 OK".into(),
+                "application/json".into(),
+                search_body.clone(),
+            ),
+            "/forbidden" => (
+                "403 Forbidden".into(),
+                "text/plain".into(),
+                "bots begone".into(),
+            ),
+            "/wiki/Antikythera" => ("200 OK".into(), "text/html".into(), page_html.clone()),
+            _ => (
+                "404 Not Found".into(),
+                "text/plain".into(),
+                "no such page".into(),
+            ),
+        }),
+    );
+    serve(
+        image_listener,
+        stop.clone(),
+        Box::new(|_| {
+            (
+                "200 OK".into(),
+                "image/svg+xml".into(),
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\"/>".into(),
+            )
+        }),
+    );
+    (origin, image_origin, stop)
+}
+
+/// R4's deterministic cross-origin acceptance (feature-built, per the
+/// contract): the shipped binary composes `web_search → GrantProposal(A)
+/// → Grant(A) → read_page(A) → derived image from ungranted origin B →
+/// displayed`, in tape order, with no grant for B ever and the CAP-4
+/// derivation edge recorded. The seam admitting loopback derivation is
+/// compiled in ONLY under this feature chain; an ordinary build has no
+/// such branch (`environment_cannot_weaken_cap4_in_the_shipped_toolset`).
+/// Run: cargo test -p yatima-drive --features hermetic-acceptance
+#[cfg(feature = "hermetic-acceptance")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_r4_deterministic_acceptance_composes_cross_origin_derivation() {
+    let _serial = SESSION.lock().await;
+    let (origin, image_origin, stop) = r4_web_stub();
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("research-journey.gguf"), b"stub").unwrap();
+    let scenario_path = dir.path().join("scenario.txt");
+    std::fs::write(
+        &scenario_path,
+        format!(
+            "find me good writeups on the antikythera mechanism\n\
+             /grant {origin}\n\
+             read the first writeup and show me an image from it\n"
+        ),
+    )
+    .unwrap();
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_yatima-drive"))
+        .arg(&scenario_path)
+        .arg("--tape")
+        .arg(dir.path().join("run"))
+        .env("YATIMA_DRIVE_TEST_STUB_DIR", dir.path())
+        .env(
+            "YATIMA_DRIVE_TEST_STUB_BIN",
+            env!("CARGO_BIN_EXE_llama-server-stub-drive"),
+        )
+        .env("YATIMA_GIT_DESCRIBE", "battery-provenance")
+        .env("YATIMA_SEARCH_URL", format!("{origin}/search"))
+        .env("YATIMA_STUB_FORBIDDEN_URL", format!("{origin}/forbidden"))
+        .env("YATIMA_STUB_PAGE_URL", format!("{origin}/wiki/Antikythera"))
+        .env("YATIMA_TEST_ALLOW_LOOPBACK_DERIVATION", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn yatima-drive");
+    let output = tokio::time::timeout(WITHIN, child.wait_with_output())
+        .await
+        .expect("bounded exit")
+        .expect("collect output");
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_dir = PathBuf::from(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .expect("run dir on stdout"),
+    );
+    let lines = tape_lines(&run_dir);
+    let search_seq = lines
+        .iter()
+        .find(|l| {
+            l["event"]["ToolNote"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("web_search"))
+        })
+        .and_then(|l| l["seq"].as_u64())
+        .expect("search on tape");
+    let proposals = event_seqs(&lines, "GrantProposal");
+    let grants = request_seqs(&lines, "Grant");
+    let first_read_seq = lines
+        .iter()
+        .find(|l| {
+            l["event"]["ToolNote"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("read_page"))
+        })
+        .and_then(|l| l["seq"].as_u64())
+        .expect("read_page on tape");
+    assert!(
+        search_seq < proposals[0] && proposals[0] < grants[0] && grants[0] < first_read_seq,
+        "search → proposal → grant → read, in tape order"
+    );
+    assert!(
+        !lines.iter().any(|l| {
+            l["request"]["Grant"]["origin"]
+                .as_str()
+                .is_some_and(|o| o.starts_with(&image_origin))
+        }),
+        "the image host is never granted — derivation, not authority"
+    );
+    let image_record = lines
+        .iter()
+        .find(|l| !l["event"]["Image"].is_null())
+        .expect("the cross-origin derived image rides the tape");
+    assert!(
+        image_record["event"]["Image"]["source"]
+            .as_str()
+            .is_some_and(|s| s.starts_with(&image_origin)),
+        "the displayed bytes came from ungranted origin B"
+    );
+    assert_eq!(
+        image_record["event"]["Image"]["derived_from"]
+            .as_str()
+            .unwrap_or_default(),
+        format!("{origin}/wiki/Antikythera"),
+        "the CAP-4 derivation edge is recorded beside the image identity"
     );
     assert!(!stub_children_alive(dir.path()).await, "child reaped");
 }

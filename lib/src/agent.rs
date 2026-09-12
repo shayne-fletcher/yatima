@@ -3,7 +3,12 @@
 //! One level up from `generate_with` (which folds *tokens* into a value), the
 //! agent folds *turns*: the model emits a tool call, a capability-scoped tool
 //! runs, its result is fed back, and the loop repeats until the model answers or
-//! `max_steps` is reached. [`Agent::run`] collects the final answer;
+//! `max_steps` is reached. Exhausting the budget is not silence: one final
+//! RESERVE completion runs after an appended user-plane `[host]` control
+//! turn says to answer now (the prompt prefix stays intact) — an answer
+//! there commits as an ordinary `Final`, while another tool call ends the
+//! run `MaxSteps` with nothing dispatched past the budget (witnessed by
+//! `budget_exhaustion_reserves_a_final_answer_round`). [`Agent::run`] collects the final answer;
 //! [`Agent::run_with_async`] is the fold a future actor/TUI streams
 //! [`AgentEvent`]s into. The model turns are sequential, but tool calls are
 //! async tasks: callers can observe starts/progress/results and cancellation
@@ -304,6 +309,15 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         let required_tools = self.tools.required_for(user);
         let mut successful_tools = HashSet::<String>::new();
         let mut requirement_misses = 0usize;
+        let mut impersonation_misses = 0usize;
+        // The budget's last act is an ANSWER, not silence: when the tool
+        // budget runs out, one reserve completion runs after an appended
+        // user-plane [host] control turn says to commit now — a rich
+        // errand once displayed five images and died wordless at
+        // MaxSteps (taped live). A model that calls yet another tool in
+        // the reserve round ends MaxSteps for real, with nothing
+        // dispatched.
+        let mut budget_final_round = false;
         // Seed the working transcript with the session history (AGENT-3): prior
         // exchanges' user/answer turns only — their tool rounds and reasoning
         // were ephemeral to their runs.
@@ -482,6 +496,43 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         ));
                         continue;
                     }
+                    // The requirement gate's dual (IMG-2): an answer that
+                    // *claims* a tool's just-now effect without a successful
+                    // call this turn bounces back with the remedy — call the
+                    // tool, or drop the claim. Capped at two bounces so a
+                    // stubborn model degrades to committing its (flagged-in-
+                    // tape) prose instead of wedging against the step budget.
+                    let impersonated = self.tools.impersonated_effects(reply, &successful_tools);
+                    if !impersonated.is_empty() && impersonation_misses < 2 {
+                        impersonation_misses += 1;
+                        let names = impersonated.join(", ");
+                        let reason = format!(
+                            "final answer withheld: it says a {names} effect just \
+                             happened, but no {names} call succeeded this turn — \
+                             either call {names} now, or restate the answer \
+                             without claiming anything was displayed"
+                        );
+                        match step(acc, AgentEvent::Retry(reason.clone()))? {
+                            ControlFlow::Continue(a) => acc = a,
+                            ControlFlow::Break(a) => {
+                                acc = a;
+                                stop = AgentStop::Stopped;
+                                break;
+                            }
+                        }
+                        steps += 1;
+                        if steps >= self.max_steps {
+                            stop = AgentStop::MaxSteps;
+                            break;
+                        }
+                        transcript[0] = Turn::system(format!(
+                            "{system}\n\nYour previous answer claimed a {names} \
+                             effect that did not happen this turn. Either call \
+                             {names} now, or answer without saying anything was \
+                             displayed."
+                        ));
+                        continue;
+                    }
                     transcript.push(Turn::assistant(reply.clone()));
                     match step(acc, AgentEvent::Final(reply.clone()))? {
                         ControlFlow::Continue(a) | ControlFlow::Break(a) => acc = a,
@@ -494,6 +545,10 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     call,
                     assistant_turn,
                 } => {
+                    if budget_final_round {
+                        stop = AgentStop::MaxSteps;
+                        break;
+                    }
                     transcript.push(assistant_turn);
                     match step(acc, AgentEvent::ToolCall(call.clone()))? {
                         ControlFlow::Continue(a) => acc = a,
@@ -602,14 +657,30 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
 
                     steps += 1;
                     if steps >= self.max_steps {
-                        stop = AgentStop::MaxSteps;
-                        break;
+                        budget_final_round = true;
+                        // Delivered as an APPENDED user-plane turn, not a
+                        // system rewrite: the suffix keeps the KV prefix
+                        // intact (a prefix mutation cost a taped 90-second
+                        // re-prefill) and recency is where a small model
+                        // actually obeys.
+                        transcript.push(Turn::user(
+                            "[host] The tool budget for this turn is \
+                             exhausted. Using only what you already have, \
+                             give the user your final answer now. Do not \
+                             call any tool — a tool call ends the turn \
+                             with no answer.",
+                        ));
+                        continue;
                     }
                 }
                 ToolExtraction::Rejected {
                     transcript: rejection,
                     message,
                 } => {
+                    if budget_final_round {
+                        stop = AgentStop::MaxSteps;
+                        break;
+                    }
                     // upholds: PROTO-1 — protocol rejection dispatches no tool;
                     // its structured turns teach the model how to recover.
                     transcript.extend(rejection);
@@ -624,8 +695,20 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     }
                     steps += 1;
                     if steps >= self.max_steps {
-                        stop = AgentStop::MaxSteps;
-                        break;
+                        budget_final_round = true;
+                        // Delivered as an APPENDED user-plane turn, not a
+                        // system rewrite: the suffix keeps the KV prefix
+                        // intact (a prefix mutation cost a taped 90-second
+                        // re-prefill) and recency is where a small model
+                        // actually obeys.
+                        transcript.push(Turn::user(
+                            "[host] The tool budget for this turn is \
+                             exhausted. Using only what you already have, \
+                             give the user your final answer now. Do not \
+                             call any tool — a tool call ends the turn \
+                             with no answer.",
+                        ));
+                        continue;
                     }
                 }
             }
@@ -845,6 +928,10 @@ mod tests {
             user == "render image"
         }
 
+        fn claims_effect(&self, answer: &str) -> bool {
+            answer.contains("just displayed")
+        }
+
         async fn call(&self, _args: serde_json::Value, _ctx: ToolCtx) -> Result<String> {
             Ok("rendered".to_string())
         }
@@ -954,6 +1041,57 @@ mod tests {
         drop(agent);
         assert!(model.prompts[1].contains("required_action must succeed"));
         assert!(!model.prompts[1].contains("I rendered it without calling anything."));
+    }
+
+    #[test]
+    fn effect_claims_without_a_call_bounce_then_commit_flagged() {
+        // upholds: IMG-2's dual — outside the required-call class ("browse
+        // another page" names no image), an answer claiming a just-now
+        // display with no successful call this turn bounces with the
+        // remedy; the bounce is capped at two, so a stubborn claim
+        // degrades to committing (tape-visible) instead of wedging.
+        let tools = Tools::new().with(RequiredAction);
+        let mut model = Scripted::new(&[
+            "I just displayed image 1 from that list.",
+            "The list is above; say the word and I will display one.",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 6);
+        let (events, run) = agent
+            .run_with("browse another page", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(
+            run.answer,
+            "The list is above; say the word and I will display one."
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Retry(_)))
+                .count(),
+            1
+        );
+
+        // The cap: three straight claims commit the third, still Final.
+        let tools = Tools::new().with(RequiredAction);
+        let mut model = Scripted::new(&[
+            "I just displayed it.",
+            "I just displayed it again, honest.",
+            "I just displayed it, final offer.",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 6);
+        let (_, run) = agent
+            .run_with(
+                "browse another page",
+                Vec::<AgentEvent>::new(),
+                |events, _| Ok(ControlFlow::Continue(events)),
+            )
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.answer, "I just displayed it, final offer.");
     }
 
     #[test]
@@ -1715,7 +1853,10 @@ mod tests {
         let tmp = tmp_with_file("note.txt", "x");
         let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
         let looping = call("read_file", "note.txt");
-        let mut model = Scripted::new(&[&looping, &looping, "Done: x."]);
+        // Three straight tool calls: the reserve answer round is offered
+        // and refused (the third call), so the run ends MaxSteps with
+        // nothing dispatched past the budget.
+        let mut model = Scripted::new(&[&looping, &looping, &looping, "Done: x."]);
         let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 2);
 
         let run1 = agent.run("read forever").unwrap();
@@ -1728,6 +1869,36 @@ mod tests {
 
         agent.reset();
         assert!(agent.history().is_empty());
+    }
+
+    #[test]
+    fn budget_exhaustion_reserves_a_final_answer_round() {
+        // The budget's last act is an answer, not silence (taped live: a
+        // rich errand displayed five images and died wordless at
+        // MaxSteps). When the tool budget runs out, one reserve
+        // completion runs after an appended user-plane [host] control
+        // turn; an answer there commits as an ordinary Final — while a
+        // model that calls yet another tool ends MaxSteps with nothing
+        // dispatched (witnessed in
+        // `interrupted_runs_leave_history_untouched`).
+        let tmp = tmp_with_file("note.txt", "x");
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let looping = call("read_file", "note.txt");
+        let mut model = Scripted::new(&[&looping, &looping, "All done: x."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 2);
+        let run = agent.run("read twice then report").unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(run.answer, "All done: x.");
+        assert_eq!(run.steps, 2, "the reserve round spends no tool step");
+        drop(agent);
+        assert!(
+            model
+                .prompts
+                .last()
+                .unwrap()
+                .contains("The tool budget for this turn is exhausted"),
+            "the reserve round's appended instruction reaches the model"
+        );
     }
 
     #[test]

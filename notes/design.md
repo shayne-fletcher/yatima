@@ -444,8 +444,11 @@ The design is **small composable boundaries**, simplest concrete impl behind eac
 - **`Agent`** — `run_async` collects the final answer; `run_with_async` is the
   fold an actor/TUI streams `AgentEvent`s into (`run_async` is the `acc = ()`
   specialization). Synchronous `run` / `run_with` wrappers remain for simple
-  callers. Bounded by `max_steps`; `AgentStop` is `Final` / `MaxSteps` /
-  `Stopped` (the last when the caller's fold returns `ControlFlow::Break`).
+  callers. Bounded by `max_steps`, with one answer-only reserve completion on
+  exhaustion (the budget's last act is prose, not silence — a tool call in the
+  reserve round ends `MaxSteps` with nothing dispatched); `AgentStop` is
+  `Final` / `MaxSteps` / `Stopped` (the last when the caller's fold returns
+  `ControlFlow::Break`).
 - **Sessionful (AGENT-3).** Successive `run`s form one conversation: each
   completed exchange persists its user turn and final answer into the agent's
   history and is re-rendered into later prompts; tool rounds and reasoning stay
@@ -974,7 +977,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   gap, stated in the registry: byte rewrites preserving both stat fields are
   local tampering by an actor who already owns the machine. Effect: the ~30 s
   launch re-hash of an unchanged 17 GB GGUF drops to milliseconds.
-- **Agent tool-round budget — temporarily 12 (2026-08-30).** `knobs::AGENT_MAX_STEPS` is raised from 6 to 12 after three live budget exhaustions during Muse image errands in one session: current web-tool friction (the `[images]`-list indirection and `read_image`'s most-recent-list constraint) roughly doubles the rounds an errand costs, and 6 was calibrated for frictionless rounds. This is a product knob, not a law — AGENT-1 still supplies termination. Revisit downward once the search/grant ergonomics work retires that friction.
+- **Agent tool-round budget — 16 (2026-09-12; previously 12 from 2026-08-30, 6 before that).** `knobs::AGENT_MAX_STEPS` is raised to 16 on live R4 evidence: the search-to-images errand — one search, two pages read two ways, five-plus images, a couple of typed-error recoveries — legitimately spends 13-14 rounds, and at 12 the turn kept ending in the reserve-answer round instead of a composed close (tape `20260912T154254Z`); at 16 the same errand settles `Eos` with prose (tape `20260912T155702Z-13565-gui`). This is a product knob, not a law — AGENT-1 still supplies termination, and its answer-only reserve completion backstops exhaustion. Revisit downward if R2's chips plus CAP-4 derivation keep retiring rounds.
 - **Remote `Completer` (Anthropic / OpenAI)** — the payoff of the async-`Completer`
   generalization (CMP-1): a `RemoteCompleter` holds only `Send` state and its
   `complete` future can therefore be `Send` by per-implementation inference; the

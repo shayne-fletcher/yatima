@@ -7,7 +7,11 @@
 /// multi-step image/research errands; revisit when search and grant
 /// ergonomics improve. The CLI's `--max-steps` remains separately
 /// configurable.
-pub const AGENT_MAX_STEPS: usize = 12;
+// 16 (from 12, 2026-09-12): the R4-class errand — search, two pages read
+// two ways, five images, a couple of recoveries — legitimately spends
+// 13-14 steps; at 12 it kept ending in the reserve round instead of a
+// composed close.
+pub const AGENT_MAX_STEPS: usize = 16;
 
 /// How long [`crate::HostOwner::shutdown`] waits for the actor's epilogue
 /// before handing the join obligation to a background reaper. Sized to the
@@ -24,6 +28,12 @@ pub const DEFAULT_AGENT_SYSTEM: &str =
     "You are a helpful assistant. Call a tool when it helps, then answer. \
      Once the request is satisfied, answer immediately: never fetch more \
      for completeness, and never re-read a page you already read. \
+     The web flow, once (R4): when the user asks to find things, search \
+     first — one web_search, immediately; then propose the best two or \
+     three pages briefly and stop (the user approves origins with one \
+     tap; you never grant). Once an origin is granted, read its pages \
+     directly and follow their same-origin links freely; a numbered \
+     [images] entry is fetchable as-is even from a different image host. \
      For a request to find, show, display, fetch, or render images from a \
      page, call read_page with images_only=true, then select numbers with \
      read_image. \

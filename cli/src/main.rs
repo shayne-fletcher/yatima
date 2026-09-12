@@ -26,7 +26,8 @@ use yatima_lib::{
     Cancel, Channel, ChatFormat, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall,
     ListDir, LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerProfile,
     LlamaServerSpawn, ModelId, ModelProfile, ModelSource, ProfileBackend, PromptTemplate,
-    QwenToolCall, ReadFile, ReadPage, Sampling, ServerIdentity, ToolCallCodec, Tools, WebOrigins,
+    QwenToolCall, ReadFile, ReadPage, ReadUrl, Sampling, SearchRegistry, ServerIdentity,
+    ToolCallCodec, Tools, WebOrigins, WebSearch,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -952,16 +953,29 @@ fn write_channel(
     let _ = out.flush();
 }
 
-/// Compose the agent's toolset: file tools under `root`, plus a `read_page` tool
-/// when a web origin is granted. Factored out so the capability wiring is
-/// unit-testable without loading a model.
+/// Compose the agent's toolset: file tools under `root`; a `read_page` and
+/// `read_url` when a web origin is granted; and `web_search` when the
+/// environment configures a provider (R1a) — all three sharing one
+/// [`SearchRegistry`], so `{"result": N}` references resolve within this
+/// invocation (R1b; result ids do not survive one-shot process restarts,
+/// and no persistence is claimed). Factored out so the capability wiring
+/// is unit-testable without loading a model.
 fn agent_tools(root: &std::path::Path, web_origin: Option<&str>) -> Result<Tools> {
     let cap = Dir::new(root);
     let mut tools = Tools::new()
         .with(ReadFile::new(cap.clone()))
         .with(ListDir::new(cap));
+    let results = SearchRegistry::default();
     if let Some(origin) = web_origin {
-        tools = tools.with(ReadPage::new(WebOrigins::one(origin)?)?);
+        let origins = WebOrigins::one(origin)?;
+        tools = tools
+            .with(ReadPage::new(origins.clone())?.with_search_results(results.clone()))
+            .with(ReadUrl::new(origins)?.with_search_results(results.clone()));
+    }
+    match WebSearch::from_env(results) {
+        Ok(Some(search)) => tools = tools.with(search),
+        Ok(None) => {} // no provider configured: the tool is simply absent
+        Err(e) => eprintln!("web_search unavailable: {e}"),
     }
     Ok(tools)
 }
@@ -1413,6 +1427,78 @@ mod tests {
     fn agent_tools_have_no_web_access_without_origin() {
         let names = tool_names(&agent_tools(std::path::Path::new("."), None).unwrap());
         assert!(!names.iter().any(|n| n == "read_page"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_tools_compose_search_and_result_references() {
+        // upholds: R1a/R1b on the direct CLI surface — one invocation
+        // shares one registry across web_search, read_page, and read_url:
+        // a search publishes ids, and `{"result": N}` reads the recorded
+        // page with no URL transcription. (Env access confined to this
+        // one test; result ids make no cross-process persistence claim.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let origin_thread = origin.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let count = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..count]).to_string();
+                let body = if request.contains("/search") {
+                    format!(
+                        r#"{{"results":[{{"title":"T","url":"{origin_thread}/article","content":"x"}}]}}"#
+                    )
+                } else {
+                    format!(
+                        "<html><body><article><p>{}</p></article></body></html>",
+                        "The article the result number resolves to. ".repeat(10)
+                    )
+                };
+                let content_type = if request.contains("/search") {
+                    "application/json"
+                } else {
+                    "text/html"
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        std::env::set_var("YATIMA_SEARCH_URL", format!("{origin}/search"));
+        let tools = agent_tools(std::path::Path::new("."), Some(&origin)).unwrap();
+        std::env::remove_var("YATIMA_SEARCH_URL");
+        let names = tool_names(&tools);
+        for expected in ["web_search", "read_page", "read_url"] {
+            assert!(names.iter().any(|n| n == expected), "{names:?}");
+        }
+        let search = tools
+            .dispatch_async(&yatima_lib::ToolCall {
+                name: "web_search".into(),
+                args: r#"{"query": "anything"}"#.parse().unwrap(),
+            })
+            .await
+            .render_for_model("web_search");
+        assert!(!search.is_error, "{}", search.content);
+        let page = tools
+            .dispatch_async(&yatima_lib::ToolCall {
+                name: "read_page".into(),
+                args: r#"{"result": 1}"#.parse().unwrap(),
+            })
+            .await
+            .render_for_model("read_page");
+        assert!(!page.is_error, "{}", page.content);
+        assert!(
+            page.content.contains("result number resolves to"),
+            "{}",
+            page.content
+        );
     }
 
     #[test]

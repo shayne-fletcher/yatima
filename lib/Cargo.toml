@@ -45,6 +45,10 @@ tracing = "0.1"
 possum-lib = { git = "https://github.com/shayne-fletcher/possum", rev = "52a9cd7390701f93437debe67c7b82ea80edff88", optional = true }
 
 [features]
+# Hermetic-acceptance seam (R4): compiles the loopback-derivation test
+# constructor into the library. NEVER enabled in ordinary builds — only
+# the drive acceptance battery requests it, transitively.
+hermetic-derivation = []
 metal = [
   "candle-core/metal",
   "candle-nn/metal",

@@ -406,6 +406,7 @@ where
             label,
             source,
             list_index,
+            derived_from,
         } = event
         else {
             return Ok(serde_json::to_value(event)?);
@@ -434,6 +435,7 @@ where
                 "label": label,
                 "source": source,
                 "list_index": list_index,
+                "derived_from": derived_from,
                 "artifact": format!("artifacts/{file}"),
                 "sha256": digest,
                 "bytes_len": bytes.len(),
@@ -727,6 +729,7 @@ mod tests {
                 label: "Mandelbrot set".into(),
                 source: Some("https://example.com/mandelbrot.png".into()),
                 list_index: Some(9),
+                derived_from: Some("https://example.com/article".into()),
             }))
             .await
             .unwrap();
@@ -832,6 +835,7 @@ mod tests {
                     label: "unsafe name".into(),
                     source: None,
                     list_index: None,
+                    derived_from: None,
                 }))
                 .await
                 .unwrap();

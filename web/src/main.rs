@@ -226,8 +226,10 @@ mod app {
             let text = self.input.trim().to_string();
             // Grant commands work any time, even mid-turn (the GUI's rule):
             // they are requests, not turns. The reports come back as notes.
-            if let Some(request) = yatima_web::parse_grant_command(&text) {
-                self.send(&request);
+            if let Some(requests) = yatima_web::parse_grant_command(&text) {
+                for request in &requests {
+                    self.send(request);
+                }
                 self.input.clear();
                 return;
             }
@@ -303,13 +305,18 @@ mod app {
             // on demand when the host starts the turn (WEB-3). Consumed
             // regardless of state; acted on only when idle (a turn the
             // user started meanwhile supersedes the retry).
-            if self.transcript.take_auto_retry() && self.transcript.in_flight().is_none() {
-                let turn_id = self.next_turn_id;
-                self.next_turn_id += 1;
-                self.send(&HostRequest::Submit {
-                    turn_id,
-                    text: "try again".to_string(),
-                });
+            if let Some(prompt) = self.transcript.take_auto_retry() {
+                if self.transcript.in_flight().is_none() && !prompt.is_empty() {
+                    let turn_id = self.next_turn_id;
+                    self.next_turn_id += 1;
+                    self.send(&HostRequest::Submit {
+                        turn_id,
+                        // The set's ORIGINAL prompt — the user's own words,
+                        // so authoritative history stays faithful (never a
+                        // fabricated "try again").
+                        text: prompt,
+                    });
+                }
             }
 
             egui::Panel::top("status").show(ui, |ui| {

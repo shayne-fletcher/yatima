@@ -50,10 +50,24 @@
 //!   carried non-whitespace text (a fully-retracted turn commits nothing,
 //!   never a blank bubble); retraction counts characters, never bytes; an
 //!   artifact renders as an image or a named placeholder, never an error.
-//! - **WEB-7** a suggested grant is one tap but still the user's act: when
-//!   a refusal names an origin to ask for ("ask the user to grant …"), the
-//!   client surfaces it as a button — inline in any prose that quotes the
-//!   url, else standalone at the conversation's tail. Its lifecycle is a
+//! - **WEB-7** (amended by R2: a cross-surface law, declared here where it
+//!   was born) a suggested grant is one tap but still the user's act, on
+//!   EVERY surface: the offer arrives as the HOST's typed
+//!   `HostEvent::GrantProposal` — canonical ASCII origins from the one
+//!   producer grammar (`yatima_lib::proposed_origins`, witnessed by
+//!   `proposed_origins_admit_canonical_ascii_web_origins_only`), carried
+//!   on the wire per PROTO-2
+//!   (`grant_proposal_round_trips_and_legacy_rejects`), emitted once per
+//!   settled turn by the host (the drive journey's proposal-order
+//!   asserts; `managed_muse_tool_round_is_typed_activity`), and never a
+//!   client parse of model prose. Each view implements the per-origin
+//!   `Offered → Sent → Landed` machine with failed-back-to-Offered and
+//!   an exactly-once retry of the set's ORIGINAL prompt: the GUI
+//!   (`chip_fold_lands_demotes_on_failure_and_triggers_retry_once`), the
+//!   TUI
+//!   (`proposal_chips_select_once_demote_on_failure_and_retry_the_original_prompt`),
+//!   and this client, whose single-button view presents a multi-origin
+//!   set sequentially with the retry waiting for the whole set. Its lifecycle is a
 //!   sum ([`GrantSuggestion`]): *offered* by the refusal, *sent* by the tap
 //!   (the button disables at once — the request queues behind an in-flight
 //!   turn, and a dead-looking live button invites duplicate clicks), and
@@ -212,34 +226,38 @@ pub fn tool_note_line(kind: ToolNoteKind, text: &str) -> String {
 /// these, plus URLs typed in a message (auto-granted at the serve edge), the
 /// only sources of web authority. String-only on purpose: the protocol-only
 /// client gets grant management without yatima-lib.
-pub fn parse_grant_command(text: &str) -> Option<HostRequest> {
+pub fn parse_grant_command(text: &str) -> Option<Vec<HostRequest>> {
     if text == "/grants" {
-        return Some(HostRequest::ListGrants);
+        return Some(vec![HostRequest::ListGrants]);
     }
-    if let Some(origin) = text.strip_prefix("/grant ") {
-        return Some(HostRequest::Grant {
-            origin: origin.trim().to_string(),
-        });
+    // One command, any number of origins: models suggest image hosts in
+    // pairs, and users paste the pair — sometimes as a multi-line command
+    // block whose newlines a single-line input collapses
+    // ("…org/grant https://…"). An origin never contains a path, so the
+    // command word itself is a safe extra separator.
+    if let Some(origins) = text.strip_prefix("/grant ") {
+        return Some(
+            origins
+                .split("/grant")
+                .flat_map(str::split_whitespace)
+                .map(|origin| HostRequest::Grant {
+                    origin: origin.to_string(),
+                })
+                .collect(),
+        );
     }
-    if let Some(origin) = text.strip_prefix("/revoke ") {
-        return Some(HostRequest::Revoke {
-            origin: origin.trim().to_string(),
-        });
+    if let Some(origins) = text.strip_prefix("/revoke ") {
+        return Some(
+            origins
+                .split("/revoke")
+                .flat_map(str::split_whitespace)
+                .map(|origin| HostRequest::Revoke {
+                    origin: origin.to_string(),
+                })
+                .collect(),
+        );
     }
     None
-}
-
-/// The origin a refusal asks for, if `text` carries the grant protocol's
-/// phrase ("ask the user to grant <origin>" — the wording every escape
-/// refusal leads with). The origin token must look like one, so arbitrary
-/// prose can't fabricate a button (WEB-7: the tool may suggest, only the
-/// user's tap grants).
-pub fn grant_suggestion(text: &str) -> Option<String> {
-    let at = text.find("ask the user to grant ")?;
-    let rest = &text[at + "ask the user to grant ".len()..];
-    let token = rest.split_whitespace().next()?;
-    let origin = token.trim_end_matches([',', ';', ':', '.', '!', '?', ')', ']']);
-    (origin.starts_with("http://") || origin.starts_with("https://")).then(|| origin.to_string())
 }
 
 /// A grant suggestion's lifecycle (WEB-7): `Offered` by a refusal that
@@ -307,15 +325,38 @@ pub struct Transcript {
     backend: BackendState,
     /// The most recent prompt token count (`Context`), for the status line.
     pub prompt_tokens: Option<usize>,
-    /// The grant suggestion's lifecycle (WEB-7): offered by a refusal,
-    /// sent by the user's tap, cleared by the landing report.
+    /// The grant suggestion's lifecycle (WEB-7): offered by the host's
+    /// typed proposal, sent by the user's tap, cleared by the landing
+    /// report.
     suggestion: GrantSuggestion,
-    /// Set when a grant report lands that satisfies the active suggestion —
-    /// the retry is then implicit: the view consumes this and re-asks on
-    /// the user's behalf (the tap already meant "try again"). A report
-    /// satisfying no suggestion (e.g. the serve-edge auto-grant at submit)
-    /// never sets it.
-    retry_ripe: bool,
+    /// The current typed proposal set (R2): turn-scoped — a later turn's
+    /// proposal replaces it, never merges — carrying the ORIGINAL prompt
+    /// that produced it. The single-button view presents its origins
+    /// sequentially; the implicit retry waits until the whole set lands.
+    proposal: Option<WebProposal>,
+    /// The most recent Submit's `(turn_id, text)` — the retry anchor for
+    /// a proposal arriving from that turn.
+    last_submit: Option<(u64, String)>,
+    /// The turn whose proposal was last accepted — outliving the set
+    /// itself, so a REPLAY of that turn's proposal (reconnect
+    /// redelivery) is a no-op even after every chip landed and retired:
+    /// a replay must never resurrect retired authority UI nor disturb
+    /// the exactly-once retry.
+    last_proposal_turn: Option<u64>,
+    /// Set when every origin the proposal named has landed: the ORIGINAL
+    /// prompt, consumed exactly once — the view re-asks it on the user's
+    /// behalf (the tap already meant "try again"; the words are the
+    /// user's own, so authoritative history stays faithful). A report
+    /// satisfying no suggestion (e.g. the serve-edge auto-grant at
+    /// submit) never sets it.
+    retry: Option<String>,
+}
+
+/// See [`Transcript::proposal`]: `(origin, landed)` in proposal order —
+/// the presented chip's Offered/Sent half lives in [`GrantSuggestion`].
+struct WebProposal {
+    prompt: String,
+    chips: Vec<(String, bool)>,
 }
 
 impl Transcript {
@@ -323,6 +364,7 @@ impl Transcript {
     /// `submit`).
     pub fn push_user(&mut self, turn_id: u64, text: &str) {
         self.entries.push(Entry::User(text.to_string()));
+        self.last_submit = Some((turn_id, text.to_string()));
         self.turn = Turn::Live {
             id: turn_id,
             answer: String::new(),
@@ -389,8 +431,8 @@ impl Transcript {
     /// report satisfied the active suggestion. The view re-asks on the
     /// user's behalf when this fires while idle (WEB-7 — tapping the grant
     /// already meant "try again"; typing it too is ceremony).
-    pub fn take_auto_retry(&mut self) -> bool {
-        std::mem::take(&mut self.retry_ripe)
+    pub fn take_auto_retry(&mut self) -> Option<String> {
+        std::mem::take(&mut self.retry)
     }
 
     /// Settle the streaming turn locally: commit its answer (with the
@@ -504,17 +546,6 @@ impl Transcript {
                 kind,
                 text,
             } => {
-                // A refusal that names a missing grant becomes a one-tap
-                // button (WEB-7); the newest suggestion wins — except when
-                // that same origin's grant is already sent and queued (a
-                // model retrying before the queue drains must not resurrect
-                // the button).
-                if let Some(origin) = grant_suggestion(&text) {
-                    match &self.suggestion {
-                        GrantSuggestion::Sent(sent) if *sent == origin => {}
-                        _ => self.suggestion = GrantSuggestion::Offered(origin),
-                    }
-                }
                 let line = tool_note_line(kind, &text);
                 match &mut self.turn {
                     Turn::Idle => {
@@ -577,21 +608,73 @@ impl Transcript {
                 }
             },
             HostEvent::Note(message) => self.entries.push(Entry::Note(message)),
-            HostEvent::Grants { origins, message } => {
-                // A landed grant clears the suggestion it satisfies —
-                // offered or sent — (the event carries the post-grant
-                // origin set).
-                let satisfied = match &self.suggestion {
-                    GrantSuggestion::Offered(o) | GrantSuggestion::Sent(o) => {
-                        origins.iter().any(|granted| granted == o)
-                    }
-                    GrantSuggestion::None => false,
+            // The host's typed proposal (WEB-7, amended by R2): chips from
+            // the wire, never a prose parse; the set is TURN-scoped and a
+            // later turn's proposal replaces it whole (never a merge).
+            // The view is single-button, so a multi-origin set presents
+            // sequentially — first un-landed origin offered, the next
+            // after each landing; the implicit retry fires only once the
+            // whole set has landed, and re-asks the set's own prompt.
+            HostEvent::GrantProposal { turn_id, origins } => {
+                // The host emits ONE canonical set per turn, so an
+                // equal-turn arrival can only be a replay (reconnect
+                // redelivery): a strict no-op — landed chips stay
+                // retired, an in-flight tap stays sent, a consumed
+                // retry stays consumed. Only a DIFFERENT turn's proposal
+                // replaces the lifecycle, and then wholesale, even over
+                // identical origin strings.
+                if self.last_proposal_turn == Some(turn_id) {
+                    return;
+                }
+                self.last_proposal_turn = Some(turn_id);
+                let prompt = match &self.last_submit {
+                    Some((id, text)) if *id == turn_id => text.clone(),
+                    _ => String::new(),
                 };
-                if satisfied {
-                    self.suggestion = GrantSuggestion::None;
-                    // The blocked conversation just unblocked: the retry is
-                    // implicit (the view consumes this and re-asks).
-                    self.retry_ripe = true;
+                self.proposal = Some(WebProposal {
+                    prompt,
+                    chips: origins.iter().map(|o| (o.clone(), false)).collect(),
+                });
+                if let Some(first) = origins.first().cloned() {
+                    self.suggestion = GrantSuggestion::Offered(first);
+                }
+            }
+            HostEvent::Grants { origins, message } => {
+                // Fold the report into the set: named origins land; a
+                // FAILED report returns the presented Sent chip to
+                // Offered (re-tappable — a pending sibling's success
+                // never demotes it); when the whole set has landed, the
+                // retry ripens with the set's original prompt.
+                let failed = message.starts_with("grant failed");
+                if let Some(set) = &mut self.proposal {
+                    for (origin, landed) in &mut set.chips {
+                        if origins.contains(origin) {
+                            *landed = true;
+                        }
+                    }
+                    match &self.suggestion {
+                        GrantSuggestion::Offered(o) | GrantSuggestion::Sent(o)
+                            if origins.iter().any(|granted| granted == o) =>
+                        {
+                            self.suggestion = GrantSuggestion::None;
+                        }
+                        GrantSuggestion::Sent(o) if failed => {
+                            self.suggestion = GrantSuggestion::Offered(o.clone());
+                        }
+                        _ => {}
+                    }
+                    if self.suggestion == GrantSuggestion::None {
+                        if let Some((next, _)) = set.chips.iter().find(|(_, landed)| !landed) {
+                            // More of the set to approve: offer the next
+                            // chip; the retry waits for the whole set.
+                            self.suggestion = GrantSuggestion::Offered(next.clone());
+                        } else {
+                            // The whole set landed: the retry is implicit
+                            // and re-asks the user's own words.
+                            self.retry = Some(set.prompt.clone());
+                            self.proposal = None;
+                        }
+                    }
                 }
                 self.entries.push(Entry::Note(message))
             }
@@ -995,41 +1078,32 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_surfaces_a_pending_grant_and_the_report_clears_it() {
-        // upholds: WEB-7 — the refusal's named origin becomes a one-tap
-        // suggestion; the landed grant (whose report carries the post-grant
-        // set) clears it. The tap itself lives in the view; authority still
-        // flows only from the user (CAP-3).
+    fn a_typed_proposal_surfaces_chips_sequentially_and_the_set_ripens_one_retry() {
+        // upholds: WEB-7 (amended by R2) — the offer comes from the host's
+        // typed GrantProposal, never a prose parse; a multi-origin set
+        // presents sequentially in the single-button view; the implicit
+        // retry ripens exactly once, when the WHOLE set has landed. The
+        // tap itself lives in the view; authority still flows only from
+        // the user (CAP-3).
         let mut t = Transcript::default();
         t.push_user(1, "show me");
-        t.fold(HostEvent::ToolNote {
+        t.fold(HostEvent::GrantProposal {
             turn_id: 1,
-            kind: ToolNoteKind::Failure,
-            text: "tool failed: ask the user to grant https://upload.wikimedia.org \
-                   — url escapes the granted web origins [https://en.wikipedia.org]: \
-                   https://upload.wikimedia.org/w"
-                .into(),
+            origins: vec![
+                "https://upload.wikimedia.org".into(),
+                "https://b.example".into(),
+            ],
         });
         assert_eq!(t.pending_grant(), Some("https://upload.wikimedia.org"));
 
         // The tap: Offered → Sent, one way. The offer is gone (the button
         // disables — no double-clicks into duplicate queued grants), and a
-        // model retrying the same refusal before the queue drains must not
-        // resurrect it.
+        // repeated proposal for the same origin must not resurrect it.
         t.mark_grant_sent();
         assert!(t.pending_grant().is_none(), "no re-clickable offer");
         assert_eq!(t.sent_grant(), Some("https://upload.wikimedia.org"));
-        t.fold(HostEvent::ToolNote {
-            turn_id: 1,
-            kind: ToolNoteKind::Failure,
-            text: "tool failed: ask the user to grant https://upload.wikimedia.org — again".into(),
-        });
-        assert!(
-            t.pending_grant().is_none(),
-            "a retry can't re-offer a sent grant"
-        );
-        assert_eq!(t.sent_grant(), Some("https://upload.wikimedia.org"));
 
+        // First landing: the next chip offers; the retry is NOT ripe yet.
         t.fold(HostEvent::Grants {
             origins: vec![
                 "https://en.wikipedia.org".into(),
@@ -1037,11 +1111,134 @@ mod tests {
             ],
             message: "granted read access to https://upload.wikimedia.org".into(),
         });
-        assert!(t.pending_grant().is_none(), "the landed grant clears it");
+        assert_eq!(t.pending_grant(), Some("https://b.example"));
+        assert!(t.take_auto_retry().is_none(), "half a set ripens nothing");
+
+        // Second landing: set exhausted → the retry ripens exactly once.
+        t.mark_grant_sent();
+        t.fold(HostEvent::Grants {
+            origins: vec![
+                "https://en.wikipedia.org".into(),
+                "https://upload.wikimedia.org".into(),
+                "https://b.example".into(),
+            ],
+            message: "granted read access to https://b.example".into(),
+        });
+        assert!(t.pending_grant().is_none(), "the landed set clears it");
         assert!(t.sent_grant().is_none(), "the sent marker clears with it");
-        // …and makes the retry implicit: consumable exactly once.
-        assert!(t.take_auto_retry(), "the landed grant ripens a retry");
-        assert!(!t.take_auto_retry(), "consumed once");
+        assert_eq!(
+            t.take_auto_retry().as_deref(),
+            Some("show me"),
+            "the landed set ripens a retry of the ORIGINAL prompt"
+        );
+        assert!(t.take_auto_retry().is_none(), "consumed once");
+    }
+
+    #[test]
+    fn a_failed_grant_reoffers_and_a_new_turn_replaces_the_set() {
+        // upholds: WEB-7/R2 — a FAILED report returns the sent chip to
+        // Offered (re-tappable, no retry); a later turn's proposal
+        // replaces the set whole (never a merge) and the retry that
+        // eventually fires carries the NEW set's own prompt.
+        let mut t = Transcript::default();
+        t.push_user(1, "first ask");
+        t.fold(HostEvent::GrantProposal {
+            turn_id: 1,
+            origins: vec!["https://a.example".into()],
+        });
+        t.mark_grant_sent();
+        t.fold(HostEvent::Grants {
+            origins: vec![],
+            message: "grant failed: refused".into(),
+        });
+        assert_eq!(
+            t.pending_grant(),
+            Some("https://a.example"),
+            "failed returns Sent to Offered"
+        );
+        assert!(t.take_auto_retry().is_none(), "a failure ripens nothing");
+
+        t.push_user(2, "second ask");
+        t.fold(HostEvent::GrantProposal {
+            turn_id: 2,
+            origins: vec!["https://b.example".into()],
+        });
+        assert_eq!(
+            t.pending_grant(),
+            Some("https://b.example"),
+            "a later turn's proposal replaces the set"
+        );
+        t.mark_grant_sent();
+        t.fold(HostEvent::Grants {
+            origins: vec!["https://b.example".into()],
+            message: "granted read access to https://b.example".into(),
+        });
+        assert_eq!(
+            t.take_auto_retry().as_deref(),
+            Some("second ask"),
+            "the retry carries the replacing set's own prompt"
+        );
+    }
+
+    #[test]
+    fn proposal_identity_is_the_turn_not_the_origin_strings() {
+        // upholds: WEB-7/R2 — the host emits one canonical set per turn,
+        // so an equal-turn redelivery (reconnect replay) is a strict
+        // no-op at EVERY point in the lifecycle: mid-tap, after a chip
+        // landed (next one Offered or Sent), and even after the whole
+        // set retired and the retry was consumed. A LATER turn's
+        // proposal replaces the lifecycle wholesale, identical origin
+        // strings and all.
+        let mut t = Transcript::default();
+        t.push_user(1, "first ask");
+        let proposal = HostEvent::GrantProposal {
+            turn_id: 1,
+            origins: vec!["https://a.example".into(), "https://b.example".into()],
+        };
+        t.fold(proposal.clone());
+        t.mark_grant_sent();
+        // Replay mid-tap: Sent survives, nothing resurrects.
+        t.fold(proposal.clone());
+        assert!(t.pending_grant().is_none(), "no resurrected button");
+        assert_eq!(t.sent_grant(), Some("https://a.example"));
+        // A lands; B offers. Replay: A stays retired, B stays offered.
+        t.fold(HostEvent::Grants {
+            origins: vec!["https://a.example".into()],
+            message: "granted read access to https://a.example".into(),
+        });
+        assert_eq!(t.pending_grant(), Some("https://b.example"));
+        t.fold(proposal.clone());
+        assert_eq!(
+            t.pending_grant(),
+            Some("https://b.example"),
+            "a replay after A landed re-offers nothing"
+        );
+        // B tapped; replay leaves the tap in flight.
+        t.mark_grant_sent();
+        t.fold(proposal.clone());
+        assert_eq!(t.sent_grant(), Some("https://b.example"));
+        // B lands: the set retires, the retry ripens once. A replay
+        // after retirement resurrects nothing and re-ripens nothing.
+        t.fold(HostEvent::Grants {
+            origins: vec!["https://a.example".into(), "https://b.example".into()],
+            message: "granted read access to https://b.example".into(),
+        });
+        assert_eq!(t.take_auto_retry().as_deref(), Some("first ask"));
+        t.fold(proposal);
+        assert!(t.pending_grant().is_none(), "retired stays retired");
+        assert!(t.take_auto_retry().is_none(), "the retry stays consumed");
+        // A later turn proposing the SAME origins: a fresh lifecycle.
+        t.push_user(2, "second ask");
+        t.fold(HostEvent::GrantProposal {
+            turn_id: 2,
+            origins: vec!["https://a.example".into()],
+        });
+        assert_eq!(
+            t.pending_grant(),
+            Some("https://a.example"),
+            "the new turn's chip offers afresh"
+        );
+        assert!(t.sent_grant().is_none());
     }
 
     #[test]
@@ -1055,28 +1252,7 @@ mod tests {
             origins: vec!["https://en.wikipedia.org".into()],
             message: "granted read access to https://en.wikipedia.org".into(),
         });
-        assert!(!t.take_auto_retry());
-    }
-
-    #[test]
-    fn grant_suggestions_parse_the_protocol_phrase_only() {
-        // upholds: WEB-7 — only the refusal wording with an origin-shaped
-        // token makes a button; prose cannot fabricate one.
-        assert_eq!(
-            grant_suggestion("tool failed: ask the user to grant https://a.example — x: y"),
-            Some("https://a.example".into())
-        );
-        assert_eq!(
-            grant_suggestion("ask the user to grant http://a.example:8443."),
-            Some("http://a.example:8443".into()),
-            "trailing punctuation trims; explicit ports survive"
-        );
-        assert_eq!(grant_suggestion("please grant me everything"), None);
-        assert_eq!(
-            grant_suggestion("ask the user to grant patience"),
-            None,
-            "a non-origin token is not a suggestion"
-        );
+        assert!(t.take_auto_retry().is_none());
     }
 
     #[test]
@@ -1086,19 +1262,33 @@ mod tests {
         // auto-grant) is not a command.
         assert_eq!(
             parse_grant_command("/grants"),
-            Some(HostRequest::ListGrants)
+            Some(vec![HostRequest::ListGrants])
         );
         assert_eq!(
             parse_grant_command("/grant https://en.wikipedia.org "),
-            Some(HostRequest::Grant {
+            Some(vec![HostRequest::Grant {
                 origin: "https://en.wikipedia.org".into()
-            })
+            }])
+        );
+        assert_eq!(
+            parse_grant_command(
+                "/grant https://upload.wikimedia.org https://commons.wikimedia.org"
+            ),
+            Some(vec![
+                HostRequest::Grant {
+                    origin: "https://upload.wikimedia.org".into()
+                },
+                HostRequest::Grant {
+                    origin: "https://commons.wikimedia.org".into()
+                },
+            ]),
+            "a pasted pair grants both origins"
         );
         assert_eq!(
             parse_grant_command("/revoke https://en.wikipedia.org"),
-            Some(HostRequest::Revoke {
+            Some(vec![HostRequest::Revoke {
                 origin: "https://en.wikipedia.org".into()
-            })
+            }])
         );
         assert_eq!(parse_grant_command("summarize https://x.org/page"), None);
         assert_eq!(
@@ -1290,6 +1480,7 @@ mod tests {
             label: "Revenue by quarter".into(),
             source: None,
             list_index: None,
+            derived_from: None,
         });
         t.fold(HostEvent::Image {
             turn_id: 1,
@@ -1298,6 +1489,7 @@ mod tests {
             label: "Mandelbrot set".into(),
             source: Some("https://example.com/mandelbrot.jpg".into()),
             list_index: Some(9),
+            derived_from: None,
         });
         t.fold(HostEvent::Image {
             turn_id: 1,
@@ -1306,6 +1498,7 @@ mod tests {
             label: "Vector figure".into(),
             source: None,
             list_index: None,
+            derived_from: None,
         });
 
         match &t.entries[0] {

@@ -159,6 +159,37 @@ pub struct App {
     /// the ordinary error after restoring the terminal.
     pub fatal: Option<String>,
     next_turn_id: TurnId,
+    /// The live grant-proposal set (R2/WEB-7): numbered chips from the
+    /// host's typed event, selected by `/grant N` (or `/grant all`) — the
+    /// selection is the user utterance that grants (CAP-3). At most one
+    /// set; a later turn's proposal replaces it. When every named origin
+    /// lands, the set's original prompt retries exactly once.
+    proposal: Option<TuiProposal>,
+    /// The most recent Submit's `(turn_id, text)` — the retry anchor.
+    last_submit: Option<(TurnId, String)>,
+}
+
+/// See [`App::proposal`].
+struct TuiProposal {
+    prompt: String,
+    /// `(origin, state)` in proposal order — `/grant N` is 1-based here.
+    chips: Vec<(String, TuiChip)>,
+    retried: bool,
+    /// "grant all" mode: one command authorizes the set; the walk
+    /// dispatches ONE grant at a time (a failure stops it). At most one
+    /// chip is ever `Sent` — no pending sibling can be demoted into a
+    /// duplicate dispatch.
+    grant_all: bool,
+}
+
+/// Per-origin chip state (R2): `Offered → Sent → Landed`; a failed grant
+/// report returns `Sent` to `Offered` (re-selectable); a `Sent` chip
+/// refuses duplicate selection until its report lands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TuiChip {
+    Offered,
+    Sent,
+    Landed,
 }
 
 impl App {
@@ -201,6 +232,8 @@ impl App {
             fatal: None,
             quit_armed: false,
             next_turn_id: 0,
+            proposal: None,
+            last_submit: None,
         }
     }
 
@@ -306,6 +339,10 @@ impl App {
         if user == "/reset" {
             let _ = self.req_tx.send(HostRequest::Reset);
             self.transcript.clear();
+            // Pending chips and the retry anchor clear with the
+            // conversation (R2's reset rule).
+            self.proposal = None;
+            self.last_submit = None;
             self.input = fresh_input();
             self.scroll_back = 0;
             return;
@@ -317,17 +354,76 @@ impl App {
             self.input = fresh_input();
             return;
         }
-        if let Some(origin) = user.strip_prefix("/grant ") {
-            let _ = self.req_tx.send(HostRequest::Grant {
-                origin: origin.trim().to_string(),
-            });
+        // Chip selection (R2): `/grant N` picks a numbered origin from the
+        // live proposal; `/grant all` sends the whole set in listed order.
+        // The selection is the user utterance that grants (CAP-3).
+        if let Some(selection) = user.strip_prefix("/grant ") {
+            if let Some(set) = &mut self.proposal {
+                let selected: Vec<usize> = if selection.trim() == "all" {
+                    (0..set.chips.len()).collect()
+                } else if let Ok(n) = selection.trim().parse::<usize>() {
+                    n.checked_sub(1)
+                        .filter(|i| *i < set.chips.len())
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if !selected.is_empty() {
+                    // ONE grant in flight at a time (the structural guard
+                    // against duplicate dispatch): while a chip is Sent,
+                    // further selection waits for its report; "all" walks
+                    // the set serially from the fold. The selection is
+                    // the user utterance (CAP-3).
+                    if set.chips.iter().any(|(_, s)| *s == TuiChip::Sent) {
+                        self.push_entry(Entry::Notice(
+                            "a grant is already in flight — wait for its report".to_string(),
+                        ));
+                        self.input = fresh_input();
+                        return;
+                    }
+                    if selection.trim() == "all" {
+                        set.grant_all = true;
+                    }
+                    let next = selected.into_iter().find_map(|i| {
+                        let (origin, state) = &mut set.chips[i];
+                        (*state == TuiChip::Offered).then(|| {
+                            *state = TuiChip::Sent;
+                            origin.clone()
+                        })
+                    });
+                    match next {
+                        Some(origin) => {
+                            let _ = self.req_tx.send(HostRequest::Grant { origin });
+                        }
+                        None => self
+                            .push_entry(Entry::Notice("that chip has already landed".to_string())),
+                    }
+                    self.input = fresh_input();
+                    return;
+                }
+            }
+        }
+        // One command, any number of origins: models suggest image hosts
+        // in pairs, and users paste the pair — sometimes as a multi-line
+        // command block whose newlines a single-line input collapses
+        // ("…org/grant https://…"). An origin never contains a path, so
+        // the command word itself is a safe extra separator.
+        if let Some(origins) = user.strip_prefix("/grant ") {
+            for origin in origins.split("/grant").flat_map(str::split_whitespace) {
+                let _ = self.req_tx.send(HostRequest::Grant {
+                    origin: origin.to_string(),
+                });
+            }
             self.input = fresh_input();
             return;
         }
-        if let Some(origin) = user.strip_prefix("/revoke ") {
-            let _ = self.req_tx.send(HostRequest::Revoke {
-                origin: origin.trim().to_string(),
-            });
+        if let Some(origins) = user.strip_prefix("/revoke ") {
+            for origin in origins.split("/revoke").flat_map(str::split_whitespace) {
+                let _ = self.req_tx.send(HostRequest::Revoke {
+                    origin: origin.to_string(),
+                });
+            }
             self.input = fresh_input();
             return;
         }
@@ -338,8 +434,17 @@ impl App {
         for origin in yatima_lib::origins_in(&user) {
             let _ = self.req_tx.send(HostRequest::Grant { origin });
         }
+        self.begin_turn(user);
+        self.input = fresh_input();
+        self.scroll_back = 0; // jump to the latest
+    }
+
+    /// Arm the in-flight turn and submit `user` as its text — the ordinary
+    /// prompt path, and the all-chips-landed retry (R2).
+    fn begin_turn(&mut self, user: String) {
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
+        self.last_submit = Some((turn_id, user.clone()));
         self.push_entry(Entry::User(user.clone()));
         self.in_flight = Some(InFlight {
             turn_id,
@@ -353,8 +458,6 @@ impl App {
             turn_id,
             text: user,
         });
-        self.input = fresh_input();
-        self.scroll_back = 0; // jump to the latest
     }
 
     /// The current prompt text (the editor's lines joined). Enter submits before
@@ -366,6 +469,51 @@ impl App {
     /// Consume a pending Ctrl+G compose request (run-loop side).
     pub fn take_compose_request(&mut self) -> bool {
         std::mem::take(&mut self.compose_requested)
+    }
+
+    /// Fold a grant report into the live proposal (R2): named origins
+    /// land; when every chip has landed, the set's original prompt
+    /// retries exactly once (idle only — TUI-7 single-in-flight holds).
+    fn fold_grants_into_proposal(&mut self, granted: &[String], failed: bool) {
+        let Some(set) = &mut self.proposal else {
+            return;
+        };
+        if failed {
+            // A failure ends the grant-all walk: the user re-decides.
+            set.grant_all = false;
+        }
+        for (origin, state) in &mut set.chips {
+            if granted.contains(origin) {
+                *state = TuiChip::Landed;
+            } else if failed && *state == TuiChip::Sent {
+                // Serialized dispatch keeps at most one chip Sent, so
+                // this demotes only the failed grant — no pending
+                // sibling exists to duplicate.
+                *state = TuiChip::Offered;
+            }
+        }
+        // The grant-all walk: next chip only once nothing is in flight.
+        if set.grant_all && !set.chips.iter().any(|(_, s)| *s == TuiChip::Sent) {
+            if let Some((origin, state)) =
+                set.chips.iter_mut().find(|(_, s)| *s == TuiChip::Offered)
+            {
+                *state = TuiChip::Sent;
+                let _ = self.req_tx.send(HostRequest::Grant {
+                    origin: origin.clone(),
+                });
+            }
+        }
+        let Some(set) = &mut self.proposal else {
+            return;
+        };
+        if set.chips.iter().all(|(_, state)| *state == TuiChip::Landed) && !set.retried {
+            set.retried = true;
+            let prompt = set.prompt.clone();
+            self.proposal = None;
+            if !prompt.is_empty() && self.in_flight.is_none() && self.loading.is_none() {
+                self.begin_turn(prompt);
+            }
+        }
     }
 
     /// Surface an app-plane notice in the transcript (compose failures land
@@ -544,8 +692,37 @@ impl App {
             // Authority changes are always current (not tied to a turn): show
             // the notice and refresh the status rail's grant list (CAP-3).
             HostEvent::Grants { origins, message } => {
-                self.status.grants = origins;
+                self.status.grants = origins.clone();
+                let failed = message.starts_with("grant failed");
                 self.push_entry(Entry::Notice(message));
+                self.fold_grants_into_proposal(&origins, failed);
+            }
+            // The host's typed proposal (R2/WEB-7): numbered chips, never
+            // a prose parse. A later turn's proposal replaces the set.
+            HostEvent::GrantProposal { turn_id, origins } => {
+                let prompt = match &self.last_submit {
+                    Some((id, text)) if *id == turn_id => text.clone(),
+                    _ => String::new(),
+                };
+                let menu = origins
+                    .iter()
+                    .enumerate()
+                    .map(|(i, origin)| format!("[{}] {origin}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                self.push_entry(Entry::Notice(format!(
+                    "proposed pages — {menu} — type /grant N (or /grant all); \
+                     nothing is granted until you do"
+                )));
+                self.proposal = Some(TuiProposal {
+                    prompt,
+                    chips: origins
+                        .into_iter()
+                        .map(|origin| (origin, TuiChip::Offered))
+                        .collect(),
+                    retried: false,
+                    grant_all: false,
+                });
             }
             // App-plane messages (a depth warning, a host notice) are always
             // current too — dropping one silently is how a known cliff reads
@@ -1115,6 +1292,92 @@ mod tests {
     }
 
     #[test]
+    fn proposal_chips_select_once_demote_on_failure_and_retry_the_original_prompt() {
+        // upholds: WEB-7/R2 in the TUI — numbered selection sends exactly
+        // one Grant per chip (a Sent chip refuses duplicates), a failed
+        // report re-offers, /reset clears the set and its anchor, and the
+        // all-landed retry re-asks the set's ORIGINAL prompt.
+        let (mut app, rx) = test_app();
+        app.set_input("find me writeups");
+        app.apply(Intent::Submit);
+        let Ok(HostRequest::Submit { turn_id, .. }) = rx.try_recv() else {
+            panic!("expected the submit");
+        };
+        app.on_engine_event(HostEvent::GrantProposal {
+            turn_id,
+            origins: vec!["https://a.example".into(), "https://b.example".into()],
+        });
+        app.on_engine_event(HostEvent::Done {
+            turn_id,
+            stop: StopKind::Eos,
+        });
+        // Select chip 1; a duplicate selection refuses (no second Grant).
+        app.set_input("/grant 1");
+        app.apply(Intent::Submit);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostRequest::Grant { origin }) if origin == "https://a.example"
+        ));
+        app.set_input("/grant 1");
+        app.apply(Intent::Submit);
+        assert!(
+            rx.try_recv().is_err(),
+            "one grant in flight: further selection waits for the report"
+        );
+        // Its grant fails: only that chip re-offers (its sibling was
+        // never Sent — serialized dispatch makes the duplicate hazard
+        // unrepresentable), and it can be selected again.
+        app.on_engine_event(HostEvent::Grants {
+            origins: vec![],
+            message: "grant failed: refused".into(),
+        });
+        app.set_input("/grant 1");
+        app.apply(Intent::Submit);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostRequest::Grant { origin }) if origin == "https://a.example"
+        ));
+        // A lands; then "grant all" walks the remainder serially — the
+        // fold auto-dispatches exactly one Grant, for B.
+        app.on_engine_event(HostEvent::Grants {
+            origins: vec!["https://a.example".into()],
+            message: "granted read access to https://a.example".into(),
+        });
+        app.set_input("/grant all");
+        app.apply(Intent::Submit);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostRequest::Grant { origin }) if origin == "https://b.example"
+        ));
+        assert!(rx.try_recv().is_err(), "the walk is one grant at a time");
+        app.on_engine_event(HostEvent::Grants {
+            origins: vec!["https://a.example".into(), "https://b.example".into()],
+            message: "granted read access to https://b.example".into(),
+        });
+        let retry = loop {
+            match rx.try_recv() {
+                Ok(HostRequest::Submit { text, .. }) => break text,
+                Ok(_) => continue,
+                Err(e) => panic!("expected the retry submit: {e}"),
+            }
+        };
+        assert_eq!(retry, "find me writeups");
+        // /reset clears a fresh set and its anchor.
+        app.on_engine_event(HostEvent::Done {
+            turn_id: 1,
+            stop: StopKind::Eos,
+        });
+        app.on_engine_event(HostEvent::GrantProposal {
+            turn_id: 99,
+            origins: vec!["https://c.example".into()],
+        });
+        app.set_input("/reset");
+        app.apply(Intent::Submit);
+        assert!(app.proposal.is_none(), "reset clears pending chips");
+        assert!(app.last_submit.is_none(), "reset clears the retry anchor");
+    }
+
+    #[test]
     fn grants_events_update_status_and_leave_a_notice() {
         // upholds: CAP-3 — authority changes are visible: the status rail
         // mirrors the granted set and the transcript records the change. (The
@@ -1173,6 +1436,7 @@ mod tests {
             label: "Mandelbrot set detail".into(),
             source: Some("https://example.com/mandelbrot.png".into()),
             list_index: Some(21),
+            derived_from: None,
         });
         app.on_engine_event(HostEvent::Done {
             turn_id: 0,

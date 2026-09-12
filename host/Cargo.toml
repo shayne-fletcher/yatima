@@ -15,6 +15,7 @@ path = "src/lib.rs"
 # on this crate. It sits between yatima-lib and the frontends in the DAG
 # (LAYER-1: frontends → yatima-host → yatima-lib; never sideways, never up).
 [features]
+hermetic-derivation = ["yatima-lib/hermetic-derivation"]
 metal = ["yatima-lib/metal"]
 fetch = ["yatima-lib/fetch"]
 

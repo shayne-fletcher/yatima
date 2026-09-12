@@ -221,7 +221,7 @@ enum Turn {
     Live {
         id: u64,
         /// When the request was submitted — the start of the wall-clock span
-        /// the settled-turn report shows ("✻ took 0:58"): request to
+        /// the settled-turn report shows ("• took 0:58"): request to
         /// ready-for-the-next-request, whatever the ending.
         submitted: std::time::Instant,
         /// The answer streaming in (armed in `submit`).
@@ -400,8 +400,98 @@ struct GuiApp {
     /// newest entry restores it.
     draft: String,
     /// The last settled turn's report — how long the request took to hand
-    /// the box back, shown by the input while idle ("✻ took 0:58").
+    /// the box back, shown by the input while idle ("• took 0:58").
     last_turn: Option<TurnReport>,
+    /// The live grant-proposal set (R2/WEB-7): chips from the host's typed
+    /// event, never parsed from prose. At most one set — a later turn's
+    /// proposal replaces it (never merges). The tap is the user utterance
+    /// that grants (CAP-3); when every named origin lands, the set's
+    /// original prompt retries exactly once.
+    proposal: Option<ProposalSet>,
+    /// The most recent Submit's `(turn_id, text)` — the retry anchor for a
+    /// proposal arriving from that turn.
+    last_submit: Option<(u64, String)>,
+}
+
+/// See [`GuiApp::proposal`]. Per origin: `Offered → Sent → Landed`; a
+/// landed chip retires from display; partial failure falls back to
+/// `Offered` (the host's failure note is already in the transcript).
+struct ProposalSet {
+    /// The user prompt that produced this proposal — what retries once
+    /// every origin lands.
+    prompt: String,
+    chips: Vec<(String, ChipState)>,
+    retried: bool,
+    /// "grant all" mode: the one click authorized the whole set, and the
+    /// view walks it ONE grant at a time (a failure stops the walk). At
+    /// most one chip is ever `Sent` — the structural fix for the
+    /// pending-sibling demotion/duplicate hazard (found in review).
+    grant_all: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChipState {
+    Offered,
+    Sent,
+    Landed,
+}
+
+/// The chip-tap action the rendered buttons call (witnessed at exactly
+/// this seam): a single tap sends that one origin, marking it `Sent`;
+/// "grant all" arms the serialized walk and sends only the first
+/// `Offered` chip (the fold advances the rest, one landed report at a
+/// time). No-ops entirely while any chip is in flight — the render also
+/// disables the controls then, but the action fn is the guarantee.
+fn tap_chip(set: &mut ProposalSet, tapped: Option<&str>, all: bool) -> Option<String> {
+    if set.chips.iter().any(|(_, state)| *state == ChipState::Sent) {
+        return None;
+    }
+    if all {
+        set.grant_all = true;
+        return next_serial_grant(&mut set.chips);
+    }
+    let tapped = tapped?;
+    set.chips
+        .iter_mut()
+        .find(|(origin, state)| origin == tapped && *state == ChipState::Offered)
+        .map(|(origin, state)| {
+            *state = ChipState::Sent;
+            origin.clone()
+        })
+}
+
+/// The next chip a serialized walk should dispatch (witnessed): `None`
+/// while any chip is still `Sent` (one in flight at a time — the
+/// structural guard against duplicate dispatch when an earlier report
+/// fails) or when nothing is left `Offered`; otherwise marks the first
+/// `Offered` chip `Sent` and returns its origin.
+fn next_serial_grant(chips: &mut [(String, ChipState)]) -> Option<String> {
+    if chips.iter().any(|(_, state)| *state == ChipState::Sent) {
+        return None;
+    }
+    chips
+        .iter_mut()
+        .find(|(_, state)| *state == ChipState::Offered)
+        .map(|(origin, state)| {
+            *state = ChipState::Sent;
+            origin.clone()
+        })
+}
+
+/// The pure per-origin chip fold for one grant report (witnessed): named
+/// origins land; on a failed report, the in-flight (`Sent`) chip falls
+/// back to `Offered`. Serialized dispatch keeps at most one chip `Sent`,
+/// so a failure can never demote a pending sibling into a duplicate.
+/// Returns whether every chip has now landed (the retry trigger).
+fn fold_chips(chips: &mut [(String, ChipState)], granted: &[String], failed: bool) -> bool {
+    for (origin, state) in chips.iter_mut() {
+        if granted.contains(origin) {
+            *state = ChipState::Landed;
+        } else if failed && *state == ChipState::Sent {
+            *state = ChipState::Offered;
+        }
+    }
+    chips.iter().all(|(_, state)| *state == ChipState::Landed)
 }
 
 /// One settled turn, reported by the input panel: the ending's verb and the
@@ -505,6 +595,40 @@ impl GuiApp {
             history_nav: None,
             draft: String::new(),
             last_turn: None,
+            proposal: None,
+            last_submit: None,
+        }
+    }
+
+    /// Fold a grant report into the live proposal set: named origins land
+    /// (their chips retire); on a failed grant, in-flight chips fall back
+    /// to `Offered` (re-tappable; the failure note is already in the
+    /// transcript). When every origin the set named has landed, the set's
+    /// original prompt retries exactly once — the model resumes the plan
+    /// the proposal interrupted, and nobody types the ask again.
+    fn fold_grants_into_proposal(&mut self, granted: &[String], failed: bool) {
+        let Some(set) = &mut self.proposal else {
+            return;
+        };
+        if failed {
+            // A failure ends the grant-all walk: the user re-decides.
+            set.grant_all = false;
+        }
+        if fold_chips(&mut set.chips, granted, failed) && !set.retried {
+            set.retried = true;
+            let prompt = set.prompt.clone();
+            self.proposal = None; // every chip retired with the landing
+            if !prompt.is_empty() && self.backend.ready().is_some() && !self.in_flight() {
+                self.begin_turn(prompt);
+            }
+            return;
+        }
+        // The grant-all walk: dispatch the next chip only once nothing is
+        // in flight (one Sent at a time, structurally).
+        if set.grant_all {
+            if let Some(origin) = next_serial_grant(&mut set.chips) {
+                self.dispatch(HostRequest::Grant { origin });
+            }
         }
     }
 
@@ -614,6 +738,7 @@ impl GuiApp {
         self.turn = Turn::Idle;
         self.help_open = false;
         self.last_turn = None;
+        self.proposal = None; // pending chips clear with the conversation
     }
 
     /// Fold host events into the UI mirror. `now` is the egui clock used to
@@ -697,8 +822,29 @@ impl GuiApp {
                     }
                 }
                 // Grant reports and app-plane messages both render as notes.
-                HostEvent::Note(message) | HostEvent::Grants { message, .. } => {
-                    self.transcript.push(Msg::Note(message))
+                HostEvent::Note(message) => self.transcript.push(Msg::Note(message)),
+                HostEvent::Grants { message, origins } => {
+                    let failed = message.starts_with("grant failed");
+                    self.transcript.push(Msg::Note(message));
+                    self.fold_grants_into_proposal(&origins, failed);
+                }
+                // The host's typed proposal (R2/WEB-7): chips, never a
+                // prose parse. A later turn's proposal replaces the set.
+                HostEvent::GrantProposal { turn_id, origins } => {
+                    let prompt = match &self.last_submit {
+                        Some((id, text)) if *id == turn_id => text.clone(),
+                        _ => String::new(),
+                    };
+                    let _ = turn_id;
+                    self.proposal = Some(ProposalSet {
+                        prompt,
+                        chips: origins
+                            .into_iter()
+                            .map(|origin| (origin, ChipState::Offered))
+                            .collect(),
+                        retried: false,
+                        grant_all: false,
+                    });
                 }
                 HostEvent::Context { prompt_tokens } => self.context_used = Some(prompt_tokens),
                 // The host read the artifact's bytes; here they become a
@@ -828,17 +974,34 @@ impl GuiApp {
             self.input.clear();
             return;
         }
-        if let Some(origin) = prompt.strip_prefix("/grant ") {
-            self.dispatch(HostRequest::Grant {
-                origin: origin.trim().to_string(),
-            });
+        // One command, any number of origins: models suggest image hosts
+        // in pairs, and users paste the pair — sometimes as a multi-line
+        // command block whose newlines the single-line input collapses
+        // ("…org/grant https://…", taped live). An origin never contains
+        // a path, so the command word itself is a safe extra separator.
+        if let Some(origins) = prompt.strip_prefix("/grant ") {
+            for origin in origins.split("/grant").flat_map(str::split_whitespace) {
+                self.dispatch(HostRequest::Grant {
+                    origin: origin.to_string(),
+                });
+            }
             self.input.clear();
+            // Granting while idle is the user's reply to the model's own
+            // request for authority: continue the conversation at once —
+            // the model's history holds its plan and HOST-6 hands it the
+            // grant news — instead of making the user prompt again
+            // (taped live: "yatima i have to prompt again").
+            if self.backend.ready().is_some() && !self.in_flight() {
+                self.begin_turn(prompt);
+            }
             return;
         }
-        if let Some(origin) = prompt.strip_prefix("/revoke ") {
-            self.dispatch(HostRequest::Revoke {
-                origin: origin.trim().to_string(),
-            });
+        if let Some(origins) = prompt.strip_prefix("/revoke ") {
+            for origin in origins.split("/revoke").flat_map(str::split_whitespace) {
+                self.dispatch(HostRequest::Revoke {
+                    origin: origin.to_string(),
+                });
+            }
             self.input.clear();
             return;
         }
@@ -849,11 +1012,20 @@ impl GuiApp {
         for origin in yatima_lib::origins_in(&prompt) {
             self.dispatch(HostRequest::Grant { origin });
         }
+        self.begin_turn(prompt);
+        self.input.clear();
+    }
+
+    /// Arm the live turn and submit `prompt` as its text — the one place a
+    /// model turn starts (the ordinary prompt path, and the grant-while-idle
+    /// continuation).
+    fn begin_turn(&mut self, prompt: String) {
         self.transcript.push(Msg::User(prompt.clone()));
         self.turn_start = None;
         self.gen_tokens = 0;
         let turn_id = self.next_turn_id;
         self.next_turn_id += 1;
+        self.last_submit = Some((turn_id, prompt.clone()));
         self.turn = Turn::Live {
             id: turn_id,
             submitted: std::time::Instant::now(),
@@ -865,7 +1037,6 @@ impl GuiApp {
             turn_id,
             text: prompt,
         });
-        self.input.clear();
     }
 }
 
@@ -1026,7 +1197,7 @@ impl eframe::App for GuiApp {
             if !self.in_flight() {
                 if let Some(report) = &self.last_turn {
                     ui.label(
-                        egui::RichText::new(format!("✻ {} {}", report.verb, fmt_took(report.secs)))
+                        egui::RichText::new(format!("• {} {}", report.verb, fmt_took(report.secs)))
                             .size(12.0)
                             .color(with_alpha(HELP_ACCENT, 170)),
                     );
@@ -1186,6 +1357,67 @@ impl eframe::App for GuiApp {
                             );
                         }
                         ui.add_space(8.0);
+                    }
+                    // The proposal chips (R2/WEB-7), under the settled
+                    // entry: a tap is the user utterance that grants
+                    // (CAP-3) — it sends an ordinary Grant request
+                    // through `tap_chip`, the witnessed action fn. One
+                    // grant in flight at a time: while a chip is Sent,
+                    // every grant control renders disabled; "grant all"
+                    // starts the serialized walk the fold advances.
+                    let mut tapped: Option<String> = None;
+                    let mut all_clicked = false;
+                    if let Some(set) = &self.proposal {
+                        let any_sent = set.chips.iter().any(|(_, s)| *s == ChipState::Sent);
+                        let offered = set
+                            .chips
+                            .iter()
+                            .filter(|(_, s)| *s != ChipState::Landed)
+                            .count();
+                        if offered > 0 {
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for (origin, state) in &set.chips {
+                                    match state {
+                                        ChipState::Landed => {}
+                                        ChipState::Sent => {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::new(format!("granting {origin}…")),
+                                            );
+                                        }
+                                        ChipState::Offered => {
+                                            if ui
+                                                .add_enabled(
+                                                    !any_sent,
+                                                    egui::Button::new(format!("grant {origin}")),
+                                                )
+                                                .clicked()
+                                            {
+                                                tapped = Some(origin.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                if offered > 1
+                                    && ui
+                                        .add_enabled(!any_sent, egui::Button::new("grant all"))
+                                        .clicked()
+                                {
+                                    all_clicked = true;
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                    }
+                    if tapped.is_some() || all_clicked {
+                        let send = self
+                            .proposal
+                            .as_mut()
+                            .and_then(|set| tap_chip(set, tapped.as_deref(), all_clicked));
+                        if let Some(origin) = send {
+                            self.dispatch(HostRequest::Grant { origin });
+                        }
                     }
                 });
         });
@@ -1734,7 +1966,12 @@ mod tests {
         // seam; the gate-adjacent Cancel is recorded before the gate trips.
         let src = include_str!("main.rs");
         let dispatch_call = format!("self.{}(", "dispatch");
-        assert_eq!(src.matches(&dispatch_call).count(), 6);
+        assert_eq!(
+            src.matches(&dispatch_call).count(),
+            8,
+            "six request routes plus the chip tap and the serialized \
+             grant-all walk — all through the seam"
+        );
         let bypass = format!("self.req_tx.{}(", "send");
         assert_eq!(src.matches(&bypass).count(), 0);
 
@@ -2004,6 +2241,132 @@ mod tests {
             submit_action("/unknown-thing", true, false),
             SubmitAction::Prompt,
             "unknown slash text remains a prompt, as ever"
+        );
+    }
+
+    #[test]
+    fn chip_fold_lands_demotes_on_failure_and_triggers_retry_once() {
+        // upholds: WEB-7/R2 — per-origin Offered→Sent→Landed; a sibling's
+        // success never demotes a pending Sent chip; a failed report
+        // returns Sent chips to Offered; all-landed is the retry trigger.
+        let mut chips = vec![
+            ("https://a.example".to_string(), ChipState::Sent),
+            ("https://b.example".to_string(), ChipState::Sent),
+        ];
+        // a lands; b (still pending) is NOT demoted by a's success.
+        assert!(!fold_chips(
+            &mut chips,
+            &["https://a.example".to_string()],
+            false
+        ));
+        assert_eq!(chips[0].1, ChipState::Landed);
+        assert_eq!(chips[1].1, ChipState::Sent);
+        // b's grant fails: back to Offered, re-tappable.
+        assert!(!fold_chips(
+            &mut chips,
+            &["https://a.example".to_string()],
+            true
+        ));
+        assert_eq!(chips[1].1, ChipState::Offered);
+        // b finally lands: everything landed → the retry trigger.
+        assert!(fold_chips(
+            &mut chips,
+            &[
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ],
+            false
+        ));
+    }
+
+    #[test]
+    fn the_rendered_tap_action_is_serial_at_its_own_seam() {
+        // upholds: WEB-7/R2 — `tap_chip` IS what the buttons call: a tap
+        // sends exactly one origin; "grant all" arms the walk and sends
+        // only the first chip; and while one is in flight every further
+        // action no-ops (the render disables the controls too, but the
+        // action fn is the guarantee the witness pins).
+        let mut set = ProposalSet {
+            prompt: "the ask".into(),
+            chips: vec![
+                ("https://a.example".to_string(), ChipState::Offered),
+                ("https://b.example".to_string(), ChipState::Offered),
+            ],
+            retried: false,
+            grant_all: false,
+        };
+        assert_eq!(
+            tap_chip(&mut set, None, true).as_deref(),
+            Some("https://a.example"),
+            "grant all sends only the first chip"
+        );
+        assert!(set.grant_all);
+        assert_eq!(set.chips[0].1, ChipState::Sent);
+        assert_eq!(set.chips[1].1, ChipState::Offered, "b was not sent");
+        assert_eq!(
+            tap_chip(&mut set, Some("https://b.example"), false),
+            None,
+            "no action while a grant is in flight"
+        );
+        assert_eq!(
+            tap_chip(&mut set, None, true),
+            None,
+            "grant all no-ops in flight too"
+        );
+        // a lands; a single tap on b sends exactly b.
+        assert!(!fold_chips(
+            &mut set.chips,
+            &["https://a.example".to_string()],
+            false
+        ));
+        set.grant_all = false;
+        assert_eq!(
+            tap_chip(&mut set, Some("https://b.example"), false).as_deref(),
+            Some("https://b.example")
+        );
+        assert_eq!(set.chips[1].1, ChipState::Sent);
+    }
+
+    #[test]
+    fn serial_grants_dispatch_one_at_a_time_and_failure_stops_the_walk() {
+        // upholds: WEB-7/R2 — at most one chip is ever Sent: the walk
+        // refuses to advance while one is in flight, a failure demotes
+        // only that one chip (no pending sibling exists to duplicate),
+        // and the next dispatch happens only after the report lands.
+        let mut chips = vec![
+            ("https://a.example".to_string(), ChipState::Offered),
+            ("https://b.example".to_string(), ChipState::Offered),
+        ];
+        assert_eq!(
+            next_serial_grant(&mut chips).as_deref(),
+            Some("https://a.example")
+        );
+        assert_eq!(chips[0].1, ChipState::Sent);
+        assert_eq!(
+            next_serial_grant(&mut chips),
+            None,
+            "nothing dispatches while a grant is in flight"
+        );
+        assert_eq!(chips[1].1, ChipState::Offered, "b was never sent");
+        // a's grant fails: only a demotes; b is untouched and no
+        // duplicate dispatch for it can exist.
+        assert!(!fold_chips(&mut chips, &[], true));
+        assert_eq!(chips[0].1, ChipState::Offered);
+        assert_eq!(chips[1].1, ChipState::Offered);
+        // The walk resumes only by explicit re-dispatch: a lands, then b
+        // is the next serial grant.
+        assert_eq!(
+            next_serial_grant(&mut chips).as_deref(),
+            Some("https://a.example")
+        );
+        assert!(!fold_chips(
+            &mut chips,
+            &["https://a.example".to_string()],
+            false
+        ));
+        assert_eq!(
+            next_serial_grant(&mut chips).as_deref(),
+            Some("https://b.example")
         );
     }
 

@@ -294,6 +294,11 @@ async fn managed_muse_tool_round_is_typed_activity() {
             }
             HostEvent::ToolNote { kind, text, .. } => notes.push((kind, text)),
             HostEvent::RetractAnswer { .. } => {}
+            // R2: the refusal named an ungranted origin, so the settled
+            // turn carries the host's typed proposal for it.
+            HostEvent::GrantProposal { origins, .. } => {
+                assert_eq!(origins, ["https://other.example"]);
+            }
             HostEvent::Done { stop, .. } => {
                 assert_eq!(stop, StopKind::Eos);
                 break;

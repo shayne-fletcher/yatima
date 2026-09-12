@@ -59,6 +59,15 @@
 //!   no estimate is presented as evidence (`/tokenize` is the recorded debt
 //!   that restores exact metering for llama-server). Wording single-sourced
 //!   in [`compaction_note`]; cited by the arithmetic/wording/trigger tests.
+//! - **HOST-6** every grant/revoke the host performs is visible to the model
+//!   as conversation text before its next turn: the reports queue and ride
+//!   the next prompt as appended host lines ([`fold_pending_notes`]) — the
+//!   conversation suffix, never the byte-stable spec prefix — each exactly
+//!   once. The model never has to infer grant state from its own prior
+//!   prose (taped live: with an origin granted and already read twice, the
+//!   model made zero calls and told the user to grant it — every re-grant
+//!   landed on the user's screen and changed nothing in the model's
+//!   context). Cited by `grant_reports_ride_the_next_prompt_once`.
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -69,12 +78,13 @@ use anyhow::{Context as _, Result};
 use chrono::Local;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use yatima_lib::{
-    device, looks_degenerate, metal_kv_depth_risk, resolve_format, verify_cancellable_sync, Agent,
-    AgentEvent, AgentStop, Cancel, Channel as LibChannel, ChatFormat, ChatSession,
-    ChildCleanupFailed, Completer, Engine, GenOpts, ImageListing, JsonToolCall, KvDepthRisk,
-    LlamaServer, LlamaServerSpawn, ModelSource, MuseAtemCodec, Plot, PlotSandbox, PromptTemplate,
-    QwenToolCall, ReadImage, ReadPage, ReadUrl, Sampling, ServerIdentity, StopReason, ToolArtifact,
-    ToolCallCodec, ToolOutcome, Tools, VerifyCancelled, WebOrigins, METAL_KV_VALIDATED,
+    device, looks_degenerate, metal_kv_depth_risk, proposed_origins, resolve_format,
+    verify_cancellable_sync, Agent, AgentEvent, AgentStop, Cancel, Channel as LibChannel,
+    ChatFormat, ChatSession, ChildCleanupFailed, Completer, Engine, GenOpts, ImageListing,
+    JsonToolCall, KvDepthRisk, LlamaServer, LlamaServerSpawn, ModelSource, MuseAtemCodec, Plot,
+    PlotSandbox, PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl, Sampling,
+    SearchRegistry, ServerIdentity, StopReason, ToolArtifact, ToolCallCodec, ToolOutcome, Tools,
+    VerifyCancelled, WebOrigins, WebSearch, METAL_KV_VALIDATED,
 };
 
 pub mod knobs;
@@ -1114,7 +1124,9 @@ fn serve_chat<C: Completer>(
             HostRequest::Cancel { turn_id } => gate.cancel(turn_id),
             HostRequest::Reset => session.reset(),
             HostRequest::Grant { origin } => refuse_grant(event_tx, format, &origin),
-            HostRequest::Revoke { origin } => report_revoke(event_tx, None, &origin),
+            HostRequest::Revoke { origin } => {
+                report_revoke(event_tx, None, &origin); // chat-only: no note to carry
+            }
             HostRequest::ListGrants => report_grants(event_tx, None),
             HostRequest::Shutdown => return Ok(()),
             _ => {} // a future request variant this host predates: ignore it.
@@ -1151,6 +1163,13 @@ fn serve_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     )
     .with_opts(opts);
 
+    // Grant/revoke reports the model has not seen yet (HOST-6): they ride
+    // the next prompt as appended lines — conversation suffix, so the
+    // byte-stable spec prefix (and its KV cache) is untouched. Without
+    // this the model's only theory of grant state is its own prior
+    // prose (taped live: with the origin granted and already read twice,
+    // the model made zero calls and told the user to grant it).
+    let mut pending_notes: Vec<String> = Vec::new();
     while let Ok(req) = req_rx.recv() {
         // A vanished event plane means no frontend can ever see another
         // event: exit through the epilogue rather than serving the void.
@@ -1159,9 +1178,12 @@ fn serve_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
         }
         match req {
             HostRequest::Submit { turn_id, text } => {
+                let text = fold_pending_notes(&mut pending_notes, text);
                 let cancel = Cancel::new();
                 gate.arm(turn_id, cancel.clone());
-                let outcome = run_agent_turn(&mut agent, event_tx, turn_id, &text, &cancel, watch);
+                let outcome = run_agent_turn(
+                    &mut agent, event_tx, turn_id, &text, &cancel, watch, origins,
+                );
                 gate.disarm();
                 if let ControlFlow::Break(debt) = outcome {
                     // Fatal backend loss: converge on the epilogue, carrying
@@ -1178,8 +1200,12 @@ fn serve_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
             }
             HostRequest::Cancel { turn_id } => gate.cancel(turn_id),
             HostRequest::Reset => agent.reset(),
-            HostRequest::Grant { origin } => report_grant(event_tx, origins, &origin),
-            HostRequest::Revoke { origin } => report_revoke(event_tx, Some(origins), &origin),
+            HostRequest::Grant { origin } => {
+                pending_notes.extend(report_grant(event_tx, origins, &origin));
+            }
+            HostRequest::Revoke { origin } => {
+                pending_notes.extend(report_revoke(event_tx, Some(origins), &origin));
+            }
             HostRequest::ListGrants => report_grants(event_tx, Some(origins)),
             HostRequest::Shutdown => return Ok(()),
             _ => {} // a future request variant this host predates: ignore it.
@@ -1189,10 +1215,34 @@ fn serve_agent<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     Ok(())
 }
 
+/// Fold grant/revoke reports the model has not seen into the next prompt
+/// (HOST-6): drained on use — each report rides exactly one prompt — as
+/// bracketed host lines appended after the user's own text.
+fn fold_pending_notes(notes: &mut Vec<String>, text: String) -> String {
+    if notes.is_empty() {
+        return text;
+    }
+    let folded = notes
+        .drain(..)
+        .map(|note| format!("[host: {note}]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{text}\n\n{folded}")
+}
+
 /// Grant an origin and report it (both the first-grant "web tools enabled"
-/// tail and the plain subsequent form). CAP-3 wording; HOST-2.
-fn report_grant(event_tx: &UnboundedSender<HostEvent>, origins: &WebOrigins, origin: &str) {
-    let (list, message) = match origins.grant(origin) {
+/// tail and the plain subsequent form). CAP-3 wording; HOST-2. Returns the
+/// note the *model* must see with its next prompt (HOST-6) — on success
+/// and on "already granted" alike: the already-granted case is precisely
+/// the one where the model holds a false belief worth correcting (taped
+/// live: a model begging for a grant it held, twice, while every re-grant
+/// landed only on the user's screen).
+fn report_grant(
+    event_tx: &UnboundedSender<HostEvent>,
+    origins: &WebOrigins,
+    origin: &str,
+) -> Option<String> {
+    let (list, message, note) = match origins.grant(origin) {
         Ok(true) => {
             let list = origins.list();
             let message = if list.len() == 1 {
@@ -1200,15 +1250,30 @@ fn report_grant(event_tx: &UnboundedSender<HostEvent>, origins: &WebOrigins, ori
             } else {
                 format!("granted read access to {origin}")
             };
-            (list, message)
+            let note = format!(
+                "the user granted read access to {origin}; granted origins \
+                 are now [{}]",
+                list.join(", ")
+            );
+            (list, message, Some(note))
         }
-        Ok(false) => (origins.list(), format!("{origin} was already granted")),
-        Err(e) => (origins.list(), format!("grant failed: {e}")),
+        Ok(false) => (
+            origins.list(),
+            format!("{origin} was already granted"),
+            Some(format!(
+                "{origin} was already granted; granted origins are [{}] — \
+                 if a fetch from it failed, the server refused: choose a \
+                 different source, do not ask for this grant again",
+                origins.list().join(", ")
+            )),
+        ),
+        Err(e) => (origins.list(), format!("grant failed: {e}"), None),
     };
     let _ = event_tx.send(HostEvent::Grants {
         origins: list,
         message,
     });
+    note
 }
 
 /// Refuse a grant on a chat-only format, naming the format and the way out
@@ -1223,28 +1288,37 @@ fn refuse_grant(event_tx: &UnboundedSender<HostEvent>, format: ChatFormat, origi
     });
 }
 
-/// Answer a revoke request (both phases; HOST-2).
+/// Answer a revoke request (both phases; HOST-2). Returns the note the
+/// model must see with its next prompt (HOST-6) when authority actually
+/// shrank.
 fn report_revoke(
     event_tx: &UnboundedSender<HostEvent>,
     origins: Option<&WebOrigins>,
     origin: &str,
-) {
+) -> Option<String> {
     let Some(origins) = origins else {
         let _ = event_tx.send(HostEvent::Grants {
             origins: vec![],
             message: "nothing granted (chat-only format)".to_string(),
         });
-        return;
+        return None;
     };
-    let message = match origins.revoke(origin) {
-        Ok(true) => format!("revoked {origin}"),
-        Ok(false) => format!("{origin} was not granted"),
-        Err(e) => format!("revoke failed: {e}"),
+    let (message, note) = match origins.revoke(origin) {
+        Ok(true) => (
+            format!("revoked {origin}"),
+            Some(format!(
+                "the user revoked {origin}; granted origins are now [{}]",
+                origins.list().join(", ")
+            )),
+        ),
+        Ok(false) => (format!("{origin} was not granted"), None),
+        Err(e) => (format!("revoke failed: {e}"), None),
     };
     let _ = event_tx.send(HostEvent::Grants {
         origins: origins.list(),
         message,
     });
+    note
 }
 
 /// Answer a list request (both phases; HOST-2).
@@ -1277,22 +1351,50 @@ fn web_tools(origins: &WebOrigins) -> Result<Tools> {
     // One listing cell per session (IMG-3): read_page publishes its numbered
     // [images] list into it, read_image selects from it by number.
     let listing = ImageListing::default();
-    let mut tools = Tools::new().with(ReadUrl::new(origins.clone())?).with(
-        ReadPage::with_limits(
-            origins.clone(),
-            knobs::READ_PAGE_MAX_INPUT_BYTES,
-            knobs::READ_PAGE_MAX_CHARS,
-        )?
-        .with_listing(listing.clone()),
-    );
+    // One search registry per session: web_search publishes stable result
+    // ids into it (R1b hands the same instance to the readers). The tool
+    // exists exactly when YATIMA_SEARCH_URL configures an endpoint —
+    // searching finds; reading still requires a grant (CAP-2/CAP-3).
+    let search_registry = SearchRegistry::default();
+    let mut tools = Tools::new()
+        .with(ReadUrl::new(origins.clone())?.with_search_results(search_registry.clone()))
+        .with(
+            ReadPage::with_limits(
+                origins.clone(),
+                knobs::READ_PAGE_MAX_INPUT_BYTES,
+                knobs::READ_PAGE_MAX_CHARS,
+            )?
+            .with_listing(listing.clone())
+            .with_search_results(search_registry.clone()),
+        );
     let cache = std::env::home_dir()
         .map(|home| home.join(".cache/yatima"))
         .unwrap_or_else(std::env::temp_dir);
-    tools =
-        tools.with(ReadImage::new(origins.clone(), cache.join("images"))?.with_listing(listing));
+    #[allow(unused_mut)]
+    let mut read_image =
+        ReadImage::new(origins.clone(), cache.join("images"))?.with_listing(listing);
+    // The R4 hermetic-acceptance seam exists ONLY when this crate is
+    // built with `hermetic-derivation` (the drive acceptance battery's
+    // feature chain); an ordinary build compiles no such branch, so no
+    // environment variable can weaken CAP-4 in a shipped binary
+    // (witnessed by `environment_cannot_weaken_cap4_in_the_shipped_toolset`).
+    #[cfg(feature = "hermetic-derivation")]
+    if std::env::var_os("YATIMA_TEST_ALLOW_LOOPBACK_DERIVATION").is_some() {
+        eprintln!(
+            "HERMETIC ACCEPTANCE SEAM ACTIVE: loopback derivation admitted \
+             (CAP-4's public-target rule relaxed for this feature-built process)"
+        );
+        read_image = read_image.with_loopback_derivation();
+    }
+    tools = tools.with(read_image);
     match PlotSandbox::system(cache.join("plots")) {
         Ok(sandbox) => tools = tools.with(Plot::new(sandbox)),
         Err(e) => eprintln!("plot tool unavailable: {e}"),
+    }
+    match WebSearch::from_env(search_registry) {
+        Ok(Some(search)) => tools = tools.with(search),
+        Ok(None) => {} // no endpoint configured: the tool is simply absent
+        Err(e) => eprintln!("web_search unavailable: {e}"),
     }
     Ok(tools)
 }
@@ -1315,6 +1417,7 @@ fn read_artifact(turn_id: TurnId, artifact: ToolArtifact) -> Result<HostEvent> {
         label: artifact.label,
         source: artifact.source,
         list_index: artifact.list_index,
+        derived_from: artifact.derived_from,
     })
 }
 
@@ -1436,6 +1539,7 @@ fn run_agent_turn<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     user: &str,
     cancel: &Cancel,
     watch: DepthWatch,
+    origins: &WebOrigins,
 ) -> ControlFlow<Option<anyhow::Error>> {
     let _ = event_tx.send(HostEvent::Started { turn_id });
 
@@ -1459,6 +1563,10 @@ fn run_agent_turn<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
     // Answer prose streamed during the *current* step; a ToolCall event means it
     // was narration, not answer — retract and reclassify.
     let mut step_answer = String::new();
+    // Unclipped tool-refusal texts, for the settled turn's grant proposal
+    // (R2): a refusal's "/grant https://…" wording must survive intact —
+    // the 160-char ToolNote clip can eat the URL.
+    let mut refusal_texts = String::new();
 
     let result = agent.run_with_cancellable(user, cancel, (), |(), event| {
         match event {
@@ -1503,10 +1611,21 @@ fn run_agent_turn<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
                         };
                         (ToolNoteKind::Success, text)
                     }
-                    other => (
-                        ToolNoteKind::Failure,
-                        clip(&other.render_for_model("").content, 160),
-                    ),
+                    other => {
+                        let full = other.render_for_model("").content;
+                        // Only a refusal that actually ASKS for a grant
+                        // feeds the proposal producer: a 404 or type
+                        // error that merely quotes a URL must not mint a
+                        // chip (taped live: a failed thumbnail fetch
+                        // proposed granting a CDN that CAP-4 derivation
+                        // makes unnecessary — the tap then re-ran the
+                        // whole errand).
+                        if full.contains("/grant ") {
+                            refusal_texts.push_str(&full);
+                            refusal_texts.push('\n');
+                        }
+                        (ToolNoteKind::Failure, clip(&full, 160))
+                    }
                 };
                 note(kind, text);
                 step_answer.clear();
@@ -1573,6 +1692,24 @@ fn run_agent_turn<C: Completer, K: ToolCallCodec, T: PromptTemplate>(
                     StopReason::Stopped
                 }
             };
+            // R2: the turn's one canonical union grant proposal — origins
+            // the settled answer or a tool refusal named that are not yet
+            // granted, extracted by the lib's single producer grammar
+            // (WEB-7: no frontend parses prose). Emitted before Done so
+            // chips fold into the settling turn; rendering proposes, only
+            // the user's tap grants (CAP-3).
+            let granted = origins.list();
+            let proposed: Vec<String> =
+                proposed_origins(&format!("{}\n{refusal_texts}", run.answer))
+                    .into_iter()
+                    .filter(|origin| !granted.contains(origin))
+                    .collect();
+            if !proposed.is_empty() {
+                let _ = event_tx.send(HostEvent::GrantProposal {
+                    turn_id,
+                    origins: proposed,
+                });
+            }
             let _ = event_tx.send(HostEvent::Done {
                 turn_id,
                 stop: to_proto_stop(stop),
@@ -1780,6 +1917,109 @@ mod tests {
     }
 
     #[test]
+    fn grant_reports_ride_the_next_prompt_once() {
+        // upholds: HOST-6 — grant/revoke reports reach the model with the
+        // next prompt, each exactly once; the already-granted report
+        // carries the do-not-ask-again redirect (the taped grant-begging
+        // wedge), and a no-op revoke is no note at all.
+        let (tx, mut rx) = unbounded_channel();
+        let origins = WebOrigins::new();
+        let mut notes = Vec::new();
+        notes.extend(report_grant(&tx, &origins, "https://example.com"));
+        notes.extend(report_grant(&tx, &origins, "https://example.com"));
+        while rx.try_recv().is_ok() {}
+        let folded = fold_pending_notes(&mut notes, "read it".to_string());
+        assert!(folded.starts_with("read it\n\n"), "{folded}");
+        assert!(
+            folded.contains("[host: the user granted read access to https://example.com"),
+            "{folded}"
+        );
+        assert!(
+            folded.contains("already granted") && folded.contains("do not ask for this grant"),
+            "{folded}"
+        );
+        assert_eq!(
+            fold_pending_notes(&mut notes, "next".to_string()),
+            "next",
+            "drained: each report rides exactly one prompt"
+        );
+        notes.extend(report_revoke(&tx, Some(&origins), "https://example.com"));
+        notes.extend(report_revoke(&tx, Some(&origins), "https://example.com"));
+        let folded = fold_pending_notes(&mut notes, "and now".to_string());
+        assert!(
+            folded.contains("the user revoked https://example.com"),
+            "{folded}"
+        );
+        assert_eq!(
+            folded.matches("revoked").count(),
+            1,
+            "a no-op revoke is not a note: {folded}"
+        );
+    }
+
+    #[cfg(not(feature = "hermetic-derivation"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn environment_cannot_weaken_cap4_in_the_shipped_toolset() {
+        // upholds: CAP-4 — the one-time loopback test seam is cfg(test)
+        // in yatima-lib and absent from this crate: even with the old
+        // variable set, the shipped `web_tools` construction refuses a
+        // page-derived loopback resource before any I/O. (The witness
+        // reads a granted loopback page whose listing nominates an
+        // UNGRANTED loopback target; only the derivation is at issue.)
+        std::env::set_var("YATIMA_TEST_ALLOW_LOOPBACK_DERIVATION", "1");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let article = "A page whose image the gate must refuse. ".repeat(10);
+                let body = format!(
+                    "<html><body><article><p>{article}</p>\
+                     <img src=\"http://127.0.0.1:9/pic.png\" alt=\"x\">\
+                     </article></body></html>"
+                );
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let origins = WebOrigins::new();
+        origins.grant(&origin).unwrap();
+        let tools = web_tools(&origins).unwrap();
+        {
+            let page = tools
+                .dispatch_async(&yatima_lib::ToolCall {
+                    name: "read_page".to_string(),
+                    args: format!(r#"{{"url": "{origin}/page"}}"#).parse().unwrap(),
+                })
+                .await
+                .render_for_model("read_page");
+            assert!(!page.is_error, "{}", page.content);
+            let image = tools
+                .dispatch_async(&yatima_lib::ToolCall {
+                    name: "read_image".to_string(),
+                    args: r#"{"image": 1}"#.parse().unwrap(),
+                })
+                .await
+                .render_for_model("read_image");
+            assert!(image.is_error, "{}", image.content);
+            assert!(
+                image.content.contains("derived resource refused"),
+                "{}",
+                image.content
+            );
+        }
+        std::env::remove_var("YATIMA_TEST_ALLOW_LOOPBACK_DERIVATION");
+    }
+
+    #[test]
     fn grant_wording_is_single_sourced() {
         // upholds: HOST-2 — the CAP-3 grant wording lives only here; the first
         // grant carries the "web tools enabled" tail, later grants do not.
@@ -1866,6 +2106,7 @@ mod tests {
             label,
             source,
             list_index,
+            derived_from: _,
         } = event
         else {
             panic!("expected image event");

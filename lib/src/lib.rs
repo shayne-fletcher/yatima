@@ -199,7 +199,11 @@
 //! Agent & tools (capability-scoped action):
 //! - **AGENT-1** the agent loop terminates after at most `max_steps` non-final
 //!   steps: a dispatched tool round, a protocol-recovery turn, or a retry for
-//!   an unmet tool-declared call requirement each consumes one.
+//!   an unmet tool-declared call requirement each consumes one. Exhaustion
+//!   buys one answer-only RESERVE completion (never a dispatch) so the
+//!   budget's last act is prose, not silence. Cited by
+//!   `budget_exhaustion_reserves_a_final_answer_round` and the
+//!   no-extra-dispatch fixture in `interrupted_runs_leave_history_untouched`.
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
 //!   name is an `is_error` result, never ambient execution (sandbox by omission).
 //! - **AGENT-3** across runs, an [`Agent`]'s persistent history carries only
@@ -233,23 +237,42 @@
 //! - **CAP-2** the agent's effects ⊆ the union of its tools' capabilities —
 //!   enforced for omission (AGENT-2) and containment (CAP-1); by construction
 //!   otherwise (tools hold their caps, no ambient `std::fs` or arbitrary
-//!   network destination). A web tool's authority is exactly its held origin
-//!   *set* ([`WebOrigins`]): membership checked at call time, escapes refused
-//!   before any network I/O, relative targets resolving only when exactly one
-//!   origin is granted — and every **redirect hop is re-checked** like a
-//!   fresh request (the network must not carry a granted request to an
-//!   ungranted origin; the ntfy publisher follows no redirects at all).
+//!   network destination). A web tool's authority is the union of its held
+//!   origin *set* ([`WebOrigins`]) and the exact resources derived from an
+//!   approved page (CAP-4): origin membership checked at call time, escapes
+//!   refused before any network I/O, relative targets resolving only when
+//!   exactly one origin is granted — and every **redirect hop is
+//!   re-checked** like a fresh request (against the granted set for direct
+//!   fetches, against CAP-4's public-web gate for derived retrievals; the
+//!   ntfy publisher follows no redirects at all).
 //!   Coverage is **https-upgrade-tolerant**: a granted `http://X` covers
 //!   `https://X` (same host/port) — the same authority over strictly
 //!   stronger transport — never the reverse (no silent downgrade).
 //!   Stated, not compiler-absolute — see `notes/design.md`.
-//! - **CAP-3** web authority derives only from **user utterances**: an origin
-//!   enters a session's [`WebOrigins`] iff the user typed a URL (auto-grant,
-//!   scanned by [`origins_in`]) or issued an explicit grant command. Grants
-//!   accumulate (session authority is the union), never persist across
-//!   sessions, and shrink only by explicit revoke. Nothing a tool returns or
-//!   the model generates reaches [`WebOrigins::grant`] — no such code path
-//!   exists, so a fetched page cannot mint authority.
+//! - **CAP-3** the root-authority rule: an *origin* enters a session's
+//!   [`WebOrigins`] iff the user typed a URL (auto-grant, scanned by
+//!   [`origins_in`]) or issued an explicit grant command. Grants accumulate
+//!   (session authority is the union), never persist across sessions, and
+//!   shrink only by explicit revoke. Nothing a tool returns or the model
+//!   generates reaches [`WebOrigins::grant`] — no such code path exists.
+//!   Content from a successfully read approved page may derive authority
+//!   only for the exact public-web resources it embeds (CAP-4) — never an
+//!   origin, never a navigational link.
+//! - **CAP-4** a derived resource is confined to its opaque listing
+//!   reference: `read_image {"image": N}` may fetch the exact URL the
+//!   granted page's [`ImageListing`] published — even on an ungranted image
+//!   host — while the direct-URL form never inherits. Derivation passes an
+//!   ingress gate (canonical public HTTP(S): no userinfo, no
+//!   localhost/.localhost, no loopback/private/unique-local/link-local/
+//!   unspecified/multicast IP; re-checked on every redirect hop, a
+//!   URL-level rule, not a DNS-rebinding defense), holds only while the
+//!   source page's grant is live (revocation kills descendants), never adds
+//!   an origin to the set, and a replaced listing retires its numbers. A
+//!   user may still grant a local origin explicitly; page content cannot
+//!   derive one. Cited by `numbered_images_inherit_the_pages_approval`,
+//!   `derived_authority_dies_with_its_page_grant`,
+//!   `derived_ingress_refuses_private_targets_before_io`, and
+//!   `public_web_url_admits_the_public_web_only`.
 //! - **CAP-3a** the rendered tool specs state the model's live authority: a
 //!   tool whose capability is empty is absent from [`Tools::specs`] (the
 //!   model never sees a tool it cannot use), and a web tool's description
@@ -263,6 +286,14 @@
 //!   article prefix exactly, and every truncation marker names the next
 //!   window's `offset` (the marker is the pagination API). An offset at or
 //!   past the end is a helpful error naming the length, never silent-empty.
+//! - **ERR-1** a web tool's HTTP-failure error never attributes a server's
+//!   refusal to missing authority: a fetch reaches the network only after
+//!   the origin gate passes, so the error states the grant is in place and
+//!   names the next move (choose a different source; wait, for 429) —
+//!   never a grant request. The spec-level grant protocol teaches the same
+//!   split, because small models plan from the spec, not the error string
+//!   (the taped cacm.acm.org 403 grant-begging wedge, 2026-09-11). Cited
+//!   by `refusal_errors_do_not_beg_for_grants`.
 //! - **PLOT-1** the [`Plot`] tool executes no model-authored code, ever: the
 //!   model submits a declarative spec against a **closed schema** (unknown
 //!   fields, unknown kinds, and anything code-shaped are typed rejections),
@@ -304,9 +335,13 @@
 //!   the regenerated tool spec, so AGENT-3's answer-only history cannot erase
 //!   this display state. For the narrow syntactic class of explicit image
 //!   display requests, the tool also requires a successful `read_image` call
-//!   before the agent may commit a final answer; narration cannot impersonate
-//!   the effect. When every listed image has been shown, the teaching states
-//!   that exhaustion as a computed fact. Cited by the required-call,
+//!   before the agent may commit a final answer — but only while the current
+//!   listing has entries: an empty listing makes the demand unsatisfiable,
+//!   and the truthful "this page has no images" answer must commit (a taped
+//!   frameset page once wedged six withheld answers against the step
+//!   budget). Narration cannot impersonate the effect. When every listed
+//!   image has been shown, the teaching states that exhaustion as a
+//!   computed fact. Cited by the required-call,
 //!   session-ledger, repeat/duplicate, re-show, exhaustion, and artifact-event
 //!   tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL
@@ -400,7 +435,9 @@ pub use backend::{
     ServerGates, ServerIdentity, ServerProps,
 };
 pub use cancel::Cancel;
-pub use capability::{origins_in, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir};
+pub use capability::{
+    origins_in, proposed_origins, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir,
+};
 pub use chat::{looks_degenerate, ChatSession};
 pub use completer::{Completer, Completion};
 #[cfg(feature = "fetch")]
@@ -426,9 +463,10 @@ pub use template::{
 };
 pub use tool::{
     ImageListing, JsonToolCall, ListDir, MuseAtemCodec, Plot, PlotBound, PlotSeries, QwenToolCall,
-    ReadFile, ReadImage, ReadPage, ReadUrl, SendNotification, Tool, ToolArtifact, ToolCall,
-    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolExtraction, ToolFailure, ToolOutcome,
-    ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WriteFile,
+    ReadFile, ReadImage, ReadPage, ReadUrl, SearchRegistry, SearchResultId, SendNotification, Tool,
+    ToolArtifact, ToolCall, ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolExtraction,
+    ToolFailure, ToolOutcome, ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WebSearch,
+    WriteFile,
 };
 pub use transcript::{Role, ToolArguments, Turn};
 

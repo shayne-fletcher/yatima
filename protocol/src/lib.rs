@@ -217,6 +217,11 @@ pub enum HostEvent {
         source: Option<String>,
         #[serde(default)]
         list_index: Option<usize>,
+        /// The granted page whose listing nominated this resource — the
+        /// recorded CAP-4 derivation edge (R3). Wire-additive
+        /// (`serde(default)`): a pre-R3 producer's event reads as `None`.
+        #[serde(default)]
+        derived_from: Option<String>,
     },
     /// The granted-origin set after a grant/revoke/list, with a line for the
     /// transcript (CAP-3 authority is visible history).
@@ -224,6 +229,17 @@ pub enum HostEvent {
         origins: Vec<String>,
         message: String,
     },
+    /// The host's canonical page-grant proposal for one settled turn (R2):
+    /// origins the model proposed (or a refusal named) that are not yet
+    /// granted — canonical ASCII only, produced by the host's single
+    /// extraction seam, never parsed from prose by a frontend (WEB-7).
+    /// Views render these as one-tap chips; the tap sends an ordinary
+    /// [`HostRequest::Grant`] — the tap is the user utterance (CAP-3). At
+    /// most one proposal per turn (the union); a later turn's proposal is
+    /// a new set, never a merge. As a new externally tagged variant this
+    /// follows PROTO-2's consumer-before-producer deployment order (cited
+    /// by `grant_proposal_round_trips_and_legacy_rejects`).
+    GrantProposal { turn_id: u64, origins: Vec<String> },
     /// An app-plane message (help, about, a chat-only refusal) — not model text.
     Note(String),
     /// The most recent rendered prompt's token count (the meter numerator).
@@ -357,10 +373,15 @@ mod tests {
                 label: "Revenue by quarter".into(),
                 source: Some("https://example.com/chart.png".into()),
                 list_index: Some(3),
+                derived_from: Some("https://example.com/article".into()),
             },
             HostEvent::Grants {
                 origins: vec!["https://example.com".into()],
                 message: "granted".into(),
+            },
+            HostEvent::GrantProposal {
+                turn_id: 1,
+                origins: vec!["https://example.com".into(), "https://b.example".into()],
             },
             HostEvent::Note("about".into()),
             HostEvent::Context {
@@ -394,6 +415,7 @@ mod tests {
                 | HostEvent::ToolNote { .. }
                 | HostEvent::Image { .. }
                 | HostEvent::Grants { .. }
+                | HostEvent::GrantProposal { .. }
                 | HostEvent::Note(_)
                 | HostEvent::Context { .. }
                 | HostEvent::Done { .. }
@@ -460,9 +482,39 @@ mod tests {
                 label,
                 source: None,
                 list_index: None,
+                derived_from: None,
                 ..
             } if label.is_empty()
         ));
+    }
+
+    #[test]
+    fn grant_proposal_round_trips_and_legacy_rejects() {
+        // upholds: PROTO-2 — the new externally tagged variant round-trips
+        // for a current consumer, and a legacy mirror (the enum as it
+        // existed before the variant) REJECTS it: wire truth, hence the
+        // consumer-before-producer deployment order.
+        let proposal = HostEvent::GrantProposal {
+            turn_id: 7,
+            origins: vec!["https://en.wikipedia.org".into()],
+        };
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert_eq!(serde_json::from_str::<HostEvent>(&json).unwrap(), proposal);
+        // The pre-R2 mirror: externally tagged, no GrantProposal.
+        #[derive(Debug, serde::Deserialize)]
+        enum LegacyHostEvent {
+            #[allow(dead_code)]
+            Grants {
+                origins: Vec<String>,
+                message: String,
+            },
+            #[allow(dead_code)]
+            Note(String),
+        }
+        assert!(
+            serde_json::from_str::<LegacyHostEvent>(&json).is_err(),
+            "an older deserializer must reject the new variant, not misread it"
+        );
     }
 
     #[test]
