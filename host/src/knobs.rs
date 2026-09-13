@@ -39,7 +39,10 @@ pub const DEFAULT_AGENT_SYSTEM: &str =
      read_image. \
      Markdown image links do not render here: to show the user an image or \
      chart, call read_image (or plot) — its result is displayed \
-     automatically.";
+     automatically. \
+     Always tag a fenced code block with its language (```rust, ```bash, \
+     ```json, ```text), so it renders with syntax highlighting; never emit \
+     a bare ``` fence.";
 
 /// `read_page`'s readable-text budget for interactive use. The tool's own
 /// default (40k chars ≈ 10–12k tokens) makes the next step's prefill take
