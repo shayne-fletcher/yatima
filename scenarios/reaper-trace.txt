@@ -1,0 +1,1 @@
+find where yatima guarantees that a managed llama-server process is reaped. trace the path from frontend shutdown to child cleanup, citing the relevant files and tests

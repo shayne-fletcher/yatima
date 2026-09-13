@@ -1337,10 +1337,6 @@ fn read_repository_file(
     }
     let text = std::fs::read_to_string(&full)
         .map_err(|e| anyhow!("read_file: cannot read UTF-8 file {path:?}: {e}"))?;
-    let windowed = matched_line.is_some() || start_line.is_some() || max_lines.is_some();
-    if !windowed {
-        return Ok(text);
-    }
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     if lines.is_empty() {
         return Ok(format!("{path}: empty file\n"));
@@ -1414,7 +1410,7 @@ impl Tool for ReadFile {
             },
             ReadFileScope::Repository(_, _) => ToolSpec {
                 name: "read_file".to_string(),
-                description: "Read exact UTF-8 repository text by relative path or grep result number. Search first when locating code; continue bounded windows with start_line.".to_string(),
+                description: "Read bounded exact UTF-8 repository text by path or grep result. Search first when locating code; path reads start at line 1; continue with start_line.".to_string(),
                 params: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -9203,6 +9199,105 @@ position over the coming years.</p>
     }
 
     #[tokio::test]
+    async fn repository_path_read_defaults_to_a_bounded_tiling_head_window() {
+        let repo = tempfile::tempdir().unwrap();
+        let text: String = (1..=260)
+            .map(|line| format!("line {line:03} {}\n", "x".repeat(32)))
+            .collect();
+        std::fs::write(repo.path().join("large.txt"), &text).unwrap();
+        let tools = repo_tools(repo.path());
+
+        let first = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "large.txt"}),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!first.is_error, "{}", first.content);
+        let (first_header, first_body) = first.content.split_once('\n').unwrap();
+        assert!(first_header.starts_with("large.txt:1.."), "{first_header}");
+        assert!(
+            first_header.contains("continue with start_line"),
+            "{first_header}"
+        );
+        assert!(first_body.chars().count() <= REPO_READ_MAX_CHARS);
+        assert!(first_body.lines().count() <= REPO_READ_MAX_LINES);
+        assert_ne!(
+            first_body, text,
+            "the default path read must not dump the file"
+        );
+
+        let next = first_header
+            .rsplit_once("continue with start_line ")
+            .unwrap()
+            .1
+            .parse::<usize>()
+            .unwrap();
+        let second = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "large.txt", "start_line": next}),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!second.is_error, "{}", second.content);
+        let (_, second_body) = second.content.split_once('\n').unwrap();
+        assert_eq!(format!("{first_body}{second_body}"), text);
+    }
+
+    #[tokio::test]
+    async fn repository_path_read_shorter_than_the_window_has_no_continuation() {
+        // A repository file shorter than the head window, read by path with
+        // no window args, returns the WHOLE content under a `path:1..N`
+        // header and NO `continue with start_line` marker (finding 1).
+        let repo = tempfile::tempdir().unwrap();
+        let text = "alpha
+beta
+gamma
+";
+        std::fs::write(repo.path().join("small.txt"), text).unwrap();
+        let tools = repo_tools(repo.path());
+        let out = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "small.txt"}),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!out.is_error, "{}", out.content);
+        let (header, body) = out.content.split_once('\n').unwrap();
+        assert_eq!(header, "small.txt:1..3", "{header}");
+        assert!(
+            !header.contains("continue with start_line"),
+            "no spurious continuation for a whole small file: {header}"
+        );
+        assert_eq!(body, text);
+    }
+
+    #[tokio::test]
+    async fn repository_empty_file_path_read_reports_empty() {
+        // An empty repository file read by path returns a named notice, not
+        // a bare empty string (finding 2 — the deliberate behavior change).
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("empty.txt"), "").unwrap();
+        let tools = repo_tools(repo.path());
+        let out = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "empty.txt"}),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content,
+            "empty.txt: empty file
+"
+        );
+    }
+
+    #[tokio::test]
     async fn repository_search_outer_cancellation_is_typed() {
         // upholds: GREP-1 / TOOL-1 — dispatcher cancellation wins promptly;
         // the blocking worker observes the same monotone token between files
@@ -9504,6 +9599,23 @@ b.txt";
             .render_for_model("read_file");
         assert!(result.is_error);
         assert!(result.content.contains("byte limit"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn legacy_read_file_still_returns_the_exact_whole_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = "first\r\nsecond  \nthird";
+        std::fs::write(tmp.path().join("small.txt"), text).unwrap();
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".to_string(),
+                args: json(r#"{"path": "small.txt"}"#),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, text);
     }
 
     #[tokio::test]

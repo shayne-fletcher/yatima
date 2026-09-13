@@ -1452,8 +1452,8 @@ mod tests {
             })
             .sum();
         // Prompt-footprint checkpoint: the three read-only repository specs
-        // add 1,200 characters before model tokenization.
-        assert_eq!(repository_spec_chars, 1_200);
+        // add 1,204 characters before model tokenization.
+        assert_eq!(repository_spec_chars, 1_204);
     }
 
     #[tokio::test(flavor = "multi_thread")]
