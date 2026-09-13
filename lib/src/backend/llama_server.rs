@@ -246,6 +246,11 @@ impl LlamaServerCompleter {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
+            // No proxy: the managed server is loopback, and reqwest's
+            // default system-proxy auto-detection blocks for seconds on
+            // macOS (SystemConfiguration) — a per-spawn tax, not just a
+            // test-timeout cause.
+            .no_proxy()
             .build()
             .context("build llama-server HTTP client")?;
         Ok(LlamaServerCompleter { client, config })
