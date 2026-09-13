@@ -26,6 +26,11 @@ use yatima_host::StartupPhase;
 const AURORA: [u8; 12] = [48, 43, 50, 51, 45, 39, 33, 63, 99, 141, 177, 213];
 const COLOR_STEP_MS: u128 = 140;
 
+// A quiet blue-gray panel on light terminals. Keep this indexed so Apple
+// Terminal renders it consistently with the rest of the TUI palette.
+const CODE_PANEL_BG: Color = Color::Indexed(255);
+const CODE_PANEL_FG: Color = Color::Indexed(236);
+
 // A single quadrant orbiting the cell corners — the activity glyph, a smooth
 // spin in the logo's block idiom.
 const ORBIT: [&str; 4] = ["▘", "▝", "▗", "▖"];
@@ -424,7 +429,14 @@ fn render_markdown_block(text: &str, width: u16) -> Vec<Line<'static>> {
         out.push(Line::from(
             line.spans
                 .into_iter()
-                .map(|s| Span::styled(s.content.into_owned(), s.style))
+                .map(|s| {
+                    let style = if s.style.bg == Some(Color::Black) {
+                        s.style.fg(CODE_PANEL_FG).bg(CODE_PANEL_BG)
+                    } else {
+                        s.style
+                    };
+                    Span::styled(s.content.into_owned(), style)
+                })
                 .collect::<Vec<_>>(),
         ));
     }
@@ -457,7 +469,8 @@ fn code_theme() -> &'static Theme {
     THEME.get_or_init(|| {
         let mut themes = ThemeSet::load_defaults().themes;
         themes
-            .remove("base16-ocean.dark")
+            .remove("InspiredGitHub")
+            .or_else(|| themes.remove("base16-ocean.light"))
             .or_else(|| themes.into_values().next())
             .expect("syntect ships default themes")
     })
@@ -511,15 +524,12 @@ fn render_code_block(lang: &str, code: &[&str], width: u16, muted: bool) -> Vec<
     let theme = code_theme();
     let mut hl = HighlightLines::new(syntax, theme);
 
-    // Answer: tint the whole block with the theme background (a panel). Reasoning:
-    // no tint, everything dimmed.
+    // Answer: tint the whole block with the shared light panel. Reasoning: no
+    // tint, everything dimmed.
     let base = if muted {
         Style::default().add_modifier(Modifier::DIM)
     } else {
-        match theme.settings.background {
-            Some(c) => Style::default().bg(Color::Indexed(rgb_to_256(c.r, c.g, c.b))),
-            None => Style::default(),
-        }
+        Style::default().bg(CODE_PANEL_BG)
     };
 
     const GUTTER: &str = "▏ ";
@@ -985,6 +995,35 @@ mod tests {
                 .any(|s| s.style.fg.is_some()),
             "syntax highlighting applied a color"
         );
+        let code_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains("fn main()")
+            })
+            .expect("code line present");
+        assert!(
+            code_line
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(CODE_PANEL_BG)),
+            "the whole fenced-code row uses the quiet panel background"
+        );
+    }
+
+    #[test]
+    fn inline_code_uses_the_quiet_panel_background() {
+        let lines = render_answer("Call `HostOwner::shutdown`.", 40);
+        let code = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "HostOwner::shutdown")
+            .expect("inline code span present");
+        assert_eq!(code.style.bg, Some(CODE_PANEL_BG));
+        assert_eq!(code.style.fg, Some(CODE_PANEL_FG));
     }
 
     #[test]

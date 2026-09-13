@@ -446,6 +446,72 @@ fn label_from(user: Option<String>) -> String {
 /// remote URLs the model wrote (that would bypass the capability doctrine),
 /// so rendering a broken-image glyph would be noise where a clickable link
 /// is honest.
+/// Lift fenced code blocks out of list items to the top level: dedent the
+/// fence and its body and surround the block with blank lines. Rendering
+/// motive: egui_commonmark lays a fence nested in a bullet as a
+/// continuation of the bullet's horizontal row, so the block lands to the
+/// RIGHT of the text and inherits only leftover width — at zero leftover
+/// it collapses to a one-token-per-line sliver (observed live). Splitting
+/// the list around a top-level block is the accepted trade. Tolerant of
+/// an unclosed (still-streaming) fence.
+pub fn lift_fenced_code_blocks(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut fence_indent: Option<usize> = None;
+    let mut blank_after_close = false;
+    let mut in_quote = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if blank_after_close {
+            if !trimmed.is_empty() {
+                out.push(String::new());
+            }
+            blank_after_close = false;
+        }
+        // A blockquote nested under a list item (indented `>`) hits the
+        // same egui_commonmark right-shift as a nested fence — lift the
+        // whole `>` run to the top level with blank-line separation.
+        if fence_indent.is_none() {
+            let nested_quote = indent > 0 && trimmed.starts_with('>');
+            if nested_quote {
+                if !in_quote && out.last().is_some_and(|prev| !prev.trim().is_empty()) {
+                    out.push(String::new());
+                }
+                in_quote = true;
+                out.push(trimmed.to_string());
+                continue;
+            }
+            if in_quote {
+                in_quote = false;
+                if !trimmed.is_empty() {
+                    out.push(String::new());
+                }
+            }
+        }
+        match fence_indent {
+            None if trimmed.starts_with("```") => {
+                if out.last().is_some_and(|prev| !prev.trim().is_empty()) {
+                    out.push(String::new());
+                }
+                out.push(trimmed.to_string());
+                fence_indent = Some(indent);
+            }
+            Some(opened) if trimmed.starts_with("```") => {
+                let _ = opened;
+                out.push(trimmed.to_string());
+                blank_after_close = true;
+                fence_indent = None;
+            }
+            Some(opened) => {
+                let strip = opened.min(indent);
+                out.push(line[strip..].to_string());
+            }
+            None => out.push(line.to_string()),
+        }
+    }
+    out.join("\n")
+}
+
 pub fn tame_markdown_images(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -545,6 +611,31 @@ pub fn strip_markdown_images(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fenced_blocks_lift_out_of_list_items() {
+        let nested = "- bullet text\n  ```rust\n  fn f() {}\n  ```\n- next";
+        assert_eq!(
+            super::lift_fenced_code_blocks(nested),
+            "- bullet text\n\n```rust\nfn f() {}\n```\n\n- next"
+        );
+        let top = "para\n\n```rust\nfn f() {}\n```\n\nafter";
+        assert_eq!(super::lift_fenced_code_blocks(top), top);
+        let streaming = "- item\n  ```rust\n  let x = 1;";
+        assert_eq!(
+            super::lift_fenced_code_blocks(streaming),
+            "- item\n\n```rust\nlet x = 1;"
+        );
+        // A blockquote nested under a bullet lifts the same way; a
+        // top-level quote is left alone.
+        let quoted = "- point\n  > a cited line\n- next";
+        assert_eq!(
+            super::lift_fenced_code_blocks(quoted),
+            "- point\n\n> a cited line\n\n- next"
+        );
+        let top_quote = "> already top\n\nafter";
+        assert_eq!(super::lift_fenced_code_blocks(top_quote), top_quote);
+    }
+
     use super::*;
 
     #[test]

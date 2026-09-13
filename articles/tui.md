@@ -12,6 +12,11 @@ source windows by numbered search result. Without `--root`, those tools are
 absent. The native GUI and `yatima-serve` use the same startup flag; a browser
 client cannot grant or change filesystem authority.
 
+Pass `--tape` to record the TUI's host requests and events under `runs/`, or
+`--tape <directory>` to choose the run directory. When recording starts, the
+TUI shows the absolute run directory in its transcript. The tape is finished
+after the terminal is restored and the backend has been shut down and joined.
+
 Configure `YATIMA_SEARCH_URL` or `YATIMA_BRAVE_KEY` to add web search. A session still starts with **zero page-reading authority**: search discovers sources but does not approve them.
 
 ## Granting web access (CAP-3)

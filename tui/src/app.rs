@@ -18,6 +18,7 @@ use ratatui::style::Style;
 use ratatui::Terminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui_textarea::{CursorMove, Input, TextArea};
+use yatima_drive::{RecorderHandle, TapeRecord};
 use yatima_host::{
     CancelGate, Channel, HostEvent, HostRequest, ModelIdentity, ModelInfo, StartupPhase, StopKind,
     ToolNoteKind, TurnId,
@@ -584,6 +585,11 @@ impl App {
     fn cancel_in_flight(&mut self) {
         if let Some(f) = self.in_flight.as_mut() {
             self.cancel.cancel(f.turn_id);
+            // The gate is the immediate cancellation path. The matching
+            // request makes that semantic action visible to a flight recorder;
+            // forwarding it to the host is harmless because cancellation is
+            // monotone.
+            let _ = self.req_tx.send(HostRequest::Cancel { turn_id: f.turn_id });
             f.cancelling = true;
         }
     }
@@ -856,6 +862,9 @@ pub async fn run_loop<B, S>(
     mut app: App,
     mut event_rx: UnboundedReceiver<HostEvent>,
     mut key_events: S,
+    host_req_tx: Sender<HostRequest>,
+    pending_req_rx: std::sync::mpsc::Receiver<HostRequest>,
+    tape: Option<RecorderHandle>,
 ) -> Result<()>
 where
     B: Backend,
@@ -883,11 +892,18 @@ where
             }
             maybe_event = event_rx.recv() => {
                 match maybe_event {
-                    Some(event) => app.on_engine_event(event),
+                    Some(event) => {
+                        record_tape(tape.as_ref(), TapeRecord::Event(event.clone())).await?;
+                        app.on_engine_event(event);
+                    }
                     None => app.should_quit = true, // actor gone
                 }
             }
         }
+        // App methods stay synchronous and pure of recorder mechanics. Every
+        // request they produced in this iteration crosses this one async edge:
+        // record first, then forward to the authoritative host plane.
+        forward_pending_requests(&pending_req_rx, &host_req_tx, tape.as_ref()).await?;
         if app.take_compose_request() {
             // Ctrl+G: hand the draft to $VISUAL/$EDITOR. The engine keeps
             // running (events buffer in the channel and land on return);
@@ -905,13 +921,32 @@ where
             break;
         }
     }
-    let _ = app.req_tx.send(HostRequest::Shutdown);
     // A Fatal ends the loop; main restores the terminal first, then reports
     // this as the ordinary error (and still joins the owner).
     match app.fatal.take() {
         Some(message) => Err(anyhow::anyhow!(message)),
         None => Ok(()),
     }
+}
+
+async fn record_tape(handle: Option<&RecorderHandle>, record: TapeRecord) -> Result<()> {
+    match handle {
+        Some(handle) => handle.enqueue(record).await,
+        None => Ok(()),
+    }
+}
+
+async fn forward_pending_requests(
+    pending: &std::sync::mpsc::Receiver<HostRequest>,
+    host: &Sender<HostRequest>,
+    tape: Option<&RecorderHandle>,
+) -> Result<()> {
+    for request in pending.try_iter() {
+        record_tape(tape, TapeRecord::Request(request.clone())).await?;
+        host.send(request)
+            .map_err(|_| anyhow::anyhow!("host request plane is closed"))?;
+    }
+    Ok(())
 }
 
 /// Suspend the TUI, run `$VISUAL`/`$EDITOR` on a temp file seeded with the
@@ -1075,7 +1110,7 @@ mod tests {
         // upholds: TUI-6 — Esc trips the host's cancel gate for the in-flight
         // turn and marks it "cancelling"; a no-op when nothing is in flight.
         assert_eq!(App::classify(key(KeyCode::Esc)), Intent::Cancel);
-        let (mut app, _rx) = test_app();
+        let (mut app, rx) = test_app();
         app.apply(Intent::Cancel); // nothing in flight: harmless
         assert!(app.in_flight.is_none());
 
@@ -1096,6 +1131,13 @@ mod tests {
             app.in_flight.as_ref().unwrap().cancelling,
             "the turn is marked cancelling for the indicator"
         );
+        // Submit was queued first; cancellation is represented on the request
+        // plane as well as tripping the immediate gate.
+        assert!(matches!(rx.try_recv(), Ok(HostRequest::Submit { .. })));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HostRequest::Cancel { turn_id: id }) if id == turn_id
+        ));
     }
 
     #[test]
@@ -1454,7 +1496,7 @@ mod tests {
         // promptly even while the "engine" is mid-decode. A background thread
         // feeds fragments with 100ms gaps (≈500ms total); a Quit key is ready at
         // once. If decode blocked the loop, quitting would wait ~500ms.
-        let (mut app, _rx) = test_app();
+        let (mut app, pending_rx) = test_app();
         app.in_flight = Some(InFlight {
             turn_id: 0,
             started: Instant::now(),
@@ -1488,12 +1530,68 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         let start = Instant::now();
-        run_loop(&mut terminal, app, event_rx, keys).await.unwrap();
+        let (host_tx, _host_rx) = std::sync::mpsc::channel();
+        run_loop(
+            &mut terminal,
+            app,
+            event_rx,
+            keys,
+            host_tx,
+            pending_rx,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             start.elapsed() < Duration::from_millis(250),
             "UI blocked during generation: took {:?}",
             start.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn async_tape_bridge_orders_both_host_planes() {
+        // upholds: TAPE-1 — the TUI uses the recorder's async producer. A
+        // request is admitted before host forwarding, then an observed event
+        // enters the same sequence before it would be applied to the view.
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let (handle, owner) = yatima_drive::start_recorder(
+            &run,
+            yatima_drive::TapeMeta {
+                origin: "yatima-tui test".into(),
+                model: "test".into(),
+                notes: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let (host_tx, host_rx) = std::sync::mpsc::channel();
+        pending_tx.send(HostRequest::Reset).unwrap();
+        forward_pending_requests(&pending_rx, &host_tx, Some(&handle))
+            .await
+            .unwrap();
+        assert!(matches!(host_rx.try_recv(), Ok(HostRequest::Reset)));
+        record_tape(
+            Some(&handle),
+            TapeRecord::Event(HostEvent::Note("observed".into())),
+        )
+        .await
+        .unwrap();
+        handle.barrier().await.unwrap();
+        drop(handle);
+        owner.finish("completed").await.unwrap();
+
+        let tape = std::fs::read_to_string(run.join("tape.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = tape
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(lines[1].get("request").is_some(), "{lines:?}");
+        assert!(lines[2].get("event").is_some(), "{lines:?}");
+        assert_eq!(lines[1]["seq"], 0);
+        assert_eq!(lines[2]["seq"], 1);
     }
 
     #[test]

@@ -39,7 +39,7 @@ use yatima_host::{
     StartupPhase, ToolNoteKind,
 };
 use yatima_lib::{GenOpts, Sampling};
-use yatima_text::{prettify_math_plain_scripts, tame_markdown_images};
+use yatima_text::{lift_fenced_code_blocks, prettify_math_plain_scripts, tame_markdown_images};
 
 const RECORDER_CONTROL_WITHIN: Duration = Duration::from_secs(5);
 
@@ -624,7 +624,11 @@ impl GuiApp {
             let prompt = set.prompt.clone();
             self.proposal = None; // every chip retired with the landing
             if !prompt.is_empty() && self.backend.ready().is_some() && !self.in_flight() {
-                self.begin_turn(prompt);
+                // The retry resubmits the user's own words QUIETLY: a muted
+                // continuation note replaces the confusing full echo.
+                self.transcript
+                    .push(Msg::Note(format!("— continuing: {prompt}")));
+                self.start_turn(prompt);
             }
             return;
         }
@@ -1026,6 +1030,12 @@ impl GuiApp {
     /// continuation).
     fn begin_turn(&mut self, prompt: String) {
         self.transcript.push(Msg::User(prompt.clone()));
+        self.start_turn(prompt);
+    }
+
+    /// Arm and submit without a transcript entry — the chip retry's quiet
+    /// path (its muted continuation note is pushed by the caller).
+    fn start_turn(&mut self, prompt: String) {
         self.turn_start = None;
         self.gen_tokens = 0;
         let turn_id = self.next_turn_id;
@@ -1358,7 +1368,7 @@ impl eframe::App for GuiApp {
                             egui_commonmark::CommonMarkViewer::new().show(
                                 ui,
                                 &mut self.md_cache,
-                                buf,
+                                &lift_fenced_code_blocks(buf),
                             );
                         }
                         ui.add_space(8.0);
@@ -1688,7 +1698,10 @@ fn commit_turn(
     let reasoning = reasoning.trim();
     // Plain scripts: egui's fonts lack the Unicode super/subscript
     // blocks (e⁻ˣ would be tofu).
-    let answer = prettify_math_plain_scripts(&tame_markdown_images(answer));
+    // Fenced blocks lift out of list items before rendering: nested in a
+    // bullet, egui_commonmark lays them to the RIGHT of the bullet row.
+    let answer =
+        lift_fenced_code_blocks(&prettify_math_plain_scripts(&tame_markdown_images(answer)));
     if answer.trim().is_empty() && reasoning.is_empty() {
         return;
     }

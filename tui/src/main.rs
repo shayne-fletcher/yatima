@@ -1,10 +1,13 @@
 //! The `yatima-tui` binary: parse args, load the model on the engine thread,
 //! enter the terminal, run the event loop, and restore the terminal on exit.
 
+use std::future::Future;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::Parser;
 use crossterm::event::{
     Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -18,10 +21,13 @@ use crossterm::terminal::{
 use futures::stream::Stream;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use yatima_drive::{start_recorder, RecorderHandle, RecorderOwner, TapeMeta, TapeRecord};
 use yatima_host::{init_file_logging, resolve_host_model, spawn_nonblocking, HostModelChoices};
 use yatima_lib::{GenOpts, Sampling};
 
 use yatima_tui::app::{run_loop, App};
+
+const RECORDER_CONTROL_WITHIN: Duration = Duration::from_secs(5);
 
 /// Interactive terminal chat over a local model.
 #[derive(Parser)]
@@ -65,6 +71,41 @@ struct Args {
     /// Grant read-only repository tools under this directory.
     #[arg(long)]
     root: Option<PathBuf>,
+    /// Record this TUI session. With no DIR, writes under runs/.
+    #[arg(long, num_args = 0..=1, value_name = "DIR")]
+    tape: Option<Option<PathBuf>>,
+}
+
+fn tape_dir(choice: &Option<Option<PathBuf>>, utc_stamp: &str, pid: u32) -> Option<PathBuf> {
+    match choice {
+        None => None,
+        Some(Some(dir)) => Some(dir.clone()),
+        Some(None) => Some(PathBuf::from(format!("runs/{utc_stamp}-{pid}-tui"))),
+    }
+}
+
+fn tape_notice(dir: &Path) -> String {
+    let absolute = dir.canonicalize().unwrap_or_else(|_| {
+        if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(dir))
+                .unwrap_or_else(|_| dir.to_path_buf())
+        }
+    });
+    format!("recording tape to {}", absolute.display())
+}
+
+async fn recorder_control_within<T, F>(what: &str, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::time::timeout(RECORDER_CONTROL_WITHIN, future)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("flight recorder {what} timed out after {RECORDER_CONTROL_WITHIN:?}")
+        })?
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -106,6 +147,8 @@ async fn main() -> Result<()> {
         .or_else(|| args.model.as_ref().map(|p| p.display().to_string()))
         .or_else(|| args.repo.clone())
         .unwrap_or_else(|| "local model".to_string());
+    let utc_stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let requested_tape = tape_dir(&args.tape, &utc_stamp, std::process::id());
 
     // Terminal ownership is established before the backend exists, and every
     // path below runs the full epilogue: restore the terminal, then consume
@@ -114,39 +157,116 @@ async fn main() -> Result<()> {
     // shortcut past the owner: a failed restore or a failed session still
     // joins, and every failure is reported, none silently dropped.
     let mut guard = TerminalGuard::enter(CrosstermTerm)?; // partial entry already unwound
-    let (result, owner) = match Terminal::new(CrosstermBackend::new(io::stdout())) {
-        Ok(mut terminal) => match spawn_nonblocking(config) {
-            Ok((client, owner)) => {
-                let app = App::loading(client.req_tx, client.cancel, label);
-                let key_events = key_event_stream();
-                let result = run_loop(&mut terminal, app, client.event_rx, key_events).await;
-                (result, Some(owner))
+    let mut host_owner = None;
+    let mut tape_handle: Option<RecorderHandle> = None;
+    let mut tape_owner: Option<RecorderOwner> = None;
+    let result = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+        Ok(mut terminal) => {
+            let recorder = match requested_tape {
+                Some(dir) => {
+                    let meta = TapeMeta {
+                        origin: format!("yatima-tui {}", env!("CARGO_PKG_VERSION")),
+                        model: label.clone(),
+                        notes: std::collections::BTreeMap::from([(
+                            "agent_max_steps".to_string(),
+                            yatima_host::knobs::AGENT_MAX_STEPS.to_string(),
+                        )]),
+                    };
+                    match recorder_control_within("startup", start_recorder(&dir, meta)).await {
+                        Ok((handle, owner)) => Ok(Some((handle, owner, dir))),
+                        Err(error) => Err(error.context("start the requested flight recorder")),
+                    }
+                }
+                None => Ok(None),
+            };
+            match recorder {
+                Err(error) => Err(error),
+                Ok(recorder) => {
+                    let tape_notice = recorder.as_ref().map(|(_, _, dir)| tape_notice(dir));
+                    if let Some((handle, owner, _)) = recorder {
+                        tape_handle = Some(handle);
+                        tape_owner = Some(owner);
+                    }
+                    match spawn_nonblocking(config) {
+                        Ok((client, owner)) => {
+                            host_owner = Some(owner);
+                            let (app_req_tx, app_req_rx) = std::sync::mpsc::channel();
+                            let mut app = App::loading(app_req_tx, client.cancel, label);
+                            if let Some(notice) = tape_notice {
+                                app.push_entry(yatima_tui::app::Entry::Notice(notice));
+                            }
+                            run_loop(
+                                &mut terminal,
+                                app,
+                                client.event_rx,
+                                key_event_stream(),
+                                client.req_tx,
+                                app_req_rx,
+                                tape_handle.clone(),
+                            )
+                            .await
+                        }
+                        // The thread never spawned: nothing to own, but the
+                        // terminal and recorder still reach their epilogues.
+                        Err(error) => Err(error),
+                    }
+                }
             }
-            // The thread never spawned: nothing to own, but the terminal
-            // must still be restored before the error prints.
-            Err(error) => (Err(error), None),
-        },
-        Err(error) => (Err(error.into()), None),
+        }
+        Err(error) => Err(error.into()),
     };
     // Explicit restore captures errors; the guard's Drop remains the
     // panic-unwind safety net (a panic anywhere above still restores).
     let restored = guard.restore();
-    let joined = match owner {
+    let shutdown_record = match &tape_handle {
+        Some(handle) => {
+            recorder_control_within(
+                "shutdown record",
+                handle.enqueue(TapeRecord::Request(yatima_host::HostRequest::Shutdown)),
+            )
+            .await
+        }
+        None => Ok(()),
+    };
+    let joined = match host_owner {
         Some(owner) => owner.shutdown().await,
         None => Ok(()),
     };
-    combined_outcome(result, restored, joined)
+    let disposition = if result.is_err() || restored.is_err() {
+        "tui-error"
+    } else if joined.is_err() {
+        "backend-error"
+    } else if shutdown_record.is_err() {
+        "recorder-error"
+    } else {
+        "completed"
+    };
+    drop(tape_handle);
+    let recorded = match tape_owner {
+        Some(owner) => recorder_control_within("finish", owner.finish(disposition))
+            .await
+            .map(|_| ()),
+        None => Ok(()),
+    };
+    combined_outcome(result, restored, shutdown_record, joined, recorded)
 }
 
-/// Fold the session's three exit results into one report: the session
-/// outcome is primary; a failed terminal restore or a failed joined shutdown
-/// is appended as context rather than lost (and stands alone when the
-/// session itself succeeded).
-fn combined_outcome(session: Result<()>, restored: Result<()>, joined: Result<()>) -> Result<()> {
+/// Fold every exit result into one report. The session outcome is primary;
+/// terminal, tape-control, host-join, and recorder-finish failures are appended
+/// as context rather than lost (HOST-3 / TAPE-1).
+fn combined_outcome(
+    session: Result<()>,
+    restored: Result<()>,
+    shutdown_record: Result<()>,
+    joined: Result<()>,
+    recorded: Result<()>,
+) -> Result<()> {
     let mut outcome = session;
     for (label, secondary) in [
         ("restore terminal", restored),
+        ("record shutdown", shutdown_record),
         ("shut down the backend owner", joined),
+        ("finish the flight recorder", recorded),
     ] {
         outcome = match (outcome, secondary) {
             (Ok(()), Ok(())) => Ok(()),
@@ -348,6 +468,33 @@ mod tests {
         assert_eq!(absent.root, None);
         let present = Args::try_parse_from(["yatima-tui", "--root", "/tmp/repo"]).unwrap();
         assert_eq!(present.root, Some(PathBuf::from("/tmp/repo")));
+    }
+
+    #[test]
+    fn tape_flag_supports_default_and_explicit_directories() {
+        let absent = Args::try_parse_from(["yatima-tui"]).unwrap();
+        assert_eq!(absent.tape, None);
+        let default = Args::try_parse_from(["yatima-tui", "--tape"]).unwrap();
+        assert_eq!(default.tape, Some(None));
+        assert_eq!(
+            tape_dir(&default.tape, "20260913T140000Z", 41),
+            Some(PathBuf::from("runs/20260913T140000Z-41-tui"))
+        );
+        let explicit = Args::try_parse_from(["yatima-tui", "--tape", "/tmp/tape"]).unwrap();
+        assert_eq!(explicit.tape, Some(Some(PathBuf::from("/tmp/tape"))));
+        assert_eq!(
+            tape_dir(&explicit.tape, "ignored", 0),
+            Some(PathBuf::from("/tmp/tape"))
+        );
+
+        let run = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tape_notice(run.path()),
+            format!(
+                "recording tape to {}",
+                run.path().canonicalize().unwrap().display()
+            )
+        );
     }
 
     /// A fake terminal recording call order (into a shared log, so a
