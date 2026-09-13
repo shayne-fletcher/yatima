@@ -39,6 +39,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync"] }
 tokio-util = "0.7"
 tracing = "0.1"
+ignore = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+globset = "0.4"
 
 # Auto-fetch (the `fetch` feature) embeds possum's downloader as a library,
 # pinned to the rev where its model commands moved into possum-lib.

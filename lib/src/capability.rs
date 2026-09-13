@@ -19,6 +19,55 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 
+/// A validated repository root used by repository-aware tools.
+///
+/// Construction canonicalizes an existing directory. Paths resolved through
+/// this value remain relative to that root and reject symlink components. This
+/// closes static symlink escapes on a stable filesystem; a concurrent process
+/// rewriting the tree between check and open is outside this path-based model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRoot {
+    root: PathBuf,
+}
+
+impl RepoRoot {
+    /// Anchor an existing repository directory.
+    pub fn anchor(root: impl AsRef<Path>) -> Result<RepoRoot> {
+        let supplied = root.as_ref();
+        let root = std::fs::canonicalize(supplied)
+            .map_err(|e| anyhow!("cannot anchor repository root {supplied:?}: {e}"))?;
+        if !root.is_dir() {
+            bail!("repository root {supplied:?} is not a directory");
+        }
+        Ok(RepoRoot { root })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn dir(&self) -> Dir {
+        Dir::new(self.root.clone())
+    }
+
+    /// Resolve an existing path without traversing a symlink component.
+    pub fn resolve_existing(&self, rel: &str) -> Result<PathBuf> {
+        if !crate::is_safe_relative(rel) {
+            bail!("path {rel:?} escapes repository root {:?}", self.root);
+        }
+        let mut path = self.root.clone();
+        for component in Path::new(rel).components() {
+            path.push(component.as_os_str());
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| anyhow!("cannot resolve repository path {rel:?}: {e}"))?;
+            if metadata.file_type().is_symlink() {
+                bail!("repository path {rel:?} contains a symlink component");
+            }
+        }
+        Ok(path)
+    }
+}
+
 /// A rooted filesystem capability: authority to reach paths under `root`, and
 /// nowhere else.
 #[derive(Debug, Clone)]
@@ -704,6 +753,36 @@ mod tests {
         for bad in ["../etc/passwd", "/etc/passwd", "a/../../b", "./x"] {
             assert!(d.resolve(bad).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn repo_root_anchors_a_directory_and_rejects_symlink_paths() {
+        // upholds: CAP-1 — repository tools begin from one canonical root and
+        // reject static symlink escapes at use time.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("inside.txt"), "inside").unwrap();
+        let root = RepoRoot::anchor(directory.path()).unwrap();
+        assert!(root.path().is_absolute());
+        assert_eq!(
+            root.resolve_existing("inside.txt").unwrap(),
+            root.path().join("inside.txt")
+        );
+        assert!(root.resolve_existing("../outside.txt").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("inside.txt", directory.path().join("link.txt")).unwrap();
+            assert!(root.resolve_existing("link.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn repo_root_rejects_missing_paths_and_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(RepoRoot::anchor(directory.path().join("missing")).is_err());
+        assert!(RepoRoot::anchor(file).is_err());
     }
 
     #[test]

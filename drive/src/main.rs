@@ -78,6 +78,9 @@ struct Args {
     /// Optional system instruction (applies for the whole session).
     #[arg(long)]
     system: Option<String>,
+    /// Grant read-only repository tools under this directory.
+    #[arg(long)]
+    root: Option<PathBuf>,
     /// Tape destination (default `runs/<utc-stamp>-<pid>-drive`). Recording
     /// is unconditional: the tape is the product.
     #[arg(long, value_name = "DIR")]
@@ -797,7 +800,9 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         cpu: args.cpu,
         offline: args.offline,
     })?;
-    Ok(resolved.into_host_config(base_gen_opts(), args.system.clone()))
+    resolved
+        .into_host_config(base_gen_opts(), args.system.clone())
+        .with_repo_root(args.root.clone())
 }
 
 fn base_gen_opts() -> GenOpts {
@@ -859,6 +864,7 @@ fn test_stub_config(args: &Args) -> Result<Option<HostConfig>> {
         ..yatima_lib::ModelProfile::default()
     };
     let config = HostConfig::managed(&profile, true, base_gen_opts(), args.system.clone())?
+        .with_repo_root(args.root.clone())?
         .with_managed_launcher(PathBuf::from(bin), Duration::from_millis(ready_ms));
     Ok(Some(config))
 }

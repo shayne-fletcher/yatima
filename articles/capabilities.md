@@ -1,6 +1,12 @@
 # Tools & capabilities
 
-Tools hold their authority. A `ReadFile` tool constructed with a `Dir` can only read under that root; `WriteFile` uses a separate `WriteDir`; `ReadUrl` and `ReadPage` share a growable set of HTTP(S) origins; and `SendNotification` is scoped to a pre-shared `NtfyTopic`. `WebSearch` discovers numbered sources but grants no authority. `ReadImage` can use an explicit origin grant or the exact listing derived from an approved page. The model supplies arguments, not authority (CAP-2). `Tool` is public and `Tools::with` takes any `impl Tool`, so a consumer crate can register its own domain tools.
+Tools hold their authority. `RepoRoot` anchors read-only repository search and file reads to one canonical directory; grep result numbers address later reads but grant nothing. `WriteFile` uses a separate `WriteDir`; `ReadUrl` and `ReadPage` share a growable set of HTTP(S) origins; and `SendNotification` is scoped to a pre-shared `NtfyTopic`. `WebSearch` discovers numbered sources but grants no authority. `ReadImage` can use an explicit origin grant or the exact listing derived from an approved page. The model supplies arguments, not authority (CAP-2). `Tool` is public and `Tools::with` takes any `impl Tool`, so a consumer crate can register its own domain tools.
+
+The CLI grants its current directory by default. TUI, GUI, and serve grant no
+filesystem access unless their native process starts with `--root`; the browser
+protocol has no request that can widen that choice. Repository walks respect
+gitignore rules, skip binary and hidden files, never follow symlinks, and stop
+at deterministic work and output limits.
 
 ## Runtime grants (CAP-3 / CAP-4)
 

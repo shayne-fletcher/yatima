@@ -27,7 +27,7 @@ cargo run -p yatima-cli --release -- agent --profile muse-glimmer --root . \
   --prompt "Read README.md and say what yatima is in two sentences."
 ```
 
-The agent speaks Muse's native ATEM tool protocol: the model addresses the capability-scoped `read_file` tool directly, and the invocation and its result enter the run transcript structurally. On a terminal, classified reasoning, answer fragments, and concise tool status appear live on stderr; the final framing-free answer remains the only stdout payload for scripts. `chat` and `agent` share one backend resolution, so `--profile`, `--backend`, and `--server-url` mean the same thing in both, and the Candle-only flags (`--cpu`, `--prefill-chunk`) are rejected with the llama-server backend in either subcommand.
+The agent speaks Muse's native ATEM tool protocol. With `--root`, it can search repository contents with `grep_files`, discover paths with `glob_files`, and follow a numbered match directly into a bounded exact-text `read_file` window. The tools respect gitignore rules and cannot leave the anchored root. On a terminal, classified reasoning, answer fragments, and concise tool status appear live on stderr; the final framing-free answer remains the only stdout payload for scripts. `chat` and `agent` share one backend resolution, so `--profile`, `--backend`, and `--server-url` mean the same thing in both.
 
 The ignored real-binary acceptance should be run in release mode; an unoptimized SHA-256 pass over the 17 GB model is needlessly slow:
 
@@ -60,8 +60,8 @@ models to be called as in-process functions. ...
 ```
 
 That command exercises the core path: local model load, prompt rendering, an
-agent turn, a capability-scoped `read_file` tool call under `--root`, and a
-grounded final answer.
+agent turn, and capability-scoped repository tools under `--root`. The CLI
+defaults an omitted `--root` to its current directory.
 
 The CLI agent also takes `--web-origin <url>` to pre-grant one HTTP(S) origin for a one-shot run. Configure `YATIMA_SEARCH_URL` or `YATIMA_BRAVE_KEY` to add `web_search`; its numbered results can be passed directly to `read_page` and `read_url`, but they grant no reading authority. The one-shot CLI has no proposal controls, so pre-grant the origin the run may read. For interactive source approval, use the [TUI](tui.md), native GUI, or [browser viewer](browser-viewer.md). The complete flow is in [Web research](web-research.md).
 

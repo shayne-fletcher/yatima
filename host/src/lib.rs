@@ -80,11 +80,12 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use yatima_lib::{
     device, looks_degenerate, metal_kv_depth_risk, proposed_origins, resolve_format,
     verify_cancellable_sync, Agent, AgentEvent, AgentStop, Cancel, Channel as LibChannel,
-    ChatFormat, ChatSession, ChildCleanupFailed, Completer, Engine, GenOpts, ImageListing,
-    JsonToolCall, KvDepthRisk, LlamaServer, LlamaServerSpawn, ModelSource, MuseAtemCodec, Plot,
-    PlotSandbox, PromptTemplate, QwenToolCall, ReadImage, ReadPage, ReadUrl, Sampling,
-    SearchRegistry, ServerIdentity, StopReason, ToolArtifact, ToolCallCodec, ToolOutcome, Tools,
-    VerifyCancelled, WebOrigins, WebSearch, METAL_KV_VALIDATED,
+    ChatFormat, ChatSession, ChildCleanupFailed, Completer, Engine, FileMatchRegistry, GenOpts,
+    GlobFiles, GrepFiles, ImageListing, JsonToolCall, KvDepthRisk, LlamaServer, LlamaServerSpawn,
+    ModelSource, MuseAtemCodec, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadFile,
+    ReadImage, ReadPage, ReadUrl, RepoRoot, Sampling, SearchRegistry, ServerIdentity, StopReason,
+    ToolArtifact, ToolCallCodec, ToolOutcome, Tools, VerifyCancelled, WebOrigins, WebSearch,
+    METAL_KV_VALIDATED,
 };
 
 pub mod knobs;
@@ -196,6 +197,8 @@ pub struct HostConfig {
     pub(crate) system: Option<String>,
     /// Display label; `None` labels with the resolved model directory.
     pub(crate) model_label: Option<String>,
+    /// Optional repository read authority, anchored before the host starts.
+    pub(crate) repo_root: Option<RepoRoot>,
     /// Test/diagnostic wiring only (see [`HostConfig::with_managed_launcher`]).
     pub(crate) managed_launcher: Option<ManagedLauncher>,
 }
@@ -229,6 +232,7 @@ impl HostConfig {
             format,
             system,
             model_label,
+            repo_root: None,
             managed_launcher: None,
         }
     }
@@ -266,8 +270,16 @@ impl HostConfig {
             format: Some(format),
             system,
             model_label: Some(profile.name.clone()),
+            repo_root: None,
             managed_launcher: None,
         })
+    }
+
+    /// Grant this host session read-only access to an explicitly chosen
+    /// repository. `None` leaves repository tools absent (CAP-3a).
+    pub fn with_repo_root(mut self, root: Option<std::path::PathBuf>) -> Result<HostConfig> {
+        self.repo_root = root.map(RepoRoot::anchor).transpose()?;
+        Ok(self)
     }
 
     /// The display label, when the resolution carried one (a profile name).
@@ -502,6 +514,7 @@ fn actor_main(
         format: format_choice,
         system,
         model_label,
+        repo_root,
         managed_launcher,
     } = config;
     let built = match build_backend(
@@ -566,6 +579,7 @@ fn actor_main(
             system,
             opts,
             watch,
+            repo_root,
             &req_rx,
             &event_tx,
             &gate,
@@ -1005,6 +1019,7 @@ fn serve_session<C: Completer>(
     system: Option<String>,
     opts: GenOpts,
     watch: DepthWatch,
+    repo_root: Option<RepoRoot>,
     req_rx: &Receiver<HostRequest>,
     event_tx: &UnboundedSender<HostEvent>,
     gate: &CancelGate,
@@ -1025,7 +1040,7 @@ fn serve_session<C: Completer>(
     let origins = WebOrigins::new();
     // Client construction cannot practically fail; degrade to empty tools
     // (the model simply never sees web tools) rather than dying.
-    let tools = web_tools(&origins).unwrap_or_default();
+    let tools = web_tools(&origins, repo_root.as_ref()).unwrap_or_default();
     let system = system.unwrap_or_else(|| knobs::DEFAULT_AGENT_SYSTEM.to_string());
     let template = format.template_with_date(Some(current_date));
     match format {
@@ -1347,7 +1362,7 @@ fn report_grants(event_tx: &UnboundedSender<HostEvent>, origins: Option<&WebOrig
 /// declarative specs only, output confined to `~/.cache/yatima/plots` — stable
 /// and content-hash named so re-renders are idempotent) — and quietly doesn't
 /// when it isn't; the model never sees a tool it cannot use.
-fn web_tools(origins: &WebOrigins) -> Result<Tools> {
+fn web_tools(origins: &WebOrigins, repo_root: Option<&RepoRoot>) -> Result<Tools> {
     // One listing cell per session (IMG-3): read_page publishes its numbered
     // [images] list into it, read_image selects from it by number.
     let listing = ImageListing::default();
@@ -1368,6 +1383,13 @@ fn web_tools(origins: &WebOrigins) -> Result<Tools> {
             .with_listing(listing.clone())
             .with_search_results(search_registry.clone()),
         );
+    if let Some(root) = repo_root {
+        let matches = FileMatchRegistry::default();
+        tools = tools
+            .with(GrepFiles::new(root.clone(), matches.clone()))
+            .with(GlobFiles::new(root.clone()))
+            .with(ReadFile::repository(root.clone(), matches));
+    }
     let cache = std::env::home_dir()
         .map(|home| home.join(".cache/yatima"))
         .unwrap_or_else(std::env::temp_dir);
@@ -1958,6 +1980,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repository_tools_are_absent_by_default_and_share_results_when_granted() {
+        // upholds: CAP-3a, FREG-1 — a native startup root is the authority
+        // ceremony, and one registry connects host grep results to reads.
+        let origins = WebOrigins::new();
+        let absent = web_tools(&origins, None).unwrap();
+        let absent_names: Vec<_> = absent.specs().into_iter().map(|spec| spec.name).collect();
+        assert!(!absent_names.iter().any(|name| name == "grep_files"));
+        assert!(!absent_names.iter().any(|name| name == "glob_files"));
+        assert!(!absent_names.iter().any(|name| name == "read_file"));
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("owner.rs"), "fn reap_child() {}\n").unwrap();
+        let root = RepoRoot::anchor(directory.path()).unwrap();
+        let tools = web_tools(&origins, Some(&root)).unwrap();
+        let names: Vec<_> = tools.specs().into_iter().map(|spec| spec.name).collect();
+        for expected in ["grep_files", "glob_files", "read_file"] {
+            assert!(names.iter().any(|name| name == expected), "{names:?}");
+        }
+        let search = tools
+            .dispatch_async(&yatima_lib::ToolCall {
+                name: "grep_files".into(),
+                args: r#"{"pattern":"reap_child"}"#.parse().unwrap(),
+            })
+            .await
+            .render_for_model("grep_files");
+        assert!(!search.is_error, "{}", search.content);
+        let read = tools
+            .dispatch_async(&yatima_lib::ToolCall {
+                name: "read_file".into(),
+                args: r#"{"result":1}"#.parse().unwrap(),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.contains("fn reap_child() {}"));
+    }
+
     #[cfg(not(feature = "hermetic-derivation"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn environment_cannot_weaken_cap4_in_the_shipped_toolset() {
@@ -1993,7 +2053,7 @@ mod tests {
         });
         let origins = WebOrigins::new();
         origins.grant(&origin).unwrap();
-        let tools = web_tools(&origins).unwrap();
+        let tools = web_tools(&origins, None).unwrap();
         {
             let page = tools
                 .dispatch_async(&yatima_lib::ToolCall {

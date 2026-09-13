@@ -63,6 +63,10 @@ struct Args {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// Grant read-only repository tools under this directory. Browser requests
+    /// cannot change this startup authority.
+    #[arg(long)]
+    root: Option<PathBuf>,
 }
 
 /// The shared host resolver (PROFILE-2), then the serve-shaped config. The
@@ -84,7 +88,9 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
         ..Default::default()
     };
-    Ok(resolved.into_host_config(base, args.system.clone()))
+    resolved
+        .into_host_config(base, args.system.clone())
+        .with_repo_root(args.root.clone())
 }
 
 #[tokio::main]
@@ -156,5 +162,25 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_root_is_an_explicit_native_server_choice() {
+        let absent = Args::try_parse_from(["yatima-serve", "--bind", "127.0.0.1:0"]).unwrap();
+        assert_eq!(absent.root, None);
+        let present = Args::try_parse_from([
+            "yatima-serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--root",
+            "/tmp/repo",
+        ])
+        .unwrap();
+        assert_eq!(present.root, Some(PathBuf::from("/tmp/repo")));
     }
 }

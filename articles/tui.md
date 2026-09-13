@@ -6,6 +6,12 @@
 cargo run -p yatima-tui --release --features metal -- --profile qwen32b
 ```
 
+Pass `--root <directory>` to add read-only repository tools for that session.
+The model can search gitignore-aware contents, glob paths, and read bounded
+source windows by numbered search result. Without `--root`, those tools are
+absent. The native GUI and `yatima-serve` use the same startup flag; a browser
+client cannot grant or change filesystem authority.
+
 Configure `YATIMA_SEARCH_URL` or `YATIMA_BRAVE_KEY` to add web search. A session still starts with **zero page-reading authority**: search discovers sources but does not approve them.
 
 ## Granting web access (CAP-3)

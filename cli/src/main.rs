@@ -23,11 +23,11 @@ use rustyline::DefaultEditor;
 use tracing_subscriber::EnvFilter;
 use yatima_lib::{
     device, model_dir, models_root, resolve_format, run_blocking, verify, Agent, AgentEvent,
-    Cancel, Channel, ChatFormat, ChatSession, Completer, Dir, Engine, GenOpts, JsonToolCall,
-    ListDir, LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerProfile,
-    LlamaServerSpawn, ModelId, ModelProfile, ModelSource, ProfileBackend, PromptTemplate,
-    QwenToolCall, ReadFile, ReadPage, ReadUrl, Sampling, SearchRegistry, ServerIdentity,
-    ToolCallCodec, Tools, WebOrigins, WebSearch,
+    Cancel, Channel, ChatFormat, ChatSession, Completer, Engine, FileMatchRegistry, GenOpts,
+    GlobFiles, GrepFiles, JsonToolCall, ListDir, LlamaServer, LlamaServerCompleter,
+    LlamaServerConfig, LlamaServerProfile, LlamaServerSpawn, ModelId, ModelProfile, ModelSource,
+    ProfileBackend, PromptTemplate, QwenToolCall, ReadFile, ReadPage, ReadUrl, RepoRoot, Sampling,
+    SearchRegistry, ServerIdentity, ToolCallCodec, Tools, WebOrigins, WebSearch,
 };
 
 /// A clap value parser for [`ChatFormat`]: its names as `--help` possible values,
@@ -961,9 +961,13 @@ fn write_channel(
 /// and no persistence is claimed). Factored out so the capability wiring
 /// is unit-testable without loading a model.
 fn agent_tools(root: &std::path::Path, web_origin: Option<&str>) -> Result<Tools> {
-    let cap = Dir::new(root);
+    let repo = RepoRoot::anchor(root)?;
+    let cap = repo.dir();
+    let file_results = FileMatchRegistry::default();
     let mut tools = Tools::new()
-        .with(ReadFile::new(cap.clone()))
+        .with(GrepFiles::new(repo.clone(), file_results.clone()))
+        .with(GlobFiles::new(repo.clone()))
+        .with(ReadFile::repository(repo, file_results))
         .with(ListDir::new(cap));
     let results = SearchRegistry::default();
     if let Some(origin) = web_origin {
@@ -1425,8 +1429,31 @@ mod tests {
 
     #[test]
     fn agent_tools_have_no_web_access_without_origin() {
-        let names = tool_names(&agent_tools(std::path::Path::new("."), None).unwrap());
+        let tools = agent_tools(std::path::Path::new("."), None).unwrap();
+        let specs = tools.specs();
+        let names: Vec<_> = specs.iter().map(|spec| spec.name.clone()).collect();
         assert!(!names.iter().any(|n| n == "read_page"));
+        for expected in ["grep_files", "glob_files", "read_file", "list_dir"] {
+            assert!(names.iter().any(|name| name == expected), "{names:?}");
+        }
+        assert!(!names.iter().any(|name| name == "edit_file"));
+        let repository_spec_chars: usize = specs
+            .iter()
+            .filter(|spec| {
+                matches!(
+                    spec.name.as_str(),
+                    "grep_files" | "glob_files" | "read_file"
+                )
+            })
+            .map(|spec| {
+                spec.name.chars().count()
+                    + spec.description.chars().count()
+                    + spec.params.to_string().chars().count()
+            })
+            .sum();
+        // Prompt-footprint checkpoint: the three read-only repository specs
+        // add 1,200 characters before model tokenization.
+        assert_eq!(repository_spec_chars, 1_200);
     }
 
     #[tokio::test(flavor = "multi_thread")]

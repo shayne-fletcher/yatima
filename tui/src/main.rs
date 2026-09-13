@@ -62,6 +62,9 @@ struct Args {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// Grant read-only repository tools under this directory.
+    #[arg(long)]
+    root: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -92,7 +95,9 @@ async fn main() -> Result<()> {
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
         ..Default::default()
     };
-    let config = resolved.into_host_config(base, args.system.clone());
+    let config = resolved
+        .into_host_config(base, args.system.clone())
+        .with_repo_root(args.root.clone())?;
     // The rail's label until Ready carries the real facts: the profile name,
     // or the source argument as given (resolution happens in the host).
     let label = config
@@ -336,6 +341,14 @@ mod tests {
     use super::*;
 
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn repository_root_is_an_explicit_tui_startup_choice() {
+        let absent = Args::try_parse_from(["yatima-tui"]).unwrap();
+        assert_eq!(absent.root, None);
+        let present = Args::try_parse_from(["yatima-tui", "--root", "/tmp/repo"]).unwrap();
+        assert_eq!(present.root, Some(PathBuf::from("/tmp/repo")));
+    }
 
     /// A fake terminal recording call order (into a shared log, so a
     /// dropped guard's calls remain observable) and injecting failures.

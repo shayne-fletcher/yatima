@@ -233,7 +233,25 @@
 //! - **TOOL-2** [`ToolOutcome`] is the runtime truth of tool execution; the
 //!   model-facing [`ToolResult`] is a projection at the protocol boundary.
 //! - **CAP-1** a [`Dir`]-scoped tool cannot reach paths outside its root
-//!   (containment, reusing `is_safe_relative` / MS-3).
+//!   (containment, reusing `is_safe_relative` / MS-3). Repository tools close
+//!   the static symlink gap locally: [`RepoRoot`] is canonical, discovery never
+//!   follows symlinks, and use-time paths reject symlink components. This is a
+//!   stable-filesystem guarantee; concurrent tree rewriting requires a future
+//!   directory-handle API.
+//! - **GREP-1** [`GrepFiles`] and [`GlobFiles`] perform gitignore-aware,
+//!   symlink-skipping repository discovery under one canonical [`RepoRoot`];
+//!   `GrepFiles` additionally skips binary CONTENT (`GlobFiles` never opens
+//!   files, and a binary pathname may rightly appear in its listing). Work
+//!   and output are deterministically bounded — the byte budget bounds bytes
+//!   REQUESTED, not merely kept — and repository-controlled filenames cannot
+//!   forge output records: control bytes and `%` percent-encode in every
+//!   displayed path, repository path ARGUMENTS consume that encoding (one
+//!   decode boundary, so any displayed path reads back verbatim), and
+//!   registries keep the raw path. A stopped search names the
+//!   limiting bound and never claims an exact omitted count.
+//! - **FREG-1** [`FileMatchRegistry`] assigns bounded, monotonic, never-reused
+//!   result ids. An id is only an address: [`ReadFile`] resolves its recorded
+//!   path through the repository capability again at use time.
 //! - **CAP-2** the agent's effects ⊆ the union of its tools' capabilities —
 //!   enforced for omission (AGENT-2) and containment (CAP-1); by construction
 //!   otherwise (tools hold their caps, no ambient `std::fs` or arbitrary
@@ -436,7 +454,8 @@ pub use backend::{
 };
 pub use cancel::Cancel;
 pub use capability::{
-    origins_in, proposed_origins, Dir, NtfyTopic, PlotSandbox, WebOrigin, WebOrigins, WriteDir,
+    origins_in, proposed_origins, Dir, NtfyTopic, PlotSandbox, RepoRoot, WebOrigin, WebOrigins,
+    WriteDir,
 };
 pub use chat::{looks_degenerate, ChatSession};
 pub use completer::{Completer, Completion};
@@ -462,11 +481,11 @@ pub use template::{
     MistralTemplate, MuseGlimmerTemplate, PlainTemplate, PromptTemplate, ReasoningStrength,
 };
 pub use tool::{
-    ImageListing, JsonToolCall, ListDir, MuseAtemCodec, Plot, PlotBound, PlotSeries, QwenToolCall,
-    ReadFile, ReadImage, ReadPage, ReadUrl, SearchRegistry, SearchResultId, SendNotification, Tool,
-    ToolArtifact, ToolCall, ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolExtraction,
-    ToolFailure, ToolOutcome, ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WebSearch,
-    WriteFile,
+    FileMatchId, FileMatchRegistry, GlobFiles, GrepFiles, ImageListing, JsonToolCall, ListDir,
+    MuseAtemCodec, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile, ReadImage, ReadPage,
+    ReadUrl, SearchRegistry, SearchResultId, SendNotification, Tool, ToolArtifact, ToolCall,
+    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolExtraction, ToolFailure, ToolOutcome,
+    ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WebSearch, WriteFile,
 };
 pub use transcript::{Role, ToolArguments, Turn};
 

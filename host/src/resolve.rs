@@ -138,6 +138,7 @@ impl ResolvedHostModel {
             format,
             system,
             model_label: self.label,
+            repo_root: None,
             managed_launcher: None,
         }
     }

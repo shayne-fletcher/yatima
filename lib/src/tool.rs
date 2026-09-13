@@ -14,14 +14,19 @@
 //! fallback for a model with no known native format. Schemas follow the de-facto
 //! standard (JSON Schema params, name + JSON args).
 
-use crate::capability::{Dir, NtfyTopic, PlotSandbox, WebOrigins, WriteDir};
+use crate::capability::{Dir, NtfyTopic, PlotSandbox, RepoRoot, WebOrigins, WriteDir};
 use crate::reasoning::{AtemInterpreter, AtemToolMessage, Reasoned};
 use crate::transcript::{render_json_inline, ToolArguments, Turn};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
+use globset::{Glob, GlobMatcher};
+use grep_regex::RegexMatcherBuilder;
+use grep_searcher::{sinks, SearcherBuilder};
+use ignore::WalkBuilder;
 use reqwest::{Client, Url};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1155,40 +1160,828 @@ fn balanced_object(s: &str) -> Option<String> {
     None
 }
 
-/// Read a UTF-8 text file under a [`Dir`] capability.
+const FILE_MATCH_REGISTRY_CAP: usize = 500;
+const REPO_PATTERN_MAX_BYTES: usize = 512;
+const REPO_REGEX_MAX_BYTES: usize = 10 * 1024 * 1024;
+const REPO_WALK_MAX_FILES: usize = 10_000;
+const REPO_GREP_MAX_BYTES: usize = 64 * 1024 * 1024;
+const REPO_CONTEXT_MAX: usize = 5;
+const REPO_GREP_DEFAULT_MATCHES: usize = 50;
+const REPO_GREP_MAX_MATCHES: usize = 200;
+const REPO_DISPLAY_LINE_CHARS: usize = 240;
+const REPO_OUTPUT_MAX_CHARS: usize = 8_000;
+const REPO_OUTPUT_TAIL_RESERVE: usize = 128;
+const REPO_GLOB_PATTERN_MAX_BYTES: usize = 256;
+const REPO_GLOB_DEFAULT_ENTRIES: usize = 200;
+const REPO_GLOB_MAX_ENTRIES: usize = 1_000;
+const REPO_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const REPO_READ_DEFAULT_RADIUS: usize = 30;
+const REPO_READ_MAX_LINES: usize = 200;
+const REPO_READ_MAX_CHARS: usize = 8_000;
+const REPO_CANCEL_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// A stable reference to one filesystem match in this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileMatchId(u64);
+
+impl std::fmt::Display for FileMatchId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FileMatch {
+    path: String,
+    line: usize,
+}
+
+/// Bounded session memory shared by repository search and `read_file`.
+/// IDs address evidence but confer no authority: every read resolves the
+/// recorded path through [`RepoRoot`] again (FREG-1).
+#[derive(Clone, Default)]
+pub struct FileMatchRegistry(Arc<std::sync::Mutex<FileMatchRegistryInner>>);
+
+#[derive(Default)]
+struct FileMatchRegistryInner {
+    next: u64,
+    entries: std::collections::VecDeque<(u64, FileMatch)>,
+}
+
+impl FileMatchRegistry {
+    fn publish(&self, matches: &[FileMatch]) -> Vec<FileMatchId> {
+        let mut inner = self.0.lock().expect("file match registry poisoned");
+        let mut ids = Vec::with_capacity(matches.len());
+        for matched in matches {
+            inner.next += 1;
+            let id = inner.next;
+            inner.entries.push_back((id, matched.clone()));
+            while inner.entries.len() > FILE_MATCH_REGISTRY_CAP {
+                inner.entries.pop_front();
+            }
+            ids.push(FileMatchId(id));
+        }
+        ids
+    }
+
+    fn resolve(&self, id: u64) -> Result<FileMatch> {
+        let inner = self.0.lock().expect("file match registry poisoned");
+        if let Some((_, matched)) = inner.entries.iter().find(|(n, _)| *n == id) {
+            return Ok(matched.clone());
+        }
+        match (inner.entries.front(), inner.entries.back()) {
+            (Some((lo, _)), Some((hi, _))) => bail!(
+                "grep_files: no result {id} — live results are {lo}..={hi} \
+                 (older results evict; search again if needed)"
+            ),
+            _ => bail!("grep_files: no results registered yet — call grep_files first"),
+        }
+    }
+}
+
+enum ReadFileScope {
+    Legacy(Dir),
+    Repository(RepoRoot, FileMatchRegistry),
+}
+
+/// Read a UTF-8 text file under a filesystem capability.
 pub struct ReadFile {
-    dir: Dir,
+    scope: ReadFileScope,
 }
 
 impl ReadFile {
+    /// The legacy path-only reader.
     pub fn new(dir: Dir) -> ReadFile {
-        ReadFile { dir }
+        ReadFile {
+            scope: ReadFileScope::Legacy(dir),
+        }
     }
+
+    /// A repository reader that also accepts stable grep result ids.
+    pub fn repository(root: RepoRoot, registry: FileMatchRegistry) -> ReadFile {
+        ReadFile {
+            scope: ReadFileScope::Repository(root, registry),
+        }
+    }
+}
+
+fn positive_usize(args: &Value, tool: &str, field: &str) -> Result<Option<usize>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let n = value.as_u64().ok_or_else(|| {
+        invalid_args(format!(
+            "{tool}: argument '{field}' must be a positive integer"
+        ))
+    })?;
+    let n = usize::try_from(n)
+        .map_err(|_| invalid_args(format!("{tool}: argument '{field}' is too large")))?;
+    if n == 0 {
+        return Err(invalid_args(format!(
+            "{tool}: argument '{field}' must be at least 1"
+        )));
+    }
+    Ok(Some(n))
+}
+
+fn repository_reader_target(
+    args: &Value,
+    registry: &FileMatchRegistry,
+) -> Result<(String, Option<usize>)> {
+    let path_present = args.get("path").is_some();
+    let result_present = args.get("result").is_some();
+    if path_present == result_present {
+        return Err(invalid_args(
+            "read_file: provide exactly one of string 'path' or integer 'result'",
+        ));
+    }
+    if path_present {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args("read_file: argument 'path' must be a string"))?;
+        // Repository paths are addressed exactly as displayed: the
+        // decode boundary makes display -> argument a true round trip.
+        return Ok((decode_repo_path("read_file", path)?, None));
+    }
+    let id = args
+        .get("result")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid_args("read_file: argument 'result' must be a positive integer"))?;
+    if id == 0 {
+        return Err(invalid_args(
+            "read_file: argument 'result' must be at least 1",
+        ));
+    }
+    let matched = registry.resolve(id)?;
+    Ok((matched.path, Some(matched.line)))
+}
+
+fn read_repository_file(
+    root: &RepoRoot,
+    path: &str,
+    matched_line: Option<usize>,
+    start_line: Option<usize>,
+    max_lines: Option<usize>,
+) -> Result<String> {
+    let full = root.resolve_existing(path)?;
+    let metadata = std::fs::metadata(&full)?;
+    if !metadata.is_file() {
+        bail!("read_file: {path:?} is not a regular file");
+    }
+    if metadata.len() > REPO_READ_MAX_BYTES {
+        bail!(
+            "read_file: {path:?} is {} bytes; repository reads are limited to {REPO_READ_MAX_BYTES} bytes",
+            metadata.len()
+        );
+    }
+    let text = std::fs::read_to_string(&full)
+        .map_err(|e| anyhow!("read_file: cannot read UTF-8 file {path:?}: {e}"))?;
+    let windowed = matched_line.is_some() || start_line.is_some() || max_lines.is_some();
+    if !windowed {
+        return Ok(text);
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        return Ok(format!("{path}: empty file\n"));
+    }
+    let requested = start_line.unwrap_or_else(|| {
+        matched_line
+            .unwrap_or(1)
+            .saturating_sub(REPO_READ_DEFAULT_RADIUS)
+            .max(1)
+    });
+    let requested_count = max_lines
+        .unwrap_or_else(|| {
+            if matched_line.is_some() {
+                REPO_READ_DEFAULT_RADIUS * 2 + 1
+            } else {
+                REPO_READ_MAX_LINES
+            }
+        })
+        .min(REPO_READ_MAX_LINES);
+    let mut first = requested.min(lines.len());
+    let clamped = requested > lines.len();
+    if clamped {
+        first = lines.len().saturating_sub(requested_count - 1).max(1);
+    }
+    let mut body = String::new();
+    let mut taken = 0usize;
+    for line in lines.iter().skip(first - 1).take(requested_count) {
+        if line.chars().count() > REPO_READ_MAX_CHARS {
+            if body.is_empty() {
+                bail!(
+                    "read_file: line {} in {path:?} is too long for an exact window",
+                    first + taken
+                );
+            }
+            break;
+        }
+        if body.chars().count() + line.chars().count() > REPO_READ_MAX_CHARS {
+            break;
+        }
+        body.push_str(line);
+        taken += 1;
+    }
+    let last = first + taken.saturating_sub(1);
+    let truncated = last < lines.len();
+    let mut header = format!("{path}:{first}..{last}");
+    if clamped {
+        header.push_str(" (requested line was past EOF; showing the final window)");
+    }
+    if truncated {
+        header.push_str(&format!("; continue with start_line {}", last + 1));
+    }
+    header.push('\n');
+    header.push_str(&body);
+    Ok(header)
 }
 
 #[async_trait]
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "read_file".to_string(),
-            description: "Read a UTF-8 text file, given a path relative to the root.".to_string(),
-            params: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "file path relative to the root" }
-                },
-                "required": ["path"]
-            }),
+        match &self.scope {
+            ReadFileScope::Legacy(_) => ToolSpec {
+                name: "read_file".to_string(),
+                description: "Read a UTF-8 text file, given a path relative to the root.".to_string(),
+                params: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "file path relative to the root" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ReadFileScope::Repository(_, _) => ToolSpec {
+                name: "read_file".to_string(),
+                description: "Read exact UTF-8 repository text by relative path or grep result number. Search first when locating code; continue bounded windows with start_line.".to_string(),
+                params: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "repository-relative file path; exclusive with result" },
+                        "result": { "type": "integer", "minimum": 1, "description": "grep_files result number; exclusive with path" },
+                        "start_line": { "type": "integer", "minimum": 1 },
+                        "max_lines": { "type": "integer", "minimum": 1, "maximum": REPO_READ_MAX_LINES }
+                    }
+                }),
+            },
         }
     }
 
     async fn call(&self, args: Value, _ctx: ToolCtx) -> Result<String> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_args("read_file: missing string argument 'path'"))?;
-        let full = self.dir.resolve(path)?; // CAP-1
-        Ok(tokio::fs::read_to_string(&full).await?)
+        match &self.scope {
+            ReadFileScope::Legacy(dir) => {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_args("read_file: missing string argument 'path'"))?;
+                let full = dir.resolve(path)?;
+                let metadata = tokio::fs::metadata(&full).await?;
+                if metadata.len() > REPO_READ_MAX_BYTES {
+                    bail!("read_file: {path:?} exceeds the {REPO_READ_MAX_BYTES}-byte limit");
+                }
+                Ok(tokio::fs::read_to_string(&full).await?)
+            }
+            ReadFileScope::Repository(root, registry) => {
+                let (path, matched_line) = repository_reader_target(&args, registry)?;
+                let start_line = positive_usize(&args, "read_file", "start_line")?;
+                let max_lines = positive_usize(&args, "read_file", "max_lines")?;
+                let max_lines = max_lines.map(|n| n.min(REPO_READ_MAX_LINES));
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    read_repository_file(&root, &path, matched_line, start_line, max_lines)
+                })
+                .await
+                .map_err(|e| anyhow!("read_file worker failed: {e}"))?
+            }
+        }
+    }
+}
+
+fn validate_repo_pattern(tool: &str, pattern: &str, max_bytes: usize) -> Result<()> {
+    if pattern.is_empty() {
+        return Err(invalid_args(format!("{tool}: pattern must not be empty")));
+    }
+    if pattern.len() > max_bytes {
+        return Err(invalid_args(format!(
+            "{tool}: pattern is {} bytes; maximum is {max_bytes}",
+            pattern.len()
+        )));
+    }
+    if Path::new(pattern).is_absolute()
+        || pattern
+            .split(['/', '\\'])
+            .any(|component| component == "..")
+    {
+        return Err(invalid_args(format!(
+            "{tool}: pattern must be relative and contain no '..' component"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_pattern_length(tool: &str, pattern: &str, max_bytes: usize) -> Result<()> {
+    if pattern.is_empty() {
+        return Err(invalid_args(format!("{tool}: pattern must not be empty")));
+    }
+    if pattern.len() > max_bytes {
+        return Err(invalid_args(format!(
+            "{tool}: pattern is {} bytes; maximum is {max_bytes}",
+            pattern.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The one display rule for repository paths (reversible, forge-proof):
+/// control bytes and `%` percent-encode, so a filename carrying a newline
+/// cannot manufacture an extra result line, a fake bound-stop, or any
+/// other output record. Display only — the registry keeps the exact raw
+/// path, and `read_file {"result": N}` resolves through that, untouched.
+fn display_repo_path(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_control() || c == '%' {
+            for byte in c.to_string().as_bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The decode boundary pairing [`display_repo_path`]: repository path
+/// ARGUMENTS consume the display encoding, so any path a tool displayed
+/// can be passed back verbatim — `%25` → `%`, `%0A` → newline — and a
+/// file whose real name contains `%` is addressed exactly as displayed.
+/// A malformed escape is a teaching error, never a silent guess.
+fn decode_repo_path(tool: &str, shown: &str) -> Result<String> {
+    let bytes = shown.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .and_then(|pair| std::str::from_utf8(pair).ok())
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| {
+                    invalid_args(format!(
+                        "{tool}: malformed %-escape in path {shown:?} — paths are \
+                         addressed exactly as displayed (%25 for a literal %)"
+                    ))
+                })?;
+            out.push(hex);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|_| invalid_args(format!("{tool}: path {shown:?} does not decode to UTF-8")))
+}
+
+fn relative_repo_path(root: &RepoRoot, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(root.path())
+        .map_err(|_| anyhow!("repository walker escaped its root: {path:?}"))?;
+    let parts: Result<Vec<_>> = relative
+        .components()
+        .map(|part| {
+            part.as_os_str()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("repository path is not UTF-8: {relative:?}"))
+        })
+        .collect();
+    Ok(parts?.join("/"))
+}
+
+fn repository_walk(root: &RepoRoot) -> ignore::Walk {
+    let mut builder = WalkBuilder::new(root.path());
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .ignore(true)
+        .follow_links(false)
+        .sort_by_file_path(|a, b| a.cmp(b));
+    builder.build()
+}
+
+#[derive(Debug)]
+struct GrepDisplayMatch {
+    matched: FileMatch,
+    text: String,
+    context: Vec<(usize, String)>,
+}
+
+struct GrepRequest {
+    pattern: String,
+    path_glob: Option<String>,
+    case_insensitive: bool,
+    context: usize,
+    max_matches: usize,
+}
+
+fn read_for_search(path: &Path, remaining: usize, ctx: &ToolCtx) -> Result<Option<Vec<u8>>> {
+    // The byte budget is a bound on bytes REQUESTED, not merely kept:
+    // the file's size is checked first (stable-filesystem premise, as
+    // elsewhere), an over-budget file is skipped without opening a
+    // window past the budget, and every read is capped to what the
+    // budget still allows — no byte beyond `remaining` is ever asked
+    // for (witnessed with a counting reader).
+    let file = std::fs::File::open(path)?;
+    let size = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    if size > remaining {
+        return Ok(None);
+    }
+    read_capped(file, size, ctx)
+}
+
+/// Read exactly `size` bytes (or to EOF, whichever first) in
+/// budget-capped chunks, checking the cancellation token per chunk. The
+/// reader is generic so a witness can COUNT the bytes requested.
+fn read_capped<R: Read>(mut reader: R, size: usize, ctx: &ToolCtx) -> Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::with_capacity(size.min(REPO_CANCEL_CHUNK_BYTES));
+    let mut chunk = vec![0u8; REPO_CANCEL_CHUNK_BYTES];
+    loop {
+        if ctx.is_cancelled() {
+            bail!("repository search cancelled");
+        }
+        let want = (size - bytes.len()).min(REPO_CANCEL_CHUNK_BYTES);
+        if want == 0 {
+            return Ok(Some(bytes));
+        }
+        let read = reader.read(&mut chunk[..want])?;
+        if read == 0 {
+            return Ok(Some(bytes));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn grep_repository(
+    root: RepoRoot,
+    registry: FileMatchRegistry,
+    request: GrepRequest,
+    ctx: ToolCtx,
+) -> Result<String> {
+    let mut matcher_builder = RegexMatcherBuilder::new();
+    matcher_builder
+        .case_insensitive(request.case_insensitive)
+        .size_limit(REPO_REGEX_MAX_BYTES);
+    let matcher = matcher_builder.build(&request.pattern).map_err(|e| {
+        invalid_args(format!(
+            "grep_files: cannot compile pattern {:?}: {e}",
+            request.pattern
+        ))
+    })?;
+    let glob = request
+        .path_glob
+        .as_deref()
+        .map(|value| {
+            Glob::new(value)
+                .map(|glob| glob.compile_matcher())
+                .map_err(|e| invalid_args(format!("grep_files: invalid glob {value:?}: {e}")))
+        })
+        .transpose()?;
+
+    let mut visited = 0usize;
+    let mut scanned = 0usize;
+    let mut found = Vec::new();
+    let mut stopped = None;
+    for entry in repository_walk(&root) {
+        if ctx.is_cancelled() {
+            bail!("repository search cancelled");
+        }
+        let entry = entry.map_err(|e| anyhow!("grep_files: repository walk failed: {e}"))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        visited += 1;
+        if visited > REPO_WALK_MAX_FILES {
+            stopped = Some(format!("file limit {REPO_WALK_MAX_FILES}"));
+            break;
+        }
+        let relative = relative_repo_path(&root, entry.path())?;
+        if glob.as_ref().is_some_and(|glob| !glob.is_match(&relative)) {
+            continue;
+        }
+        let remaining = REPO_GREP_MAX_BYTES.saturating_sub(scanned);
+        let Some(bytes) = read_for_search(entry.path(), remaining, &ctx)? else {
+            stopped = Some(format!("byte limit {REPO_GREP_MAX_BYTES}"));
+            break;
+        };
+        scanned += bytes.len();
+        if bytes.contains(&0) {
+            continue;
+        }
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let mut line_matches = Vec::new();
+        let mut searcher = SearcherBuilder::new().line_number(true).build();
+        searcher.search_slice(
+            &matcher,
+            bytes.as_slice(),
+            sinks::UTF8(|line_number, line| {
+                line_matches.push((
+                    line_number as usize,
+                    line.trim_end_matches(['\r', '\n']).to_string(),
+                ));
+                Ok(found.len() + line_matches.len() < request.max_matches)
+            }),
+        )?;
+        for (line, raw) in line_matches {
+            let first = line.saturating_sub(request.context).max(1);
+            let last = (line + request.context).min(lines.len());
+            let surrounding = (first..=last)
+                .filter(|candidate| *candidate != line)
+                .map(|candidate| {
+                    (
+                        candidate,
+                        search_text_line(
+                            lines[candidate - 1],
+                            REPO_DISPLAY_LINE_CHARS.saturating_sub(1),
+                        ),
+                    )
+                })
+                .collect();
+            found.push(GrepDisplayMatch {
+                matched: FileMatch {
+                    path: relative.clone(),
+                    line,
+                },
+                text: search_text_line(&raw, REPO_DISPLAY_LINE_CHARS.saturating_sub(1)),
+                context: surrounding,
+            });
+            if found.len() >= request.max_matches {
+                stopped = Some(format!("match limit {}", request.max_matches));
+                break;
+            }
+        }
+        if stopped.is_some() {
+            break;
+        }
+    }
+
+    if found.is_empty() && stopped.is_none() {
+        let scope = request.path_glob.as_deref().unwrap_or("the repository");
+        bail!(
+            "grep_files: no matches for {:?} in {scope}",
+            request.pattern
+        );
+    }
+    if found.is_empty() {
+        return Ok(format!(
+            "stopped at {}; no matches were reached and more may exist",
+            stopped.expect("checked above")
+        ));
+    }
+    let mut displayed = Vec::new();
+    let mut lines = Vec::new();
+    for item in found {
+        let shown_path = display_repo_path(&item.matched.path);
+        let provisional = format!(
+            "{}. {}:{} — {}",
+            displayed.len() + 1,
+            shown_path,
+            item.matched.line,
+            item.text
+        );
+        let contexts: Vec<String> = item
+            .context
+            .iter()
+            .map(|(line, text)| format!("   {shown_path}:{line} — {text}"))
+            .collect();
+        let added = provisional.chars().count()
+            + contexts
+                .iter()
+                .map(|line| line.chars().count() + 1)
+                .sum::<usize>()
+            + 1;
+        let current = lines
+            .iter()
+            .map(|line: &String| line.chars().count() + 1)
+            .sum::<usize>();
+        if current + added > REPO_OUTPUT_MAX_CHARS - REPO_OUTPUT_TAIL_RESERVE {
+            stopped = Some(format!("output limit {REPO_OUTPUT_MAX_CHARS} characters"));
+            break;
+        }
+        displayed.push(item.matched);
+        lines.push(provisional);
+        lines.extend(contexts);
+    }
+    let ids = registry.publish(&displayed);
+    let mut match_index = 0usize;
+    for line in &mut lines {
+        if line.starts_with(|c: char| c.is_ascii_digit()) {
+            if let Some((_, rest)) = line.split_once(". ") {
+                *line = format!("{}. {rest}", ids[match_index]);
+                match_index += 1;
+            }
+        }
+    }
+    if let Some(bound) = stopped {
+        lines.push(format!("stopped at {bound}; more results may exist"));
+    } else {
+        lines.push(format!(
+            "{} matches; repository walk completed",
+            displayed.len()
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Gitignore-aware, bounded repository content search.
+pub struct GrepFiles {
+    root: RepoRoot,
+    registry: FileMatchRegistry,
+}
+
+impl GrepFiles {
+    pub fn new(root: RepoRoot, registry: FileMatchRegistry) -> GrepFiles {
+        GrepFiles { root, registry }
+    }
+}
+
+#[async_trait]
+impl Tool for GrepFiles {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "grep_files".into(),
+            description: "Search repository text. Results are numbered; inspect one with read_file {\"result\": N}. Search output is abbreviated, so copy exact edit text only from read_file.".into(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string" },
+                    "glob": { "type": "string", "description": "optional globset path filter" },
+                    "case_insensitive": { "type": "boolean" },
+                    "context": { "type": "integer", "minimum": 0, "maximum": REPO_CONTEXT_MAX },
+                    "max_matches": { "type": "integer", "minimum": 1, "maximum": REPO_GREP_MAX_MATCHES }
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String> {
+        let pattern = required_string(&args, "grep_files", "pattern")?.to_string();
+        validate_pattern_length("grep_files", &pattern, REPO_PATTERN_MAX_BYTES)?;
+        let path_glob = optional_string(&args, "glob")?.map(str::to_string);
+        if let Some(glob) = &path_glob {
+            validate_repo_pattern("grep_files", glob, REPO_GLOB_PATTERN_MAX_BYTES)?;
+        }
+        let case_insensitive =
+            optional_bool(&args, "grep_files", "case_insensitive")?.unwrap_or(false);
+        let context = args.get("context").map_or(Ok(0usize), |value| {
+            value
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| invalid_args("grep_files: 'context' must be a non-negative integer"))
+        })?;
+        if context > REPO_CONTEXT_MAX {
+            return Err(invalid_args(format!(
+                "grep_files: 'context' cannot exceed {REPO_CONTEXT_MAX}"
+            )));
+        }
+        let max_matches = positive_usize(&args, "grep_files", "max_matches")?
+            .unwrap_or(REPO_GREP_DEFAULT_MATCHES)
+            .min(REPO_GREP_MAX_MATCHES);
+        let root = self.root.clone();
+        let registry = self.registry.clone();
+        let worker_ctx = ctx.clone();
+        let request = GrepRequest {
+            pattern,
+            path_glob,
+            case_insensitive,
+            context,
+            max_matches,
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            grep_repository(root, registry, request, worker_ctx)
+        })
+        .await
+        .map_err(|e| anyhow!("grep_files worker failed: {e}"))?;
+        // The dispatcher's outer race is the ONLY cancelled
+        // representation: a narrowly-lost race must not turn a completed
+        // worker's result into a success-typed cancellation claim.
+        result
+    }
+}
+
+fn glob_repository(
+    root: RepoRoot,
+    glob: GlobMatcher,
+    pattern: String,
+    max: usize,
+    ctx: ToolCtx,
+) -> Result<String> {
+    let mut visited = 0usize;
+    let mut paths = Vec::new();
+    let mut stopped = None;
+    for entry in repository_walk(&root) {
+        if ctx.is_cancelled() {
+            bail!("repository glob cancelled");
+        }
+        let entry = entry.map_err(|e| anyhow!("glob_files: repository walk failed: {e}"))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        visited += 1;
+        if visited > REPO_WALK_MAX_FILES {
+            stopped = Some(format!("entry limit {REPO_WALK_MAX_FILES}"));
+            break;
+        }
+        let relative = relative_repo_path(&root, entry.path())?;
+        if relative.is_empty() || !glob.is_match(&relative) {
+            continue;
+        }
+        let mut shown = display_repo_path(&relative);
+        if file_type.is_dir() {
+            shown.push('/');
+        }
+        paths.push(shown);
+        if paths.len() >= max {
+            stopped = Some(format!("result limit {max}"));
+            break;
+        }
+    }
+    if paths.is_empty() {
+        bail!("glob_files: no paths matched {pattern:?} in the repository");
+    }
+    paths.sort();
+    if let Some(bound) = stopped {
+        paths.push(format!("stopped at {bound}; more results may exist"));
+    } else {
+        paths.push(format!("{} paths; repository walk completed", paths.len()));
+    }
+    Ok(paths.join("\n"))
+}
+
+/// Gitignore-aware, bounded repository path discovery.
+pub struct GlobFiles {
+    root: RepoRoot,
+}
+
+impl GlobFiles {
+    pub fn new(root: RepoRoot) -> GlobFiles {
+        GlobFiles { root }
+    }
+}
+
+#[async_trait]
+impl Tool for GlobFiles {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "glob_files".into(),
+            description: "List repository files and directories matching a globset pattern. Paths are root-relative and sorted.".into(),
+            params: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "glob": { "type": "string" },
+                    "max": { "type": "integer", "minimum": 1, "maximum": REPO_GLOB_MAX_ENTRIES }
+                },
+                "required": ["glob"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String> {
+        let pattern = required_string(&args, "glob_files", "glob")?.to_string();
+        validate_repo_pattern("glob_files", &pattern, REPO_GLOB_PATTERN_MAX_BYTES)?;
+        let matcher = Glob::new(&pattern)
+            .map_err(|e| invalid_args(format!("glob_files: invalid glob {pattern:?}: {e}")))?
+            .compile_matcher();
+        let max = positive_usize(&args, "glob_files", "max")?
+            .unwrap_or(REPO_GLOB_DEFAULT_ENTRIES)
+            .min(REPO_GLOB_MAX_ENTRIES);
+        let root = self.root.clone();
+        let worker_ctx = ctx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            glob_repository(root, matcher, pattern, max, worker_ctx)
+        })
+        .await
+        .map_err(|e| anyhow!("glob_files worker failed: {e}"))?;
+        result
     }
 }
 
@@ -8221,6 +9014,542 @@ position over the coming years.</p>
         task.cancel();
         let result = task.join().await;
         assert_eq!(result, ToolOutcome::Cancelled { reason: None });
+    }
+
+    fn repo_tools(root: &std::path::Path) -> Tools {
+        let root = RepoRoot::anchor(root).unwrap();
+        let registry = FileMatchRegistry::default();
+        Tools::new()
+            .with(GrepFiles::new(root.clone(), registry.clone()))
+            .with(GlobFiles::new(root.clone()))
+            .with(ReadFile::repository(root, registry))
+    }
+
+    #[tokio::test]
+    async fn grep_result_reads_exact_repository_text() {
+        // upholds: GREP-1, FREG-1 — discovery is gitignore-aware and a
+        // numbered result resolves to the exact recorded path through the
+        // repository authority at use time.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(repo.path().join("ignored.rs"), "managed_reap hidden\n").unwrap();
+        std::fs::write(
+            repo.path().join("src/owner.rs"),
+            "fn shutdown() {\n    managed_reap();\n}\n",
+        )
+        .unwrap();
+        let tools = repo_tools(repo.path());
+        let search = tools
+            .dispatch_async(&ToolCall {
+                name: "grep_files".into(),
+                args: serde_json::json!({"pattern": "managed_reap", "glob": "src/**"}),
+            })
+            .await
+            .render_for_model("grep_files");
+        assert!(!search.is_error, "{}", search.content);
+        assert!(
+            search.content.contains("1. src/owner.rs:2"),
+            "{}",
+            search.content
+        );
+        assert!(!search.content.contains("ignored.rs"));
+
+        let read = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"result": 1, "start_line": 1, "max_lines": 3}),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!read.is_error, "{}", read.content);
+        assert!(read.content.starts_with("src/owner.rs:1..3\n"));
+        assert!(read
+            .content
+            .ends_with("fn shutdown() {\n    managed_reap();\n}\n"));
+    }
+
+    #[tokio::test]
+    async fn repository_discovery_skips_symlinks_and_is_deterministic() {
+        // upholds: GREP-1 — static symlink escape is absent on the stable
+        // fixture filesystem, and glob output has one deterministic order.
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("b.rs"), "needle\n").unwrap();
+        std::fs::write(repo.path().join("a.rs"), "needle\n").unwrap();
+        std::fs::write(outside.path().join("outside.rs"), "needle\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.rs"),
+            repo.path().join("linked.rs"),
+        )
+        .unwrap();
+        let tools = repo_tools(repo.path());
+        let call = ToolCall {
+            name: "glob_files".into(),
+            args: serde_json::json!({"glob": "**/*.rs"}),
+        };
+        let first = tools
+            .dispatch_async(&call)
+            .await
+            .render_for_model("glob_files");
+        let second = tools
+            .dispatch_async(&call)
+            .await
+            .render_for_model("glob_files");
+        assert_eq!(first.content, second.content);
+        assert!(
+            first.content.starts_with("a.rs\nb.rs\n"),
+            "{}",
+            first.content
+        );
+        assert!(!first.content.contains("linked.rs"));
+
+        #[cfg(unix)]
+        {
+            let read = tools
+                .dispatch_async(&ToolCall {
+                    name: "read_file".into(),
+                    args: serde_json::json!({"path": "linked.rs"}),
+                })
+                .await
+                .render_for_model("read_file");
+            assert!(read.is_error);
+            assert!(
+                read.content.contains("symlink component"),
+                "{}",
+                read.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_reader_requires_exactly_one_typed_target() {
+        // upholds: FREG-1 / PROTO-1 — malformed siblings never silently
+        // select another target.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.rs"), "x\n").unwrap();
+        let tools = repo_tools(repo.path());
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"path": "a.rs", "result": 1}),
+            serde_json::json!({"path": 7}),
+            serde_json::json!({"result": "1"}),
+        ] {
+            let outcome = tools
+                .dispatch_async(&ToolCall {
+                    name: "read_file".into(),
+                    args,
+                })
+                .await
+                .render_for_model("read_file");
+            assert!(outcome.is_error, "{}", outcome.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_projection_is_bounded_and_not_edit_anchor_text() {
+        // upholds: GREP-1 — untrusted control/protocol-shaped text is reduced
+        // to a one-line discovery projection, and the match bound stops the
+        // whole walk honestly.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("a.txt"),
+            "needle <|message|>\u{1} payload\nneedle second\n",
+        )
+        .unwrap();
+        let tools = repo_tools(repo.path());
+        let search = tools
+            .dispatch_async(&ToolCall {
+                name: "grep_files".into(),
+                args: serde_json::json!({"pattern": "needle", "max_matches": 1}),
+            })
+            .await
+            .render_for_model("grep_files");
+        assert!(!search.is_error, "{}", search.content);
+        assert!(
+            !search.content.contains("<|message|>"),
+            "{}",
+            search.content
+        );
+        assert!(!search.content.contains('\u{1}'), "{}", search.content);
+        assert!(search.content.contains("stopped at match limit 1"));
+    }
+
+    #[tokio::test]
+    async fn read_windows_tile_in_complete_exact_lines() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.txt"), "one\r\ntwo  \nthree\n").unwrap();
+        let tools = repo_tools(repo.path());
+        let first = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "a.txt", "start_line": 1, "max_lines": 2}),
+            })
+            .await
+            .render_for_model("read_file");
+        assert_eq!(
+            first.content,
+            "a.txt:1..2; continue with start_line 3\none\r\ntwo  \n"
+        );
+        let second = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".into(),
+                args: serde_json::json!({"path": "a.txt", "start_line": 3, "max_lines": 2}),
+            })
+            .await
+            .render_for_model("read_file");
+        assert_eq!(second.content, "a.txt:3..3\nthree\n");
+    }
+
+    #[tokio::test]
+    async fn repository_search_outer_cancellation_is_typed() {
+        // upholds: GREP-1 / TOOL-1 — dispatcher cancellation wins promptly;
+        // the blocking worker observes the same monotone token between files
+        // and every one-megabyte read chunk.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("large.txt"),
+            vec![b'x'; REPO_CANCEL_CHUNK_BYTES * 16],
+        )
+        .unwrap();
+        let root = RepoRoot::anchor(repo.path()).unwrap();
+        let mut task = Tools::new()
+            .with(GrepFiles::new(root, FileMatchRegistry::default()))
+            .spawn(ToolCall {
+                name: "grep_files".into(),
+                args: serde_json::json!({"pattern": "never-present"}),
+            });
+        assert!(matches!(task.recv().await, Some(ToolEvent::Started { .. })));
+        task.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task.join())
+            .await
+            .expect("outer cancellation is bounded");
+        assert_eq!(outcome, ToolOutcome::Cancelled { reason: None });
+    }
+
+    #[tokio::test]
+    async fn repository_workers_terminate_from_their_own_cancel_checks() {
+        // upholds: GREP-1 — the blocking workers observe the shared token
+        // themselves; their termination does not depend on the dropped outer
+        // JoinHandle being abortable.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("a.txt"), "needle\n").unwrap();
+        let root = RepoRoot::anchor(repo.path()).unwrap();
+        let cancelled_ctx = || {
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let (events, _) = broadcast::channel(1);
+            ToolCtx::new(1, cancel, events)
+        };
+        let grep = tokio::task::spawn_blocking({
+            let root = root.clone();
+            move || {
+                grep_repository(
+                    root,
+                    FileMatchRegistry::default(),
+                    GrepRequest {
+                        pattern: "needle".into(),
+                        path_glob: None,
+                        case_insensitive: false,
+                        context: 0,
+                        max_matches: 10,
+                    },
+                    cancelled_ctx(),
+                )
+            }
+        });
+        let glob = tokio::task::spawn_blocking(move || {
+            glob_repository(
+                root,
+                Glob::new("**").unwrap().compile_matcher(),
+                "**".into(),
+                10,
+                cancelled_ctx(),
+            )
+        });
+        for worker in [grep, glob] {
+            let result = tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .expect("cancelled worker terminates")
+                .expect("worker does not panic");
+            assert!(
+                result.unwrap_err().to_string().contains("cancelled"),
+                "the worker observed its token"
+            );
+        }
+    }
+
+    #[test]
+    fn read_capped_never_requests_past_the_budget() {
+        // upholds: GREP-1 — the byte budget bounds bytes REQUESTED. A
+        // counting reader proves the sum of requested buffer space never
+        // exceeds the size handed to read_capped, chunk math included.
+        struct Counting {
+            served: usize,
+            requested: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Read for Counting {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.requested.set(self.requested.get() + buf.len());
+                let give = buf.len().min(self.served);
+                self.served -= give;
+                buf[..give].fill(b'x');
+                Ok(give)
+            }
+        }
+        let requested = std::rc::Rc::new(std::cell::Cell::new(0));
+        let cancel = CancellationToken::new();
+        let (events, _) = broadcast::channel(1);
+        let ctx = ToolCtx::new(1, cancel, events);
+        let size = REPO_CANCEL_CHUNK_BYTES * 3 + 17;
+        let reader = Counting {
+            served: size * 2, // the "file" is bigger than the budget slice
+            requested: requested.clone(),
+        };
+        let bytes = read_capped(reader, size, &ctx).unwrap().unwrap();
+        assert_eq!(bytes.len(), size);
+        assert_eq!(
+            requested.get(),
+            size,
+            "not one byte beyond the budget is asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_lists_binary_paths_that_grep_declines_to_search() {
+        // upholds: GREP-1 (narrowed) — binary classification is a CONTENT
+        // rule: glob_files never opens files and rightly lists a binary
+        // pathname; grep_files skips its content.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("blob.bin"), b"needle needle").unwrap();
+        std::fs::write(
+            repo.path().join("plain.txt"),
+            "needle
+",
+        )
+        .unwrap();
+        let root = RepoRoot::anchor(repo.path()).unwrap();
+        let tools = Tools::new()
+            .with(GrepFiles::new(root.clone(), FileMatchRegistry::default()))
+            .with(GlobFiles::new(root));
+        let listed = tools
+            .dispatch_async(&ToolCall {
+                name: "glob_files".to_string(),
+                args: json(r#"{"glob": "*.bin"}"#),
+            })
+            .await
+            .render_for_model("glob_files");
+        assert!(!listed.is_error, "{}", listed.content);
+        assert!(listed.content.contains("blob.bin"), "{}", listed.content);
+        let matches = tools
+            .dispatch_async(&ToolCall {
+                name: "grep_files".to_string(),
+                args: json(r#"{"pattern": "needle"}"#),
+            })
+            .await
+            .render_for_model("grep_files");
+        assert!(!matches.is_error, "{}", matches.content);
+        assert!(matches.content.contains("plain.txt"), "{}", matches.content);
+        assert!(
+            !matches.content.contains("blob.bin"),
+            "binary content never searches: {}",
+            matches.content
+        );
+    }
+
+    #[tokio::test]
+    async fn control_bearing_filenames_cannot_forge_output_records() {
+        // upholds: GREP-1 — a filename carrying a newline percent-encodes
+        // in every displayed path, so it cannot manufacture an extra
+        // result line or a fake bound-stop; the registry keeps the raw
+        // path, so read-by-result still opens the real file.
+        let repo = tempfile::tempdir().unwrap();
+        let evil = "a
+b.txt";
+        std::fs::write(
+            repo.path().join(evil),
+            "needle here
+",
+        )
+        .unwrap();
+        let root = RepoRoot::anchor(repo.path()).unwrap();
+        let registry = FileMatchRegistry::default();
+        let tools = Tools::new()
+            .with(GrepFiles::new(root.clone(), registry.clone()))
+            .with(GlobFiles::new(root.clone()))
+            .with(ReadFile::repository(root, registry));
+        let matches = tools
+            .dispatch_async(&ToolCall {
+                name: "grep_files".to_string(),
+                args: json(r#"{"pattern": "needle"}"#),
+            })
+            .await
+            .render_for_model("grep_files");
+        assert!(!matches.is_error, "{}", matches.content);
+        assert!(
+            matches.content.contains("a%0Ab.txt"),
+            "the newline encodes: {}",
+            matches.content
+        );
+        let numbered = matches
+            .content
+            .lines()
+            .filter(|line| {
+                line.split_once(". ")
+                    .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            })
+            .count();
+        assert_eq!(numbered, 1, "one match, one record: {}", matches.content);
+        let listed = tools
+            .dispatch_async(&ToolCall {
+                name: "glob_files".to_string(),
+                args: json(r#"{"glob": "*.txt"}"#),
+            })
+            .await
+            .render_for_model("glob_files");
+        assert!(listed.content.contains("a%0Ab.txt"), "{}", listed.content);
+        let read = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".to_string(),
+                args: json(r#"{"result": 1}"#),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!read.is_error, "{}", read.content);
+        assert!(
+            read.content.contains("needle here"),
+            "resolution uses the raw path: {}",
+            read.content
+        );
+        // The displayed encoding is CONSUMED by path arguments — a true
+        // round trip for the newline name and for a literal `%` name.
+        let by_shown = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".to_string(),
+                args: json(r#"{"path": "a%0Ab.txt"}"#),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!by_shown.is_error, "{}", by_shown.content);
+        assert!(
+            by_shown.content.contains("needle here"),
+            "{}",
+            by_shown.content
+        );
+        std::fs::write(
+            repo.path().join("rate%notes.txt"),
+            "percent file
+",
+        )
+        .unwrap();
+        let listed = tools
+            .dispatch_async(&ToolCall {
+                name: "glob_files".to_string(),
+                args: json(r#"{"glob": "rate*"}"#),
+            })
+            .await
+            .render_for_model("glob_files");
+        assert!(
+            listed.content.contains("rate%25notes.txt"),
+            "the literal % encodes: {}",
+            listed.content
+        );
+        let round = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".to_string(),
+                args: json(r#"{"path": "rate%25notes.txt"}"#),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(!round.is_error, "{}", round.content);
+        assert!(
+            round.content.contains("percent file"),
+            "glob display feeds read_file verbatim: {}",
+            round.content
+        );
+        let malformed = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".to_string(),
+                args: json(r#"{"path": "rate%zznotes.txt"}"#),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(malformed.is_error);
+        assert!(
+            malformed.content.contains("malformed %-escape"),
+            "{}",
+            malformed.content
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_read_file_shares_the_pinned_input_cap() {
+        // upholds: the plan's pinned 2 MB read cap applies to BOTH scopes —
+        // the legacy Dir-based arm refuses an oversized file with the same
+        // teaching instead of the pre-plan unbounded read_to_string.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("huge.txt"),
+            vec![b'x'; (REPO_READ_MAX_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
+        let result = tools
+            .dispatch_async(&ToolCall {
+                name: "read_file".to_string(),
+                args: json(r#"{"path": "huge.txt"}"#),
+            })
+            .await
+            .render_for_model("read_file");
+        assert!(result.is_error);
+        assert!(result.content.contains("byte limit"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn repository_read_refuses_oversized_input_and_lines() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("large.txt"),
+            vec![b'x'; REPO_READ_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("line.txt"),
+            format!("{}\n", "x".repeat(REPO_READ_MAX_CHARS + 1)),
+        )
+        .unwrap();
+        let tools = repo_tools(repo.path());
+        for args in [
+            serde_json::json!({"path": "large.txt"}),
+            serde_json::json!({"path": "line.txt", "start_line": 1}),
+        ] {
+            let read = tools
+                .dispatch_async(&ToolCall {
+                    name: "read_file".into(),
+                    args,
+                })
+                .await
+                .render_for_model("read_file");
+            assert!(read.is_error, "{}", read.content);
+        }
+    }
+
+    #[test]
+    fn file_match_registry_evicts_without_reusing_ids() {
+        // upholds: FREG-1 — ids are monotonic and old addresses do not point
+        // at new evidence after eviction.
+        let registry = FileMatchRegistry::default();
+        let entries: Vec<_> = (0..=FILE_MATCH_REGISTRY_CAP)
+            .map(|n| FileMatch {
+                path: format!("{n}.rs"),
+                line: 1,
+            })
+            .collect();
+        let ids = registry.publish(&entries);
+        assert_eq!(ids.last().unwrap().0, (FILE_MATCH_REGISTRY_CAP + 1) as u64);
+        assert!(registry.resolve(1).is_err());
+        assert_eq!(registry.resolve(2).unwrap().path, "1.rs");
     }
 
     fn header_value<'a>(request: &'a wiremock::Request, name: &str) -> &'a str {

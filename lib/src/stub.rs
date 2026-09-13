@@ -170,6 +170,25 @@ pub fn run() -> ! {
                         " to=self<|message|>results in hand; report them<|eom|>",
                         "<|start|>assistant to=user<|message|>found: the listed pages above<|eot|>",
                     ]),
+                    // Read-only repository journey: discover a symbol, follow
+                    // its stable result id into exact source, then answer.
+                    "repo-read-round" if completion_hits == 1 => sse(&[
+                        " to=self<|message|>locate the cleanup path<|eom|>",
+                        "<|start|>assistant to=grep_files<|message|><atem:function_calls>\n",
+                        "<atem:invoke name=\"grep_files\">\n<atem:parameter name=\"pattern\">",
+                        "reap_managed_child</atem:parameter>\n</atem:invoke>\n",
+                        "</atem:function_calls><|eot|>",
+                    ]),
+                    "repo-read-round" if completion_hits == 2 => sse(&[
+                        " to=self<|message|>read the exact match<|eom|>",
+                        "<|start|>assistant to=read_file<|message|><atem:function_calls>\n",
+                        "<atem:invoke name=\"read_file\">\n<atem:parameter name=\"result\">1",
+                        "</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|>",
+                    ]),
+                    "repo-read-round" => sse(&[
+                        " to=self<|message|>the source and witness agree<|eom|>",
+                        "<|start|>assistant to=user<|message|>frontend shutdown reaches reap_managed_child in owner.rs, witnessed by lifecycle.rs.<|eot|>",
+                    ]),
                     // The full research journey (the drive acceptance
                     // scenario): search and report; then, once granted, a
                     // 403'd fetch survived in-turn, the good page's images

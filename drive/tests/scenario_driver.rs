@@ -454,6 +454,69 @@ async fn the_shipped_binary_composes_search_without_minting_authority() {
     assert!(!stub_children_alive(dir.path()).await, "child reaped");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shipped_binary_composes_repository_search_and_read_by_result() {
+    // upholds: GREP-1, FREG-1, CAP-3a — the real driver grants one anchored
+    // read root; the scripted model discovers and reads by stable id, while
+    // mutation tools remain absent.
+    let _serial = SESSION.lock().await;
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(
+        repo.join("owner.rs"),
+        "fn shutdown() { reap_managed_child(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lifecycle.rs"),
+        "#[test]\nfn child_is_reaped() {}\n",
+    )
+    .unwrap();
+    let root = repo.to_str().unwrap();
+    let run = run_driver(
+        &dir,
+        "repo-read-round",
+        "trace managed child cleanup and cite its test\n",
+        &["--root", root],
+    )
+    .await;
+    assert_eq!(run.status.code(), Some(0), "stderr: {}", run.stderr);
+    let lines = tape_lines(&run.run_dir);
+    let notes: Vec<_> = lines
+        .iter()
+        .filter_map(|line| {
+            let note = &line["event"]["ToolNote"];
+            Some((note["kind"].as_str()?, note["text"].as_str()?))
+        })
+        .collect();
+    let grep_at = notes
+        .iter()
+        .position(|(kind, text)| *kind == "Call" && text.contains("grep_files"))
+        .unwrap_or_else(|| panic!("grep call is taped: {notes:?}"));
+    let read_at = notes
+        .iter()
+        .position(|(kind, text)| *kind == "Call" && text.contains("read_file"))
+        .unwrap_or_else(|| panic!("read call is taped: {notes:?}"));
+    assert!(grep_at < read_at, "search precedes read: {notes:?}");
+    assert!(
+        notes.iter().filter(|(kind, _)| *kind == "Success").count() >= 2,
+        "both calls succeed: {notes:?}"
+    );
+    assert!(!notes.iter().any(|(kind, _)| *kind == "Failure"));
+
+    let prompt = std::fs::read_to_string(dir.path().join("repo-read-round.prompt1"))
+        .expect("stub captured the rendered tool prompt");
+    for tool in ["grep_files", "glob_files", "read_file"] {
+        assert!(prompt.contains(tool), "{tool} is advertised: {prompt}");
+    }
+    assert!(
+        !prompt.contains("edit_file"),
+        "read-only grant stays read-only"
+    );
+    assert!(!stub_children_alive(dir.path()).await, "child reaped");
+}
+
 /// The journey's whole hermetic web: search endpoint, a 403-serving page,
 /// a readable article with one image, and the image itself — one origin,
 /// one listener, ephemeral port. std TCP, no dependencies.

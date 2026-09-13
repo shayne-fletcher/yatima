@@ -80,6 +80,9 @@ struct Args {
     /// Don't auto-fetch a missing model; error instead.
     #[arg(long)]
     offline: bool,
+    /// Grant read-only repository tools under this directory.
+    #[arg(long)]
+    root: Option<PathBuf>,
     /// Record this GUI session. With no DIR, writes under runs/.
     #[arg(long, num_args = 0..=1, value_name = "DIR")]
     tape: Option<Option<PathBuf>>,
@@ -103,7 +106,9 @@ fn resolve(args: &Args) -> Result<HostConfig> {
         sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
         ..Default::default()
     };
-    Ok(resolved.into_host_config(base, args.system.clone()))
+    resolved
+        .into_host_config(base, args.system.clone())
+        .with_repo_root(args.root.clone())
 }
 
 fn tape_dir(choice: &Option<Option<PathBuf>>, utc_stamp: &str, pid: u32) -> Option<PathBuf> {
@@ -1888,6 +1893,14 @@ mod tests {
 
         let explicit = Args::try_parse_from(["yatima-gui", "--tape", "/tmp/yatima-run"]).unwrap();
         assert_eq!(explicit.tape, Some(Some(PathBuf::from("/tmp/yatima-run"))));
+    }
+
+    #[test]
+    fn repository_root_is_an_explicit_gui_startup_choice() {
+        let absent = Args::try_parse_from(["yatima-gui"]).unwrap();
+        assert_eq!(absent.root, None);
+        let present = Args::try_parse_from(["yatima-gui", "--root", "/tmp/repo"]).unwrap();
+        assert_eq!(present.root, Some(PathBuf::from("/tmp/repo")));
     }
 
     #[test]

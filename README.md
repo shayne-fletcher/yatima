@@ -36,10 +36,10 @@ The native GUI, asked to find and render Mandelbrot images: each picture carries
 # Interactive TUI. Type a URL to grant its origin.
 cargo run -p yatima-tui --release --features metal -- --profile qwen32b
 
-# Verified Muse agent. read_file is confined to --root.
+# Verified Muse agent with read-only repository discovery under --root.
 cargo run -p yatima-cli --release -- agent \
   --profile muse-glimmer --offline --root . \
-  --prompt "Read README.md and explain what Yatima is."
+  --prompt "Find where managed llama-server cleanup is guaranteed and cite the source and tests."
 ```
 
 Managed mode requires `llama-server` on `PATH`. Yatima verifies the model, starts the server on loopback, and reaps it on success, failure, or Ctrl-C. Missing weights are fetched through [`possum`](https://github.com/shayne-fletcher/possum); `--offline` disables network access.
@@ -50,7 +50,8 @@ Managed mode requires `llama-server` on `PATH`. Yatima verifies the model, start
 - Use Yatima through the CLI, TUI, native egui app, browser viewer, or embedded in Rust.
 - Chat and run capability-scoped tools. Muse Glimmer's native ATEM protocol works through the CLI, TUI, native GUI, and browser viewer.
 - Search the web, approve proposed sources, and render images discovered on approved pages.
-- Give tools explicit authority such as a directory or a set of web origins.
+- Search and read a granted repository with bounded, gitignore-aware tools.
+- Give tools explicit authority such as a repository root or a set of web origins.
 - Stream reasoning, answers, and tool status without leaking protocol markup.
 
 The crate registry names the important guarantees, and tests cite the laws they witness.
