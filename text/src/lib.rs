@@ -512,6 +512,70 @@ pub fn lift_fenced_code_blocks(text: &str) -> String {
     out.join("\n")
 }
 
+/// Rewrite a fenced block's language tag to the file *extension* a syntax
+/// highlighter resolves. egui_commonmark (and syntect beneath it) look a
+/// fence's language up with `find_syntax_by_extension`, not by name: the
+/// registered extension for Haskell is `hs`, for Rust `rs`, for Python `py`.
+/// A model's natural ```haskell / ```rust / ```python tag therefore matches
+/// nothing and the block renders unhighlighted. Only the *opening* fence's
+/// first token is rewritten, and only for names whose extension differs from
+/// the name; tags that already are extensions (`hs`, `rs`), tags syntect
+/// accepts by name (`bash`, `json`, `cpp`, `yaml`, `go`, `java`, …), unknown
+/// tags, bare fences, and every content line pass through byte-for-byte.
+pub fn canonicalize_code_fence_langs(text: &str) -> String {
+    // name → extension, only where the language *name* fails an extension
+    // lookup but the extension resolves (verified against syntect's default
+    // syntax set). Names that already work as extensions are absent by design.
+    fn ext_for(lang: &str) -> Option<&'static str> {
+        Some(match lang.to_ascii_lowercase().as_str() {
+            "haskell" => "hs",
+            "rust" => "rs",
+            "python" | "python3" => "py",
+            "javascript" | "node" => "js",
+            "ruby" => "rb",
+            "csharp" | "c#" => "cs",
+            "shell" => "sh",
+            "text" | "plaintext" => "txt",
+            "golang" => "go",
+            "ocaml" => "ml",
+            "clojure" => "clj",
+            "erlang" => "erl",
+            "perl" => "pl",
+            _ => return None,
+        })
+    }
+    let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("```") {
+            out.push(line.to_string());
+            continue;
+        }
+        if in_fence {
+            // A fence while open closes the block; never a language tag.
+            in_fence = false;
+            out.push(line.to_string());
+            continue;
+        }
+        in_fence = true;
+        // Opening fence: keep the indent and the exact backtick run, rewrite
+        // only the leading language token when it maps to an extension.
+        let indent = &line[..line.len() - trimmed.len()];
+        let ticks = trimmed.len() - trimmed.trim_start_matches('`').len();
+        let info = trimmed[ticks..].trim_start();
+        let (lang, rest) = match info.find(char::is_whitespace) {
+            Some(i) => (&info[..i], &info[i..]),
+            None => (info, ""),
+        };
+        match ext_for(lang) {
+            Some(ext) => out.push(format!("{indent}{}{ext}{rest}", "`".repeat(ticks))),
+            None => out.push(line.to_string()),
+        }
+    }
+    out.join("\n")
+}
+
 pub fn tame_markdown_images(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -637,6 +701,51 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn code_fence_langs_canonicalize_to_syntect_extensions() {
+        // The names a model actually writes resolve only by extension, so the
+        // opening tag is rewritten to the extension syntect registers.
+        assert_eq!(
+            canonicalize_code_fence_langs("```haskell\njoinSlot :: Slot\n```"),
+            "```hs\njoinSlot :: Slot\n```"
+        );
+        assert_eq!(
+            canonicalize_code_fence_langs("```rust\nfn f() {}\n```"),
+            "```rs\nfn f() {}\n```"
+        );
+        assert_eq!(
+            canonicalize_code_fence_langs("```python\nx = 1\n```"),
+            "```py\nx = 1\n```"
+        );
+        // Case-insensitive on the name; the extension is lowercase.
+        assert_eq!(
+            canonicalize_code_fence_langs("```Haskell\nx\n```"),
+            "```hs\nx\n```"
+        );
+        // Tags that already resolve by name pass through untouched, as do
+        // unknown tags and bare fences.
+        for keep in [
+            "```bash\nls\n```",
+            "```json\n{}\n```",
+            "```hs\nx\n```",
+            "```brainfuck\n+++\n```",
+            "```\nplain\n```",
+        ] {
+            assert_eq!(canonicalize_code_fence_langs(keep), keep);
+        }
+        // A fence-like line *inside* a block is the closing fence, never a
+        // language tag: a ```haskell that opens must not be re-treated on close.
+        assert_eq!(
+            canonicalize_code_fence_langs("```haskell\ncode\n```\n```rust\nmore\n```"),
+            "```hs\ncode\n```\n```rs\nmore\n```"
+        );
+        // Trailing attributes after the language token survive.
+        assert_eq!(
+            canonicalize_code_fence_langs("```rust ignore\nfn f() {}\n```"),
+            "```rs ignore\nfn f() {}\n```"
+        );
+    }
 
     #[test]
     fn stripped_images_reduce_to_their_alt_or_nothing() {

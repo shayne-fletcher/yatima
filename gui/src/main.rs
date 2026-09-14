@@ -39,7 +39,10 @@ use yatima_host::{
     StartupPhase, ToolNoteKind,
 };
 use yatima_lib::{GenOpts, Sampling};
-use yatima_text::{lift_fenced_code_blocks, prettify_math_plain_scripts, tame_markdown_images};
+use yatima_text::{
+    canonicalize_code_fence_langs, lift_fenced_code_blocks, prettify_math_plain_scripts,
+    tame_markdown_images,
+};
 
 const RECORDER_CONTROL_WITHIN: Duration = Duration::from_secs(5);
 
@@ -517,25 +520,34 @@ fn fmt_took(secs: f32) -> String {
 
 /// Put Source Code Pro at the head of both font families, keeping egui's
 /// built-ins behind it as fallback (they carry the emoji/symbol glyphs a
-/// code face lacks — `⚙`/`⚠` must keep rendering). The *static* Regular
-/// instance is embedded (assets/, OFL-licensed): egui's rasterizer draws a
-/// variable font at its design origin — Source Code Pro's is ExtraLight,
-/// which reads as washed-out — so the machine's variable-font install is
-/// deliberately not used. Embedding also carries the face into the coming
-/// WASM client unchanged.
+/// code face lacks — `⚙`/`⚠` must keep rendering), and JuliaMono LAST as a
+/// mathematical-operator fallback: Source Code Pro and egui's built-ins
+/// both lack the lattice/order glyphs (`⊥ ⊤ ⊓ ⊔ ⊑ ⊒ ∧ ∨ ⋈ ≡ ⟨ ⟩ ∅`) that
+/// showed as tofu (observed live on graft's lattice algebra), and JuliaMono
+/// — built for exactly this technical-Unicode-in-monospace use — carries
+/// them all. Appended, not inserted, so SCP still wins every glyph it has;
+/// only the operators nothing earlier covers fall through to JuliaMono.
+/// Both faces are embedded (assets/, permissively licensed): egui's
+/// rasterizer draws a variable font at its design origin — Source Code
+/// Pro's is ExtraLight, which reads as washed-out — so the machine's
+/// variable-font install is deliberately not used. Embedding also carries
+/// the faces into the coming WASM client unchanged.
 fn install_fonts(ctx: &egui::Context) {
-    let bytes = include_bytes!("../assets/SourceCodePro-Regular.ttf");
+    let scp = include_bytes!("../assets/SourceCodePro-Regular.ttf");
+    let juliamono = include_bytes!("../assets/JuliaMono-Regular.ttf");
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "source-code-pro".to_string(),
-        std::sync::Arc::new(egui::FontData::from_static(bytes)),
+        std::sync::Arc::new(egui::FontData::from_static(scp)),
+    );
+    fonts.font_data.insert(
+        "julia-mono".to_string(),
+        std::sync::Arc::new(egui::FontData::from_static(juliamono)),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "source-code-pro".to_string());
+        let list = fonts.families.entry(family).or_default();
+        list.insert(0, "source-code-pro".to_string());
+        list.push("julia-mono".to_string());
     }
     ctx.set_fonts(fonts);
 }
@@ -1700,8 +1712,11 @@ fn commit_turn(
     // blocks (e⁻ˣ would be tofu).
     // Fenced blocks lift out of list items before rendering: nested in a
     // bullet, egui_commonmark lays them to the RIGHT of the bullet row.
-    let answer =
-        lift_fenced_code_blocks(&prettify_math_plain_scripts(&tame_markdown_images(answer)));
+    // Then the language tag is rewritten to the extension syntect resolves
+    // (```haskell → ```hs), or the block renders unhighlighted.
+    let answer = canonicalize_code_fence_langs(&lift_fenced_code_blocks(
+        &prettify_math_plain_scripts(&tame_markdown_images(answer)),
+    ));
     if answer.trim().is_empty() && reasoning.is_empty() {
         return;
     }
