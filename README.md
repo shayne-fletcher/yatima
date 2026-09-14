@@ -17,7 +17,7 @@
 <br>
 
 <p align="center">
-  <img src="./images/slot-lattice.png" width="780" alt="yatima rendering a Haskell lattice: highlighted source and typeset order notation">
+  <img src="./images/slot-lattice.png" width="560" alt="yatima rendering a Haskell lattice: highlighted source and typeset order notation">
 </p>
 <p align="center">
   <sub>A local model, reasoning in Haskell and lattice notation.</sub>
@@ -36,7 +36,7 @@
 <br>
 
 <p align="center">
-  <img src="./images/yatima-penrose.png" width="780" alt="yatima mid-turn: a granted origin, a page read, an answer streaming">
+  <img src="./images/yatima-penrose.png" width="560" alt="yatima mid-turn: a granted origin, a page read, an answer streaming">
 </p>
 <p align="center">
   <sub>One unstaged turn.</sub>
