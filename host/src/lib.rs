@@ -275,6 +275,23 @@ impl HostConfig {
         })
     }
 
+    /// An explicit per-session temperature, applied AFTER profile layering
+    /// so it wins over a profile's pin (PROFILE-1's one exception). `None`
+    /// changes nothing. Muse's profile pins 1.0; without this a frontend's
+    /// `--temperature 0.3` was silently discarded and two "comparison"
+    /// sessions would have sampled identically — the resolved value is what
+    /// `Ready.sampling` reports, so a tape shows which ran.
+    pub fn with_temperature(mut self, temperature: Option<f64>) -> HostConfig {
+        if let Some(temperature) = temperature {
+            let (top_p, seed) = match self.opts.sampling {
+                Sampling::Greedy => (None, 0),
+                Sampling::Sample { top_p, seed, .. } => (top_p, seed),
+            };
+            self.opts.sampling = Sampling::nucleus(temperature, top_p, seed);
+        }
+        self
+    }
+
     /// Grant this host session read-only access to an explicitly chosen
     /// repository. `None` leaves repository tools absent (CAP-3a).
     pub fn with_repo_root(mut self, root: Option<std::path::PathBuf>) -> Result<HostConfig> {
@@ -1792,6 +1809,52 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_temperature_wins_over_the_profile_pin() {
+        // upholds: PROFILE-1's exception — a per-session --temperature is
+        // applied after layering, so the muse pin of 1.0 yields to 0.3 and
+        // the reported sampling says so; None leaves the pin in force; the
+        // caller's top_p and seed survive.
+        let profile = yatima_lib::ModelProfile::builtin("muse-glimmer").expect("builtin");
+        let base = GenOpts {
+            sampling: Sampling::nucleus(0.0, Some(0.9), 7),
+            ..Default::default()
+        };
+        let pinned = profile.apply_gen_overrides(base.clone());
+        assert!(
+            matches!(pinned.sampling, Sampling::Sample { temperature, .. } if temperature == 1.0)
+        );
+        let source = || {
+            yatima_lib::ModelSource::from_args(
+                Some(std::path::PathBuf::from("/nonexistent")),
+                None,
+                None,
+                true,
+                None,
+            )
+            .expect("a directory source")
+        };
+        let config = |opts: GenOpts| HostConfig::engine(source(), true, opts, None, None, None);
+        // The profile also pins top_p and seed; only the temperature moves.
+        let Sampling::Sample { top_p, seed, .. } = pinned.sampling else {
+            panic!("muse samples")
+        };
+        let overridden = config(pinned.clone()).with_temperature(Some(0.3));
+        assert_eq!(
+            overridden.opts.sampling,
+            Sampling::Sample {
+                temperature: 0.3,
+                top_p,
+                seed
+            }
+        );
+        assert!(sampling_summary(overridden.opts.sampling).starts_with("temp 0.30 · top-p 0.95"));
+        assert_eq!(
+            config(pinned.clone()).with_temperature(None).opts.sampling,
+            pinned.sampling
+        );
+    }
 
     #[test]
     fn lib_types_map_to_wire_mirrors() {

@@ -70,8 +70,10 @@ struct Args {
     system: Option<String>,
     #[arg(long, default_value_t = 1024)]
     max_tokens: usize,
-    #[arg(long, default_value_t = 0.0)]
-    temperature: f64,
+    /// Sampling temperature. Omitted: the profile's (muse pins 1.0), else
+    /// greedy. Given: wins over the profile's pin for this session.
+    #[arg(long)]
+    temperature: Option<f64>,
     /// Nucleus (top-p) sampling cutoff; omit for the full distribution.
     #[arg(long)]
     top_p: Option<f64>,
@@ -106,11 +108,12 @@ fn resolve(args: &Args) -> Result<HostConfig> {
     })?;
     let base = GenOpts {
         max_tokens: args.max_tokens,
-        sampling: Sampling::nucleus(args.temperature, args.top_p, args.seed),
+        sampling: Sampling::nucleus(args.temperature.unwrap_or(0.0), args.top_p, args.seed),
         ..Default::default()
     };
     resolved
         .into_host_config(base, args.system.clone())
+        .with_temperature(args.temperature)
         .with_repo_root(args.root.clone())
 }
 

@@ -87,7 +87,11 @@
 //!   ([`ModelProfile::apply_gen_overrides`]): profile fields override a caller
 //!   base `GenOpts`, except a reasoning profile's token budget is a floor that
 //!   never reduces a larger caller budget; an unset `prefill_chunk` defers to
-//!   the engine default.
+//!   the engine default. One exception, applied after layering: an explicit
+//!   per-session temperature (`HostConfig::with_temperature`, the GUI's
+//!   `--temperature`) wins over a profile's pin, and the resolved value is
+//!   what `Ready.sampling` reports (cited by
+//!   `an_explicit_temperature_wins_over_the_profile_pin`).
 //! - **PROFILE-2** a [`ModelProfile`] resolves to exactly one source (`repo`
 //!   xor `dir`) before load, and that source is authoritative: combining any
 //!   profile with a model-source flag (`--model`, `--repo`, `--gguf`,
