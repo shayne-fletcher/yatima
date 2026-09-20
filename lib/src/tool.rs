@@ -4222,6 +4222,11 @@ impl Tool for ReadImage {
             "displaying them",
             "displaying these",
             "fresh ones now",
+            // Markdown image syntax: the spec tells the model it never
+            // renders, so writing one is presenting a display that did not
+            // happen (taped 2026-09-20: seven `![…](https://example.com/…)`
+            // links around zero new displays).
+            "![",
         ]
         .iter()
         .any(|phrase| answer.contains(phrase))

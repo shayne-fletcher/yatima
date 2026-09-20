@@ -31,6 +31,23 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
+/// The persisted display record's opener (AGENT-3); the host writes it,
+/// the model must not.
+const DISPLAY_RECORD_OPEN: &str = "[displayed via ";
+
+/// `reply` without any line the model wrote in the host's display-record
+/// shape.
+fn without_host_display_lines(reply: &str) -> String {
+    let kept: Vec<&str> = reply
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !(line.starts_with(DISPLAY_RECORD_OPEN) && line.ends_with(']'))
+        })
+        .collect();
+    kept.join("\n").trim_end().to_string()
+}
+
 /// Corrections per user turn before a withheld answer commits anyway
 /// (IMG-2): two, shared by both grounds for withholding. Beyond it the
 /// prose commits with its Retry events on the tape — a bounded correction,
@@ -482,6 +499,13 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 // A plain answer: the run is done (the reasoning span, if any, has
                 // already been stripped from `reply`).
                 ToolExtraction::None => {
+                    // The display-record line is host-owned (AGENT-3): a
+                    // model that has seen it in history writes its own,
+                    // with its own numbers (taped 2026-09-20, one turn after
+                    // the line was introduced). Strip imitations before the
+                    // reply is judged, shown, or persisted.
+                    let cleaned = without_host_display_lines(reply);
+                    let reply = &cleaned;
                     // No tool call and no answer text — the reply was all
                     // reasoning or framing (a truncated turn). Emitting
                     // `Final("")` would tell the caller the model answered;
@@ -785,7 +809,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 let mut tools: Vec<&str> = evidenced_tools.iter().map(String::as_str).collect();
                 tools.sort_unstable();
                 format!(
-                    "{answer}\n[displayed via {}: {}]",
+                    "{answer}\n{DISPLAY_RECORD_OPEN}{}: {}]",
                     tools.join(", "),
                     displayed.join(", ")
                 )

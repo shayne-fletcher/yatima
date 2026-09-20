@@ -519,6 +519,11 @@ pub fn origins_in(text: &str) -> Vec<String> {
 /// dot. Extraction adds no authority: a proposal is rendered, and only
 /// the user's tap grants (CAP-3).
 pub fn proposed_origins(text: &str) -> Vec<String> {
+    // Markdown image syntax never renders here and its URL is whatever the
+    // model invented for it (taped 2026-09-20: artifact filenames glued to
+    // https://example.com/ became a grant chip, a tap, and a wasted turn),
+    // so `![…](…)` spans are not proposal material.
+    let text = without_markdown_images(text);
     let mut out: Vec<String> = Vec::new();
     for word in text.split_whitespace() {
         let Some(at) = word.find("http://").or_else(|| word.find("https://")) else {
@@ -538,6 +543,7 @@ pub fn proposed_origins(text: &str) -> Vec<String> {
             || url.password().is_some()
             || !host.is_ascii()
             || !host.contains('.')
+            || is_reserved_example_host(host)
         {
             continue;
         }
@@ -549,6 +555,38 @@ pub fn proposed_origins(text: &str) -> Vec<String> {
             out.push(origin);
         }
     }
+    out
+}
+
+/// RFC 2606's reserved second-level names: by definition not a real site,
+/// so never a grant to propose — a model reaching for a placeholder reaches
+/// for these. (The `.example` TLD is left alone: hermetic fixtures use it
+/// as an ordinary host.)
+fn is_reserved_example_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
+    matches!(host, "example.com" | "example.net" | "example.org")
+        || host.ends_with(".example.com")
+        || host.ends_with(".example.net")
+        || host.ends_with(".example.org")
+}
+
+/// `text` with every markdown image span `![alt](target)` blanked out.
+fn without_markdown_images(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        let Some(close) = rest[start..].find("](") else {
+            break;
+        };
+        let Some(end) = rest[start + close..].find(')') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        rest = &rest[start + close + end + 1..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -696,6 +734,15 @@ mod tests {
         assert_eq!(
             proposed_origins("Grant `https://science.nasa.gov` and **https://www.esa.int/x**_"),
             ["https://science.nasa.gov", "https://www.esa.int"]
+        );
+        // Placeholders and markdown image links are not proposals (taped
+        // 2026-09-20: `![x](https://example.com/img-….jpg)` became a chip).
+        assert_eq!(
+            proposed_origins(
+                "![Comet](https://example.com/img-1.jpg) see https://sub.example.org/p \
+                 and ![two](https://www.esa.int/real.jpg) but read https://www.esa.int/page"
+            ),
+            ["https://www.esa.int"]
         );
     }
 
