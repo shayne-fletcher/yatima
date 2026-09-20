@@ -465,12 +465,23 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         stop = AgentStop::NoAnswer;
                         break;
                     }
+                    // Re-ask each tool whether the obligation is still
+                    // satisfiable NOW, not only at turn start: a read_page
+                    // during the turn can empty the [images] listing, after
+                    // which no legal read_image call exists and the truthful
+                    // "no images here" answer must pass (taped 2026-09-20: a
+                    // JS gallery page, five withheld answers, user cancel).
+                    // The bounce is also capped like the impersonation gate:
+                    // a model that will not call the tool degrades to
+                    // committing its flagged prose instead of wedging.
+                    let still_required = self.tools.required_for(user);
                     let unmet: Vec<&str> = required_tools
                         .iter()
                         .filter(|name| !successful_tools.contains(*name))
+                        .filter(|name| still_required.contains(*name))
                         .map(String::as_str)
                         .collect();
-                    if !unmet.is_empty() {
+                    if !unmet.is_empty() && requirement_misses < 3 {
                         requirement_misses += 1;
                         let names = unmet.join(", ");
                         let reason = format!(
@@ -490,7 +501,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                             break;
                         }
                         transcript[0] = Turn::system(format!(
-                            "{system}\n\nRequired action for this user turn: {names} must succeed before you answer. Attempt {requirement_misses} was rejected because it answered without doing so. Call the required tool now; do not claim the action happened, list candidates, or ask permission."
+                            "{system}\n\nRequired action for this user turn: {names} must succeed before you answer. Attempt {requirement_misses} was rejected because it answered without doing so. Call {names} now, with arguments taken from the latest tool result (for read_image: not-yet-shown numbers from the list state); do not claim the action happened, list candidates, or ask permission."
                         ));
                         continue;
                     }
@@ -507,8 +518,10 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         let reason = format!(
                             "final answer withheld: it says a {names} effect just \
                              happened, but no {names} call succeeded this turn — \
-                             either call {names} now, or restate the answer \
-                             without claiming anything was displayed"
+                             call {names} now with the numbers the user asked \
+                             for; if that is impossible, say plainly that \
+                             nothing was displayed and why — do not ask \
+                             permission, the request already is permission"
                         );
                         match step(acc, AgentEvent::Retry(reason.clone()))? {
                             ControlFlow::Continue(a) => acc = a,
@@ -525,9 +538,10 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         }
                         transcript[0] = Turn::system(format!(
                             "{system}\n\nYour previous answer claimed a {names} \
-                             effect that did not happen this turn. Either call \
-                             {names} now, or answer without saying anything was \
-                             displayed."
+                             effect that did not happen this turn. Call {names} \
+                             now with the numbers the user asked for; if that is \
+                             impossible, say plainly that nothing was displayed \
+                             and why. Do not ask permission."
                         ));
                         continue;
                     }

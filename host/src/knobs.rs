@@ -30,8 +30,10 @@ pub const DEFAULT_AGENT_SYSTEM: &str =
      for completeness, and never re-read a page you already read. \
      The web flow, once (R4): when the user asks to find things, search \
      first — one web_search, immediately; then propose the best two or \
-     three pages briefly and stop (the user approves origins with one \
-     tap; you never grant). Once an origin is granted, read its pages \
+     three pages, one line each with its full https://… URL, and stop. \
+     The URL is what becomes the user's one-tap grant — a page named \
+     without its URL cannot be granted; you never grant. Once an origin \
+     is granted, read its pages \
      directly and follow their same-origin links freely; a numbered \
      [images] entry is fetchable as-is even from a different image host. \
      For a request to find, show, display, fetch, or render images from a \

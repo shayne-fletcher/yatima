@@ -490,8 +490,9 @@ pub fn origins_in(text: &str) -> Vec<String> {
         let Some(at) = word.find("http://").or_else(|| word.find("https://")) else {
             continue;
         };
-        let candidate =
-            word[at..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'', '>']);
+        let candidate = word[at..].trim_end_matches([
+            '.', ',', ';', ':', '!', '?', ')', ']', '"', '\'', '>', '`', '*', '_',
+        ]);
         let Ok(url) = Url::parse(candidate) else {
             continue;
         };
@@ -523,8 +524,9 @@ pub fn proposed_origins(text: &str) -> Vec<String> {
         let Some(at) = word.find("http://").or_else(|| word.find("https://")) else {
             continue;
         };
-        let candidate =
-            word[at..].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'', '>']);
+        let candidate = word[at..].trim_end_matches([
+            '.', ',', ';', ':', '!', '?', ')', ']', '"', '\'', '>', '`', '*', '_',
+        ]);
         let Ok(url) = Url::parse(candidate) else {
             continue;
         };
@@ -688,6 +690,13 @@ mod tests {
             "unicode hosts render as punycode, never as confusable glyphs"
         );
         assert!(proposed_origins("no urls here, just prose").is_empty());
+        // Markdown punctuation glued to a URL is not part of the origin
+        // (taped 2026-09-20: "Grant `https://science.nasa.gov`" proposed a
+        // second chip for "https://science.nasa.gov`").
+        assert_eq!(
+            proposed_origins("Grant `https://science.nasa.gov` and **https://www.esa.int/x**_"),
+            ["https://science.nasa.gov", "https://www.esa.int"]
+        );
     }
 
     #[test]

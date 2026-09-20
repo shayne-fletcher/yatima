@@ -2464,10 +2464,12 @@ impl Tool for WebSearch {
                  numbers are stable for this session, and reading any \
                  result's page still requires the user to grant that \
                  page's origin first. After searching, be brief: propose \
-                 the two or three best pages in one line each and end by \
-                 asking for the grant — do not re-narrate every result; \
-                 the user saw none of them and wants a short menu, not a \
-                 survey.",
+                 the two or three best pages, one line each as \
+                 `title — full url`, and end by asking for the grant. The \
+                 URL is what becomes the user's one-tap grant, so a \
+                 proposal without its https://… cannot be granted. Do not \
+                 re-narrate every result; the user saw none of them and \
+                 wants a short menu, not a survey.",
             ),
             params: serde_json::json!({
                 "type": "object",
@@ -2883,26 +2885,41 @@ impl PageCache {
     }
 }
 
-/// The most recent `[images]` listing `read_page` published, shared with
+/// Every `[images]` listing `read_page` published this session, shared with
 /// `read_image` so the model selects a picture by its list number instead
 /// of transcribing a thumbnail URL (IMG-3 — one live session produced the
 /// full failure taxonomy of the URL form: mis-copies, constructions with
 /// invented hash directories, re-fetches). One cell per session, wired
-/// into both tools at construction; a later page's listing replaces an
-/// earlier one, so a number always means "from the most recent listing".
+/// into both tools at construction. Numbers are unique across the session,
+/// like `web_search` result ids: page A lists 1..=12, page B continues at
+/// 13, and re-listing page A keeps its numbers. A number therefore names
+/// one image whichever page was listed last — a listing that replaced its
+/// predecessor let a model select "ESA 7" and receive Wikipedia 7 eight
+/// times in a row (taped 2026-09-20). The most recently listed page is
+/// still tracked as the *current* page: exhaustion and the display
+/// obligation are judged against it.
 #[derive(Clone, Default)]
 pub struct ImageListing(std::sync::Arc<std::sync::Mutex<ListingInner>>);
 
-/// The listing's images plus the granted page that published them — the
-/// page is the derivation anchor (CAP-4): a numbered selection inherits
-/// its approval, and only while that page's origin stays granted.
-#[derive(Default)]
-struct ListingInner {
-    source: Option<String>,
-    images: Vec<(String, String)>,
+/// One listed image: its session-unique number, URL, label, and the
+/// granted page that published it — the page is the derivation anchor
+/// (CAP-4): a numbered selection inherits its approval, and only while
+/// that page's origin stays granted.
+struct ListedImage {
+    n: usize,
+    url: String,
+    label: String,
+    source: String,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
+struct ListingInner {
+    entries: Vec<ListedImage>,
+    /// The page whose listing was published most recently.
+    current: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 struct ImageTarget {
     target: String,
     label: Option<String>,
@@ -2924,58 +2941,103 @@ impl ImageTarget {
 }
 
 impl ImageListing {
-    fn publish(&self, source: &str, images: &[(String, String)]) {
+    /// Publish a page's images and make it the current page. Returns the
+    /// session-unique number of each image, in order: fresh numbers for a
+    /// page listed for the first time, the same numbers as before for a
+    /// page listed again (so a re-read never renumbers what the model has
+    /// already been told). A page with no images publishes nothing but
+    /// still becomes current, so exhaustion and the display obligation
+    /// see an empty page.
+    fn publish(&self, source: &str, images: &[(String, String)]) -> Vec<usize> {
         let mut inner = self.0.lock().expect("image listing poisoned");
-        inner.source = Some(source.to_string());
-        inner.images = images.to_vec();
+        inner.current = Some(source.to_string());
+        let known: Vec<usize> = inner
+            .entries
+            .iter()
+            .filter(|e| e.source == source)
+            .map(|e| e.n)
+            .collect();
+        if !known.is_empty() {
+            return known;
+        }
+        let mut next = inner.entries.last().map_or(0, |e| e.n);
+        let mut numbers = Vec::with_capacity(images.len());
+        for (url, label) in images {
+            next += 1;
+            numbers.push(next);
+            inner.entries.push(ListedImage {
+                n: next,
+                url: url.clone(),
+                label: label.clone(),
+                source: source.to_string(),
+            });
+        }
+        numbers
     }
 
-    /// The entry at 1-based `n`, or the listing's current length for the
-    /// teaching message when `n` misses.
+    /// The entry numbered `n` from any listing this session, or the highest
+    /// live number for the teaching message when `n` misses (0: nothing
+    /// listed yet).
     fn select(&self, n: usize) -> std::result::Result<ImageTarget, usize> {
         let inner = self.0.lock().expect("image listing poisoned");
-        n.checked_sub(1)
-            .and_then(|i| inner.images.get(i))
-            .map(|(url, label)| ImageTarget {
-                target: url.clone(),
-                label: Some(label.clone()),
-                list_index: Some(n),
-                derived_from: inner.source.clone(),
+        inner
+            .entries
+            .iter()
+            .find(|e| e.n == n)
+            .map(|e| ImageTarget {
+                target: e.url.clone(),
+                label: Some(e.label.clone()),
+                list_index: Some(e.n),
+                derived_from: Some(e.source.clone()),
             })
-            .ok_or(inner.images.len())
+            .ok_or(inner.entries.last().map_or(0, |e| e.n))
     }
 
     fn describe(&self, url: &str) -> Option<(usize, String)> {
         self.0
             .lock()
             .expect("image listing poisoned")
-            .images
+            .entries
             .iter()
-            .enumerate()
-            .find(|(_, (listed, _))| listed == url)
-            .map(|(index, (_, label))| (index + 1, label.clone()))
+            .find(|e| e.url == url)
+            .map(|e| (e.n, e.label.clone()))
     }
 
-    /// Every listed URL — what `read_image` checks the shown-set against to
-    /// state exhaustion as a fact rather than let the model guess it.
+    /// The current page's listed URLs — what `read_image` checks the
+    /// shown-set against to state exhaustion as a fact rather than let the
+    /// model guess it, and what the display obligation needs non-empty.
     fn urls(&self) -> Vec<String> {
-        self.0
-            .lock()
-            .expect("image listing poisoned")
-            .images
+        let inner = self.0.lock().expect("image listing poisoned");
+        inner
+            .entries
             .iter()
-            .map(|(url, _)| url.clone())
+            .filter(|e| Some(&e.source) == inner.current.as_ref())
+            .map(|e| e.url.clone())
             .collect()
     }
 
-    /// Partition the current listing's one-based numbers by whether their URL
-    /// has already produced an image this session.
+    /// Partition the current page's numbers by whether their URL has
+    /// already produced an image this session.
     fn display_partition(
         &self,
         shown_urls: &std::collections::HashSet<String>,
     ) -> (Vec<usize>, Vec<usize>) {
         let inner = self.0.lock().expect("image listing poisoned");
-        (1..=inner.images.len()).partition(|n| shown_urls.contains(&inner.images[*n - 1].0))
+        inner
+            .entries
+            .iter()
+            .filter(|e| Some(&e.source) == inner.current.as_ref())
+            .map(|e| e.n)
+            .partition(|n| {
+                shown_urls.contains(
+                    &inner
+                        .entries
+                        .iter()
+                        .find(|e| e.n == *n)
+                        .expect("listed")
+                        .url,
+                )
+            })
     }
 }
 
@@ -3067,11 +3129,14 @@ impl ReadPage {
         // Image discovery rides in the header (single-newline lines, so the
         // header/body/marker window structure is untouched — WIN-1), once,
         // in the first window.
-        if offset == 0 {
-            // A page with no images also replaces the prior listing: "most
-            // recent" must never leave stale selection authority behind.
-            self.listing.publish(url, &page.images); // IMG-3: what {"image": N} selects from
-        }
+        // IMG-3: what {"image": N} selects from. A page with no images
+        // still becomes the current page, so exhaustion and the display
+        // obligation see it as empty.
+        let numbers = if offset == 0 {
+            self.listing.publish(url, &page.images)
+        } else {
+            Vec::new()
+        };
         if offset == 0 && !page.images.is_empty() {
             out.push_str(
                 "\n[images — display one with read_image {\"image\": N} or \
@@ -3079,13 +3144,12 @@ impl ReadPage {
                  not render; prefer article-content entries and fetch ones \
                  marked as site chrome only when explicitly asked:",
             );
-            for (n, (src, alt)) in page
-                .images
+            for (n, (src, alt)) in numbers
                 .iter()
+                .zip(&page.images)
                 .take(READ_PAGE_MAX_IMAGES_SHOWN)
-                .enumerate()
             {
-                out.push_str(&format!("\n  {}. ", n + 1));
+                out.push_str(&format!("\n  {n}. "));
                 if images_only {
                     out.push_str(&image_listing_label(src, alt));
                 } else {
@@ -3989,7 +4053,9 @@ impl Tool for ReadImage {
                  not-yet-shown numbers are available, call read_image now and \
                  do not ask whether to fetch or render them. Prefer \
                  {{\"image\": N}} — the entry's number in the \
-                 most recent read_page [images] list — or several at once \
+                 a read_page [images] list (numbers are unique across the \
+                 session, so an earlier page's numbers still work) — or \
+                 several at once \
                  with {{\"images\": [N, …]}} (at most {READ_IMAGE_MAX_BATCH} \
                  per call): one round instead of many. A numbered entry \
                  inherits its listing page's approval and works even when \
@@ -4009,12 +4075,12 @@ impl Tool for ReadImage {
                 "properties": {
                     "image": {
                         "type": "integer",
-                        "description": "1-based number of an entry in the most recent read_page [images] list (preferred)"
+                        "description": "number of an entry in a read_page [images] list this session (preferred; numbers are unique across pages)"
                     },
                     "images": {
                         "type": "array",
                         "items": {"type": "integer"},
-                        "description": "several images in one call: 1-based numbers from the most recent read_page [images] list (at most 8 per call)"
+                        "description": "several images in one call: numbers from read_page [images] lists this session (at most 8 per call)"
                     },
                     "url": {
                         "type": "string",
@@ -4214,8 +4280,8 @@ impl ReadImage {
                  by number"
             ),
             len => anyhow!(
-                "read_image: image {n} is out of range — the most recent \
-                 read_page listed {len} images (1..={len})"
+                "read_image: no image is numbered {n} — numbers run 1..={len} \
+                 across every [images] list this session"
             ),
         })
     }
@@ -4261,12 +4327,11 @@ impl ReadImage {
         // Fetch-once: a repeat of a URL this session re-teaches but neither
         // re-fetches nor re-emits unless `again` records an explicit request
         // to show the same bytes again (IMG-2).
-        let (memo_hit, shown_urls, exhausted) = {
+        let (memo_hit, exhausted) = {
             let memo = self.fetched.lock().expect("read_image memo poisoned");
             let listed = self.listing.urls();
             (
                 memo.by_url.get(url.as_str()).cloned(),
-                sorted_urls(&memo.by_url),
                 !listed.is_empty() && listed.iter().all(|u| memo.by_url.contains_key(u)),
             )
         };
@@ -4287,13 +4352,14 @@ impl ReadImage {
                      page or origin"
                 ));
             }
+            // No URL dump here: the list-state line appended to every
+            // result already says which numbers are shown (a taped repeat
+            // loop paid 4 KB of wikimedia URLs per step, 2026-09-20).
             return Ok(format!(
                 "{summary} — already shown; not displayed again; it was \
-                 already fetched this session, \
-                 so do not present it as new. Shown so far: {shown_urls}. If \
-                 the user wants another, pick a different number from the \
-                 read_page [images] list (call read_page again if you no \
-                 longer have the list)"
+                 already fetched this session, so do not present it as new. \
+                 Do not call read_image on this number again: pick a \
+                 not-yet-shown number from the list state below, or answer"
             ));
         }
         let fetching = if derived {
@@ -4374,15 +4440,13 @@ impl ReadImage {
                     ctx.emit_artifact(artifact);
                     return Ok(format!("{summary} — re-shown at the user's request"));
                 }
-                let shown_urls = sorted_urls(&memo.by_url);
                 drop(memo);
                 return Ok(format!(
                     "{summary} — already shown; not displayed again; \
                      byte-identical to an image \
                      already fetched this session under a different URL, so \
-                     do not present it as new. Shown so far: {shown_urls}. \
-                     If the user wants another, pick a different number from \
-                     the read_page [images] list"
+                     do not present it as new. Pick a not-yet-shown number \
+                     from the list state below, or answer"
                 ));
             }
             memo.by_url
@@ -6667,7 +6731,7 @@ copy of the whole set at every scale a reader cares to zoom.</p>
         assert!(content.contains("image 1: wrote"), "{content}");
         assert!(content.contains("image 2: wrote"), "{content}");
         assert!(
-            content.contains("image 99: ") && content.contains("out of range"),
+            content.contains("image 99: ") && content.contains("numbers run 1..=2"),
             "a bad entry reports in place: {content}"
         );
     }
@@ -6796,7 +6860,7 @@ copy of the whole set at every scale a reader cares to zoom.</p>
             all_bad.content
         );
         assert!(
-            all_bad.content.contains("out of range"),
+            all_bad.content.contains("numbers run 1..=1"),
             "the per-entry teaching survives into the batch failure: {}",
             all_bad.content
         );
@@ -6871,6 +6935,56 @@ copy of the whole set at every scale a reader cares to zoom.</p>
             copy.contains("byte-identical to an image already fetched"),
             "same bytes at a new URL teach, not re-present: {copy}"
         );
+    }
+
+    #[test]
+    fn image_numbers_are_unique_across_pages_and_survive_relisting() {
+        // upholds: IMG-3 — a number names one image for the whole session.
+        // Page A lists 1..=2; page B continues at 3; re-listing A keeps
+        // 1..=2 and makes A current again (exhaustion and the display
+        // obligation are judged against the current page only). Taped
+        // 2026-09-20: with per-page renumbering, "ESA 7" selected
+        // Wikipedia 7 eight times in a row.
+        let listing = ImageListing::default();
+        let a = "https://a.example/page";
+        let b = "https://b.example/page";
+        let pics = |host: &str, n: usize| -> Vec<(String, String)> {
+            (1..=n)
+                .map(|i| (format!("https://{host}/{i}.png"), format!("pic {i}")))
+                .collect()
+        };
+        assert_eq!(listing.publish(a, &pics("a.example", 2)), [1, 2]);
+        assert_eq!(listing.publish(b, &pics("b.example", 3)), [3, 4, 5]);
+        // B is current: its URLs are what exhaustion checks.
+        assert_eq!(listing.urls().len(), 3);
+        // A's numbers still select A's images, with A as the derivation
+        // anchor (CAP-4).
+        let one = listing.select(1).unwrap();
+        assert_eq!(one.target, "https://a.example/1.png");
+        assert_eq!(one.derived_from.as_deref(), Some(a));
+        assert_eq!(listing.select(5).unwrap().target, "https://b.example/3.png");
+        assert_eq!(
+            listing.select(6).err(),
+            Some(5),
+            "misses teach the live top"
+        );
+        // Re-listing A neither renumbers nor duplicates.
+        assert_eq!(listing.publish(a, &pics("a.example", 2)), [1, 2]);
+        assert_eq!(listing.urls().len(), 2, "A is current again");
+        assert_eq!(
+            listing.describe("https://b.example/2.png"),
+            Some((4, "pic 2".into()))
+        );
+        // The list state names the current page's numbers, not 1..=len.
+        let shown: std::collections::HashSet<String> =
+            ["https://a.example/2.png".to_string()].into();
+        assert_eq!(listing.display_partition(&shown), (vec![2], vec![1]));
+        // An empty page still becomes current: no legal call remains.
+        assert_eq!(
+            listing.publish("https://c.example/empty", &[]),
+            Vec::<usize>::new()
+        );
+        assert!(listing.urls().is_empty());
     }
 
     #[tokio::test]
@@ -6991,7 +7105,7 @@ as the first window of the page without tripping any extraction guard.</p>
         // Misses teach with the live range / the conflicting args.
         let range = tools.dispatch_async(&image_call(r#"{"image": 5}"#)).await;
         let range = range.render_for_model("").content;
-        assert!(range.contains("listed 1 images (1..=1)"), "{range}");
+        assert!(range.contains("numbers run 1..=1"), "{range}");
         let both = tools
             .dispatch_async(&image_call(
                 r#"{"image": 1, "url": "https://x.example/a.png"}"#,
