@@ -4285,8 +4285,20 @@ impl Tool for ReadImage {
         if answer.contains("![") {
             return true;
         }
+        let entries = self.listing.entries();
+        // A label is vouched for by ANY displayed image that carries it: a
+        // page often lists a card thumbnail and the full image under one
+        // caption, so the displayed one's caption is honest to write even
+        // though its undisplayed twin has the same words (taped
+        // 2026-09-20 20:34: five honest captions withheld, 200 s lost).
+        // URLs stay per image — one URL names one image.
+        let vouched: std::collections::HashSet<String> = entries
+            .iter()
+            .filter(|(url, _)| displayed.contains(url))
+            .map(|(_, label)| label.trim().to_lowercase())
+            .collect();
         let lower = answer.to_lowercase();
-        self.listing.entries().into_iter().any(|(url, label)| {
+        entries.into_iter().any(|(url, label)| {
             if displayed.contains(&url) {
                 return false;
             }
@@ -4294,7 +4306,9 @@ impl Tool for ReadImage {
                 return true;
             }
             let label = label.trim().to_lowercase();
-            label.split_whitespace().count() >= 3 && lower.contains(&label)
+            label.split_whitespace().count() >= 3
+                && !vouched.contains(&label)
+                && lower.contains(&label)
         })
     }
 
@@ -7511,6 +7525,39 @@ as the first window of the page without tripping any extraction guard.</p>
                 &shown
             ),
             "one real display does not vouch for a second, undisplayed one"
+        );
+        // A caption shared by a displayed image and an undisplayed twin
+        // (ESA lists the card and the full image under one label) is
+        // vouched for by the displayed one: writing it is honest.
+        listing.publish(
+            "https://a.example/gallery",
+            &[
+                (
+                    "https://cdn.example/1.webp".to_string(),
+                    "WebP Image".to_string(),
+                ),
+                (
+                    "https://cdn.example/2.webp".to_string(),
+                    "Comet Lemmon meets NGC 3184".to_string(),
+                ),
+                (
+                    "https://cdn.example/2-full.webp".to_string(),
+                    "Comet Lemmon meets NGC 3184".to_string(),
+                ),
+            ],
+        );
+        let shown_two: std::collections::HashSet<String> =
+            ["https://cdn.example/2.webp".to_string()].into();
+        assert!(
+            !tool.names_undisplayed("Displayed: Comet Lemmon meets NGC 3184", &shown_two),
+            "the displayed image's caption is honest despite its undisplayed twin"
+        );
+        assert!(
+            tool.names_undisplayed(
+                "Displayed: Comet Lemmon meets NGC 3184 — https://cdn.example/2-full.webp",
+                &shown_two
+            ),
+            "naming the twin's own URL is still a claim"
         );
         assert!(tool.names_undisplayed("![x](https://anywhere.example/y.png)", &shown));
     }
