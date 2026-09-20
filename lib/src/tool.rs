@@ -2823,15 +2823,11 @@ pub struct ReadPage {
     /// spend). FIFO-evicted at [`READ_PAGE_CACHE_PAGES`]; session-lifetime
     /// only. A std `Mutex` — never held across an `.await`.
     cache: std::sync::Mutex<PageCache>,
-    /// Windows already served this session, keyed `(url, offset,
-    /// images_only)`. Fetch-once makes a repeated identical window
-    /// byte-identical, so re-serving it re-prefills thousands of chars for
-    /// zero information — one live session re-read the same page three times
-    /// in a turn (2026-09-06). A repeat gets a two-line reminder instead;
-    /// the `[images]` listing is still republished so selection numbers
-    /// never go stale. Only windows whose page is still cached count: an
-    /// evicted page genuinely refetches and serves in full again.
-    served: std::sync::Mutex<std::collections::HashSet<(String, usize, bool)>>,
+    /// The sibling `read_image`'s memo, when wired (see [`ImageMemo`]): the
+    /// `images_only` projection ends with the page's shown/not-yet-shown
+    /// numbers, so a turn that starts by re-reading a page learns what the
+    /// user has already seen without a guess or a duplicate call.
+    shown: Option<ImageMemo>,
     /// Where window 0 publishes its numbered `[images]` list (IMG-3);
     /// `read_image` holds the same handle and selects by number.
     listing: ImageListing,
@@ -2855,10 +2851,10 @@ struct CachedPage {
     /// see the dozen sub-galleries it linked to).
     links: Vec<(String, String)>,
     /// The page's canonical identity: the FINAL (post-redirect) URL the
-    /// bytes actually came from. Listing provenance (CAP-4), the served
-    /// display URL, and window dedup all key on this — a request to A
-    /// that redirects to B is B's page, and B's revocation must kill its
-    /// descendants (the requested URL is only a cache alias).
+    /// bytes actually came from. Listing provenance (CAP-4) and the
+    /// displayed page URL key on this — a request to A that redirects to
+    /// B is B's page, and B's revocation must kill its descendants (the
+    /// requested URL is only a cache alias).
     final_url: String,
 }
 
@@ -3016,6 +3012,22 @@ impl ImageListing {
             .collect()
     }
 
+    /// The current page's shown/not-yet-shown numbers as one line — the
+    /// same projection whichever tool prints it, so `read_page`'s image
+    /// view and every `read_image` result agree.
+    fn state_line(&self, shown_urls: &std::collections::HashSet<String>) -> String {
+        let (shown, available) = self.display_partition(shown_urls);
+        if shown.is_empty() && available.is_empty() {
+            "[no read_page [images] list is currently available]".to_string()
+        } else {
+            format!(
+                "[list state — already shown: {}; not yet shown: {}]",
+                number_ranges(&shown),
+                number_ranges(&available)
+            )
+        }
+    }
+
     /// Partition the current page's numbers by whether their URL has
     /// already produced an image this session.
     fn display_partition(
@@ -3068,7 +3080,7 @@ impl ReadPage {
             max_input_bytes,
             max_output_chars,
             cache: std::sync::Mutex::new(PageCache::default()),
-            served: std::sync::Mutex::new(std::collections::HashSet::new()),
+            shown: None,
             listing: ImageListing::default(),
             results: None,
         })
@@ -3079,6 +3091,13 @@ impl ReadPage {
     /// from it.
     pub fn with_listing(mut self, listing: ImageListing) -> ReadPage {
         self.listing = listing;
+        self
+    }
+
+    /// Share `read_image`'s memo (see [`ImageMemo`]) so the `images_only`
+    /// projection can say which listed numbers are already shown.
+    pub fn with_shown_images(mut self, memo: ImageMemo) -> ReadPage {
+        self.shown = Some(memo);
         self
     }
 
@@ -3184,6 +3203,16 @@ impl ReadPage {
                  image hosts need no extra grant",
             );
             out.push(']');
+            // The image projection is what a turn re-reads to recover its
+            // footing, so it carries the shown state from the memo that
+            // controls displays — the same line every read_image result
+            // ends with. Not in the article view: that is for reading.
+            if images_only {
+                if let Some(memo) = &self.shown {
+                    out.push('\n');
+                    out.push_str(&self.listing.state_line(&memo.shown_urls()));
+                }
+            }
         } else if offset == 0 && images_only {
             out.push_str("\n[images: none found on this page]");
         }
@@ -3312,11 +3341,13 @@ impl Tool for ReadPage {
         }
         let url = self.origins.resolve(target)?;
 
-        // Fetch-once: a cached extraction serves every continuation without
-        // touching the network (or a throttled host's request budget). An
-        // *identical* window repeat is pure waste — the cache guarantees the
-        // same bytes — so it gets a reminder, not a re-prefill; the listing
-        // still republishes so image numbers keep selecting from this page.
+        // Fetch-once: a cached extraction serves every window — repeat or
+        // continuation — without touching the network (or a throttled
+        // host's request budget). A repeat is served in FULL, never as a
+        // note: tool results are ephemeral across runs (AGENT-3), so a later
+        // turn re-reading a page is how the model recovers what history
+        // dropped. A note claiming "that text is earlier in this
+        // conversation" was false on the very next turn (taped 2026-09-20).
         let cached = self
             .cache
             .lock()
@@ -3329,18 +3360,6 @@ impl Tool for ReadPage {
             // (found in review: a request-URL alias A otherwise kept a
             // revoked B's cached body readable).
             self.origins.resolve(&page.final_url)?;
-            let repeat = !self
-                .served
-                .lock()
-                .expect("read_page served memo poisoned")
-                .insert((page.final_url.clone(), offset, images_only));
-            if repeat {
-                if offset == 0 {
-                    self.listing.publish(&page.final_url, &page.images);
-                }
-                let note = already_read_note(&page.final_url, &page, offset);
-                return Ok(note);
-            }
             let final_url = page.final_url.clone();
             return self.render_window(&final_url, &page, offset, images_only);
         }
@@ -3473,33 +3492,8 @@ impl Tool for ReadPage {
                 cache.insert(url.to_string(), page.clone());
             }
         }
-        self.served
-            .lock()
-            .expect("read_page served memo poisoned")
-            .insert((final_url.clone(), offset, images_only));
         self.render_window(&final_url, &page, offset, images_only)
     }
-}
-
-/// What an identical window repeat gets instead of thousands of re-prefilled
-/// chars: where the content already is, and what a useful next step looks
-/// like. Decisiveness is the point — a model circling "maybe read it again"
-/// is told plainly that the step bought nothing.
-fn already_read_note(url: &str, page: &CachedPage, offset: usize) -> String {
-    let total = page.text.chars().count();
-    let images = if page.images.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "; its {} [images] are still the ones selectable by number",
-            page.images.len()
-        )
-    };
-    format!(
-        "[already read this session: {url} at offset {offset} ({total} chars total{images}). \
-         That window's text is earlier in this conversation, unchanged — re-reading it adds \
-         nothing. Answer from what you have, or continue at a different offset.]"
-    )
 }
 
 /// A list index however the model spelled it: a JSON number, or a numeric
@@ -3817,7 +3811,8 @@ pub struct ReadImage {
     /// caught after its (unavoidable) fetch and teaches the same lesson
     /// instead of being presented as a new picture. Repeats of either kind
     /// emit no artifact event: the user is never shown the same bytes twice.
-    fetched: std::sync::Mutex<ImageMemo>,
+    /// Shared with the sibling `read_page` (see [`ImageMemo`]).
+    fetched: ImageMemo,
     /// The numbered listing the sibling `read_page` last published (IMG-3);
     /// `{"image": N}` selects from it, so picking a picture is an index
     /// copy, never a URL transcription.
@@ -3832,11 +3827,36 @@ pub struct ReadImage {
     derived_public_only: bool,
 }
 
+/// The image memo's shared handle. `read_image` writes it as pictures are
+/// fetched; `read_page`'s image projection reads it, so a fresh turn's
+/// first tool result already says which listed numbers the user has seen.
+/// One cell per session, wired into both tools like [`ImageListing`]. Tool
+/// results are ephemeral across runs (AGENT-3): this handle — not the
+/// model's memory of a vanished result — is how shown state survives a
+/// turn (taped 2026-09-20: "please retrieve more" began every follow-up
+/// turn by guessing, or by re-displaying, what the host already knew).
+#[derive(Clone, Default)]
+pub struct ImageMemo(Arc<std::sync::Mutex<ImageMemoInner>>);
+
+impl ImageMemo {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ImageMemoInner> {
+        self.0.lock().expect("read_image memo poisoned")
+    }
+
+    /// Every URL that has produced an image this session — the shown-set
+    /// the listing partitions numbers against. A URL that resolved to bytes
+    /// already displayed under another URL is in here too: it is
+    /// represented, and selecting it would show nothing new.
+    fn shown_urls(&self) -> std::collections::HashSet<String> {
+        self.lock().by_url.keys().cloned().collect()
+    }
+}
+
 /// See [`ReadImage::fetched`]. `by_url` keeps the complete artifact as data
 /// alongside the summary so an `"again": true` re-show preserves its human
 /// identity without parsing the tool's own prose.
 #[derive(Default)]
-struct ImageMemo {
+struct ImageMemoInner {
     by_url: std::collections::HashMap<String, (String, ToolArtifact)>,
     shown: std::collections::HashSet<String>,
 }
@@ -3921,9 +3941,17 @@ impl ReadImage {
             derived_client,
             derived_public_only: true,
             max_bytes,
-            fetched: std::sync::Mutex::new(ImageMemo::default()),
+            fetched: ImageMemo::default(),
             listing: ImageListing::default(),
         })
+    }
+
+    /// Share the image memo with the `read_page` holding the same handle,
+    /// so its image projection can report which listed numbers are already
+    /// shown (see [`ImageMemo`]).
+    pub fn with_memo(mut self, memo: ImageMemo) -> ReadImage {
+        self.fetched = memo;
+        self
     }
 
     /// Test seam only: hermetic witnesses live on loopback, which CAP-4's
@@ -4008,24 +4036,7 @@ impl ReadImage {
     /// AGENT-3's lean history cannot make the model forget what it already
     /// displayed, because the freshest tool result says so (IMG-2).
     fn listing_state(&self) -> String {
-        let shown_urls: std::collections::HashSet<String> = self
-            .fetched
-            .lock()
-            .expect("read_image memo poisoned")
-            .by_url
-            .keys()
-            .cloned()
-            .collect();
-        let (shown, available) = self.listing.display_partition(&shown_urls);
-        if shown.is_empty() && available.is_empty() {
-            "[no read_page [images] list is currently available]".to_string()
-        } else {
-            format!(
-                "[list state — already shown: {}; not yet shown: {}]",
-                number_ranges(&shown),
-                number_ranges(&available)
-            )
-        }
+        self.listing.state_line(&self.fetched.shown_urls())
     }
 }
 
@@ -4219,7 +4230,7 @@ impl Tool for ReadImage {
                     // interrogated the user anyway). Ambiguity names the
                     // candidates copy-ready; zero teaches the first step.
                     let (count, only, urls) = {
-                        let memo = self.fetched.lock().expect("read_image memo poisoned");
+                        let memo = self.fetched.lock();
                         (
                             memo.shown.len(),
                             memo.by_url.values().next().cloned(),
@@ -4328,7 +4339,7 @@ impl ReadImage {
         // re-fetches nor re-emits unless `again` records an explicit request
         // to show the same bytes again (IMG-2).
         let (memo_hit, exhausted) = {
-            let memo = self.fetched.lock().expect("read_image memo poisoned");
+            let memo = self.fetched.lock();
             let listed = self.listing.urls();
             (
                 memo.by_url.get(url.as_str()).cloned(),
@@ -4428,7 +4439,7 @@ impl ReadImage {
         let summary = format!("wrote {} ({ext}, {} bytes)", out.display(), body.len());
         let artifact = self.describe_artifact(target, &url, out.clone());
         {
-            let mut memo = self.fetched.lock().expect("read_image memo poisoned");
+            let mut memo = self.fetched.lock();
             // Same bytes under a different URL (the artifact name is the
             // content hash): teach, don't re-show (IMG-2). The URL is
             // memoized too, so its own repeats short-circuit the fetch.
@@ -7587,17 +7598,20 @@ position over the coming years.</p>
     }
 
     #[tokio::test]
-    async fn read_page_serves_an_identical_window_once() {
-        // A repeated identical window is a two-line reminder, never a
-        // re-prefill (fetch-once makes the repeat byte-identical); a
-        // different offset still serves in full, and an offset-0 repeat
-        // republishes the [images] listing so numbers stay selectable.
+    async fn read_page_serves_a_repeat_window_in_full_from_cache() {
+        // upholds: PAGE-1 — a repeated window is served again in FULL from
+        // the cache: one fetch, identical content, no note. Tool results
+        // are ephemeral across runs (AGENT-3), so the repeat is how a later
+        // turn recovers a page history dropped; a note saying the text was
+        // "earlier in this conversation" was false on the next turn (taped
+        // 2026-09-20). A different offset serves its own window.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(ARTICLE_HTML.as_bytes().to_vec(), "text/html"),
             )
+            .expect(1) // every repeat is a cache hit
             .mount(&server)
             .await;
         let listing = ImageListing::default();
@@ -7623,22 +7637,145 @@ position over the coming years.</p>
             .await
             .render_for_model("read_page");
         assert!(!repeat.is_error);
-        assert!(
-            repeat.content.contains("already read this session"),
-            "the repeat is a reminder: {}",
-            repeat.content
+        assert_eq!(
+            repeat.content, first.content,
+            "the repeat is the same window, served in full"
         );
         assert!(
-            !repeat.content.contains("Quarterly Report"),
-            "no re-prefill"
+            !repeat.content.contains("already read"),
+            "no note stands in for content: {}",
+            repeat.content
         );
 
         let continued = call(r#"{"url": "/post", "offset": 50}"#)
             .await
             .render_for_model("read_page");
+        assert!(!continued.is_error);
+        assert_ne!(
+            continued.content, first.content,
+            "a fresh offset is its own window"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_page_images_only_recovers_candidates_and_shown_state_after_history_loss() {
+        // upholds: PAGE-1 / IMG-2 — the recovery a fresh turn needs, before
+        // any image call: re-reading a page with images_only is a cache hit
+        // (one fetch) that lists the numbered candidates again AND says
+        // which of them the user has already seen, from the memo that
+        // controls displays. The agent keeps no tool results across runs
+        // (AGENT-3), so this result is the whole of what the model knows.
+        let server = MockServer::start().await;
+        let html = r#"<html><body><article><h1>Gallery</h1>
+<img src="/one.png" alt="first picture">
+<img src="/two.png" alt="second picture">
+<img src="/three.png" alt="third picture">
+<p>Some readable article prose long enough to extract cleanly and render
+as the first window of the page without tripping any extraction guard.</p>
+</article></body></html>"#;
+        Mock::given(method("GET"))
+            .and(path("/gallery"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        for name in ["/one.png", "/two.png", "/three.png"] {
+            Mock::given(method("GET"))
+                .and(path(name))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "image/png")
+                        .set_body_bytes(
+                            [b"\x89PNG\r\n\x1a\n".as_slice(), name.as_bytes()].concat(),
+                        ),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let origins = WebOrigins::one(&server.uri()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let listing = ImageListing::default();
+        let memo = ImageMemo::default();
+        let tools = Tools::new()
+            .with(
+                ReadPage::with_limits(origins.clone(), 1_000_000, 4_000)
+                    .unwrap()
+                    .with_listing(listing.clone())
+                    .with_shown_images(memo.clone()),
+            )
+            .with(
+                ReadImage::new(origins, dir.path().join("images"))
+                    .unwrap()
+                    .with_listing(listing)
+                    .with_memo(memo),
+            );
+        let call = |name: &str, args: &str| ToolCall {
+            name: name.to_string(),
+            args: json(args),
+        };
+
+        // Run 1: discover, then display number 2.
+        let listed = tools
+            .dispatch_async(&call(
+                "read_page",
+                r#"{"url": "/gallery", "images_only": true}"#,
+            ))
+            .await
+            .render_for_model("read_page");
+        assert!(!listed.is_error, "{}", listed.content);
         assert!(
-            !continued.content.contains("already read this session"),
-            "a fresh offset serves in full"
+            listed.content.contains("1. first picture"),
+            "{}",
+            listed.content
+        );
+        assert!(
+            listed
+                .content
+                .contains("[list state — already shown: none; not yet shown: 1-3]"),
+            "nothing shown yet: {}",
+            listed.content
+        );
+        let shown = tools
+            .dispatch_async(&call("read_image", r#"{"image": 2}"#))
+            .await
+            .render_for_model("read_image");
+        assert!(!shown.is_error, "{}", shown.content);
+
+        // Run 2 (the prior run's tool results are gone): the first tool
+        // result already carries the candidates and the shown state.
+        let recovered = tools
+            .dispatch_async(&call(
+                "read_page",
+                r#"{"url": "/gallery", "images_only": true}"#,
+            ))
+            .await
+            .render_for_model("read_page");
+        assert!(!recovered.is_error, "{}", recovered.content);
+        assert!(
+            recovered.content.contains("1. first picture"),
+            "{}",
+            recovered.content
+        );
+        assert!(
+            recovered.content.contains("3. third picture"),
+            "{}",
+            recovered.content
+        );
+        assert!(
+            recovered
+                .content
+                .contains("[list state — already shown: 2; not yet shown: 1, 3]"),
+            "the shown state came from the display memo: {}",
+            recovered.content
+        );
+        assert!(
+            !recovered.content.contains("readable article prose"),
+            "image-only stays image-only: {}",
+            recovered.content
         );
     }
 

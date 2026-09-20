@@ -81,11 +81,11 @@ use yatima_lib::{
     device, looks_degenerate, metal_kv_depth_risk, proposed_origins, resolve_format,
     verify_cancellable_sync, Agent, AgentEvent, AgentStop, Cancel, Channel as LibChannel,
     ChatFormat, ChatSession, ChildCleanupFailed, Completer, Engine, FileMatchRegistry, GenOpts,
-    GlobFiles, GrepFiles, ImageListing, JsonToolCall, KvDepthRisk, LlamaServer, LlamaServerSpawn,
-    ModelSource, MuseAtemCodec, Plot, PlotSandbox, PromptTemplate, QwenToolCall, ReadFile,
-    ReadImage, ReadPage, ReadUrl, RepoRoot, Sampling, SearchRegistry, ServerIdentity, StopReason,
-    ToolArtifact, ToolCallCodec, ToolOutcome, Tools, VerifyCancelled, WebOrigins, WebSearch,
-    METAL_KV_VALIDATED,
+    GlobFiles, GrepFiles, ImageListing, ImageMemo, JsonToolCall, KvDepthRisk, LlamaServer,
+    LlamaServerSpawn, ModelSource, MuseAtemCodec, Plot, PlotSandbox, PromptTemplate, QwenToolCall,
+    ReadFile, ReadImage, ReadPage, ReadUrl, RepoRoot, Sampling, SearchRegistry, ServerIdentity,
+    StopReason, ToolArtifact, ToolCallCodec, ToolOutcome, Tools, VerifyCancelled, WebOrigins,
+    WebSearch, METAL_KV_VALIDATED,
 };
 
 pub mod knobs;
@@ -1366,6 +1366,10 @@ fn web_tools(origins: &WebOrigins, repo_root: Option<&RepoRoot>) -> Result<Tools
     // One listing cell per session (IMG-3): read_page publishes its numbered
     // [images] list into it, read_image selects from it by number.
     let listing = ImageListing::default();
+    // The image memo is shared the same way (PAGE-1): read_image writes
+    // it, read_page's image view reads it, so a fresh turn's re-read of a
+    // page already says which numbers the user has seen.
+    let shown_images = ImageMemo::default();
     // One search registry per session: web_search publishes stable result
     // ids into it (R1b hands the same instance to the readers). The tool
     // exists when YATIMA_SEARCH_URL configures a SearXNG endpoint or
@@ -1381,6 +1385,7 @@ fn web_tools(origins: &WebOrigins, repo_root: Option<&RepoRoot>) -> Result<Tools
                 knobs::READ_PAGE_MAX_CHARS,
             )?
             .with_listing(listing.clone())
+            .with_shown_images(shown_images.clone())
             .with_search_results(search_registry.clone()),
         );
     if let Some(root) = repo_root {
@@ -1394,8 +1399,9 @@ fn web_tools(origins: &WebOrigins, repo_root: Option<&RepoRoot>) -> Result<Tools
         .map(|home| home.join(".cache/yatima"))
         .unwrap_or_else(std::env::temp_dir);
     #[allow(unused_mut)]
-    let mut read_image =
-        ReadImage::new(origins.clone(), cache.join("images"))?.with_listing(listing);
+    let mut read_image = ReadImage::new(origins.clone(), cache.join("images"))?
+        .with_listing(listing)
+        .with_memo(shown_images);
     // The R4 hermetic-acceptance seam exists ONLY when this crate is
     // built with `hermetic-derivation` (the drive acceptance battery's
     // feature chain); an ordinary build compiles no such branch, so no

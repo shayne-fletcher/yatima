@@ -299,6 +299,13 @@
 //!   most once: repeat and continuation (`offset`) reads are served from a
 //!   per-tool, FIFO-bounded cache and never touch the network — re-fetching
 //!   is the expensive act for throttled hosts (EDGAR), re-reading is free.
+//!   A repeat window is served **in full**, never as a note: the agent keeps
+//!   no tool results across runs (AGENT-3), so a later turn's re-read is how
+//!   the model recovers what history dropped. The `images_only` projection
+//!   also carries the page's shown/not-yet-shown numbers from the shared
+//!   [`ImageMemo`], so recovery includes what the user has already seen.
+//!   Cited by `read_page_serves_a_repeat_window_in_full_from_cache` and
+//!   `read_page_images_only_recovers_candidates_and_shown_state_after_history_loss`.
 //! - **WIN-1** `read_page` windows tile: successive windows are adjacent and
 //!   non-overlapping, concatenating them in offset order reconstructs the
 //!   article prefix exactly, and every truncation marker names the next
@@ -481,11 +488,11 @@ pub use template::{
     MistralTemplate, MuseGlimmerTemplate, PlainTemplate, PromptTemplate, ReasoningStrength,
 };
 pub use tool::{
-    FileMatchId, FileMatchRegistry, GlobFiles, GrepFiles, ImageListing, JsonToolCall, ListDir,
-    MuseAtemCodec, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile, ReadImage, ReadPage,
-    ReadUrl, SearchRegistry, SearchResultId, SendNotification, Tool, ToolArtifact, ToolCall,
-    ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolExtraction, ToolFailure, ToolOutcome,
-    ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WebSearch, WriteFile,
+    FileMatchId, FileMatchRegistry, GlobFiles, GrepFiles, ImageListing, ImageMemo, JsonToolCall,
+    ListDir, MuseAtemCodec, Plot, PlotBound, PlotSeries, QwenToolCall, ReadFile, ReadImage,
+    ReadPage, ReadUrl, SearchRegistry, SearchResultId, SendNotification, Tool, ToolArtifact,
+    ToolCall, ToolCallCodec, ToolCallId, ToolCtx, ToolEvent, ToolExtraction, ToolFailure,
+    ToolOutcome, ToolRejection, ToolResult, ToolSpec, ToolTask, Tools, WebSearch, WriteFile,
 };
 pub use transcript::{Role, ToolArguments, Turn};
 
