@@ -1,0 +1,15 @@
+[package]
+name = "yatima-media"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+# Image-artifact decoding shared by every yatima view: PNG/JPEG stills and
+# animated GIF (every frame, with hold times) to raw RGBA, plus the pure
+# frame stepper a view feeds its clock. On the `yatima-text` precedent:
+# dependency-light, view-type-free, wasm-clean (WASM-1), so the native GUI
+# and the browser client stand on one implementation instead of two.
+# yatima-lib is NOT a valid home: it drags candle/tokenizers/reqwest and
+# will never target a browser.
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }

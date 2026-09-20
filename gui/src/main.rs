@@ -203,8 +203,9 @@ enum Msg {
         /// it after the fact. Never re-enters the prompt (the lib drops it).
         reasoning: Option<String>,
     },
-    /// A decoded image artifact, uploaded as a GPU texture, with the identity
-    /// assigned by the tool that selected it.
+    /// A decoded image artifact — its frames uploaded once as GPU textures
+    /// (one for a still, one per frame for an animated GIF) — with the
+    /// identity assigned by the tool that selected it.
     Image(ImageMsg),
     /// An app message (e.g. `/help`, `/about`) — not from the model.
     Note(String),
@@ -212,7 +213,11 @@ enum Msg {
 }
 
 struct ImageMsg {
-    texture: egui::TextureHandle,
+    /// One texture per frame, uploaded once; `frame_at` picks which to
+    /// paint. A still is the one-frame case.
+    frames: Vec<egui::TextureHandle>,
+    /// Each frame's hold time — what `yatima_media::frame_at` steps over.
+    timing: Vec<yatima_media::AnimationFrame>,
     label: String,
     source: Option<String>,
     list_index: Option<usize>,
@@ -885,10 +890,14 @@ impl GuiApp {
                     if let Some(path) = persist_artifact(&name, &bytes) {
                         self.artifact_paths.insert(name.clone(), path);
                     }
+                    // An SVG rasterizes to PNG first; every raster format —
+                    // including each frame of an animated GIF — decodes
+                    // through the shared decoder and uploads one texture
+                    // per frame.
                     let decoded = if name.ends_with(".svg") {
-                        rasterize_svg(&bytes).and_then(|png| decode_texture(&self.ctx, &png))
+                        rasterize_svg(&bytes).and_then(|png| decode_frames(&self.ctx, &name, &png))
                     } else {
-                        decode_texture(&self.ctx, &bytes)
+                        decode_frames(&self.ctx, &name, &bytes)
                     };
                     let label = if label.trim().is_empty() {
                         name.clone()
@@ -896,8 +905,9 @@ impl GuiApp {
                         label
                     };
                     let msg = match decoded {
-                        Ok(texture) => Msg::Image(ImageMsg {
-                            texture,
+                        Ok((frames, timing)) => Msg::Image(ImageMsg {
+                            frames,
+                            timing,
                             label,
                             source,
                             list_index,
@@ -1621,9 +1631,18 @@ fn render_msg(
             // UI, and clamped to the available width so an over-wide artifact
             // never pushes the scroll content off the left edge.
             let max_w = (ui.available_width() - 8.0).clamp(64.0, 640.0);
+            // An animated GIF steps through its pre-uploaded frames on
+            // egui's clock, and only a PAINTED entry schedules the repaint
+            // for exactly the next flip — an animation scrolled out of view
+            // costs nothing, and a still schedules none.
+            let (frame, until_next) = yatima_media::frame_at(&image.timing, ui.input(|i| i.time));
+            if let Some(secs) = until_next {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(secs));
+            }
             ui.vertical_centered(|ui| {
                 ui.add(
-                    egui::Image::new(egui::load::SizedTexture::from_handle(&image.texture))
+                    egui::Image::new(egui::load::SizedTexture::from_handle(&image.frames[frame]))
                         .max_width(max_w)
                         .tint(image_tint),
                 );
@@ -1728,12 +1747,38 @@ fn commit_turn(
     }
 }
 
-/// Decode PNG bytes and upload them as an egui texture.
-fn decode_texture(ctx: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHandle> {
-    let rgba = image::load_from_memory(bytes)?.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
-    Ok(ctx.load_texture("artifact", color, egui::TextureOptions::default()))
+/// Decode raster bytes (PNG/JPEG still, or every frame of an animated GIF)
+/// and upload one egui texture per frame. Returns the textures and the
+/// frame timing `frame_at` steps over; a still is one zero-delay frame.
+fn decode_frames(
+    ctx: &egui::Context,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(Vec<egui::TextureHandle>, Vec<yatima_media::AnimationFrame>)> {
+    let decoded = yatima_media::decode_rgba(bytes)
+        .ok_or_else(|| anyhow::anyhow!("unsupported or corrupt image data"))?;
+    let frames = decoded
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, frame)| {
+            let color = egui::ColorImage::from_rgba_unmultiplied(decoded.size, &frame.rgba);
+            ctx.load_texture(
+                format!("{name}#{i}"),
+                color,
+                egui::TextureOptions::default(),
+            )
+        })
+        .collect();
+    let timing = decoded
+        .frames
+        .into_iter()
+        .map(|frame| yatima_media::AnimationFrame {
+            rgba: Vec::new(), // pixels live in the textures now
+            delay_ms: frame.delay_ms,
+        })
+        .collect();
+    Ok((frames, timing))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -2189,11 +2234,62 @@ mod tests {
 
     fn test_image() -> ImageMsg {
         ImageMsg {
-            texture: test_texture(),
+            frames: vec![test_texture()],
+            timing: vec![yatima_media::AnimationFrame {
+                rgba: Vec::new(),
+                delay_ms: 0,
+            }],
             label: "triangle".into(),
             source: Some("https://example.com/triangle.png".into()),
             list_index: Some(3),
         }
+    }
+
+    #[test]
+    fn animated_gif_folds_to_one_texture_per_frame_and_a_png_to_one() {
+        // upholds: IMG-1 (view half) — the fold uploads every GIF frame as
+        // its own texture with the GIF's hold times, and a PNG as one
+        // zero-delay frame, through the real decode path. A headless
+        // egui Context serves as the GPU.
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, Rgba, RgbaImage};
+        let ctx = egui::Context::default();
+        let mut gif = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut gif);
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for c in [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]] {
+                enc.encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(1, 1, Rgba(c)),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(80, 1),
+                ))
+                .unwrap();
+            }
+        }
+        let (frames, timing) = decode_frames(&ctx, "anim.gif", &gif).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(timing.len(), 3);
+        assert!(timing.iter().all(|f| f.delay_ms == 80));
+        // The stepper flips through them and asks for a repaint at the flip.
+        let (i, wait) = yatima_media::frame_at(&timing, 0.1);
+        assert_eq!(i, 1);
+        assert!(wait.is_some());
+
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([9, 9, 9, 255])))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let (frames, timing) = decode_frames(&ctx, "still.png", &png).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            yatima_media::frame_at(&timing, 5.0),
+            (0, None),
+            "a still never repaints"
+        );
+
+        assert!(decode_frames(&ctx, "x.bin", b"not an image").is_err());
     }
 
     #[test]

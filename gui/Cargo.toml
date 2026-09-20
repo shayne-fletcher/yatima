@@ -45,9 +45,11 @@ eframe = { version = "0.35", default-features = false, features = [
   "x11",
   "wayland",
 ] }
-# Decode artifact images to upload as egui textures: PNG/JPEG stills, and
-# GIF (first frame here; the web client animates — GUI animation is a
-# recorded follow-on).
+# Decode artifact images to upload as egui textures: PNG/JPEG stills and
+# every frame of an animated GIF, stepped on egui's clock — the one
+# implementation the browser client paints from too.
+yatima-media = { path = "../media" }
+# The SVG rasterizer's PNG hand-off and the artifact witnesses' fixtures.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 egui_commonmark = { version = "0.24", default-features = false, features = ["pulldown_cmark", "better_syntax_highlighting"] }
 # SVG rasterization for read_image artifacts (usvg parse + tiny-skia

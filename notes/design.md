@@ -110,6 +110,7 @@ details close to the code.
   same pass, and it must compile anywhere they do. Extracted from the TUI's
   renderer when the GUI became its second consumer; `yatima-lib` (candle,
   tokenizers, reqwest) can never be its home.
+- **`yatima-media`** — image-artifact decoding on the same precedent: PNG/JPEG stills and every frame of an animated GIF to raw RGBA (frame-capped, delays clamped), plus the pure `frame_at` stepper a view feeds its clock. View-type-free and WASM-clean, so the native GUI and the browser client animate from one implementation; each uploads the frames as textures and paints the one `frame_at` names, scheduling a repaint for exactly the next flip (a painted animation only — nothing off-screen wakes the shell). Extracted from `yatima-web` when the GUI became its second consumer.
 
 ## Module layering (LAYER-1)
 

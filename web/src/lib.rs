@@ -1,7 +1,7 @@
 //! The browser client's transcript model: a deliberately small miniature of
 //! the GUI's `Msg` list — its *semantics* copied, not its code. The model is
 //! plain Rust over `yatima-protocol` types (plus `yatima-text` for the
-//! commit-time polish and the `image` crate for artifact decode — the
+//! commit-time polish and `yatima-media` for artifact decode — the
 //! wasm-clean set, WASM-1), so everything subtle here — char-boundary
 //! retraction, the image path, the commit-on-Done rules — is unit-tested
 //! natively, without a browser in the loop. The egui app in `main.rs` is a
@@ -110,10 +110,9 @@ pub enum Entry {
     Error(String),
 }
 
-/// An artifact decoded to raw RGBA — everything the view needs to make
-/// textures, with no view types in the model (that keeps this half testable
-/// off-browser). One frame for a still; many, each with its hold time, for
-/// an animated GIF.
+/// An artifact decoded to raw RGBA plus the identity the tool assigned it.
+/// The pixels and frames come from `yatima-media` (shared with the GUI);
+/// the identity is this transcript's.
 pub struct DecodedImage {
     pub name: String,
     pub label: String,
@@ -123,85 +122,19 @@ pub struct DecodedImage {
     pub frames: Vec<AnimationFrame>,
 }
 
-/// One frame of a decoded image: raw RGBA plus how long it holds before
-/// the next (0 for a still).
-pub struct AnimationFrame {
-    pub rgba: Vec<u8>,
-    pub delay_ms: u32,
-}
+pub use yatima_media::{decode_rgba as decode_frames, frame_at, AnimationFrame};
 
-/// Animated GIFs keep at most this many frames — a runaway file (the fetch
-/// is already byte-capped upstream) degrades to a long-but-finite loop,
-/// never an unbounded texture upload.
-const MAX_GIF_FRAMES: usize = 128;
-
-/// Decode PNG/JPEG (one frame) or GIF (every frame, with delays) to RGBA.
-/// `None` is not an error: the spike renders unknown formats (SVG, WebP, …)
-/// as a named placeholder line.
+/// Decode to this transcript's entry shape; identity is filled by the fold.
 pub fn decode_rgba(bytes: &[u8]) -> Option<DecodedImage> {
-    if bytes.starts_with(b"GIF8") {
-        use image::AnimationDecoder;
-        let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
-        let mut frames = Vec::new();
-        let mut size = [0usize; 2];
-        for frame in decoder.into_frames().take(MAX_GIF_FRAMES) {
-            let frame = frame.ok()?;
-            // Browsers clamp near-zero GIF delays to ~100ms; a raw 0 would
-            // spin the repaint loop for no visible motion.
-            let (numer, denom) = frame.delay().numer_denom_ms();
-            let delay_ms = (numer / denom.max(1)).max(20);
-            let buf = frame.into_buffer();
-            size = [buf.width() as usize, buf.height() as usize];
-            frames.push(AnimationFrame {
-                rgba: buf.into_raw(),
-                delay_ms,
-            });
-        }
-        if frames.is_empty() {
-            return None;
-        }
-        return Some(DecodedImage {
-            name: String::new(),
-            label: String::new(),
-            source: None,
-            list_index: None,
-            size,
-            frames,
-        });
-    }
-    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
-    let (w, h) = rgba.dimensions();
+    let decoded = decode_frames(bytes)?;
     Some(DecodedImage {
         name: String::new(),
         label: String::new(),
         source: None,
         list_index: None,
-        size: [w as usize, h as usize],
-        frames: vec![AnimationFrame {
-            rgba: rgba.into_raw(),
-            delay_ms: 0,
-        }],
+        size: decoded.size,
+        frames: decoded.frames,
     })
-}
-
-/// Which frame an animation shows at time `t` (seconds, any monotonic
-/// clock), and how long until the next flip (`None` for a still — no
-/// repaint needed). Pure, so the stepping is testable off-browser; the
-/// view feeds it egui's clock and schedules a repaint for the flip.
-pub fn frame_at(frames: &[AnimationFrame], t: f64) -> (usize, Option<f64>) {
-    let total_ms: u64 = frames.iter().map(|f| f.delay_ms as u64).sum();
-    if frames.len() < 2 || total_ms == 0 {
-        return (0, None);
-    }
-    let mut into = ((t * 1000.0) as u64) % total_ms;
-    for (i, frame) in frames.iter().enumerate() {
-        let hold = frame.delay_ms as u64;
-        if into < hold {
-            return (i, Some((hold - into) as f64 / 1000.0));
-        }
-        into -= hold;
-    }
-    (0, Some(frames[0].delay_ms as f64 / 1000.0)) // unreachable by arithmetic
 }
 
 /// Render a tool-note payload in this view's marker vocabulary — the same
@@ -1526,47 +1459,6 @@ mod tests {
             !t.entries.iter().any(|e| matches!(e, Entry::Error(_))),
             "an unrenderable image is never an error"
         );
-    }
-
-    #[test]
-    fn gif_decodes_to_frames_and_the_stepper_walks_them() {
-        // upholds: WEB-6 (the artifact renders honestly — an animated GIF
-        // is its frames, not a frozen first one). The stepper is pure: two
-        // 100ms frames → t picks 0, then 1, then wraps; a still never asks
-        // for a repaint.
-        use image::codecs::gif::{GifEncoder, Repeat};
-        use image::{Delay, Frame, Rgba, RgbaImage};
-        let mut bytes = Vec::new();
-        {
-            let mut enc = GifEncoder::new(&mut bytes);
-            enc.set_repeat(Repeat::Infinite).unwrap();
-            for color in [[255u8, 0, 0, 255], [0, 255, 0, 255]] {
-                enc.encode_frame(Frame::from_parts(
-                    RgbaImage::from_pixel(1, 1, Rgba(color)),
-                    0,
-                    0,
-                    Delay::from_numer_denom_ms(100, 1),
-                ))
-                .unwrap();
-            }
-        }
-        let decoded = decode_rgba(&bytes).expect("gif decodes");
-        assert_eq!(decoded.frames.len(), 2);
-        assert!(decoded.frames.iter().all(|f| f.delay_ms >= 20));
-
-        let d = &decoded.frames;
-        assert_eq!(frame_at(d, 0.05).0, 0);
-        assert_eq!(frame_at(d, 0.15).0, 1);
-        assert_eq!(frame_at(d, 0.25).0, 0, "wraps");
-        assert!(
-            frame_at(d, 0.05).1.is_some(),
-            "animations schedule repaints"
-        );
-        let still = vec![AnimationFrame {
-            rgba: vec![0; 4],
-            delay_ms: 0,
-        }];
-        assert_eq!(frame_at(&still, 123.0), (0, None), "stills never repaint");
     }
 
     #[test]
