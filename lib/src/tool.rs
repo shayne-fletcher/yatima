@@ -4054,13 +4054,35 @@ fn requests_image_display(user: &str) -> bool {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect();
-    let has_image = words.iter().any(|word| {
+    // The object of the request: an image noun, or — once a listing
+    // exists, which is when this predicate is consulted — an anaphor for
+    // listed images. "display more" after five pictures is a display
+    // request; requiring the noun let a taped turn (2026-09-20) answer
+    // "Displaying a few fresh ones now" with no call and no correction.
+    let has_object = words.iter().any(|word| {
         matches!(
             *word,
-            "image" | "images" | "picture" | "pictures" | "photo" | "photos"
+            "image"
+                | "images"
+                | "picture"
+                | "pictures"
+                | "photo"
+                | "photos"
+                | "more"
+                | "them"
+                | "all"
+                | "rest"
+                | "remaining"
+                | "another"
+                | "others"
+                | "next"
+                | "these"
+                | "those"
+                | "ones"
+                | "few"
         )
     });
-    has_image
+    has_object
         && words.iter().enumerate().any(|(i, word)| {
             matches!(*word, "fetch" | "show" | "display" | "render")
                 && !matches!(
@@ -4193,6 +4215,13 @@ impl Tool for ReadImage {
             "here they are",
             "image 1: http",
             "image 2: http",
+            // "Displaying a few fresh ones now" (taped 2026-09-20): the
+            // present-participle "serving them now" framings.
+            "displaying a few",
+            "displaying more",
+            "displaying them",
+            "displaying these",
+            "fresh ones now",
         ]
         .iter()
         .any(|phrase| answer.contains(phrase))
@@ -7315,6 +7344,13 @@ as the first window of the page without tripping any extraction guard.</p>
             "fetch more images from the page and render them",
             "find and render even more images; do not render the same image twice",
             "show me a picture",
+            // Anaphora for listed images (the listing exists whenever this
+            // predicate is consulted): taped 2026-09-20, "display more"
+            // after five pictures went uncorrected.
+            "very good. search for more. display more",
+            "show me another",
+            "display the rest",
+            "render a few fresh ones",
         ] {
             assert!(requests_image_display(user), "{user}");
         }
@@ -7323,6 +7359,8 @@ as the first window of the page without tripping any extraction guard.</p>
             "do not render images",
             "never show pictures",
             "find images but do not render them",
+            "show me the page",
+            "display the source as a table",
         ] {
             assert!(!requests_image_display(user), "{user}");
         }
