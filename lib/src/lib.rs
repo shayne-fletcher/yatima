@@ -295,10 +295,13 @@
 //!   tool whose capability is empty is absent from [`Tools::specs`] (the
 //!   model never sees a tool it cannot use), and a web tool's description
 //!   enumerates its granted origins.
-//! - **PAGE-1** within a session, [`ReadPage`] fetches each resolved URL at
-//!   most once: repeat and continuation (`offset`) reads are served from a
-//!   per-tool, FIFO-bounded cache and never touch the network — re-fetching
-//!   is the expensive act for throttled hosts (EDGAR), re-reading is free.
+//! - **PAGE-1** [`ReadPage`] fetches a resolved URL at most once **while its
+//!   page is resident** in the per-tool, FIFO-bounded cache: repeat and
+//!   continuation (`offset`) reads of a resident page are served from cache
+//!   and never touch the network — re-fetching is the expensive act for
+//!   throttled hosts (EDGAR), re-reading is free. Eviction permits a fresh
+//!   fetch; the refreshed page republishes under IMG-3's identity rules (old
+//!   numbers hold, removed images leave the page's membership).
 //!   A repeat window is served **in full**, never as a note: the agent keeps
 //!   no tool results across runs (AGENT-3), so a later turn's re-read is how
 //!   the model recovers what history dropped. The `images_only` projection

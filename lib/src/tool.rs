@@ -2891,9 +2891,14 @@ impl PageCache {
 /// 13, and re-listing page A keeps its numbers. A number therefore names
 /// one image whichever page was listed last — a listing that replaced its
 /// predecessor let a model select "ESA 7" and receive Wikipedia 7 eight
-/// times in a row (taped 2026-09-20). The most recently listed page is
-/// still tracked as the *current* page: exhaustion and the display
-/// obligation are judged against it.
+/// times in a row (taped 2026-09-20). A number is a session identity,
+/// bound to one (page, image URL) pair; a page's *current membership* —
+/// the ordered numbers of its latest publication — is recorded separately,
+/// so a page re-fetched after cache eviction with an image removed stops
+/// advertising that image (it stays selectable by its old number) without
+/// renumbering anything. The most recently listed page is the *current*
+/// page: exhaustion and the display obligation are judged against its
+/// membership, and every projection of it names the page.
 #[derive(Clone, Default)]
 pub struct ImageListing(std::sync::Arc<std::sync::Mutex<ListingInner>>);
 
@@ -2910,9 +2915,29 @@ struct ListedImage {
 
 #[derive(Default)]
 struct ListingInner {
+    /// Every (page, URL) ever listed, in numbering order; never shrinks or
+    /// renumbers within a session.
     entries: Vec<ListedImage>,
+    /// Each page's latest publication: its images' numbers in page order.
+    /// An entry absent from its page's membership was removed on refresh.
+    membership: std::collections::HashMap<String, Vec<usize>>,
     /// The page whose listing was published most recently.
     current: Option<String>,
+}
+
+impl ListingInner {
+    /// The current page's membership, in page order (empty when the page
+    /// lists no images or nothing has been listed).
+    fn current_members(&self) -> &[usize] {
+        self.current
+            .as_ref()
+            .and_then(|page| self.membership.get(page))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn entry(&self, n: usize) -> Option<&ListedImage> {
+        self.entries.iter().find(|e| e.n == n)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2938,36 +2963,42 @@ impl ImageTarget {
 
 impl ImageListing {
     /// Publish a page's images and make it the current page. Returns the
-    /// session-unique number of each image, in order: fresh numbers for a
-    /// page listed for the first time, the same numbers as before for a
-    /// page listed again (so a re-read never renumbers what the model has
-    /// already been told). A page with no images publishes nothing but
-    /// still becomes current, so exhaustion and the display obligation
-    /// see an empty page.
+    /// session-unique number of each image, in page order. An image URL
+    /// this page listed before keeps its number (its label refreshes); a
+    /// new URL takes the next number; an image no longer on the page keeps
+    /// its entry — still selectable by its old number under the page's
+    /// live grant — but leaves the page's membership. A page with no images
+    /// publishes an empty membership and still becomes current, so
+    /// exhaustion and the display obligation see an empty page.
     fn publish(&self, source: &str, images: &[(String, String)]) -> Vec<usize> {
         let mut inner = self.0.lock().expect("image listing poisoned");
         inner.current = Some(source.to_string());
-        let known: Vec<usize> = inner
-            .entries
-            .iter()
-            .filter(|e| e.source == source)
-            .map(|e| e.n)
-            .collect();
-        if !known.is_empty() {
-            return known;
-        }
         let mut next = inner.entries.last().map_or(0, |e| e.n);
         let mut numbers = Vec::with_capacity(images.len());
         for (url, label) in images {
-            next += 1;
-            numbers.push(next);
-            inner.entries.push(ListedImage {
-                n: next,
-                url: url.clone(),
-                label: label.clone(),
-                source: source.to_string(),
-            });
+            let n = match inner
+                .entries
+                .iter_mut()
+                .find(|e| e.source == source && e.url == *url)
+            {
+                Some(entry) => {
+                    entry.label = label.clone();
+                    entry.n
+                }
+                None => {
+                    next += 1;
+                    inner.entries.push(ListedImage {
+                        n: next,
+                        url: url.clone(),
+                        label: label.clone(),
+                        source: source.to_string(),
+                    });
+                    next
+                }
+            };
+            numbers.push(n);
         }
+        inner.membership.insert(source.to_string(), numbers.clone());
         numbers
     }
 
@@ -2977,9 +3008,7 @@ impl ImageListing {
     fn select(&self, n: usize) -> std::result::Result<ImageTarget, usize> {
         let inner = self.0.lock().expect("image listing poisoned");
         inner
-            .entries
-            .iter()
-            .find(|e| e.n == n)
+            .entry(n)
             .map(|e| ImageTarget {
                 target: e.url.clone(),
                 label: Some(e.label.clone()),
@@ -2999,58 +3028,71 @@ impl ImageListing {
             .map(|e| (e.n, e.label.clone()))
     }
 
-    /// The current page's listed URLs — what `read_image` checks the
+    /// The current page's member URLs — what `read_image` checks the
     /// shown-set against to state exhaustion as a fact rather than let the
     /// model guess it, and what the display obligation needs non-empty.
+    /// Images removed on refresh are not members.
     fn urls(&self) -> Vec<String> {
         let inner = self.0.lock().expect("image listing poisoned");
         inner
-            .entries
+            .current_members()
             .iter()
-            .filter(|e| Some(&e.source) == inner.current.as_ref())
+            .filter_map(|n| inner.entry(*n))
             .map(|e| e.url.clone())
             .collect()
     }
 
-    /// The current page's shown/not-yet-shown numbers as one line — the
-    /// same projection whichever tool prints it, so `read_page`'s image
-    /// view and every `read_image` result agree.
+    /// The current page's shown/not-yet-shown numbers as one line naming
+    /// the page — the same projection whichever tool prints it, so
+    /// `read_page`'s image view and every `read_image` result agree, and a
+    /// selection from an older page is never mistaken for this page's state.
     fn state_line(&self, shown_urls: &std::collections::HashSet<String>) -> String {
+        let page = {
+            let inner = self.0.lock().expect("image listing poisoned");
+            inner.current.clone()
+        };
+        let Some(page) = page else {
+            return "[no read_page [images] list is currently available]".to_string();
+        };
         let (shown, available) = self.display_partition(shown_urls);
         if shown.is_empty() && available.is_empty() {
-            "[no read_page [images] list is currently available]".to_string()
+            format!("[list state for {page} — this page lists no images]")
         } else {
             format!(
-                "[list state — already shown: {}; not yet shown: {}]",
+                "[list state for {page} — already shown: {}; not yet shown: {}]",
                 number_ranges(&shown),
                 number_ranges(&available)
             )
         }
     }
 
-    /// Partition the current page's numbers by whether their URL has
-    /// already produced an image this session.
+    /// Partition the current page's member numbers, ascending, by whether
+    /// their URL has already produced an image this session.
     fn display_partition(
         &self,
         shown_urls: &std::collections::HashSet<String>,
     ) -> (Vec<usize>, Vec<usize>) {
         let inner = self.0.lock().expect("image listing poisoned");
-        inner
-            .entries
-            .iter()
-            .filter(|e| Some(&e.source) == inner.current.as_ref())
-            .map(|e| e.n)
-            .partition(|n| {
-                shown_urls.contains(
-                    &inner
-                        .entries
-                        .iter()
-                        .find(|e| e.n == *n)
-                        .expect("listed")
-                        .url,
-                )
-            })
+        let mut members = inner.current_members().to_vec();
+        members.sort_unstable();
+        members
+            .into_iter()
+            .partition(|n| inner.entry(*n).is_some_and(|e| shown_urls.contains(&e.url)))
     }
+}
+
+/// The numbers of a listing's entries past the printed head, as exact ids
+/// or real contiguous runs (`25-30, 32`) — never a `first..last` interval,
+/// which after a refresh can span another page's ids. `None` when the head
+/// shows everything.
+fn omitted_tail(numbers: &[usize]) -> Option<String> {
+    let tail = numbers.get(READ_PAGE_MAX_IMAGES_SHOWN..)?;
+    if tail.is_empty() {
+        return None;
+    }
+    let mut tail = tail.to_vec();
+    tail.sort_unstable();
+    Some(number_ranges(&tail))
 }
 
 impl ReadPage {
@@ -3186,11 +3228,9 @@ impl ReadPage {
             // The head is printed; the whole list is selectable. Say what is
             // not shown — silent truncation once cost a session its ability
             // to tell "out of images" from "out of listed images".
-            if page.images.len() > READ_PAGE_MAX_IMAGES_SHOWN {
+            if let Some(tail) = omitted_tail(&numbers) {
                 out.push_str(&format!(
-                    "\n  …plus {}.–{}., not shown but selectable by number",
-                    READ_PAGE_MAX_IMAGES_SHOWN + 1,
-                    page.images.len()
+                    "\n  …plus {tail}, not shown but selectable by number"
                 ));
             }
             // Wikipedia-shaped sites serve images from sibling CDN origins
@@ -6208,7 +6248,7 @@ as the first window of the page without tripping any extraction guard.</p>
         assert!(
             first
                 .content
-                .contains("…plus 25.–29., not shown but selectable by number"),
+                .contains("…plus 25-29, not shown but selectable by number"),
             "{}",
             first.content
         );
@@ -6950,22 +6990,27 @@ copy of the whole set at every scale a reader cares to zoom.</p>
 
     #[test]
     fn image_numbers_are_unique_across_pages_and_survive_relisting() {
-        // upholds: IMG-3 — a number names one image for the whole session.
-        // Page A lists 1..=2; page B continues at 3; re-listing A keeps
-        // 1..=2 and makes A current again (exhaustion and the display
-        // obligation are judged against the current page only). Taped
-        // 2026-09-20: with per-page renumbering, "ESA 7" selected
-        // Wikipedia 7 eight times in a row.
+        // upholds: IMG-3 — a number is a session identity bound to one
+        // (page, URL); a page's current membership is separate from those
+        // bindings. Page A lists 1..=2; page B continues at 3; re-listing A
+        // keeps 1..=2 and makes A current again. A refresh that removes,
+        // reorders, or adds images renumbers nothing: removed images stay
+        // selectable by their old number but leave discovery and
+        // exhaustion; new URLs take fresh numbers; the omitted tail names
+        // exact ids. Taped 2026-09-20: with per-page renumbering, "ESA 7"
+        // selected Wikipedia 7 eight times in a row.
         let listing = ImageListing::default();
         let a = "https://a.example/page";
         let b = "https://b.example/page";
-        let pics = |host: &str, n: usize| -> Vec<(String, String)> {
-            (1..=n)
-                .map(|i| (format!("https://{host}/{i}.png"), format!("pic {i}")))
-                .collect()
+        let pic = |host: &str, i: usize| (format!("https://{host}/{i}.png"), format!("pic {i}"));
+        let pics = |host: &str, ids: &[usize]| -> Vec<(String, String)> {
+            ids.iter().map(|i| pic(host, *i)).collect()
         };
-        assert_eq!(listing.publish(a, &pics("a.example", 2)), [1, 2]);
-        assert_eq!(listing.publish(b, &pics("b.example", 3)), [3, 4, 5]);
+        assert_eq!(listing.publish(a, &pics("a.example", &[1, 2])), [1, 2]);
+        assert_eq!(
+            listing.publish(b, &pics("b.example", &[1, 2, 3])),
+            [3, 4, 5]
+        );
         // B is current: its URLs are what exhaustion checks.
         assert_eq!(listing.urls().len(), 3);
         // A's numbers still select A's images, with A as the derivation
@@ -6979,23 +7024,81 @@ copy of the whole set at every scale a reader cares to zoom.</p>
             Some(5),
             "misses teach the live top"
         );
-        // Re-listing A neither renumbers nor duplicates.
-        assert_eq!(listing.publish(a, &pics("a.example", 2)), [1, 2]);
+        // Re-listing A unchanged neither renumbers nor duplicates.
+        assert_eq!(listing.publish(a, &pics("a.example", &[1, 2])), [1, 2]);
         assert_eq!(listing.urls().len(), 2, "A is current again");
         assert_eq!(
             listing.describe("https://b.example/2.png"),
             Some((4, "pic 2".into()))
         );
-        // The list state names the current page's numbers, not 1..=len.
+        // The state line names the page and partitions its members.
         let shown: std::collections::HashSet<String> =
             ["https://a.example/2.png".to_string()].into();
         assert_eq!(listing.display_partition(&shown), (vec![2], vec![1]));
+        assert_eq!(
+            listing.state_line(&shown),
+            format!("[list state for {a} — already shown: 2; not yet shown: 1]")
+        );
+
+        // Refresh A after eviction: image 1 removed, a new image first,
+        // image 2 relabelled. Old numbers hold; the new URL is 6; the
+        // removed image leaves membership but stays selectable.
+        let refreshed = vec![
+            pic("a.example", 9),
+            ("https://a.example/2.png".into(), "renamed".into()),
+        ];
+        assert_eq!(listing.publish(a, &refreshed), [6, 2]);
+        assert_eq!(
+            listing.urls(),
+            ["https://a.example/9.png", "https://a.example/2.png"],
+            "membership is the latest publication, in page order"
+        );
+        assert_eq!(listing.select(1).unwrap().target, "https://a.example/1.png");
+        assert_eq!(listing.select(2).unwrap().label.as_deref(), Some("renamed"));
+        assert_eq!(listing.display_partition(&shown), (vec![2], vec![6]));
+        // Reorder only: same numbers, new order, same membership set.
+        assert_eq!(
+            listing.publish(b, &pics("b.example", &[3, 1, 2])),
+            [5, 3, 4]
+        );
+        assert_eq!(
+            listing.display_partition(&Default::default()),
+            (vec![], vec![3, 4, 5])
+        );
+        // Empty after refresh: current, but no member remains.
+        assert_eq!(listing.publish(b, &[]), Vec::<usize>::new());
+        assert!(listing.urls().is_empty());
+        assert_eq!(
+            listing.state_line(&Default::default()),
+            format!("[list state for {b} — this page lists no images]")
+        );
+        assert_eq!(listing.select(4).unwrap().target, "https://b.example/2.png");
         // An empty page still becomes current: no legal call remains.
         assert_eq!(
             listing.publish("https://c.example/empty", &[]),
             Vec::<usize>::new()
         );
         assert!(listing.urls().is_empty());
+    }
+
+    #[test]
+    fn omitted_tail_names_exact_ids_not_an_interval() {
+        // upholds: IMG-3 — the head prints READ_PAGE_MAX_IMAGES_SHOWN
+        // entries; whatever follows is named by its real numbers. After a
+        // refresh put a new image first, the tail holds non-adjacent ids;
+        // "25.–26." (page-local) or "24–26" (an interval) would both point
+        // at images that are not there.
+        assert_eq!(omitted_tail(&[]), None);
+        let head: Vec<usize> = (1..=READ_PAGE_MAX_IMAGES_SHOWN).collect();
+        assert_eq!(omitted_tail(&head), None);
+        let mut with_tail = head.clone();
+        with_tail.extend([25, 26]);
+        assert_eq!(omitted_tail(&with_tail).as_deref(), Some("25-26"));
+        // A new image first pushes 24 into the tail beside 26 (25 removed).
+        let mut reordered = vec![27];
+        reordered.extend(1..=24);
+        reordered.push(26);
+        assert_eq!(omitted_tail(&reordered).as_deref(), Some("24, 26"));
     }
 
     #[tokio::test]
@@ -7663,8 +7766,9 @@ position over the coming years.</p>
         // any image call: re-reading a page with images_only is a cache hit
         // (one fetch) that lists the numbered candidates again AND says
         // which of them the user has already seen, from the memo that
-        // controls displays. The agent keeps no tool results across runs
-        // (AGENT-3), so this result is the whole of what the model knows.
+        // controls displays. This drives the two tools directly and checks
+        // the result a later run would receive; that a later run has no
+        // earlier tool results is AGENT-3's own, separately witnessed law.
         let server = MockServer::start().await;
         let html = r#"<html><body><article><h1>Gallery</h1>
 <img src="/one.png" alt="first picture">
@@ -7732,10 +7836,11 @@ as the first window of the page without tripping any extraction guard.</p>
             "{}",
             listed.content
         );
+        let page = format!("{}/gallery", server.uri());
         assert!(
-            listed
-                .content
-                .contains("[list state — already shown: none; not yet shown: 1-3]"),
+            listed.content.contains(&format!(
+                "[list state for {page} — already shown: none; not yet shown: 1-3]"
+            )),
             "nothing shown yet: {}",
             listed.content
         );
@@ -7766,9 +7871,9 @@ as the first window of the page without tripping any extraction guard.</p>
             recovered.content
         );
         assert!(
-            recovered
-                .content
-                .contains("[list state — already shown: 2; not yet shown: 1, 3]"),
+            recovered.content.contains(&format!(
+                "[list state for {page} — already shown: 2; not yet shown: 1, 3]"
+            )),
             "the shown state came from the display memo: {}",
             recovered.content
         );
