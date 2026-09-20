@@ -328,6 +328,12 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         // budget is spent the prose commits, flagged in the tape by its
         // Retry events: bounded correction, never a wedge.
         let mut corrections = 0usize;
+        // What this run displayed, by list number (or label): persisted
+        // with the answer so the next run's prompt shows that the pictures
+        // came from a call. Without it a model re-reads its own bullet list
+        // as the thing that satisfied the user and reproduces the list
+        // instead of the call (taped 2026-09-20, turn 2).
+        let mut displayed: Vec<String> = Vec::new();
         // The budget's last act is an ANSWER, not silence: when the tool
         // budget runs out, one reserve completion runs after an appended
         // user-plane [host] control turn says to commit now — a rich
@@ -621,6 +627,11 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                 // or an artifact before a later failure,
                                 // counts; another tool's artifact does not.
                                 evidenced_tools.insert(tool_name.clone());
+                                displayed.push(
+                                    artifact
+                                        .list_index
+                                        .map_or_else(|| artifact.label.clone(), |n| n.to_string()),
+                                );
                                 match step(acc, AgentEvent::ToolArtifact(artifact))? {
                                     ControlFlow::Continue(a) => acc = a,
                                     ControlFlow::Break(a) => {
@@ -766,7 +777,20 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
             );
         } else if stop == AgentStop::Final {
             self.history.push(Turn::user(user));
-            self.history.push(Turn::assistant(answer.clone()));
+            // The answer plus its display effects (AGENT-3): the model must
+            // see next turn that the images came from a tool call.
+            let persisted = if displayed.is_empty() {
+                answer.clone()
+            } else {
+                let mut tools: Vec<&str> = evidenced_tools.iter().map(String::as_str).collect();
+                tools.sort_unstable();
+                format!(
+                    "{answer}\n[displayed via {}: {}]",
+                    tools.join(", "),
+                    displayed.join(", ")
+                )
+            };
+            self.history.push(Turn::assistant(persisted));
         }
         Ok((
             acc,
@@ -1108,6 +1132,11 @@ mod tests {
         assert_eq!(run.stop, AgentStop::Final);
         assert_eq!(run.steps, 2, "one requirement retry plus one tool round");
         assert_eq!(run.answer, "The image is now rendered.");
+        assert_eq!(
+            agent.history()[1].content(),
+            Some("The image is now rendered.\n[displayed via required_action: rendered]"),
+            "history records that the answer's pictures came from a call (AGENT-3)"
+        );
         assert_eq!(
             events
                 .iter()

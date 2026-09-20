@@ -207,7 +207,10 @@
 //! - **AGENT-2** only tools in the agent's set are dispatchable — an unknown
 //!   name is an `is_error` result, never ambient execution (sandbox by omission).
 //! - **AGENT-3** across runs, an [`Agent`]'s persistent history carries only
-//!   each completed exchange's user turn and final answer. Its per-run working
+//!   each completed exchange's user turn and final answer — the answer
+//!   suffixed with one host line naming what the run displayed (`[displayed
+//!   via read_image: 30, 31]`), so the next prompt shows that pictures came
+//!   from a call, not from the answer's prose. Its per-run working
 //!   transcript additionally carries structured assistant invocations and
 //!   named tool results so the next prompt can render a complete tool round;
 //!   those tool rounds and reasoning remain ephemeral to the run (the
