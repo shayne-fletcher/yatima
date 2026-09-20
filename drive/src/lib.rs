@@ -9,6 +9,9 @@
 //!   carries the relative path, SHA-256 digest, and byte count.
 //! - `summary.json` closes a clean run with request, event, and turn counts.
 //!
+//! [`report`] renders a tape readably — fragments folded into spans, turns
+//! timed from their `Submit` — for the improvement loop (D3).
+//!
 //! One Tokio task owns the writer and assigns every sequence number. Async
 //! callers await [`RecorderHandle::enqueue`]; synchronous view code may use
 //! [`RecorderHandle::enqueue_blocking`] only from an established blocking
@@ -25,6 +28,8 @@
 //!   summary. The capacity-one queue bounds the recoverable omitted suffix
 //!   after abrupt death to the in-progress record and one queued record. Cited
 //!   by the tests in this crate.
+
+pub mod report;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
