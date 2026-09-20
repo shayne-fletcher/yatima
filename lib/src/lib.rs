@@ -356,21 +356,27 @@
 //!   `artifact_read_takes_the_event_path`, the protocol/tape round trips, and
 //!   the GUI/TUI/web image projection tests.
 //!   `read_image`'s session memo is keyed by URL and content hash: a repeat
-//!   never refetches
-//!   or emits another display event, while `{"again": true}` is the sole
-//!   explicit re-show path. Before every agent run, its current numbered
-//!   listing is partitioned into already-shown and not-yet-shown numbers in
-//!   the regenerated tool spec, so AGENT-3's answer-only history cannot erase
-//!   this display state. For the narrow syntactic class of explicit image
-//!   display requests, the tool also requires a successful `read_image` call
-//!   before the agent may commit a final answer — but only while the current
-//!   listing has entries: an empty listing makes the demand unsatisfiable,
-//!   and the truthful "this page has no images" answer must commit (a taped
-//!   frameset page once wedged six withheld answers against the step
-//!   budget). Narration cannot impersonate the effect. When every listed
-//!   image has been shown, the teaching states that exhaustion as a
-//!   computed fact. Cited by the required-call,
-//!   session-ledger, repeat/duplicate, re-show, exhaustion, and artifact-event
+//!   never refetches or emits another display event, while `{"again": true}`
+//!   is the sole explicit re-show path. Every `read_image` result — and the
+//!   `images_only` page projection (PAGE-1) — ends with the current page's
+//!   shown/not-yet-shown numbers from that memo, so AGENT-3's answer-only
+//!   history cannot erase display state. For the narrow syntactic class of
+//!   explicit display requests the agent withholds a final answer until
+//!   `read_image`'s own **artifact event** has occurred this run: typed
+//!   display authority, not a successful return (a memo-served duplicate
+//!   returns `Ok` and displays nothing). The obligation holds only while the
+//!   current page has an unshown member; an empty or exhausted page lifts it,
+//!   and a failed attempt this run releases it without counting as a
+//!   display, so the truthful "nothing more here" commits. Its dual — an
+//!   answer that *claims* a just-now display no artifact backs — is a
+//!   best-effort narration check over a fixed phrase list. Both draw on one
+//!   budget of [`CORRECTION_BUDGET`] corrections per turn, each an appended
+//!   `[host]` user turn (the system prefix is never rewritten); beyond it the
+//!   prose commits with its Retry events on the tape. Cited by
+//!   `display_evidence_is_the_artifact_event_not_a_successful_return`,
+//!   `corrections_share_one_budget_and_never_rewrite_the_system_prefix`,
+//!   `display_requirement_holds_only_while_an_unshown_member_exists`, the
+//!   required-call, repeat/duplicate, re-show, exhaustion, and artifact-event
 //!   tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL
 //!   transcription: `read_page`'s first window publishes its numbered
@@ -457,7 +463,7 @@ mod token_output_stream;
 mod tool;
 mod transcript;
 
-pub use agent::{Agent, AgentEvent, AgentStop, Run};
+pub use agent::{Agent, AgentEvent, AgentStop, Run, CORRECTION_BUDGET};
 pub use backend::{
     ChildCleanupFailed, LlamaServer, LlamaServerCompleter, LlamaServerConfig, LlamaServerSpawn,
     ServerGates, ServerIdentity, ServerProps,

@@ -4151,12 +4151,18 @@ impl Tool for ReadImage {
     }
 
     fn requires_call_for(&self, user: &str) -> bool {
-        // The demand must be satisfiable: with an empty listing there is
-        // no legal read_image call, and withholding the truthful "this
-        // page has no images" answer wedges the turn against the step
-        // budget (taped live: six withheld answers on a frameset landing
-        // page whose empty listing had replaced the previous page's).
-        requests_image_display(user) && !self.listing.urls().is_empty()
+        // The demand must be satisfiable: only while the current page has
+        // a member the user has not seen is there a read_image call that
+        // can display anything. An empty page, or one whose every image is
+        // already shown, lifts it, so the truthful "nothing more here"
+        // commits instead of wedging against the step budget (taped: a
+        // frameset landing page, six withheld answers; a JS gallery, five).
+        requests_image_display(user)
+            && !self
+                .listing
+                .display_partition(&self.fetched.shown_urls())
+                .1
+                .is_empty()
     }
 
     fn claims_effect(&self, answer: &str) -> bool {
@@ -7323,27 +7329,41 @@ as the first window of the page without tripping any extraction guard.</p>
     }
 
     #[test]
-    fn display_requirement_holds_only_while_the_listing_has_entries() {
-        // upholds: IMG-2 — the call obligation must be satisfiable: an
-        // empty listing (a page with no article images replaces the prior
-        // list) has no legal read_image call, and the truthful "no images
-        // here" answer must be allowed to commit instead of wedging the
-        // turn against the step budget.
+    fn display_requirement_holds_only_while_an_unshown_member_exists() {
+        // upholds: IMG-2 — the call obligation must be satisfiable: it
+        // holds only while the current page has a member not yet shown. No
+        // listing, an empty page, or an exhausted page each lift it, so the
+        // truthful "nothing more here" answer commits instead of wedging
+        // the turn against the step budget.
         let listing = ImageListing::default();
+        let memo = ImageMemo::default();
         let dir = std::env::temp_dir().join("yatima-required-call-test");
         let tool = ReadImage::new(WebOrigins::one("https://a.example").unwrap(), &dir)
             .unwrap()
-            .with_listing(listing.clone());
+            .with_listing(listing.clone())
+            .with_memo(memo.clone());
         assert!(!tool.requires_call_for("show me the images"));
         listing.publish(
             "https://a.example/page",
             &[("https://a.example/x.png".to_string(), String::new())],
         );
         assert!(tool.requires_call_for("show me the images"));
+        // The one member shown: exhausted, nothing a call could display.
+        memo.lock().by_url.insert(
+            "https://a.example/x.png".to_string(),
+            (
+                "shown".to_string(),
+                ToolArtifact::image("x.png", "x", "https://a.example/x.png", Some(1)),
+            ),
+        );
+        assert!(
+            !tool.requires_call_for("show me the images"),
+            "an exhausted page lifts the obligation"
+        );
         listing.publish("https://a.example/empty", &[]);
         assert!(
             !tool.requires_call_for("show me the images"),
-            "an empty replacement listing lifts the obligation"
+            "an empty page lifts the obligation"
         );
     }
 

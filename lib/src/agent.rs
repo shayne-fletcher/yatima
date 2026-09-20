@@ -31,6 +31,12 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
+/// Corrections per user turn before a withheld answer commits anyway
+/// (IMG-2): two, shared by both grounds for withholding. Beyond it the
+/// prose commits with its Retry events on the tape — a bounded correction,
+/// never a wedge against the step budget.
+pub const CORRECTION_BUDGET: usize = 2;
+
 /// An observable step of a run, delivered to [`Agent::run_with`]'s fold.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -44,9 +50,11 @@ pub enum AgentEvent {
     ToolArtifact(ToolArtifact),
     ToolOutcome(ToolOutcome),
     /// A candidate final answer did not discharge a tool-declared obligation
-    /// for this user turn. Streaming consumers retract that step's answer;
-    /// the agent strengthens the system instruction and retries under the
-    /// same finite step budget (AGENT-1/AGENT-4).
+    /// for this user turn, or claimed an effect no call produced. Streaming
+    /// consumers retract that step's answer; the agent appends one `[host]`
+    /// correction turn (the system prefix is never rewritten) and retries
+    /// under the same finite step budget, at most [`CORRECTION_BUDGET`]
+    /// times per turn (AGENT-1/AGENT-4, IMG-2).
     Retry(String),
     /// A live slice of the current step's decode (AGENT-4), classified as it
     /// streams: chain-of-thought on [`Channel::Reasoning`], prose on
@@ -305,9 +313,21 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         let rendered_tools = self.codec.render_system(&self.tools.specs());
         let system = self.template.compose_system(&self.system, &rendered_tools);
         let required_tools = self.tools.required_for(user);
-        let mut successful_tools = HashSet::<String>::new();
-        let mut requirement_misses = 0usize;
-        let mut impersonation_misses = 0usize;
+        // Display evidence is the typed artifact event from a tool's own
+        // task (IMG-2) — never a successful `Ok`, which a memo-served
+        // duplicate also returns. `attempted_failed` releases an obligation
+        // the tool tried and could not meet this run (a refused fetch is a
+        // reason to explain, not a reason to be withheld forever); both
+        // sets are scoped to this run.
+        let mut evidenced_tools = HashSet::<String>::new();
+        let mut failed_tools = HashSet::<String>::new();
+        // One shared budget for both corrections (withheld: obligation
+        // unmet; withheld: claimed an effect that did not happen). Feedback
+        // is an appended user-plane `[host]` turn, like the budget notice —
+        // the system prefix stays byte-identical across bounces. When the
+        // budget is spent the prose commits, flagged in the tape by its
+        // Retry events: bounded correction, never a wedge.
+        let mut corrections = 0usize;
         // The budget's last act is an ANSWER, not silence: when the tool
         // budget runs out, one reserve completion runs after an appended
         // user-plane [host] control turn says to commit now — a rich
@@ -465,85 +485,83 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         stop = AgentStop::NoAnswer;
                         break;
                     }
-                    // Re-ask each tool whether the obligation is still
-                    // satisfiable NOW, not only at turn start: a read_page
-                    // during the turn can empty the [images] listing, after
-                    // which no legal read_image call exists and the truthful
-                    // "no images here" answer must pass (taped 2026-09-20: a
-                    // JS gallery page, five withheld answers, user cancel).
-                    // The bounce is also capped like the impersonation gate:
-                    // a model that will not call the tool degrades to
-                    // committing its flagged prose instead of wedging.
+                    // The obligation is judged NOW, against evidence: it
+                    // must still be satisfiable (a read_page during the turn
+                    // can leave no unshown image, and the truthful "nothing
+                    // more here" must pass), it is discharged only by the
+                    // tool's own artifact event, and a failed attempt this
+                    // run releases it (taped 2026-09-20: a JS gallery page,
+                    // five withheld answers, user cancel).
                     let still_required = self.tools.required_for(user);
                     let unmet: Vec<&str> = required_tools
                         .iter()
-                        .filter(|name| !successful_tools.contains(*name))
                         .filter(|name| still_required.contains(*name))
+                        .filter(|name| !evidenced_tools.contains(*name))
+                        .filter(|name| !failed_tools.contains(*name))
                         .map(String::as_str)
                         .collect();
-                    if !unmet.is_empty() && requirement_misses < 3 {
-                        requirement_misses += 1;
+                    // The obligation's dual (IMG-2): an answer that *claims*
+                    // a tool's just-now effect no artifact of that tool
+                    // backs this turn.
+                    let impersonated = self.tools.impersonated_effects(reply, &evidenced_tools);
+                    let correction = if !unmet.is_empty() {
                         let names = unmet.join(", ");
-                        let reason = format!(
-                            "final answer withheld: this request requires a successful {names} call"
-                        );
-                        match step(acc, AgentEvent::Retry(reason.clone()))? {
-                            ControlFlow::Continue(a) => acc = a,
-                            ControlFlow::Break(a) => {
-                                acc = a;
-                                stop = AgentStop::Stopped;
-                                break;
-                            }
-                        }
-                        steps += 1;
-                        if steps >= self.max_steps {
-                            stop = AgentStop::MaxSteps;
-                            break;
-                        }
-                        transcript[0] = Turn::system(format!(
-                            "{system}\n\nRequired action for this user turn: {names} must succeed before you answer. Attempt {requirement_misses} was rejected because it answered without doing so. Call {names} now, with arguments taken from the latest tool result (for read_image: not-yet-shown numbers from the list state); do not claim the action happened, list candidates, or ask permission."
-                        ));
-                        continue;
-                    }
-                    // The requirement gate's dual (IMG-2): an answer that
-                    // *claims* a tool's just-now effect without a successful
-                    // call this turn bounces back with the remedy — call the
-                    // tool, or drop the claim. Capped at two bounces so a
-                    // stubborn model degrades to committing its (flagged-in-
-                    // tape) prose instead of wedging against the step budget.
-                    let impersonated = self.tools.impersonated_effects(reply, &successful_tools);
-                    if !impersonated.is_empty() && impersonation_misses < 2 {
-                        impersonation_misses += 1;
+                        Some((
+                            format!(
+                                "final answer withheld: this request requires a \
+                                 successful {names} call"
+                            ),
+                            format!(
+                                "[host] Your answer was withheld: this request \
+                                 needs a successful {names} call before you \
+                                 answer. Call {names} now with arguments from \
+                                 the latest tool result (for read_image: a \
+                                 not-yet-shown number from the list state). If \
+                                 that is impossible, say so plainly. Do not claim \
+                                 it happened, do not list candidates, do not ask \
+                                 permission."
+                            ),
+                        ))
+                    } else if !impersonated.is_empty() {
                         let names = impersonated.join(", ");
-                        let reason = format!(
-                            "final answer withheld: it says a {names} effect just \
-                             happened, but no {names} call succeeded this turn — \
-                             call {names} now with the numbers the user asked \
-                             for; if that is impossible, say plainly that \
-                             nothing was displayed and why — do not ask \
-                             permission, the request already is permission"
-                        );
-                        match step(acc, AgentEvent::Retry(reason.clone()))? {
-                            ControlFlow::Continue(a) => acc = a,
-                            ControlFlow::Break(a) => {
-                                acc = a;
-                                stop = AgentStop::Stopped;
+                        Some((
+                            format!(
+                                "final answer withheld: it says a {names} effect \
+                                 just happened, but no {names} call produced one \
+                                 this turn"
+                            ),
+                            format!(
+                                "[host] Your answer was withheld: it claims a \
+                                 {names} effect that did not happen this turn. \
+                                 Call {names} now with what the user asked for; \
+                                 if that is impossible, say plainly that nothing \
+                                 was displayed and why. Do not ask permission."
+                            ),
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some((reason, host_turn)) = correction {
+                        if corrections < CORRECTION_BUDGET {
+                            corrections += 1;
+                            match step(acc, AgentEvent::Retry(reason))? {
+                                ControlFlow::Continue(a) => acc = a,
+                                ControlFlow::Break(a) => {
+                                    acc = a;
+                                    stop = AgentStop::Stopped;
+                                    break;
+                                }
+                            }
+                            steps += 1;
+                            if steps >= self.max_steps {
+                                stop = AgentStop::MaxSteps;
                                 break;
                             }
+                            transcript.push(Turn::user(host_turn));
+                            continue;
                         }
-                        steps += 1;
-                        if steps >= self.max_steps {
-                            stop = AgentStop::MaxSteps;
-                            break;
-                        }
-                        transcript[0] = Turn::system(format!(
-                            "{system}\n\nYour previous answer claimed a {names} \
-                             effect that did not happen this turn. Call {names} \
-                             now with the numbers the user asked for; if that is \
-                             impossible, say plainly that nothing was displayed \
-                             and why. Do not ask permission."
-                        ));
-                        continue;
+                        // Budget spent: the prose commits, and the tape shows
+                        // the Retry events that preceded it.
                     }
                     transcript.push(Turn::assistant(reply.clone()));
                     match step(acc, AgentEvent::Final(reply.clone()))? {
@@ -598,6 +616,11 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                 }
                             }
                             Some(ToolEvent::Artifact { artifact, .. }) => {
+                                // IMG-2: the artifact event of THIS tool's
+                                // task is the display evidence; a re-show,
+                                // or an artifact before a later failure,
+                                // counts; another tool's artifact does not.
+                                evidenced_tools.insert(tool_name.clone());
                                 match step(acc, AgentEvent::ToolArtifact(artifact))? {
                                     ControlFlow::Continue(a) => acc = a,
                                     ControlFlow::Break(a) => {
@@ -650,8 +673,8 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     };
 
                     let result = outcome.render_for_model(&tool_name);
-                    if outcome.is_success() {
-                        successful_tools.insert(tool_name.clone());
+                    if !outcome.is_success() {
+                        failed_tools.insert(tool_name.clone());
                     }
                     transcript.push(Turn::tool_result(
                         result.name,
@@ -924,7 +947,17 @@ mod tests {
         )
     }
 
-    struct RequiredAction;
+    /// What the stub's call does: emit an artifact (real display evidence),
+    /// succeed without one (a memo-served duplicate), or fail (a refused
+    /// fetch).
+    #[derive(Clone, Copy)]
+    enum StubEffect {
+        Emit,
+        Noop,
+        Fail,
+    }
+
+    struct RequiredAction(StubEffect);
 
     #[async_trait::async_trait]
     impl Tool for RequiredAction {
@@ -944,9 +977,53 @@ mod tests {
             answer.contains("just displayed")
         }
 
-        async fn call(&self, _args: serde_json::Value, _ctx: ToolCtx) -> Result<String> {
-            Ok("rendered".to_string())
+        async fn call(&self, _args: serde_json::Value, ctx: ToolCtx) -> Result<String> {
+            match self.0 {
+                StubEffect::Emit => {
+                    ctx.emit_artifact(ToolArtifact::image(
+                        "rendered.png",
+                        "rendered",
+                        "stub://required",
+                        None,
+                    ));
+                    Ok("rendered".to_string())
+                }
+                StubEffect::Noop => Ok("already shown; not displayed again".to_string()),
+                StubEffect::Fail => anyhow::bail!("refused: 403"),
+            }
         }
+    }
+
+    /// An unrelated tool that also emits artifacts: its evidence must not
+    /// discharge `required_action`'s obligation.
+    struct OtherArtifact;
+
+    #[async_trait::async_trait]
+    impl Tool for OtherArtifact {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "other_artifact".to_string(),
+                description: "produce an unrelated artifact".to_string(),
+                params: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, _args: serde_json::Value, ctx: ToolCtx) -> Result<String> {
+            ctx.emit_artifact(ToolArtifact::image(
+                "other.png",
+                "other",
+                "stub://other",
+                None,
+            ));
+            Ok("produced".to_string())
+        }
+    }
+
+    fn retries(events: &[AgentEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::Retry(_)))
+            .count()
     }
 
     fn muse_call(tool: &str, paths: &[&str]) -> String {
@@ -1009,9 +1086,11 @@ mod tests {
     fn required_tool_call_blocks_narrated_success_then_recovers() {
         // upholds: AGENT-1 / AGENT-4 / IMG-2 — a candidate answer cannot
         // impersonate a required effect. It is observable as Retry, never
-        // Final or history; the successful call discharges the requirement;
-        // both non-final steps consume the common finite budget.
-        let tools = Tools::new().with(RequiredAction);
+        // Final or history; the call's ARTIFACT discharges the requirement;
+        // both non-final steps consume the common finite budget; the
+        // correction arrives as an appended [host] turn and the system
+        // prefix is byte-identical across prompts.
+        let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
         let call = call("required_action", "unused");
         let mut model = Scripted::new(&[
             "I rendered it without calling anything.",
@@ -1051,8 +1130,150 @@ mod tests {
             "the rejected claim never enters working or persistent history"
         );
         drop(agent);
-        assert!(model.prompts[1].contains("required_action must succeed"));
+        assert!(
+            model.prompts[1].contains("[host] Your answer was withheld")
+                && model.prompts[1].contains("needs a successful required_action call"),
+            "{}",
+            model.prompts[1]
+        );
         assert!(!model.prompts[1].contains("I rendered it without calling anything."));
+        // Each rendered prompt ends with the assistant opener; everything
+        // before it in prompt 0 is a literal prefix of prompt 1.
+        let opener = "<|assistant|>\n";
+        assert!(
+            model.prompts[1].starts_with(model.prompts[0].trim_end_matches(opener)),
+            "the correction is appended; the prefix the KV cache holds is unchanged"
+        );
+    }
+
+    #[test]
+    fn display_evidence_is_the_artifact_event_not_a_successful_return() {
+        // upholds: IMG-2 — a call that returns Ok without an artifact (a
+        // memo-served duplicate) is not a display; the obligation stands and
+        // the answer is corrected. A call that FAILS releases the
+        // obligation: the truthful explanation commits without a Retry and
+        // without counting as displayed. Another tool's artifact is not
+        // evidence for this one.
+        let tools = Tools::new().with(RequiredAction(StubEffect::Noop));
+        let call = call("required_action", "unused");
+        let mut model = Scripted::new(&[&call, "Shown.", "Shown, really.", "Shown, final."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(
+            retries(&events),
+            CORRECTION_BUDGET,
+            "a no-op is not evidence"
+        );
+        assert_eq!(
+            run.answer, "Shown, final.",
+            "the budget spent, the prose commits"
+        );
+
+        let tools = Tools::new().with(RequiredAction(StubEffect::Fail));
+        let mut model = Scripted::new(&[&call, "The server refused the image; nothing was shown."]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(retries(&events), 0, "a failed attempt releases the demand");
+        assert_eq!(
+            run.answer,
+            "The server refused the image; nothing was shown."
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolArtifact(_))),
+            "release is not evidence"
+        );
+
+        let tools = Tools::new()
+            .with(RequiredAction(StubEffect::Emit))
+            .with(OtherArtifact);
+        let other = super::tests::call("other_artifact", "unused");
+        let mut model = Scripted::new(&[&other, "Displayed.", "Displayed!", "Displayed!!"]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolArtifact(_)))
+                .count(),
+            1,
+            "the other tool's artifact is displayed"
+        );
+        assert_eq!(
+            retries(&events),
+            CORRECTION_BUDGET,
+            "but it is not required_action's evidence"
+        );
+    }
+
+    #[test]
+    fn corrections_share_one_budget_and_never_rewrite_the_system_prefix() {
+        // upholds: IMG-2 / AGENT-4 — an unmet obligation and a claimed
+        // effect draw on ONE budget of CORRECTION_BUDGET per turn; each
+        // correction is an appended [host] turn, so every prompt extends
+        // the previous one and the system prefix is never rewritten.
+        let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
+        let mut model = Scripted::new(&[
+            "Here you go.",             // unmet obligation
+            "I just displayed it.",     // claimed effect
+            "I just displayed it, ok?", // budget spent: commits
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(retries(&events), CORRECTION_BUDGET);
+        assert_eq!(run.answer, "I just displayed it, ok?");
+        drop(agent);
+        assert_eq!(model.prompts.len(), 3);
+        let opener = "<|assistant|>\n";
+        for pair in model.prompts.windows(2) {
+            assert!(
+                pair[1].starts_with(pair[0].trim_end_matches(opener)),
+                "each prompt extends the last: prefix intact\n{}\n---\n{}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Both corrections were appended [host] turns; under an unmet
+        // obligation the claimed-effect ground is subsumed (the obligation
+        // is judged first), so both name the required call.
+        for prompt in &model.prompts[1..] {
+            assert!(
+                prompt.contains("[host] Your answer was withheld"),
+                "{prompt}"
+            );
+        }
+        assert_eq!(
+            model.prompts[2]
+                .matches("[host] Your answer was withheld")
+                .count(),
+            2,
+            "the second correction was appended after the first, not in its place"
+        );
     }
 
     #[test]
@@ -1060,9 +1281,9 @@ mod tests {
         // upholds: IMG-2's dual — outside the required-call class ("browse
         // another page" names no image), an answer claiming a just-now
         // display with no successful call this turn bounces with the
-        // remedy; the bounce is capped at two, so a stubborn claim
-        // degrades to committing (tape-visible) instead of wedging.
-        let tools = Tools::new().with(RequiredAction);
+        // remedy; the bounce is capped at CORRECTION_BUDGET, so a stubborn
+        // claim degrades to committing (tape-visible) instead of wedging.
+        let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
         let mut model = Scripted::new(&[
             "I just displayed image 1 from that list.",
             "The list is above; say the word and I will display one.",
@@ -1088,7 +1309,7 @@ mod tests {
         );
 
         // The cap: three straight claims commit the third, still Final.
-        let tools = Tools::new().with(RequiredAction);
+        let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
         let mut model = Scripted::new(&[
             "I just displayed it.",
             "I just displayed it again, honest.",
@@ -1110,7 +1331,7 @@ mod tests {
     fn required_tool_call_retries_are_bounded_and_commit_nothing() {
         // upholds: AGENT-1 / IMG-2 — a model that keeps narrating a required
         // effect cannot loop forever or commit the fabrication.
-        let tools = Tools::new().with(RequiredAction);
+        let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
         let mut model = Scripted::new(&["done without a call", "still no call"]);
         let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 2);
         let (events, run) = agent
