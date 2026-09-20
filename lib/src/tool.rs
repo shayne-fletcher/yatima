@@ -412,12 +412,13 @@ pub trait Tool: Send + Sync {
     }
     /// Whether `answer` presents this tool's effect on things it did not
     /// produce this run. `displayed` is the set of source URLs this run's
-    /// artifacts carried. Judged against host state — what is listed, what
-    /// was shown — never against the answer's wording: a phrase list was
-    /// paraphrased past in three tapes on 2026-09-20 ("Displaying a few
-    /// fresh ones now", "They're saved and displayed", a page summary with
-    /// no read). A hit with no artifact of this tool this run is a false
-    /// claim the agent corrects instead of committing (IMG-2).
+    /// artifacts carried, and the comparison is per item: what this run
+    /// actually displayed is honest to name, anything else listed is not,
+    /// however many real displays sit beside it. Judged against host state
+    /// — what is listed, what was shown — never against the answer's
+    /// wording: a phrase list was paraphrased past in three tapes on
+    /// 2026-09-20. A hit is a false claim the agent corrects instead of
+    /// committing (IMG-2).
     fn names_undisplayed(
         &self,
         _answer: &str,
@@ -488,23 +489,22 @@ impl Tools {
             .collect()
     }
 
-    /// Available tools with no artifact this run whose effect `answer`
-    /// nevertheless presents — false claims the agent must not commit
-    /// (IMG-2). `evidenced` is the run's artifact-backed tool set,
-    /// `displayed` the source URLs those artifacts carried.
+    /// Available tools whose effect `answer` presents on things this run
+    /// did not produce — false claims the agent must not commit (IMG-2).
+    /// `displayed` is the set of source URLs this run's artifacts carried;
+    /// each tool's hook compares item by item, so one real display never
+    /// vouches for the others an answer names alongside it (Codex, Review
+    /// 10: a tool-wide short-circuit let "shown: 1" cover "2, 3, 4" too).
     pub fn impersonated_effects(
         &self,
         answer: &str,
-        evidenced: &std::collections::HashSet<String>,
         displayed: &std::collections::HashSet<String>,
     ) -> Vec<String> {
         self.tools
             .iter()
             .filter(|tool| tool.available())
             .map(|tool| (tool, tool.spec().name))
-            .filter(|(tool, name)| {
-                !evidenced.contains(name) && tool.names_undisplayed(answer, displayed)
-            })
+            .filter(|(tool, _)| tool.names_undisplayed(answer, displayed))
             .map(|(_, name)| name)
             .collect()
     }
@@ -7504,6 +7504,13 @@ as the first window of the page without tripping any extraction guard.</p>
         assert!(
             !tool.names_undisplayed("Shown: https://cdn.example/1.webp", &shown),
             "naming what this run displayed is honest"
+        );
+        assert!(
+            tool.names_undisplayed(
+                "Shown: https://cdn.example/1.webp and comet lemmon meets ngc 3184",
+                &shown
+            ),
+            "one real display does not vouch for a second, undisplayed one"
         );
         assert!(tool.names_undisplayed("![x](https://anywhere.example/y.png)", &shown));
     }

@@ -544,11 +544,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     // The obligation's dual (IMG-2): an answer that presents
                     // a tool's effect on things no artifact of that tool
                     // backs this run — judged on host state, not wording.
-                    let impersonated = self.tools.impersonated_effects(
-                        reply,
-                        &evidenced_tools,
-                        &displayed_sources,
-                    );
+                    let impersonated = self.tools.impersonated_effects(reply, &displayed_sources);
                     let correction = if !unmet.is_empty() {
                         let names = unmet.join(", ");
                         Some((
@@ -1521,6 +1517,77 @@ mod tests {
             .unwrap();
         assert_eq!(run.stop, AgentStop::Final);
         assert_eq!(retries(&events), 1, "a granted origin is not a new source");
+    }
+
+    #[test]
+    fn one_real_display_does_not_vouch_for_undisplayed_images_named_beside_it() {
+        // upholds: IMG-2 (Codex, Review 10) — the false-claim check is per
+        // image, not per tool: after a real display, an answer naming only
+        // that image commits; an answer naming it AND an undisplayed listed
+        // image is corrected. The stub's listing is two images; its call
+        // displays `pic` only.
+        let tools = Tools::new().with(RequiredTwo);
+        let render = call("required_action", "unused");
+        let mut model = Scripted::new(&[&render, "Shown: stub://required/pic"]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(retries(&events), 0, "naming the displayed image is honest");
+
+        let tools = Tools::new().with(RequiredTwo);
+        let mut model = Scripted::new(&[
+            &render,
+            "Shown: stub://required/pic and stub://required/other",
+            "Shown: stub://required/pic",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(
+            retries(&events),
+            1,
+            "the undisplayed one beside it is a false claim"
+        );
+        assert_eq!(run.answer, "Shown: stub://required/pic");
+    }
+
+    /// A required tool whose "listing" is two images, only one of which
+    /// its call displays — the per-image contrast Review 10 asked for.
+    struct RequiredTwo;
+
+    #[async_trait::async_trait]
+    impl Tool for RequiredTwo {
+        fn spec(&self) -> ToolSpec {
+            RequiredAction(StubEffect::Emit).spec()
+        }
+
+        fn requires_call_for(&self, user: &str) -> bool {
+            user == "render image"
+        }
+
+        fn names_undisplayed(
+            &self,
+            answer: &str,
+            displayed: &std::collections::HashSet<String>,
+        ) -> bool {
+            ["stub://required/pic", "stub://required/other"]
+                .iter()
+                .any(|url| answer.contains(url) && !displayed.contains(*url))
+        }
+
+        async fn call(&self, args: serde_json::Value, ctx: ToolCtx) -> Result<String> {
+            RequiredAction(StubEffect::Emit).call(args, ctx).await
+        }
     }
 
     #[test]

@@ -378,7 +378,9 @@
 //!   for new sources the run itself found — `web_search` succeeded this run
 //!   and the answer names an origin not yet granted, which the model cannot
 //!   read without asking. Proposing pages from memory while unshown images
-//!   sit on the current page is none of these and is corrected. The request test
+//!   sit on the current page is none of these and is corrected. The false-claim
+//!   check is per image: one real display never vouches for other listed
+//!   images an answer names beside it. The request test
 //!   is the object of the sentence (an image noun, or an anaphor for the
 //!   listed ones), never a verb list — "find more" after five pictures is a
 //!   request for more pictures. Its dual — an answer that presents listed
@@ -397,7 +399,8 @@
 //!   `a_false_display_claim_is_a_listed_image_not_displayed_this_run`,
 //!   `find_more_with_a_listing_is_corrected_until_the_pictures_are_shown`,
 //!   `answer_gate_drops_imitated_host_lines_live_and_only_those`,
-//!   `a_display_turn_may_end_by_proposing_sources_the_run_found`, the
+//!   `a_display_turn_may_end_by_proposing_sources_the_run_found`,
+//!   `one_real_display_does_not_vouch_for_undisplayed_images_named_beside_it`, the
 //!   required-call, repeat/duplicate, re-show, exhaustion, and artifact-event
 //!   tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL
