@@ -370,15 +370,25 @@
 //!   returns `Ok` and displays nothing). The obligation holds only while the
 //!   current page has an unshown member; an empty or exhausted page lifts it,
 //!   and a failed attempt this run releases it without counting as a
-//!   display, so the truthful "nothing more here" commits. Its dual — an
-//!   answer that *claims* a just-now display no artifact backs — is a
-//!   best-effort narration check over a fixed phrase list. Both draw on one
+//!   display, so the truthful "nothing more here" commits. The request test
+//!   is the object of the sentence (an image noun, or an anaphor for the
+//!   listed ones), never a verb list — "find more" after five pictures is a
+//!   request for more pictures. Its dual — an answer that presents listed
+//!   images this run did not display, by URL or three-plus-word label, or
+//!   any markdown image — is judged on the listing and this run's artifacts,
+//!   never on the answer's wording (three phrase-list evasions on
+//!   2026-09-20). Lines in a host-owned shape (`[displayed via …]`,
+//!   `[list state for …]`) are the host's to write: a model's imitation is
+//!   dropped live from the stream and from the reply. Both checks draw on one
 //!   budget of [`CORRECTION_BUDGET`] corrections per turn, each an appended
 //!   `[host]` user turn (the system prefix is never rewritten); beyond it the
 //!   prose commits with its Retry events on the tape. Cited by
 //!   `display_evidence_is_the_artifact_event_not_a_successful_return`,
 //!   `corrections_share_one_budget_and_never_rewrite_the_system_prefix`,
-//!   `display_requirement_holds_only_while_an_unshown_member_exists`, the
+//!   `display_requirement_holds_only_while_an_unshown_member_exists`,
+//!   `a_false_display_claim_is_a_listed_image_not_displayed_this_run`,
+//!   `find_more_with_a_listing_is_corrected_until_the_pictures_are_shown`,
+//!   `answer_gate_drops_imitated_host_lines_live_and_only_those`, the
 //!   required-call, repeat/duplicate, re-show, exhaustion, and artifact-event
 //!   tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL

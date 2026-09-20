@@ -35,16 +35,20 @@ use std::ops::ControlFlow;
 /// the model must not.
 const DISPLAY_RECORD_OPEN: &str = "[displayed via ";
 
-/// `reply` without any line the model wrote in the host's display-record
-/// shape.
+/// Lines only the host writes. A model imitates whatever host line it has
+/// seen — the display record one turn after it appeared, the list-state
+/// line the next session — so a line in either shape is dropped from the
+/// model's reply before it is streamed, judged, shown, or persisted.
+const HOST_LINE_OPENERS: &[&str] = &[DISPLAY_RECORD_OPEN, "[list state for "];
+
+fn is_host_line(line: &str) -> bool {
+    let line = line.trim_start();
+    HOST_LINE_OPENERS.iter().any(|open| line.starts_with(open))
+}
+
+/// `reply` without any line the model wrote in a host-owned shape.
 fn without_host_display_lines(reply: &str) -> String {
-    let kept: Vec<&str> = reply
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            !(line.starts_with(DISPLAY_RECORD_OPEN) && line.ends_with(']'))
-        })
-        .collect();
+    let kept: Vec<&str> = reply.lines().filter(|line| !is_host_line(line)).collect();
     kept.join("\n").trim_end().to_string()
 }
 
@@ -338,6 +342,9 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         // sets are scoped to this run.
         let mut evidenced_tools = HashSet::<String>::new();
         let mut failed_tools = HashSet::<String>::new();
+        // The source URLs this run's artifacts carried: what a false display
+        // claim is judged against (IMG-2).
+        let mut displayed_sources = HashSet::<String>::new();
         // One shared budget for both corrections (withheld: obligation
         // unmet; withheld: claimed an effect that did not happen). Feedback
         // is an appended user-plane `[host]` turn, like the budget notice —
@@ -410,18 +417,15 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     }
                 };
                 let mut classifier = self.template.classifier();
-                let mut gate = self.codec.open_marker().map(AnswerGate::new);
+                let mut gate = AnswerGate::new(self.codec.open_marker());
                 let mut on_token = |frag: &str| {
                     classifier.push(frag, |channel, text| match channel {
                         Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
-                        Channel::Answer => match gate.as_mut() {
-                            Some(gate) => {
-                                if let Some(safe) = gate.push(text) {
-                                    deliver(Channel::Answer, safe);
-                                }
+                        Channel::Answer => {
+                            if let Some(safe) = gate.push(text) {
+                                deliver(Channel::Answer, safe);
                             }
-                            None => deliver(Channel::Answer, text.to_string()),
-                        },
+                        }
                         Channel::ToolCall => {}
                     });
                 };
@@ -434,20 +438,15 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 // partial-opener lookalike that turned out to be prose).
                 classifier.finish(|channel, text| match channel {
                     Channel::Reasoning => deliver(Channel::Reasoning, text.to_string()),
-                    Channel::Answer => match gate.as_mut() {
-                        Some(gate) => {
-                            if let Some(safe) = gate.push(text) {
-                                deliver(Channel::Answer, safe);
-                            }
+                    Channel::Answer => {
+                        if let Some(safe) = gate.push(text) {
+                            deliver(Channel::Answer, safe);
                         }
-                        None => deliver(Channel::Answer, text.to_string()),
-                    },
+                    }
                     Channel::ToolCall => {}
                 });
-                if let Some(gate) = gate {
-                    if let Some(rest) = gate.finish() {
-                        deliver(Channel::Answer, rest);
-                    }
+                if let Some(rest) = gate.finish() {
+                    deliver(Channel::Answer, rest);
                 }
                 completion
             };
@@ -530,10 +529,14 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         .filter(|name| !failed_tools.contains(*name))
                         .map(String::as_str)
                         .collect();
-                    // The obligation's dual (IMG-2): an answer that *claims*
-                    // a tool's just-now effect no artifact of that tool
-                    // backs this turn.
-                    let impersonated = self.tools.impersonated_effects(reply, &evidenced_tools);
+                    // The obligation's dual (IMG-2): an answer that presents
+                    // a tool's effect on things no artifact of that tool
+                    // backs this run — judged on host state, not wording.
+                    let impersonated = self.tools.impersonated_effects(
+                        reply,
+                        &evidenced_tools,
+                        &displayed_sources,
+                    );
                     let correction = if !unmet.is_empty() {
                         let names = unmet.join(", ");
                         Some((
@@ -556,16 +559,16 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         let names = impersonated.join(", ");
                         Some((
                             format!(
-                                "final answer withheld: it says a {names} effect \
-                                 just happened, but no {names} call produced one \
-                                 this turn"
+                                "final answer withheld: it presents images no \
+                                 {names} call displayed this turn"
                             ),
                             format!(
-                                "[host] Your answer was withheld: it claims a \
-                                 {names} effect that did not happen this turn. \
+                                "[host] Your answer was withheld: it presents \
+                                 images that {names} did not display this turn. \
                                  Call {names} now with what the user asked for; \
                                  if that is impossible, say plainly that nothing \
-                                 was displayed and why. Do not ask permission."
+                                 was displayed and why, and do not name images \
+                                 as shown. Do not ask permission."
                             ),
                         ))
                     } else {
@@ -651,6 +654,9 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                                 // or an artifact before a later failure,
                                 // counts; another tool's artifact does not.
                                 evidenced_tools.insert(tool_name.clone());
+                                if let Some(source) = &artifact.source {
+                                    displayed_sources.insert(source.clone());
+                                }
                                 displayed.push(
                                     artifact
                                         .list_index
@@ -843,44 +849,107 @@ struct StepFold<A> {
 /// arrives as [`AgentEvent::ToolCall`] instead); a lookalike that diverges is
 /// released as ordinary prose.
 struct AnswerGate {
-    opener: String,
+    /// The codec's tool-call opener, if it has one: from its first byte the
+    /// rest of the step is a call, never answer text.
+    opener: Option<String>,
     held: String,
     suppressed: bool,
+    /// Inside a line that began with a host-owned opener: dropped up to and
+    /// including its newline, then normal service resumes.
+    dropping_line: bool,
+    /// Whether the next held byte is the first of a line.
+    at_line_start: bool,
 }
 
 impl AnswerGate {
-    fn new(opener: &str) -> AnswerGate {
+    fn new(opener: Option<&str>) -> AnswerGate {
         AnswerGate {
-            opener: opener.to_string(),
+            opener: opener.map(str::to_string),
             held: String::new(),
             suppressed: false,
+            dropping_line: false,
+            at_line_start: true,
         }
     }
 
+    /// Every marker a held tail may be the start of: the codec's opener
+    /// and the host-owned line openers.
+    fn markers(&self) -> impl Iterator<Item = &str> {
+        self.opener
+            .as_deref()
+            .into_iter()
+            .chain(HOST_LINE_OPENERS.iter().copied())
+    }
+
+    /// The index in `held` where a host-owned line begins, if one does: a
+    /// host opener counts only at the start of a line.
+    fn host_line_at(&self) -> Option<usize> {
+        HOST_LINE_OPENERS
+            .iter()
+            .filter_map(|open| {
+                self.held
+                    .match_indices(open)
+                    .map(|(i, _)| i)
+                    .find(|&i| (i == 0 && self.at_line_start) || self.held[..i].ends_with('\n'))
+            })
+            .min()
+    }
+
     /// Feed `text`; returns answer-safe output to emit now (never empty).
+    /// The tool opener suppresses the rest of the step; a host-owned line
+    /// opener at the start of a line suppresses that line only — the model
+    /// imitates host lines, and the user must not see the imitation.
     fn push(&mut self, text: &str) -> Option<String> {
         if self.suppressed {
             return None;
         }
         self.held.push_str(text);
-        if let Some(at) = self.held.find(&self.opener) {
-            let safe = self.held[..at].to_string();
-            self.suppressed = true;
-            self.held.clear();
-            return (!safe.is_empty()).then_some(safe);
+        let mut out = String::new();
+        loop {
+            if self.dropping_line {
+                match self.held.find('\n') {
+                    Some(nl) => {
+                        self.held.drain(..=nl);
+                        self.dropping_line = false;
+                        self.at_line_start = true;
+                    }
+                    None => {
+                        self.held.clear();
+                        break;
+                    }
+                }
+            }
+            if let Some(at) = self.opener.as_deref().and_then(|o| self.held.find(o)) {
+                out.push_str(&self.held[..at]);
+                self.suppressed = true;
+                self.held.clear();
+                break;
+            }
+            if let Some(at) = self.host_line_at() {
+                out.push_str(&self.held[..at]);
+                self.held.drain(..at);
+                self.dropping_line = true;
+                continue;
+            }
+            let hold = self
+                .markers()
+                .map(|m| longest_opener_prefix_suffix(&self.held, m))
+                .max()
+                .unwrap_or(0);
+            let emit = self.held.len() - hold;
+            if emit > 0 {
+                let safe: String = self.held.drain(..emit).collect();
+                self.at_line_start = safe.ends_with('\n');
+                out.push_str(&safe);
+            }
+            break;
         }
-        let hold = longest_opener_prefix_suffix(&self.held, &self.opener);
-        let emit = self.held.len() - hold;
-        if emit == 0 {
-            return None;
-        }
-        let safe: String = self.held.drain(..emit).collect();
-        Some(safe)
+        (!out.is_empty()).then_some(out)
     }
 
     /// The stream ended without a complete opener: release what was held.
     fn finish(self) -> Option<String> {
-        (!self.suppressed && !self.held.is_empty()).then_some(self.held)
+        (!self.suppressed && !self.dropping_line && !self.held.is_empty()).then_some(self.held)
     }
 }
 
@@ -1021,8 +1090,15 @@ mod tests {
             user == "render image"
         }
 
-        fn claims_effect(&self, answer: &str) -> bool {
-            answer.contains("just displayed")
+        /// The stub's "listing" is one image, `stub://required/pic`, and
+        /// naming it while it was not displayed this run is a false claim
+        /// — the same shape as ReadImage's structural check.
+        fn names_undisplayed(
+            &self,
+            answer: &str,
+            displayed: &std::collections::HashSet<String>,
+        ) -> bool {
+            answer.contains("stub://required/pic") && !displayed.contains("stub://required/pic")
         }
 
         async fn call(&self, _args: serde_json::Value, ctx: ToolCtx) -> Result<String> {
@@ -1031,7 +1107,7 @@ mod tests {
                     ctx.emit_artifact(ToolArtifact::image(
                         "rendered.png",
                         "rendered",
-                        "stub://required",
+                        "stub://required/pic",
                         None,
                     ));
                     Ok("rendered".to_string())
@@ -1279,6 +1355,43 @@ mod tests {
     }
 
     #[test]
+    fn find_more_with_a_listing_is_corrected_until_the_pictures_are_shown() {
+        // upholds: IMG-2 — tape 20260920T163342Z, turns 3-4: "find more"
+        // answered "They're saved and displayed" over listed URLs with no
+        // call, twice, uncorrected. Now the obligation arms on the
+        // request's object (no verb list) and the claim check reads host
+        // state: the answer is withheld, the [host] correction lands, the
+        // call happens, the artifact discharges the obligation, and the
+        // honest answer commits.
+        let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
+        let call = call("required_action", "unused");
+        let mut model = Scripted::new(&[
+            "They're saved and displayed: stub://required/pic",
+            &call,
+            "Here it is: stub://required/pic",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(retries(&events), 1, "one correction, then the call");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolArtifact(_)))
+                .count(),
+            1
+        );
+        assert_eq!(run.answer, "Here it is: stub://required/pic");
+        drop(agent);
+        assert!(model.prompts[1].contains("[host] Your answer was withheld"));
+    }
+
+    #[test]
     fn corrections_share_one_budget_and_never_rewrite_the_system_prefix() {
         // upholds: IMG-2 / AGENT-4 — an unmet obligation and a claimed
         // effect draw on ONE budget of CORRECTION_BUDGET per turn; each
@@ -1286,9 +1399,9 @@ mod tests {
         // the previous one and the system prefix is never rewritten.
         let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
         let mut model = Scripted::new(&[
-            "Here you go.",             // unmet obligation
-            "I just displayed it.",     // claimed effect
-            "I just displayed it, ok?", // budget spent: commits
+            "Here you go.",                          // unmet obligation
+            "Here it is: stub://required/pic",       // names an undisplayed image
+            "Here it is again: stub://required/pic", // budget spent: commits
         ]);
         let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
         let (events, run) = agent
@@ -1299,7 +1412,7 @@ mod tests {
             .unwrap();
         assert_eq!(run.stop, AgentStop::Final);
         assert_eq!(retries(&events), CORRECTION_BUDGET);
-        assert_eq!(run.answer, "I just displayed it, ok?");
+        assert_eq!(run.answer, "Here it is again: stub://required/pic");
         drop(agent);
         assert_eq!(model.prompts.len(), 3);
         let opener = "<|assistant|>\n";
@@ -1338,7 +1451,7 @@ mod tests {
         // claim degrades to committing (tape-visible) instead of wedging.
         let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
         let mut model = Scripted::new(&[
-            "I just displayed image 1 from that list.",
+            "Displayed for you: stub://required/pic",
             "The list is above; say the word and I will display one.",
         ]);
         let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 6);
@@ -1364,9 +1477,9 @@ mod tests {
         // The cap: three straight claims commit the third, still Final.
         let tools = Tools::new().with(RequiredAction(StubEffect::Emit));
         let mut model = Scripted::new(&[
-            "I just displayed it.",
-            "I just displayed it again, honest.",
-            "I just displayed it, final offer.",
+            "Saved and displayed: stub://required/pic",
+            "They are shown: stub://required/pic",
+            "Shown, final: stub://required/pic",
         ]);
         let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 6);
         let (_, run) = agent
@@ -1377,7 +1490,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run.stop, AgentStop::Final);
-        assert_eq!(run.answer, "I just displayed it, final offer.");
+        assert_eq!(run.answer, "Shown, final: stub://required/pic");
     }
 
     #[test]
@@ -2067,7 +2180,7 @@ mod tests {
         // upholds: AGENT-4 — the gate's unit algebra: complete openers
         // suppress from the marker on; partial-opener tails are held, then
         // released when they diverge or the stream ends.
-        let mut gate = AnswerGate::new("<tool_call>");
+        let mut gate = AnswerGate::new(Some("<tool_call>"));
         assert_eq!(gate.push("Hello "), Some("Hello ".to_string()));
         assert_eq!(gate.push("<tool"), None); // could still become the opener
         assert_eq!(gate.push("boxes> ok"), Some("<toolboxes> ok".to_string()));
@@ -2075,12 +2188,62 @@ mod tests {
         assert_eq!(gate.push("more"), None);
         assert_eq!(gate.finish(), None);
 
-        let mut gate = AnswerGate::new("<tool_call>");
+        let mut gate = AnswerGate::new(Some("<tool_call>"));
         assert_eq!(
             gate.push("ends on a cliff <tool_ca"),
             Some("ends on a cliff ".to_string())
         );
         assert_eq!(gate.finish(), Some("<tool_ca".to_string()));
+    }
+
+    #[test]
+    fn answer_gate_drops_imitated_host_lines_live_and_only_those() {
+        // upholds: IMG-2 / AGENT-3 — a line the model writes in a
+        // host-owned shape never reaches the user, token by token or
+        // whole; the surrounding prose does, and a host opener mid-line is
+        // ordinary text. Works with or without a codec opener. Taped
+        // 2026-09-20: a forged "[displayed via read_image: 5, 6, 7, 8]".
+        let mut gate = AnswerGate::new(None);
+        let mut seen = String::new();
+        for frag in [
+            "Here are four more.\n",
+            "[displayed via ",
+            "read_image: 5, 6, 7, 8]\n",
+            "Want more?",
+        ] {
+            if let Some(safe) = gate.push(frag) {
+                seen.push_str(&safe);
+            }
+        }
+        if let Some(rest) = gate.finish() {
+            seen.push_str(&rest);
+        }
+        assert_eq!(seen, "Here are four more.\nWant more?");
+
+        // A forged list-state line at the very start, and one without a
+        // trailing newline at the very end, both vanish.
+        let mut gate = AnswerGate::new(Some("<tool_call>"));
+        let mut seen = String::new();
+        for frag in ["[list state for x — shown 1]\nok\n[displayed via y: 2]"] {
+            if let Some(safe) = gate.push(frag) {
+                seen.push_str(&safe);
+            }
+        }
+        if let Some(rest) = gate.finish() {
+            seen.push_str(&rest);
+        }
+        assert_eq!(seen, "ok\n");
+
+        // Mid-line, the opener text is prose.
+        let mut gate = AnswerGate::new(None);
+        let mut seen = String::new();
+        if let Some(safe) = gate.push("see [displayed via foo] above\n") {
+            seen.push_str(&safe);
+        }
+        if let Some(rest) = gate.finish() {
+            seen.push_str(&rest);
+        }
+        assert_eq!(seen, "see [displayed via foo] above\n");
     }
 
     #[test]

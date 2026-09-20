@@ -398,14 +398,19 @@ pub trait Tool: Send + Sync {
     fn requires_call_for(&self, _user: &str) -> bool {
         false
     }
-    /// Whether `answer` claims this tool's user-visible effect happened
-    /// just now. Paired at commit time with the run's success set: a claim
-    /// with no successful call this turn is an impersonation the agent
-    /// bounces back instead of committing (IMG-2 — narration cannot
-    /// impersonate the effect; taped live: "I just displayed image 1"
-    /// with no read_image call anywhere in the turn). Default: no claim
-    /// vocabulary. Opt in only with narrow, deterministic phrases.
-    fn claims_effect(&self, _answer: &str) -> bool {
+    /// Whether `answer` presents this tool's effect on things it did not
+    /// produce this run. `displayed` is the set of source URLs this run's
+    /// artifacts carried. Judged against host state — what is listed, what
+    /// was shown — never against the answer's wording: a phrase list was
+    /// paraphrased past in three tapes on 2026-09-20 ("Displaying a few
+    /// fresh ones now", "They're saved and displayed", a page summary with
+    /// no read). A hit with no artifact of this tool this run is a false
+    /// claim the agent corrects instead of committing (IMG-2).
+    fn names_undisplayed(
+        &self,
+        _answer: &str,
+        _displayed: &std::collections::HashSet<String>,
+    ) -> bool {
         false
     }
     /// Run the tool. Returning `Err` is fine — [`Tools::dispatch_async`] turns it
@@ -452,19 +457,23 @@ impl Tools {
             .collect()
     }
 
-    /// Available tools whose effect `answer` claims but which had no
-    /// successful call this turn — impersonations the agent must not
-    /// commit (IMG-2).
+    /// Available tools with no artifact this run whose effect `answer`
+    /// nevertheless presents — false claims the agent must not commit
+    /// (IMG-2). `evidenced` is the run's artifact-backed tool set,
+    /// `displayed` the source URLs those artifacts carried.
     pub fn impersonated_effects(
         &self,
         answer: &str,
-        successful: &std::collections::HashSet<String>,
+        evidenced: &std::collections::HashSet<String>,
+        displayed: &std::collections::HashSet<String>,
     ) -> Vec<String> {
         self.tools
             .iter()
             .filter(|tool| tool.available())
             .map(|tool| (tool, tool.spec().name))
-            .filter(|(tool, name)| !successful.contains(name) && tool.claims_effect(answer))
+            .filter(|(tool, name)| {
+                !evidenced.contains(name) && tool.names_undisplayed(answer, displayed)
+            })
             .map(|(_, name)| name)
             .collect()
     }
@@ -3018,6 +3027,18 @@ impl ImageListing {
             .ok_or(inner.entries.last().map_or(0, |e| e.n))
     }
 
+    /// Every `(url, label)` listed this session — what a false display
+    /// claim is judged against.
+    fn entries(&self) -> Vec<(String, String)> {
+        self.0
+            .lock()
+            .expect("image listing poisoned")
+            .entries
+            .iter()
+            .map(|e| (e.url.clone(), e.label.clone()))
+            .collect()
+    }
+
     fn describe(&self, url: &str) -> Option<(usize, String)> {
         self.0
             .lock()
@@ -4044,11 +4065,16 @@ fn image_ext(content_type: Option<&str>, body: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// The deliberately small language recognized as an explicit image-display
-/// request. An image noun must occur somewhere, and at least one action word
+/// Whether the user's text is about images — an image noun, or, once a
+/// listing exists (the only time this is consulted), an anaphor for the
+/// listed ones — and not negated. No verb list: "find more" after five
+/// pictures is a request for more pictures, and requiring "show/display"
+/// let two taped turns (2026-09-20) answer "They're saved and displayed"
+/// with no call. The predicate is paired with satisfiability (an unshown
+/// member must exist), so it never arms before any picture is listed.
 /// must not be immediately negated. This is a syntactic trigger, not an
 /// attempt to understand arbitrary prose.
-fn requests_image_display(user: &str) -> bool {
+fn requests_images(user: &str) -> bool {
     let normalized = user
         .to_lowercase()
         .replace("don't", "do not")
@@ -4085,14 +4111,10 @@ fn requests_image_display(user: &str) -> bool {
                 | "few"
         )
     });
-    has_object
-        && words.iter().enumerate().any(|(i, word)| {
-            matches!(*word, "fetch" | "show" | "display" | "render")
-                && !matches!(
-                    i.checked_sub(1).and_then(|j| words.get(j)),
-                    Some(&"not") | Some(&"never")
-                )
-        })
+    let negated = words
+        .iter()
+        .any(|word| matches!(*word, "not" | "never" | "without" | "no"));
+    has_object && !negated
 }
 
 impl ReadImage {
@@ -4182,7 +4204,9 @@ impl Tool for ReadImage {
         // already shown, lifts it, so the truthful "nothing more here"
         // commits instead of wedging against the step budget (taped: a
         // frameset landing page, six withheld answers; a JS gallery, five).
-        requests_image_display(user)
+        // No listing yet — turn 0's "find images of X" — never arms it, so
+        // search-and-propose stays free.
+        requests_images(user)
             && !self
                 .listing
                 .display_partition(&self.fetched.shown_urls())
@@ -4190,49 +4214,30 @@ impl Tool for ReadImage {
                 .is_empty()
     }
 
-    fn claims_effect(&self, answer: &str) -> bool {
-        // Narrow first-person just-now display language only: phrases a
-        // truthful cross-turn reference ("earlier I showed…") rarely uses.
-        // Deterministic on purpose; the bounce is capped, never a wedge.
-        let answer = answer.to_lowercase();
-        [
-            "just displayed",
-            "just showed",
-            "just rendered",
-            "now displayed",
-            "now displaying",
-            "i've displayed",
-            "i have displayed",
-            "i've rendered",
-            "i have rendered",
-            "displaying it now",
-            "displayed below",
-            "shown below",
-            "rendered below",
-            // Link substitution presented as display (taped live: "Here
-            // are the first three now: Image 1: https://…jpg" — nothing
-            // rendered): the "serving them now" framings, and the
-            // numbered-URL shape itself.
-            "here are the first",
-            "here is the first",
-            "here they are",
-            "image 1: http",
-            "image 2: http",
-            // "Displaying a few fresh ones now" (taped 2026-09-20): the
-            // present-participle "serving them now" framings.
-            "displaying a few",
-            "displaying more",
-            "displaying them",
-            "displaying these",
-            "fresh ones now",
-            // Markdown image syntax: the spec tells the model it never
-            // renders, so writing one is presenting a display that did not
-            // happen (taped 2026-09-20: seven `![…](https://example.com/…)`
-            // links around zero new displays).
-            "![",
-        ]
-        .iter()
-        .any(|phrase| answer.contains(phrase))
+    fn names_undisplayed(
+        &self,
+        answer: &str,
+        displayed: &std::collections::HashSet<String>,
+    ) -> bool {
+        // Structural, from the listing the host published: the answer
+        // carries a listed image's URL, or a listed label of three or more
+        // words, for an image this run did not display. Markdown image
+        // syntax is a display claim by construction — the spec says it
+        // never renders — whatever URL it names.
+        if answer.contains("![") {
+            return true;
+        }
+        let lower = answer.to_lowercase();
+        self.listing.entries().into_iter().any(|(url, label)| {
+            if displayed.contains(&url) {
+                return false;
+            }
+            if answer.contains(&url) {
+                return true;
+            }
+            let label = label.trim().to_lowercase();
+            label.split_whitespace().count() >= 3 && lower.contains(&label)
+        })
     }
 
     async fn call(&self, args: Value, ctx: ToolCtx) -> Result<String> {
@@ -7350,28 +7355,77 @@ as the first window of the page without tripping any extraction guard.</p>
         for user in [
             "read the page and render mandelbrot images",
             "fetch more images from the page and render them",
-            "find and render even more images; do not render the same image twice",
             "show me a picture",
             // Anaphora for listed images (the listing exists whenever this
             // predicate is consulted): taped 2026-09-20, "display more"
-            // after five pictures went uncorrected.
+            // after five pictures went uncorrected, then "find more" —
+            // no verb from any list — went uncorrected twice.
             "very good. search for more. display more",
             "show me another",
             "display the rest",
             "render a few fresh ones",
+            "find more",
+            "can you get the rest?",
+            "yes, all of them",
         ] {
-            assert!(requests_image_display(user), "{user}");
+            assert!(requests_images(user), "{user}");
         }
         for user in [
-            "explain image rendering",
             "do not render images",
             "never show pictures",
             "find images but do not render them",
             "show me the page",
             "display the source as a table",
+            "read the article without the pictures",
         ] {
-            assert!(!requests_image_display(user), "{user}");
+            assert!(!requests_images(user), "{user}");
         }
+    }
+
+    #[test]
+    fn a_false_display_claim_is_a_listed_image_not_displayed_this_run() {
+        // upholds: IMG-2 — the claim check reads host state, not prose.
+        // Naming a listed image's URL, or its three-plus-word label, that
+        // this run did not display is a false claim in any wording;
+        // naming one that was displayed is not; markdown image syntax is
+        // always a claim. Taped 2026-09-20: "They're saved and displayed"
+        // over four listed URLs, zero calls.
+        let listing = ImageListing::default();
+        let dir = std::env::temp_dir().join("yatima-false-claim-test");
+        let tool = ReadImage::new(WebOrigins::one("https://a.example").unwrap(), &dir)
+            .unwrap()
+            .with_listing(listing.clone());
+        listing.publish(
+            "https://a.example/gallery",
+            &[
+                (
+                    "https://cdn.example/1.webp".to_string(),
+                    "WebP Image".to_string(),
+                ),
+                (
+                    "https://cdn.example/2.webp".to_string(),
+                    "Comet Lemmon meets NGC 3184".to_string(),
+                ),
+            ],
+        );
+        let none: std::collections::HashSet<String> = Default::default();
+        assert!(tool.names_undisplayed(
+            "They're saved and displayed: https://cdn.example/1.webp",
+            &none
+        ));
+        assert!(tool.names_undisplayed("Here you go — comet lemmon meets ngc 3184.", &none));
+        assert!(
+            !tool.names_undisplayed("Here you go — WebP Image.", &none),
+            "a two-word label is too generic to be a claim"
+        );
+        assert!(!tool.names_undisplayed("I could not fetch anything.", &none));
+        let shown: std::collections::HashSet<String> =
+            ["https://cdn.example/1.webp".to_string()].into();
+        assert!(
+            !tool.names_undisplayed("Shown: https://cdn.example/1.webp", &shown),
+            "naming what this run displayed is honest"
+        );
+        assert!(tool.names_undisplayed("![x](https://anywhere.example/y.png)", &shown));
     }
 
     #[test]
