@@ -1,8 +1,8 @@
 //! Decode image artifacts to raw RGBA and step animations on a clock.
 //!
 //! One frame for a still; every frame with its hold time for an animated
-//! GIF; `None` for a format this build does not render (the caller decides
-//! what a placeholder looks like). Nothing here is a view type, so the
+//! GIF or WebP; `None` for a format this build does not render (the caller
+//! decides what a placeholder looks like). Nothing here is a view type, so the
 //! stepping is unit-tested natively and the same code paints in the native
 //! GUI and in the browser.
 
@@ -23,39 +23,31 @@ pub struct AnimationFrame {
     pub delay_ms: u32,
 }
 
-/// Animated GIFs keep at most this many frames — a runaway file (the fetch
+/// Animations keep at most this many frames — a runaway file (the fetch
 /// is already byte-capped upstream) degrades to a long-but-finite loop,
 /// never an unbounded texture upload.
 pub const MAX_GIF_FRAMES: usize = 128;
 
-/// Browsers clamp near-zero GIF delays to about this; a raw 0 would spin a
-/// repaint loop for no visible motion.
+/// Browsers clamp near-zero frame delays to about this; a raw 0 would spin
+/// a repaint loop for no visible motion.
 const MIN_GIF_DELAY_MS: u32 = 20;
 
-/// Decode PNG/JPEG (one frame) or GIF (every frame, with delays) to RGBA.
-/// `None` is not an error: an unknown format (SVG, WebP, …) is the
-/// caller's placeholder.
+/// Decode PNG/JPEG/still WebP (one frame) or an animated GIF/WebP (every
+/// frame, with delays) to RGBA. `None` is not an error: an unknown format
+/// (SVG, …) is the caller's placeholder.
 pub fn decode_rgba(bytes: &[u8]) -> Option<DecodedImage> {
+    use image::AnimationDecoder;
+    let cursor = std::io::Cursor::new(bytes);
     if bytes.starts_with(b"GIF8") {
-        use image::AnimationDecoder;
-        let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
-        let mut frames = Vec::new();
-        let mut size = [0usize; 2];
-        for frame in decoder.into_frames().take(MAX_GIF_FRAMES) {
-            let frame = frame.ok()?;
-            let (numer, denom) = frame.delay().numer_denom_ms();
-            let delay_ms = (numer / denom.max(1)).max(MIN_GIF_DELAY_MS);
-            let buf = frame.into_buffer();
-            size = [buf.width() as usize, buf.height() as usize];
-            frames.push(AnimationFrame {
-                rgba: buf.into_raw(),
-                delay_ms,
-            });
+        let decoder = image::codecs::gif::GifDecoder::new(cursor).ok()?;
+        return animation(decoder.into_frames());
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        let decoder = image::codecs::webp::WebPDecoder::new(cursor).ok()?;
+        if decoder.has_animation() {
+            return animation(decoder.into_frames());
         }
-        if frames.is_empty() {
-            return None;
-        }
-        return Some(DecodedImage { size, frames });
+        // A still WebP falls through to the one-frame path below.
     }
     let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -66,6 +58,28 @@ pub fn decode_rgba(bytes: &[u8]) -> Option<DecodedImage> {
             delay_ms: 0,
         }],
     })
+}
+
+/// Every frame of an animation, capped and delay-clamped; `None` when the
+/// stream yields no decodable frame.
+fn animation(frames: image::Frames<'_>) -> Option<DecodedImage> {
+    let mut out = Vec::new();
+    let mut size = [0usize; 2];
+    for frame in frames.take(MAX_GIF_FRAMES) {
+        let frame = frame.ok()?;
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay_ms = (numer / denom.max(1)).max(MIN_GIF_DELAY_MS);
+        let buf = frame.into_buffer();
+        size = [buf.width() as usize, buf.height() as usize];
+        out.push(AnimationFrame {
+            rgba: buf.into_raw(),
+            delay_ms,
+        });
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(DecodedImage { size, frames: out })
 }
 
 /// Which frame an animation shows at time `t` (seconds, any monotonic
@@ -121,6 +135,94 @@ mod tests {
         // A zero delay clamps up: no repaint spin.
         let fast = decode_rgba(&gif(2, 0)).expect("gif decodes");
         assert!(fast.frames.iter().all(|f| f.delay_ms == MIN_GIF_DELAY_MS));
+    }
+
+    /// A lossless still WebP from the crate's own encoder.
+    fn webp_still(w: u32, h: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
+            .encode(
+                RgbaImage::from_pixel(w, h, Rgba(color)).as_raw(),
+                w,
+                h,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        bytes
+    }
+
+    /// An animated WebP assembled by hand: the crate encodes stills only,
+    /// so this wraps each still's `VP8L` chunk in an `ANMF` frame under a
+    /// `VP8X`+`ANIM` header (the container is a plain RIFF chunk list).
+    fn webp_animated(colors: &[[u8; 4]], delay_ms: u32) -> Vec<u8> {
+        fn chunk(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut c = fourcc.to_vec();
+            c.extend((payload.len() as u32).to_le_bytes());
+            c.extend(payload);
+            if payload.len() % 2 == 1 {
+                c.push(0);
+            }
+            c
+        }
+        fn u24(v: u32) -> [u8; 3] {
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+        }
+        let mut body = Vec::new();
+        // VP8X: animation + alpha flags, canvas 1×1.
+        let mut vp8x = vec![0x02 | 0x10, 0, 0, 0];
+        vp8x.extend(u24(0));
+        vp8x.extend(u24(0));
+        body.extend(chunk(b"VP8X", &vp8x));
+        // ANIM: background colour, loop forever.
+        body.extend(chunk(b"ANIM", &[0, 0, 0, 0, 0, 0]));
+        for color in colors {
+            let still = webp_still(1, 1, *color);
+            // The still is RIFF(4) size(4) WEBP(4) then its VP8L chunk.
+            let vp8l = &still[12..];
+            let mut anmf = Vec::new();
+            anmf.extend(u24(0)); // x/2
+            anmf.extend(u24(0)); // y/2
+            anmf.extend(u24(0)); // width-1
+            anmf.extend(u24(0)); // height-1
+            anmf.extend(u24(delay_ms));
+            anmf.push(0); // blend + dispose flags
+            anmf.extend(vp8l);
+            body.extend(chunk(b"ANMF", &anmf));
+        }
+        let mut file = b"RIFF".to_vec();
+        file.extend(((body.len() + 4) as u32).to_le_bytes());
+        file.extend(b"WEBP");
+        file.extend(body);
+        file
+    }
+
+    #[test]
+    fn webp_still_is_one_frame_and_animated_webp_is_every_frame() {
+        let still = decode_rgba(&webp_still(2, 1, [7, 8, 9, 255])).expect("webp decodes");
+        assert_eq!(still.size, [2, 1]);
+        assert_eq!(still.frames.len(), 1);
+        assert_eq!(still.frames[0].delay_ms, 0);
+        assert_eq!(&still.frames[0].rgba[..4], &[7, 8, 9, 255]);
+
+        let anim = decode_rgba(&webp_animated(
+            &[[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]],
+            90,
+        ))
+        .expect("animated webp decodes");
+        assert_eq!(anim.frames.len(), 3);
+        assert!(anim.frames.iter().all(|f| f.delay_ms == 90));
+        // The animation compositor may round a channel by one; the frame's
+        // identity is its dominant channel.
+        let px = &anim.frames[2].rgba[..4];
+        assert!(
+            px[2] >= 254 && px[0] <= 1 && px[1] <= 1 && px[3] == 255,
+            "{px:?}"
+        );
+        assert_eq!(
+            frame_at(&anim.frames, 0.1).0,
+            1,
+            "the stepper walks webp frames too"
+        );
     }
 
     #[test]

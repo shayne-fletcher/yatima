@@ -3613,6 +3613,7 @@ const IMAGE_TYPES: &[(&str, &str)] = &[
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
     ("image/gif", "gif"),
+    ("image/webp", "webp"),
 ];
 
 /// A quoted attribute's value inside an HTML tag body (`src="…"`), with a
@@ -4034,6 +4035,8 @@ fn image_ext(content_type: Option<&str>, body: &[u8]) -> Option<&'static str> {
         Some("jpg")
     } else if body.starts_with(b"GIF87a") || body.starts_with(b"GIF89a") {
         Some("gif")
+    } else if body.len() >= 12 && &body[..4] == b"RIFF" && &body[8..12] == b"WEBP" {
+        Some("webp")
     } else {
         let head = &body[..body.len().min(512)];
         let head = String::from_utf8_lossy(head);
@@ -7619,6 +7622,24 @@ as the first window of the page without tripping any extraction guard.</p>
             let path = content.split_whitespace().nth(1).unwrap();
             assert!(path.ends_with(".gif"), "honest extension: {path}");
         }
+    }
+
+    #[test]
+    fn image_ext_admits_webp_by_type_and_by_magic() {
+        // upholds: IMG-1 — WebP is an image we save (CDNs serve it more
+        // every year); a lying or silent server still gets the sniff.
+        let riff = b"RIFF\x1a\x00\x00\x00WEBPVP8L\x0e\x00\x00\x00...";
+        assert_eq!(image_ext(Some("image/webp"), b""), Some("webp"));
+        assert_eq!(image_ext(None, riff), Some("webp"));
+        assert_eq!(
+            image_ext(Some("application/octet-stream"), riff),
+            Some("webp")
+        );
+        assert_eq!(
+            image_ext(None, b"RIFF\x00\x00\x00\x00WAVE"),
+            None,
+            "RIFF alone is not WebP"
+        );
     }
 
     #[tokio::test]

@@ -342,7 +342,7 @@
 //!   size/dpi, stable metadata, spec-hash filenames): the same spec yields
 //!   the same artifact — a plot can be journaled like any other evidence.
 //! - **IMG-1** the [`ReadImage`] tool fetches only from granted origins
-//!   (CAP-2/CAP-3 reused), gates on image honesty (SVG/PNG/JPEG by
+//!   (CAP-2/CAP-3 reused), gates on image honesty (SVG/PNG/JPEG/GIF/WebP by
 //!   content-type, magic-byte sniff when the server is silent — anything
 //!   else is a teaching rejection), caps input size while streaming, and
 //!   confines output to its [`WriteDir`] at a content-hash name: the model
