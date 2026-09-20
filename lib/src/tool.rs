@@ -398,6 +398,18 @@ pub trait Tool: Send + Sync {
     fn requires_call_for(&self, _user: &str) -> bool {
         false
     }
+    /// Whether `answer` is an honest way to end a turn that required this
+    /// tool without calling it: the run did the work that makes a proposal
+    /// the right next move. `succeeded` is the set of tools that returned
+    /// success this run. Default: nothing releases. Judged on host state,
+    /// never on wording.
+    fn releases_obligation(
+        &self,
+        _answer: &str,
+        _succeeded: &std::collections::HashSet<String>,
+    ) -> bool {
+        false
+    }
     /// Whether `answer` presents this tool's effect on things it did not
     /// produce this run. `displayed` is the set of source URLs this run's
     /// artifacts carried. Judged against host state — what is listed, what
@@ -454,6 +466,25 @@ impl Tools {
             .iter()
             .filter(|tool| tool.available() && tool.requires_call_for(user))
             .map(|tool| tool.spec().name)
+            .collect()
+    }
+
+    /// The required tools among `names` whose obligation `answer` honestly
+    /// ends without a call, given what succeeded this run (IMG-2's third
+    /// ending: a proposal for sources the run itself found).
+    pub fn released_by(
+        &self,
+        names: &[&str],
+        answer: &str,
+        succeeded: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        self.tools
+            .iter()
+            .map(|tool| (tool, tool.spec().name))
+            .filter(|(tool, name)| {
+                names.contains(&name.as_str()) && tool.releases_obligation(answer, succeeded)
+            })
+            .map(|(_, name)| name)
             .collect()
     }
 
@@ -609,6 +640,7 @@ pub trait ToolCallCodec {
             Some(Ok(call)) => ToolExtraction::Call {
                 call,
                 assistant_turn: Turn::assistant(interpreted.answer.clone()),
+                dropped: 0,
             },
             Some(Err(error)) => {
                 let message = format!("malformed tool call: {error}");
@@ -633,6 +665,9 @@ pub enum ToolExtraction {
     Call {
         call: ToolCall,
         assistant_turn: Turn,
+        /// Further invocations the same turn carried that were not
+        /// dispatched (one call per turn); the agent tells the model.
+        dropped: usize,
     },
     /// Protocol-level rejection. These turns are fed back to the model; no
     /// tool is dispatched.
@@ -978,14 +1013,9 @@ impl ToolCallCodec for MuseAtemCodec {
                 "ATEM turn mixed answer text with a tool call; expected exactly one or the other"
                     .to_string(),
             ),
-            Ok(messages) if messages.len() != 1 => Some(format!(
-                "ATEM turn contained {} tool messages; exactly one is supported",
-                messages.len()
-            )),
-            Ok(messages) if messages[0].1.len() != 1 => Some(format!(
-                "ATEM tool message contained {} invocations; exactly one is supported",
-                messages[0].1.len()
-            )),
+            Ok(messages) if messages.iter().any(|(_, calls)| calls.is_empty()) => {
+                Some("ATEM tool message contained no invocation".to_string())
+            }
             Ok(messages) if messages[0].0.recipient != messages[0].1[0].name => Some(format!(
                 "ATEM recipient {:?} does not match invocation {:?}",
                 messages[0].0.recipient, messages[0].1[0].name
@@ -1004,11 +1034,18 @@ impl ToolCallCodec for MuseAtemCodec {
             };
         }
 
-        let (_, mut calls) =
-            parsed.expect("the rejection cases established one parsed message")[0].clone();
+        // One call per turn is the protocol; a model that batches several
+        // (taped 2026-09-20: three, then four, each rejected whole at a
+        // 25-second step) gets its FIRST dispatched and is told the rest
+        // were dropped, instead of losing the step. The dropped count rides
+        // the tool result so the model can re-issue them one at a time.
+        let messages = parsed.expect("the rejection cases established parsed messages");
+        let total: usize = messages.iter().map(|(_, calls)| calls.len()).sum();
+        let (_, calls) = messages[0].clone();
         let invocation = calls
-            .pop()
-            .expect("the rejection cases established one call");
+            .into_iter()
+            .next()
+            .expect("the rejection cases established at least one call");
         let call = ToolCall {
             name: invocation.name.clone(),
             args: invocation.arguments.to_json_object(),
@@ -1016,6 +1053,7 @@ impl ToolCallCodec for MuseAtemCodec {
         ToolExtraction::Call {
             call,
             assistant_turn: Turn::assistant_tool_call(invocation.name, invocation.arguments),
+            dropped: total.saturating_sub(1),
         }
     }
 }
@@ -4214,6 +4252,26 @@ impl Tool for ReadImage {
                 .is_empty()
     }
 
+    fn releases_obligation(
+        &self,
+        answer: &str,
+        succeeded: &std::collections::HashSet<String>,
+    ) -> bool {
+        // The third honest ending of a display turn: the run searched, and
+        // the answer proposes at least one origin the user has not granted
+        // — the model cannot display from there yet, so asking is the act.
+        // Without a search this run, proposing pages from memory while
+        // unshown images sit on the current page is declining to act, and
+        // the correction stands (taped 2026-09-20: both cases, one tape).
+        if !succeeded.contains("web_search") {
+            return false;
+        }
+        let granted = self.origins.list();
+        crate::capability::proposed_origins(answer)
+            .iter()
+            .any(|origin| !granted.contains(origin))
+    }
+
     fn names_undisplayed(
         &self,
         answer: &str,
@@ -5437,6 +5495,7 @@ mod tests {
         let ToolExtraction::Call {
             call,
             assistant_turn,
+            dropped: 0,
         } = MuseAtemCodec.extract(&raw, &interpreted)
         else {
             panic!("one matching invocation must be callable")
@@ -5453,11 +5512,17 @@ mod tests {
 
     #[test]
     fn muse_codec_rejects_every_unsupported_call_shape() {
-        // upholds: PROTO-1 — malformed, ambiguous, or parallel attempts yield
-        // model-readable structured feedback and never a dispatchable call.
+        // upholds: PROTO-1 — malformed or ambiguous attempts yield
+        // model-readable structured feedback and never a dispatchable call;
+        // a batch of well-formed calls dispatches its first and reports the
+        // rest dropped.
         let one = atem_invoke("read_file", &[("path", "README.md")]);
         let second = "<atem:invoke name=\"read_file\">\n<atem:parameter name=\"path\">Cargo.toml</atem:parameter>\n</atem:invoke>\n";
-        let two_invokes = one.replacen("</atem:function_calls>", second, 1);
+        let two_invokes = one.replacen(
+            "</atem:function_calls>",
+            &format!("{second}</atem:function_calls>"),
+            1,
+        );
         let duplicate = atem_invoke(
             "read_file",
             &[("path", "README.md"), ("path", "Cargo.toml")],
@@ -5474,9 +5539,24 @@ mod tests {
             atem_turn("read_file", &one).trim_end_matches("<|eot|>")
         );
 
+        // Batched calls dispatch their first and report the rest dropped
+        // (taped 2026-09-20: whole turns lost to "exactly one is
+        // supported"); the malformed shapes below still reject.
+        for (label, raw, expect_dropped) in [
+            ("two invokes", atem_turn("read_file", &two_invokes), 1),
+            ("two messages", two_messages, 1),
+        ] {
+            let interpreted = AtemInterpreter::interpret(&raw);
+            let ToolExtraction::Call { call, dropped, .. } =
+                MuseAtemCodec.extract(&raw, &interpreted)
+            else {
+                panic!("{label}: the first invocation dispatches")
+            };
+            assert_eq!(call.name, "read_file", "{label}");
+            assert_eq!(call.args["path"], "README.md", "{label}: the FIRST one");
+            assert_eq!(dropped, expect_dropped, "{label}");
+        }
         for (label, raw) in [
-            ("two invokes", atem_turn("read_file", &two_invokes)),
-            ("two messages", two_messages),
             ("recipient mismatch", mismatch),
             ("duplicate parameter", atem_turn("read_file", &duplicate)),
             ("trailing payload", atem_turn("read_file", &trailing)),

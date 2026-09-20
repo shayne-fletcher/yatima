@@ -342,6 +342,9 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
         // sets are scoped to this run.
         let mut evidenced_tools = HashSet::<String>::new();
         let mut failed_tools = HashSet::<String>::new();
+        // Tools that returned success this run — the work an honest
+        // proposal must be built on (a search before proposing sources).
+        let mut succeeded_tools = HashSet::<String>::new();
         // The source URLs this run's artifacts carried: what a false display
         // claim is judged against (IMG-2).
         let mut displayed_sources = HashSet::<String>::new();
@@ -521,13 +524,22 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                     // tool's own artifact event, and a failed attempt this
                     // run releases it (taped 2026-09-20: a JS gallery page,
                     // five withheld answers, user cancel).
+                    // A display turn has three honest endings (IMG-2): the
+                    // display itself; an honest inability (failed attempt, or
+                    // nothing unshown); or a proposal for new sources the run
+                    // itself found. Anything else is declining to act.
                     let still_required = self.tools.required_for(user);
-                    let unmet: Vec<&str> = required_tools
+                    let candidates: Vec<&str> = required_tools
                         .iter()
                         .filter(|name| still_required.contains(*name))
                         .filter(|name| !evidenced_tools.contains(*name))
                         .filter(|name| !failed_tools.contains(*name))
                         .map(String::as_str)
+                        .collect();
+                    let released = self.tools.released_by(&candidates, reply, &succeeded_tools);
+                    let unmet: Vec<&str> = candidates
+                        .into_iter()
+                        .filter(|name| !released.iter().any(|r| r == name))
                         .collect();
                     // The obligation's dual (IMG-2): an answer that presents
                     // a tool's effect on things no artifact of that tool
@@ -607,6 +619,7 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                 ToolExtraction::Call {
                     call,
                     assistant_turn,
+                    dropped,
                 } => {
                     if budget_final_round {
                         stop = AgentStop::MaxSteps;
@@ -713,9 +726,24 @@ impl<'a, C: Completer, K: ToolCallCodec, T: PromptTemplate> Agent<'a, C, K, T> {
                         }
                     };
 
-                    let result = outcome.render_for_model(&tool_name);
-                    if !outcome.is_success() {
+                    let mut result = outcome.render_for_model(&tool_name);
+                    if outcome.is_success() {
+                        succeeded_tools.insert(tool_name.clone());
+                    } else {
                         failed_tools.insert(tool_name.clone());
+                    }
+                    if dropped > 0 {
+                        // The protocol is one call per turn; the rest of a
+                        // batch was not dispatched, and the model must not
+                        // believe it was.
+                        result.content.push_str(&format!(
+                            "\n[host: {dropped} further invocation{} in that turn \
+                             {} not dispatched — one call per turn; re-issue \
+                             {} one at a time if still needed]",
+                            if dropped == 1 { "" } else { "s" },
+                            if dropped == 1 { "was" } else { "were" },
+                            if dropped == 1 { "it" } else { "them" },
+                        ));
                     }
                     transcript.push(Turn::tool_result(
                         result.name,
@@ -1150,18 +1178,6 @@ mod tests {
             .count()
     }
 
-    fn muse_call(tool: &str, paths: &[&str]) -> String {
-        let mut body =
-            format!(" to={tool}<|message|><atem:function_calls>\n<atem:invoke name=\"{tool}\">\n");
-        for path in paths {
-            body.push_str(&format!(
-                "<atem:parameter name=\"path\">{path}</atem:parameter>\n"
-            ));
-        }
-        body.push_str("</atem:invoke>\n</atem:function_calls><|eot|>");
-        body
-    }
-
     fn muse_parallel_calls(tool: &str, paths: &[&str]) -> String {
         let mut body = format!(" to={tool}<|message|><atem:function_calls>\n");
         for path in paths {
@@ -1391,6 +1407,122 @@ mod tests {
         assert!(model.prompts[1].contains("[host] Your answer was withheld"));
     }
 
+    /// A stand-in for `web_search`: succeeds, produces nothing else.
+    struct StubSearch;
+
+    #[async_trait::async_trait]
+    impl Tool for StubSearch {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "web_search".to_string(),
+                description: "search".to_string(),
+                params: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, _args: serde_json::Value, _ctx: ToolCtx) -> Result<String> {
+            Ok("1. A page — https://new.example/gallery — pictures".to_string())
+        }
+    }
+
+    /// The required tool with the third honest ending: after a successful
+    /// `web_search` this run, proposing an origin outside the granted set
+    /// (here, anything but `granted.example`) releases the obligation.
+    struct RequiredWithProposal;
+
+    #[async_trait::async_trait]
+    impl Tool for RequiredWithProposal {
+        fn spec(&self) -> ToolSpec {
+            RequiredAction(StubEffect::Emit).spec()
+        }
+
+        fn requires_call_for(&self, user: &str) -> bool {
+            user == "render image"
+        }
+
+        fn releases_obligation(
+            &self,
+            answer: &str,
+            succeeded: &std::collections::HashSet<String>,
+        ) -> bool {
+            succeeded.contains("web_search")
+                && crate::capability::proposed_origins(answer)
+                    .iter()
+                    .any(|origin| origin != "https://granted.example")
+        }
+
+        async fn call(&self, args: serde_json::Value, ctx: ToolCtx) -> Result<String> {
+            RequiredAction(StubEffect::Emit).call(args, ctx).await
+        }
+    }
+
+    #[test]
+    fn a_display_turn_may_end_by_proposing_sources_the_run_found() {
+        // upholds: IMG-2 — the third honest ending. Tape 20260920T170425Z,
+        // turn 4: the model searched, then proposed ungranted galleries the
+        // user had asked for, and was withheld twice for not displaying.
+        // With a search this run, the proposal commits with no correction.
+        let tools = Tools::new().with(RequiredWithProposal).with(StubSearch);
+        let search = call("web_search", "unused");
+        let mut model = Scripted::new(&[
+            &search,
+            "Pick one and grant it: A page — https://new.example/gallery",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(
+            retries(&events),
+            0,
+            "a searched proposal is an honest ending"
+        );
+        assert_eq!(run.steps, 1);
+
+        // Without a search this run, the same proposal is declining to
+        // act (turn 2 of the same tape: ESA pages from memory while ESA
+        // still had unshown images) and is corrected.
+        let tools = Tools::new().with(RequiredWithProposal).with(StubSearch);
+        let render = call("required_action", "unused");
+        let mut model = Scripted::new(&[
+            "Which would you like opened? A page — https://new.example/gallery",
+            &render,
+            "Shown.",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(retries(&events), 1, "proposing from memory is corrected");
+        assert_eq!(run.answer, "Shown.");
+
+        // A proposal of an already-granted origin releases nothing.
+        let tools = Tools::new().with(RequiredWithProposal).with(StubSearch);
+        let mut model = Scripted::new(&[
+            &search,
+            "See https://granted.example/page",
+            &render,
+            "Shown.",
+        ]);
+        let mut agent = Agent::new(&mut model, &tools, JsonToolCall, PlainTemplate, "helper", 8);
+        let (events, run) = agent
+            .run_with("render image", Vec::new(), |mut events, event| {
+                events.push(event);
+                Ok(ControlFlow::Continue(events))
+            })
+            .unwrap();
+        assert_eq!(run.stop, AgentStop::Final);
+        assert_eq!(retries(&events), 1, "a granted origin is not a new source");
+    }
+
     #[test]
     fn corrections_share_one_budget_and_never_rewrite_the_system_prefix() {
         // upholds: IMG-2 / AGENT-4 — an unmet obligation and a claimed
@@ -1524,15 +1656,17 @@ mod tests {
     }
 
     #[test]
-    fn muse_rejection_dispatches_nothing_then_recovers() {
-        // upholds: PROTO-1, AGENT-1 — two invocations are rejected before the
-        // tool boundary. The structured feedback reaches the next prompt; one
-        // subsequent invocation dispatches once and the run completes.
+    fn muse_batched_calls_dispatch_the_first_and_report_the_rest_dropped() {
+        // upholds: PROTO-1, AGENT-1 — a turn carrying two invocations
+        // dispatches the FIRST (one call per turn) and the tool result tells
+        // the model the other was not dispatched, so the step is not lost
+        // (taped 2026-09-20: three- and four-call batches each rejected
+        // whole at a 25-second step) and the model never believes the
+        // dropped call ran.
         let tmp = tmp_with_file("note.txt", "the sky is blue");
         let tools = Tools::new().with(ReadFile::new(Dir::new(tmp.path())));
-        let malformed = muse_parallel_calls("read_file", &["note.txt", "other.txt"]);
-        let valid = muse_call("read_file", &["note.txt"]);
-        let mut model = Scripted::new(&[&malformed, &valid, "The sky is blue."]);
+        let batch = muse_parallel_calls("read_file", &["note.txt", "other.txt"]);
+        let mut model = Scripted::new(&[&batch, "The sky is blue."]);
         let mut agent = Agent::new(
             &mut model,
             &tools,
@@ -1549,7 +1683,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(run.stop, AgentStop::Final);
-        assert_eq!(run.steps, 2, "one rejected attempt plus one tool round");
+        assert_eq!(
+            run.steps, 1,
+            "the batch cost one tool round, not a rejection plus one"
+        );
         assert_eq!(run.answer, "The sky is blue.");
         assert_eq!(
             events
@@ -1557,39 +1694,31 @@ mod tests {
                 .filter(|event| matches!(event, AgentEvent::ToolStarted(_)))
                 .count(),
             1,
-            "the rejected parallel attempt never reached dispatch"
+            "exactly the first invocation reached dispatch"
         );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, AgentEvent::ToolCall(_)))
-                .count(),
-            1,
-            "only the supported call becomes tool activity"
+        assert!(
+            run.transcript.iter().any(|turn| matches!(
+                turn,
+                Turn::ToolResult { content, .. }
+                    if content.contains("the sky is blue")
+                        && content.contains("1 further invocation in that turn was not dispatched")
+            )),
+            "the result carries the note: {:?}",
+            run.transcript
         );
         assert!(run.transcript.iter().any(|turn| matches!(
             turn,
             Turn::AssistantToolCall { name, .. } if name == "read_file"
         )));
-        assert!(run.transcript.iter().any(|turn| matches!(
-            turn,
-            Turn::ToolResult {
-                name,
-                content,
-                is_error: true,
-            } if name == "read_file" && content.contains("exactly one")
-        )));
-        assert!(run.transcript.iter().any(|turn| matches!(
-            turn,
-            Turn::ToolResult {
-                name,
-                content,
-                is_error: false,
-            } if name == "read_file" && content.contains("the sky is blue")
-        )));
+        assert!(
+            !run.transcript
+                .iter()
+                .any(|turn| matches!(turn, Turn::ToolResult { is_error: true, .. })),
+            "no rejection turn: the batch was served, not refused"
+        );
         drop(agent);
-        assert!(model.prompts[1].contains("tool protocol rejected"));
-        assert!(model.prompts[2].contains("the sky is blue"));
+        assert!(model.prompts[1].contains("the sky is blue"));
+        assert!(model.prompts[1].contains("was not dispatched"));
     }
 
     #[test]

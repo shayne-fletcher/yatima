@@ -364,13 +364,17 @@
 //!   `images_only` page projection (PAGE-1) — ends with the current page's
 //!   shown/not-yet-shown numbers from that memo, so AGENT-3's answer-only
 //!   history cannot erase display state. For the narrow syntactic class of
-//!   explicit display requests the agent withholds a final answer until
-//!   `read_image`'s own **artifact event** has occurred this run: typed
-//!   display authority, not a successful return (a memo-served duplicate
-//!   returns `Ok` and displays nothing). The obligation holds only while the
-//!   current page has an unshown member; an empty or exhausted page lifts it,
-//!   and a failed attempt this run releases it without counting as a
-//!   display, so the truthful "nothing more here" commits. The request test
+//!   explicit display requests the agent withholds a final answer unless the
+//!   turn ends one of three honest ways: (1) a display — `read_image`'s own
+//!   **artifact event** this run, typed display authority, not a successful
+//!   return (a memo-served duplicate returns `Ok` and displays nothing);
+//!   (2) an honest inability — a failed `read_image` attempt this run, or no
+//!   unshown member on the current page (an empty or exhausted page lifts the
+//!   obligation), so the truthful "nothing more here" commits; (3) a proposal
+//!   for new sources the run itself found — `web_search` succeeded this run
+//!   and the answer names an origin not yet granted, which the model cannot
+//!   read without asking. Proposing pages from memory while unshown images
+//!   sit on the current page is none of these and is corrected. The request test
 //!   is the object of the sentence (an image noun, or an anaphor for the
 //!   listed ones), never a verb list — "find more" after five pictures is a
 //!   request for more pictures. Its dual — an answer that presents listed
@@ -388,7 +392,8 @@
 //!   `display_requirement_holds_only_while_an_unshown_member_exists`,
 //!   `a_false_display_claim_is_a_listed_image_not_displayed_this_run`,
 //!   `find_more_with_a_listing_is_corrected_until_the_pictures_are_shown`,
-//!   `answer_gate_drops_imitated_host_lines_live_and_only_those`, the
+//!   `answer_gate_drops_imitated_host_lines_live_and_only_those`,
+//!   `a_display_turn_may_end_by_proposing_sources_the_run_found`, the
 //!   required-call, repeat/duplicate, re-show, exhaustion, and artifact-event
 //!   tests.
 //! - **IMG-3** picking a picture is an index copy, never a URL
@@ -410,10 +415,15 @@
 //!   No listing yet and out-of-range numbers teach rather than fail
 //!   opaquely. Cited by the numbered-listing, page-wide-coverage,
 //!   spoken-truncation, and select-by-number tests.
-//! - **PROTO-1** a malformed, ambiguous, mismatched, duplicate, parallel, or
-//!   unknown tool call dispatches no unintended tool. It becomes a typed
-//!   non-success [`ToolOutcome`] and an `is_error` [`ToolResult`] the model can
-//!   recover from, never a truncation or silent mis-execution.
+//! - **PROTO-1** a malformed, ambiguous, mismatched, duplicate, or unknown
+//!   tool call dispatches no unintended tool. It becomes a typed non-success
+//!   [`ToolOutcome`] and an `is_error` [`ToolResult`] the model can recover
+//!   from, never a truncation or silent mis-execution. A batch of well-formed
+//!   calls in one turn dispatches exactly its **first**; the tool result
+//!   states how many further invocations were not dispatched, so the model
+//!   never believes a dropped call ran (a whole-turn rejection cost taped
+//!   25-second steps for eagerness, 2026-09-20). Cited by
+//!   `muse_batched_calls_dispatch_the_first_and_report_the_rest_dropped`.
 //!
 //! Observability:
 //! - **OBS-1** `yatima-lib` emits `tracing` spans/events but never installs a
