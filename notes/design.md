@@ -943,6 +943,12 @@ and deliberately shelved — the note records why so we don't repeat them.
   first slices of the broader capability model.
 - **MCP edge adapter** — consume an MCP server *as* a `Tool`, or expose our tools
   *as* an MCP server (out-of-process; rides the same boundaries at the edge).
+- **Observed model behaviour (lessons that outlive the designs they came from).** Recorded so a later design does not relearn them.
+  - *Lean memory amplifies loops* (2026-08). AGENT-3 persists the final answer and drops the tool evidence, so a weak model re-reads its own confident failures with the refutation deleted and imitates them. A strong model escapes through the user's complaints; a weak one repeats. Seen again 2026-09-20: a model read its own persisted display record and doubted it had displayed anything.
+  - *Slow disguises shaky* (2026-08). At minutes per agent turn on local Metal decode, "working", "wedged", and "lying" look identical from the user's chair. Visibility (telemetry, the flight recorder, `yatima-report`) is half the cure.
+  - *Host-written lines get imitated* (2026-09-20). Any line the host writes into the model's view — a display record, a list-state line — was reproduced by the model, with invented numbers, within a turn. A host-owned line must be one the host also refuses to accept back.
+  - *Wording checks get paraphrased past* (2026-09-20). Three phrase-list gates were each evaded by new wording in the next live session. Rules the model must obey are enforced from host state (artifact events, listings, grants), never by reading the model's prose.
+  - *Anthropic Messages API quirks*, recorded 2026-08 for any future direct Anthropic backend (recheck before relying on them): on `stop_reason: "stop_sequence"` the matched stop string is not echoed, so a contract that includes it must re-append it; `temperature`/`top_p` return 400 on current Claude models, so sampling does not map one-to-one; handle `stop_reason: "refusal"` before reading content; `POST /v1/messages/count_tokens` gives a pre-send count.
 
 ### Models / engine
 - **Engine swappability** — cross-arch dispatch + GGUF/quantized + self-contained
@@ -963,36 +969,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   local tampering by an actor who already owns the machine. Effect: the ~30 s
   launch re-hash of an unchanged 17 GB GGUF drops to milliseconds.
 - **Agent tool-round budget — 16 (2026-09-12; previously 12 from 2026-08-30, 6 before that).** `knobs::AGENT_MAX_STEPS` is raised to 16 on live R4 evidence: the search-to-images errand — one search, two pages read two ways, five-plus images, a couple of typed-error recoveries — legitimately spends 13-14 rounds, and at 12 the turn kept ending in the reserve-answer round instead of a composed close (tape `20260912T154254Z`); at 16 the same errand settles `Eos` with prose (tape `20260912T155702Z-13565-gui`). This is a product knob, not a law — AGENT-1 still supplies termination, and its answer-only reserve completion backstops exhaustion. Revisit downward if R2's chips plus CAP-4 derivation keep retiring rounds.
-- **Remote `Completer` (Anthropic / OpenAI)** — the payoff of the async-`Completer`
-  generalization (CMP-1): a `RemoteCompleter` holds only `Send` state and its
-  `complete` future can therefore be `Send` by per-implementation inference; the
-  current streaming method also borrows a callback without a `Send` bound, so no
-  blanket Send claim applies to `complete_streaming`. It **awaits HTTP directly**
-  — no `run_blocking`, no `BlockingIsland` (RT-2 gates only the
-  local sync decode). Rust has no official Anthropic SDK, so use raw `reqwest`
-  (already a dep) against `POST /v1/messages`: headers `x-api-key` +
-  `anthropic-version: 2023-06-01`; body `{model, max_tokens, system?, messages,
-  stop_sequences?}`; model ids bare (`claude-opus-4-8`, …, no date suffix);
-  `complete_streaming` reads SSE `content_block_delta` → `text_delta` onto
-  `on_token`; budget via `POST /v1/messages/count_tokens` + response `usage`.
-  Three real impedance points to design around, not gloss:
-  1. **Stop sequences aren't echoed.** Our `Completer` contract *includes* the
-     matched stop marker (so a `ToolCallCodec` sees `</tool_call>`); the Messages
-     API omits it on `stop_reason: "stop_sequence"`. The impl must re-append it.
-  2. **`temperature`/`top_p` are 400s on current Claude models.** `Sampling`
-     doesn't forward 1:1 — drop it, or map "more/less thinking" onto `effort`.
-  3. **The boundary passes a flat prompt string; the chat API wants structured
-     `messages`.** A first cut sends the rendered prompt as one `user` message
-     (works, loses role structure). Doing it well is the boundary refinement below.
-  Also: handle `stop_reason: "refusal"` before reading content. A flat-prompt,
-  greedy-only remote completer is buildable today with no boundary surgery.
-  **Scope decision (deliberate): a remote `Completer` is chat/generate, text
-  only — no tools.** Our tools live in the `Agent` loop via a *text* codec gated
-  to local tool-trained formats (Qwen/Plain); a hosted model's **native** tool
-  use (`tool_use`/`tool_result` blocks, `stop_reason: "tool_use"`) cannot ride
-  the flat-string `Completer` boundary and would need a separate "agent backend"
-  abstraction (most likely letting the provider run its own tool loop). That is
-  explicitly **kicked down the road** — do not conflate it with the `Completer`.
+- **OpenRouter Muse Spark integration — decided 2026-09-20.** This supersedes the earlier Anthropic, raw-Qwen, and flat-string remote-completer designs; their API findings that still matter are kept under *Observed model behaviour* (Tools / agent). The implementation plan was drafted and converge-reviewed locally (plans are not tracked); this entry records the decisions it rests on. The architectural decision is one Yatima-owned structured `ConversationModel` boundary for every backend. The existing raw-prompt `Completer` is renamed `PromptCompleter` and retained as the lower decoder/transport interface shared by Candle and llama-server; peer `ConversationModel` implementations translate to those local prompt protocols or to OpenRouter's structured messages and structured tool protocol. Candle and managed llama-server remain first-class, offline, and default; OpenRouter joins rather than displaces them. The delivery ladder is CLI → TUI → GUI/web for chat, then the same ladder for agent. `meta/muse-spark-1.3` is an explicit profile with no silent model/provider fallback. Other OpenRouter models, Qwen first, are meant to arrive as profile data only; needing a change to the shared trait, the loops, the transport, or a frontend to add one would mean this boundary failed.
 - **More chat templates** — Llama-3, Zephyr/TinyLlama (same shape as Gemma/Mistral).
 - **Sampling quality** — `top_p`/`top_k` nucleus sampling (only temperature
   today) for better free-text on smaller models; download integrity/resume.
@@ -1048,15 +1025,7 @@ and deliberately shelved — the note records why so we don't repeat them.
 - **Async `yatima-host`** — the current host owns the `Engine` on one thread and
   serves one session synchronously; the evolution wraps `run_with_async` for
   cross-request concurrency and KV-cache reuse (see Concurrency).
-- **Structured-message `Completer` boundary** — `complete` takes a *rendered prompt
-  string* today, which suits a local model fed one prompt but loses role
-  structure for a hosted chat API (Anthropic/OpenAI take `messages[]`, not a
-  flat string). A richer boundary would hand the completer the structured turns
-  (`&[Turn]`) and let each impl render: local impls run their `PromptTemplate`,
-  a remote impl maps turns → API `messages`. Trigger: the remote `Completer`
-  above — until then the flat string is fine. **Prerequisite done:** `Role`/`Turn`
-  now live in a neutral `transcript` module (were in `agent`), so the boundary would
-  not make the model layer depend upward into the agent layer.
+- **Structured conversation boundary — planned.** Rename the existing low-level rendered-prompt trait to `PromptCompleter`; it remains the decoder/transport abstraction shared by Candle and llama-server but is no longer described as the agent's complete model boundary. `ChatSession` and `Agent` move to the single higher, Yatima-owned `ConversationModel` trait, which always receives structured turns and tool specs and returns typed answer/reasoning/tool-call/usage data. Peer implementations translate that contract to local prompt protocols or native remote chat protocols; neither defines the shared semantics, and local is not a compatibility mode. `Role`/`Turn` already live in the neutral `transcript` module, and native tool-result correlation will add a required opaque model call ID. Rejected, so they are not revived: the earlier `wants_turns()` branch on the raw trait (a method most implementations could not honour), and a rendered prompt wrapped as one remote user message (two competing protocol owners, and native tool calls thrown away only to be re-parsed from text).
 - **Serving & scale (the tailnet bridge is built; the *tiers* stay deferred —
   a different *process/tier*, not a module).** `yatima-lib` is the in-process
   **leaf**; serving concerns must not leak into it (no auth/tenancy/routing in
@@ -1147,45 +1116,7 @@ and deliberately shelved — the note records why so we don't repeat them.
   more than a code slice (rustls listener or a `tailscale serve` front).
   Tap-to-grant (WEB-7) already removed the sharpest copy/paste need; this
   removes the class.
-- **Remote `Completer` — deferred behind the local llama-server backend (reordered 2026-08-21; design retained): rented per-token compute for the open weights; Anthropic optional, not foundational.**
-  The weekend's verdict, reached live: the stack is proven and the local
-  quantized model is every remaining failure — it fabricates unguessable
-  Wikimedia hash paths, abandons its own read_page → read_image plan
-  mid-way, narrates success over an empty screen, and loops the identical
-  failure verbatim. Two findings sharpen it. *Slow disguises shaky*: a 32B
-  on Metal grinding multi-round agent turns is minutes per turn, so
-  "working", "wedged", and "lying" look identical from the user's chair
-  (the telemetry entry below is the visibility half of the cure). And
-  *lean memory amplifies loops* (AGENT-3): persisted exchanges keep the
-  final answer but drop the tool evidence, so a weak model re-reads its
-  own confident failures with the refutation deleted and imitates them —
-  self-reinforcing theater a strong model escapes via the user's
-  complaints. The design, grounded and ready (working plan held locally):
-  a **structured seam** on `Completer` — `wants_turns()` +
-  `complete_turns_streaming(&[Turn], …)`, defaults preserving every
-  existing impl — cashing the promise `transcript` module docs already
-  reserve ("a future structured `Completer` boundary that takes turns
-  rather than a rendered string"); an `AnthropicCompleter` in yatima-lib
-  (reqwest + `stream`, a small hand-rolled SSE parser; `ANTHROPIC_API_KEY`
-  read at construction per the `HF_TOKEN` precedent and never logged —
-  OBS-2; API quirk: `stop_sequence` responses *exclude* the matched
-  string, which must be re-appended to honor the `Completion` contract
-  the tool codec depends on); the **text `ToolCallCodec` kept** in slice
-  1 (Claude follows codec markup; the whole AGENT/PROTO machinery runs
-  byte-identical — native `tool_use` blocks are slice 2, only if ever
-  needed); `HostConfig.dir` generalizing to `ModelBackend { Local { dir,
-  cpu }, Anthropic { model } }` with the Engine-only surfaces (DepthWatch,
-  CTX-2, arch/backend probing) bypassed for remote; selection via builtin
-  **profiles** (`claude` → sonnet, `claude-opus`, `claude-haiku`) so
-  `--profile claude` works in every frontend; GenOpts mapping: max_tokens
-  and temperature/top_p map (clamped), Greedy → temperature 0, **seed and
-  repeat_penalty do not map** (drop "seed N" from the remote sampling
-  summary). All tests offline via wiremock (the agent's `Scripted`
-  streaming completer is the shape; a canned SSE stream drives a real
-  tool round end to end). On-host inference remains the private, free,
-  offline tier — the *patient* tier — and the remote fork is exactly the
-  identity the Serving & scale entry named: yatima orchestrates.
-  **Ordering revised 2026-08-21:** prove the same raw-prompt HTTP boundary locally with `llama-server` and Muse Glimmer first. This immediately unlocks a model Candle cannot run, preserves sovereign local weights, and exercises child ownership and protocol fidelity without provider credentials or dialect uncertainty. The OpenAI-dialect rented backend remains the next scale-out use of the same transport work when local throughput becomes the constraint; the Anthropic design remains optional capability headroom, built only if wanted.
+- **Remote model — OpenRouter Muse Spark is next (decision 2026-09-20).** The local llama-server integration and image-flow repairs are complete enough to expose the remaining model-quality constraint. The next objective is the standard `meta/muse-spark-1.3` model through OpenRouter, integrated as a first-class structured conversation backend rather than a raw-prompt transport. The accepted order is CLI → TUI → GUI/web for chat, then CLI → TUI → GUI/web for the existing Yatima-owned agent loop using OpenRouter structured tool calls. Each rung is reviewed and accepted on its own surface, and chat is accepted everywhere before agent work starts. The older Anthropic/text-codec and raw-Qwen designs are historical only.
 - **Browser-client near-term queue (distilled from local working plans,
   2026-07-13; full execution scripts held outside the repo per the
   plans-are-ephemeral convention).** In order, after the remote
