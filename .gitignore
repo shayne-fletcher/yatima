@@ -9,3 +9,7 @@ plans/
 .venv/
 /.cargo/
 web/dist/
+# Reference papers kept beside the code for reading. Not committed: most
+# are all-rights-reserved and this repository is public — cite by URL in
+# articles/relevant-research.md instead.
+papers/
